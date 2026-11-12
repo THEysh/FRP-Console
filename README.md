@@ -219,6 +219,22 @@ tools/           构建与自检脚本（after-build.cjs 生成启动器；deplo
 build/installer.nsh  NSIS 安装脚本：把快捷方式改写成带 --no-sandbox 的版本
 ```
 
+### 版本管理
+
+仓库已用 git 管理（分支 `main`），提交历史按「基线 → 修 bug → 删死代码」拆分，便于回溯和回滚：
+
+```bash
+git log --oneline        # 查看提交
+git status               # 看工作区改动
+git diff                 # 看未提交的修改
+git checkout -- <文件>    # 丢弃某个文件的改动
+git revert <commit>      # 撤销某次提交（保留历史）
+```
+
+`.gitignore` 已排除 `node_modules/`、`dist*/`、`.npm-cache/`、`frp-console-data/` 与本地日志，
+因此 `git clone` 后需要先 `npm install`；`resources/frps/` 下的两个 frps 二进制（amd64 / arm64）
+是「一键配置」的必需输入，已随仓库跟踪，不要删除。
+
 ## 常见问题
 
 - **双击 exe 没有窗口 / 进程一闪就退出**：本机（以及多数以管理员身份运行的受限桌面）里 Chromium 沙箱初始化会失败，进程在进入主进程代码之前就以退出码 `3` 结束，所以界面上完全没有提示。命令行参数是唯一生效的方式：装完后请从**桌面 / 开始菜单快捷方式**启动（安装器已把 `--no-sandbox` 写进快捷方式）；如果你手动建的快捷方式或免安装目录，需要自行在「属性 → 目标」末尾补 ` --no-sandbox`，或改用同目录的 `启动 FRP 控制台.cmd`（内容为纯 ASCII，中文路径也不会乱码）。开发时 `npm run dev` 已内置该参数。
