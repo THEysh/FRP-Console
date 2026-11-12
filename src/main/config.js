@@ -131,10 +131,6 @@ function validate(model) {
       push('error', `proxies[${index}].type`, `不支持的代理类型「${proxy.type}」`);
     }
 
-    if (!HOST_TYPES.includes(proxy.type) && proxy.type !== 'tcpmux') {
-      // http/https/stcp/sudp/xtcp 均不使用 localIP/localPort 以外的远程端口
-    }
-
     if (!proxy.plugin) {
       if (!Number.isInteger(proxy.localPort) || proxy.localPort < 1 || proxy.localPort > 65535) {
         push('error', `proxies[${index}].localPort`, `${label} 的本地端口无效`);
@@ -409,9 +405,6 @@ function makeProxy(input) {
     const cleaned = domains.map((d) => String(d).trim()).filter(Boolean);
     if (cleaned.length) base.customDomains = cleaned;
     if (input.subdomain) base.subdomain = String(input.subdomain).trim();
-    if (cleaned.length === 0 && !base.subdomain) {
-      // 留空由校验提示
-    }
   }
   if (input.secretKey) base.secretKey = String(input.secretKey);
   const transport = {};

@@ -143,14 +143,6 @@ function logLevelOf(text) {
   return { D: 'debug', I: 'info', W: 'warn', E: 'error' }[m[1].toUpperCase()] || 'info';
 }
 
-function proxyNameFromLog(text) {
-  let m = /\[([^\]]+)\] (?:start proxy success|start proxy error|close proxy|proxy added)/.exec(text || '');
-  if (m) return m[1];
-  m = /proxy added: \[([^\]]+)\]/.exec(text || '');
-  if (m) return m[1].split(/\s+/).filter(Boolean);
-  return null;
-}
-
 function ensureDir(dir) {
   try {
     fs.mkdirSync(dir, { recursive: true });
@@ -171,6 +163,5 @@ module.exports = {
   formatDuration,
   parseTimestamp,
   logLevelOf,
-  proxyNameFromLog,
   ensureDir,
 };

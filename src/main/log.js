@@ -2,7 +2,7 @@
 
 const fs = require('node:fs');
 const { EventEmitter } = require('node:events');
-const { logLevelOf, parseTimestamp, proxyNameFromLog } = require('./util');
+const { logLevelOf, parseTimestamp } = require('./util');
 
 function parseLine(raw, id) {
   const text = raw.replace(/\r$/, '');
@@ -18,7 +18,6 @@ function parseLine(raw, id) {
     time,
     level,
     text,
-    proxy: proxyNameFromLog(text),
   };
 }
 
