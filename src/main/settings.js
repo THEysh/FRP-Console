@@ -28,6 +28,8 @@ const DEFAULT_SETTINGS = {
   launchAtLogin: false,
   confirmStopService: true,
   logBuffer: 600,
+  // 首启生成过模板配置就置 true：用户之后手动删掉它，也不该再冒出来。
+  starterConfigCreated: false,
   // 统一模型：所有 frps 服务器都是档案；activeServerId 是当前查看的档案，
   // clientServerId 是本机 frpc.toml 当前实际指向的档案。
   servers: [],

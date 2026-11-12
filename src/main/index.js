@@ -1056,6 +1056,12 @@ function scheduleHealth(delay = 1200) {
 
 async function checkHealth() {
   if (!model) return;
+  // 还没填服务器地址时，隧道和公网两层必然不通，检查出来全是红色异常，
+  // 反而让第一次打开的人以为自己配错了。等用户在设置里填好再开始算。
+  if (!model.serverAddr) {
+    healthCache.clear();
+    return;
+  }
   const targets = model.proxies.filter((p) => p.localPort && !p.plugin).slice(0, 16);
   const serverAddr = model.serverAddr;
   const serverPort = Number(model.serverPort);
@@ -1169,6 +1175,19 @@ async function checkExternalConfig() {
     configError = `配置解析失败：${e.message}`;
     pushState();
   }
+}
+
+/* 启动隧道前必须先满足的前提。返回空串表示可以启动。
+ * 首次安装时 frpc.exe 与服务器地址都可能还没有，这时给一句人话，
+ * 而不是把 spawn EPERM 抛到界面上。 */
+function tunnelPrerequisiteError() {
+  if (!paths.frpcPath || !fs.existsSync(paths.frpcPath)) {
+    return '还没找到 frpc.exe：把它放到本程序同目录，或在「设置 → 可执行文件与路径」里指定位置';
+  }
+  if (!model || !model.serverAddr) {
+    return '还没填服务器地址：到「设置 → 服务器连接」填上你自己的 frps 地址，保存后再启动';
+  }
+  return '';
 }
 
 function registerIpc() {
@@ -1367,6 +1386,10 @@ function registerIpc() {
   });
 
   ipcMain.handle('tunnel:start', async () => {
+    /* 还没配好就直接 spawn，只会弹出 "spawn EPERM" 这种没人看得懂的错误，
+     * 所以先在主进程里把缺的前提说清楚。 */
+    const missing = tunnelPrerequisiteError();
+    if (missing) return fail(missing, { state: buildState() });
     await refreshService({ detect: true });
     const result = await manager.start({ runMode: settings.runMode });
     await manager.refresh().catch(() => {});
@@ -2076,11 +2099,59 @@ function startPolling() {
 follower.on('lines', (lines) => send('logs:append', lines));
 follower.on('reset', () => send('logs:reset', { lines: follower.recent(300) }));
 
+/* 首次运行（哪儿都找不到 frpc.toml）时给一份能直接改的模板：服务器地址留空，
+ * 只带一条 Windows-RDP 代理。新手不用从零写 TOML，包里也不会夹带任何人的服务器。
+ * 只生成一次：用户之后自己删掉，也不会再冒出来。 */
+const STARTER_CONFIG = [
+  '# FRP 控制台生成的默认配置。',
+  '# 把 serverAddr / auth.token 换成你自己服务器的，再到「设置 → 服务器连接」点「保存并重启」。',
+  'serverAddr = ""',
+  'serverPort = 7000',
+  'loginFailExit = false',
+  '',
+  'auth.method = "token"',
+  'auth.token = ""',
+  '',
+  'log.to = "./frpc.log"',
+  'log.level = "info"',
+  '',
+  '[[proxies]]',
+  'name = "Windows-RDP"',
+  'type = "tcp"',
+  'localIP = "127.0.0.1"',
+  'localPort = 3389',
+  'remotePort = 13389',
+  '',
+].join('\n');
+
+function ensureStarterConfig() {
+  if (paths.configPath && fs.existsSync(paths.configPath)) return false;
+  if (settings.starterConfigCreated) return false;
+  // 优先放在 frpc.exe 同目录（和 frp 官方压缩包的习惯一致）；不可写时退回数据目录。
+  const candidates = [];
+  if (paths.frpcPath) candidates.push(path.join(path.dirname(paths.frpcPath), 'frpc.toml'));
+  candidates.push(path.join(settingsModule.dataDir(), 'frpc.toml'));
+  for (const file of candidates) {
+    try {
+      settingsModule.ensureDir(path.dirname(file));
+      // wx：已存在就不覆盖。撞上了就换下一个位置。
+      fs.writeFileSync(file, STARTER_CONFIG, { encoding: 'utf8', flag: 'wx' });
+    } catch {
+      continue;
+    }
+    settings = settingsModule.save({ configPath: file, starterConfigCreated: true });
+    paths = { ...paths, configPath: file };
+    return true;
+  }
+  return false;
+}
+
 async function bootstrap() {
   settings = settingsModule.load();
   // 先载入本机配置并按 frpc.toml 归档，再迁移 v1 单密码：
   // 这样“由 frpc.toml 派生出来的档案”也能拿到旧密码。
   paths = { ...paths, ...(await settingsModule.refreshPaths()) };
+  ensureStarterConfig();
   loadConfigFromDisk();
   ensureClientServerProfile();
   migrateLegacyServerSecret();

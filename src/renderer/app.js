@@ -389,6 +389,12 @@ function renderOverview(force = false) {
   const config = state.config || {};
   const dashboard = state.dashboardUrl || '';
   const validation = state.validation || {};
+  // 第一次打开时只差“服务器地址”没填，这是正常状态而不是配置出错：
+  // 用中性提示引导去设置，别拿红色报错吓人。
+  const validationErrors = validation.errors || [];
+  const onlyMissingServer = !config.serverAddr
+    && validationErrors.length === 1
+    && validationErrors[0].field === 'serverAddr';
 
   const addresses = proxies
     .filter((p) => p.publicAddress)
@@ -419,8 +425,10 @@ function renderOverview(force = false) {
 
   const issues = [];
   if (state.configError) issues.push(`<div class="note error">${icon('alert')}<div>${esc(state.configError)}</div></div>`);
-  if (validation.errors && validation.errors.length) {
-    issues.push(`<div class="note error">${icon('alert')}<div><strong>配置存在 ${validation.errors.length} 处错误</strong><br>${esc(validation.errors[0].message)}</div></div>`);
+  if (onlyMissingServer) {
+    issues.push(`<div class="note">${icon('alert')}<div><strong>还没有配置服务器</strong><br>到「设置 → 服务器连接」填你自己的 frps 地址与 Token，保存后点“启动隧道”即可。<br><span style="opacity:.75">下面这条 Windows-RDP 是自带的示例代理，本地端口 3389 可直接用。</span></div></div>`);
+  } else if (validationErrors.length) {
+    issues.push(`<div class="note error">${icon('alert')}<div><strong>配置存在 ${validationErrors.length} 处错误</strong><br>${esc(validationErrors[0].message)}</div></div>`);
   }
   const runtime = state.runtime || {};
   // 两种情况都算“没连上”：frpc 没起来 / 起来了但没登录上 frps / 日志里明确记着连不上。
@@ -489,12 +497,12 @@ function renderOverview(force = false) {
         <div class="card metric">
           <div class="metric-top"><span class="metric-label">在线代理</span><span class="metric-icon">${icon('activity')}</span></div>
           <div class="metric-value">${esc(counts.online)}<small> / ${esc(counts.total)}</small></div>
-          <div class="metric-foot"><span class="${counts.online === counts.total && counts.total ? 'up' : 'down'}">${counts.total ? (counts.online === counts.total ? '全部在线' : `${counts.total - counts.online} 条未通过连通性检查`) : '暂无代理'}</span></div>
+          <div class="metric-foot"><span class="${!config.serverAddr ? '' : (counts.online === counts.total && counts.total ? 'up' : 'down')}">${!config.serverAddr ? '配置服务器后自动检测' : counts.total ? (counts.online === counts.total ? '全部在线' : `${counts.total - counts.online} 条未通过连通性检查`) : '暂无代理'}</span></div>
         </div>
         <div class="card metric">
           <div class="metric-top"><span class="metric-label">连通性异常</span><span class="metric-icon">${icon('cpu')}</span></div>
-          <div class="metric-value">${esc(counts.unhealthy || 0)}</div>
-          <div class="metric-foot"><span class="${counts.unhealthy ? 'down' : 'up'}">${counts.unhealthy ? layerFailText(counts) : '三层检查均通过'}</span></div>
+          <div class="metric-value">${config.serverAddr ? esc(counts.unhealthy || 0) : '—'}</div>
+          <div class="metric-foot"><span class="${!config.serverAddr ? '' : counts.unhealthy ? 'down' : 'up'}">${!config.serverAddr ? '尚未开始检测' : counts.unhealthy ? layerFailText(counts) : '三层检查均通过'}</span></div>
         </div>
         <div class="card metric">
           <div class="metric-top"><span class="metric-label">运行时长</span><span class="metric-icon">${icon('clock')}</span></div>
