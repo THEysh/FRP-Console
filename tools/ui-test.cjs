@@ -11,7 +11,9 @@ const http = require('node:http');
 const path = require('node:path');
 
 const PORT = Number(process.env.CDP_PORT || 9333);
-const OUT_DIR = process.env.OUT_DIR || '/tmp/ui-shots';
+// 默认落在项目内的 .shots/（已 gitignore）。别用 /tmp：Windows 上 Node 会把它
+// 解析成当前盘符根目录，截图会散落到 F://tmp。
+const OUT_DIR = process.env.OUT_DIR || path.join(__dirname, '..', '.shots');
 const VIEWS = ['overview', 'proxies', 'discovery', 'server', 'logs', 'settings'];
 
 function getJson(p) {

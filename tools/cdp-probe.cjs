@@ -2,9 +2,13 @@
 /* 用 CDP 截取窗口右上角，确认三个窗口按钮的图标真的画出来了。 */
 const fs = require('node:fs');
 const http = require('node:http');
+const path = require('node:path');
 
 const PORT = Number(process.env.CDP_PORT || 9333);
-const OUT = process.env.OUT || '/tmp/win-buttons.png';
+// 默认落在项目内的 .shots/（已 gitignore）。别用 /tmp：在 Windows 上 Node 会把它
+// 解析成当前盘符根目录，截图会散落到 F:\tmp。
+const SHOTS = path.join(__dirname, '..', '.shots');
+const OUT = process.env.OUT || path.join(SHOTS, 'win-buttons.png');
 
 function getJson(path) {
   return new Promise((resolve, reject) => {
@@ -36,6 +40,7 @@ async function waitTarget() {
 }
 
 async function main() {
+  fs.mkdirSync(SHOTS, { recursive: true });
   const page = await waitTarget();
   const ws = new WebSocket(page.webSocketDebuggerUrl);
   let seq = 0;
@@ -128,8 +133,9 @@ async function main() {
       clip: { x: Math.max(0, size2.窗口宽 - 240), y: 0, width: 240, height: 52, scale: 3 },
       captureBeyondViewport: false,
     });
-    fs.writeFileSync(process.env.OUT2 || '/tmp/win-buttons-max.png', Buffer.from(shot2.data, 'base64'));
-    console.log('[shot2]', process.env.OUT2 || '/tmp/win-buttons-max.png');
+    const out2 = process.env.OUT2 || path.join(SHOTS, 'win-buttons-max.png');
+    fs.writeFileSync(out2, Buffer.from(shot2.data, 'base64'));
+    console.log('[shot2]', out2);
   }
 
   ws.close();
