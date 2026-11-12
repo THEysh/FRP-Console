@@ -2532,7 +2532,7 @@ function renderSettings(force = false) {
             <div class="path-row">
               <div class="path-display grow">
                 <span class="p-label">托盘图标</span>
-                <span class="p-value mono">${S.app && S.app.tray ? '已创建，右键可退出' : '未创建'}</span>
+                <span class="p-value mono">${S.app && S.app.tray ? '已创建，右键可退出' : S.app && S.app.trayCreated ? '已创建，但系统没显示图标' : '未创建'}</span>
                 <span class="tag ${S.app && S.app.tray ? 'ok' : 'bad'}">${S.app && S.app.tray ? '可用' : '不可用'}</span>
               </div>
             </div>
@@ -2541,7 +2541,9 @@ function renderSettings(force = false) {
               「完全退出」会先停掉控制台自己拉起的 frpc，再结束进程。
               系统服务模式的隧道不受影响——那是单独的常驻服务。
             </div>
-            ${S.app && S.app.tray ? '' : `<div class="note warn">${icon('alert')}<div>托盘图标没能创建（assets 下的 tray-*.png 缺失或被拦截）。此时关闭窗口会<strong>直接退出程序</strong>，不会藏起来，避免窗口消失后叫不回来。</div></div>`}
+            ${S.app && S.app.tray ? '' : `<div class="note warn">${icon('alert')}<div>${S.app && S.app.trayCreated
+              ? '托盘对象已创建，但系统没有给它分配屏幕位置（可能只被折叠进「^ 显示隐藏的图标」，先点 ^ 看看）。<br>如果 ^ 里也没有，多半是<strong>程序所在目录被安全软件/管控策略保护</strong>，系统拒绝为该目录下的程序注册托盘图标——把程序安装或移动到默认目录（C 盘的「应用程序」目录）再打开即可。此时关闭窗口会<strong>直接退出程序</strong>，不会藏起来。'
+              : '托盘图标没能创建（assets 下的 tray-*.png 缺失或被拦截）。此时关闭窗口会<strong>直接退出程序</strong>，不会藏起来，避免窗口消失后叫不回来。'}</div></div>`}
           </div>
         </section>
 

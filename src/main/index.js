@@ -66,6 +66,12 @@ let trayKey = '';
 let trayHintShown = false;
 // 当前托盘图标的色调，避免状态轮询里反复 setImage。
 let trayToneCache = '';
+// 系统是否真的把托盘图标显示出来了。Electron 在个别 Windows 上会出现
+// 「Tray 对象创建成功，但 Shell_NotifyIcon 失败」（日志：notify_icon.cc
+// Unable to create status tray icon），此时 getBounds() 全 0。
+// 这种“假托盘”最危险：点 X 把窗口藏起来，用户却找不到图标，只能杀进程。
+let trayUsable = true;
+let trayProbeFails = 0;
 let settings = null;
 let paths = { frpcPath: '', configPath: '', logPath: '' };
 let model = null;
@@ -386,7 +392,38 @@ function revealPathSafe(which) {
   }
 }
 
+// 只有托盘真的可见，才允许把窗口收进去。
+function canHideToTray() {
+  return !!tray && trayUsable;
+}
+
+/* 托盘自检：系统没给图标分配屏幕位置就说明它其实没显示出来。
+ * 连续三次（约 9 秒）都拿不到位置才下结论，避免把「图标被折叠进 ^ 溢出面板」误判成故障。
+ * 一旦判定不可用，就把已经藏起来的窗口叫回来——绝不能把用户锁在界面外面。 */
+function probeTray() {
+  if (!tray || tray.isDestroyed()) return;
+  let shown = true;
+  try {
+    const b = tray.getBounds();
+    shown = !!(b && b.width > 0 && b.height > 0);
+  } catch {
+    shown = true; // 平台不支持 getBounds 时不干预
+  }
+  if (shown) {
+    trayProbeFails = 0;
+    if (!trayUsable) { trayUsable = true; refreshTray(true); }
+    return;
+  }
+  trayProbeFails += 1;
+  if (trayProbeFails < 3 || !trayUsable) return;
+  trayUsable = false;
+  console.warn('[tray] 系统未显示托盘图标（getBounds 全 0），关闭窗口将直接退出而不是收进托盘');
+  if (win && !win.isDestroyed() && !win.isVisible()) showMainWindow();
+  refreshTray(true);
+}
+
 function refreshTray(force = false) {
+  probeTray();
   if (!tray || !settings) return;
   const runtime = manager
     ? runtimeView(manager.snapshot())
@@ -486,7 +523,7 @@ function createWindow() {
 
   win.once('ready-to-show', () => {
     // 托盘都没建出来时不能真的静默启动，否则窗口永远叫不出来。
-    if (!settings.startMinimized || !tray) win.show();
+    if (!settings.startMinimized || !canHideToTray()) win.show();
   });
 
   const persistBounds = () => {
@@ -506,7 +543,7 @@ function createWindow() {
   win.on('close', (event) => {
     if (isQuitting) return; // 走退出流程，正常销毁
     // 没有托盘就不能藏：藏了就再也找不回来，只能杀进程。
-    if (settings.closeToTray === false || !tray) return;
+    if (settings.closeToTray === false || !canHideToTray()) return;
     event.preventDefault();
     win.hide();
     hintTrayOnce();
@@ -705,7 +742,8 @@ function buildState() {
       uptime: runtime.since ? Date.now() - runtime.since : 0,
       uptimeLabel: runtime.since ? formatDuration(Date.now() - runtime.since) : '',
       // 设置页据此提示“关闭窗口会不会真退出”
-      tray: !!tray,
+      tray: canHideToTray(),
+      trayCreated: !!tray,
     },
     settings: settingsForState(),
     paths: pathsForState(),
@@ -1035,7 +1073,8 @@ function registerIpc() {
         maximized: !!(win && !win.isDestroyed() && win.isMaximized()),
         // 托盘是否真的建出来了。建不出来时界面要提示：这时“关闭窗口”会直接退出，
         // 而不是像往常那样收进托盘（否则窗口会消失且叫不回来）。
-        tray: !!tray,
+        tray: canHideToTray(),
+        trayCreated: !!tray,
       },
     });
   });
@@ -1819,7 +1858,7 @@ function registerIpc() {
       else win.maximize();
     } else if (action === 'hide') {
       // 没有托盘就别藏，否则窗口再也叫不回来。
-      if (!tray) return fail('托盘不可用，无法隐藏窗口');
+      if (!canHideToTray()) return fail('托盘不可用，无法隐藏窗口');
       win.hide();
       hintTrayOnce();
     } else if (action === 'show') {
@@ -1839,6 +1878,8 @@ function registerIpc() {
   // 设置页会把它显示出来，也方便自动化测试断言。
   ipcMain.handle('app:tray-state', async () => ok({
     tray: !!tray,
+    usable: canHideToTray(),
+    bounds: (() => { try { return tray && !tray.isDestroyed() ? tray.getBounds() : null; } catch { return null; } })(),
     tone: trayToneCache || '',
     windowVisible: !!(win && !win.isDestroyed() && win.isVisible()),
     windowDestroyed: !win || win.isDestroyed(),

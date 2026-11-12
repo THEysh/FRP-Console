@@ -185,6 +185,17 @@ SSH 这边同理：档案里**记住密码**后，选中档案（或首次打开
 
 **如果托盘建不出来**（图标缺失或被安全软件拦截），关闭窗口会直接退出程序，而不是把窗口藏起来——避免“窗口消失且叫不回来”只能去任务管理器杀进程。
 
+### 托盘图标不显示的排查
+
+控制台每 3 秒用 `tray.getBounds()` 自检一次：系统给图标分配的屏幕位置若连续三次都是 0，就判定为“假托盘”（`Tray` 对象创建成功，但 `Shell_NotifyIcon` 失败）。此时设置页会提示、点 X 改为直接退出，并会把已经藏起来的窗口重新叫回来。
+
+遇到看不到托盘时按这个顺序查：
+
+1. **先点任务栏的「^ 显示隐藏的图标」**。Windows 默认会把新图标折叠进溢出面板，折叠时 `getBounds()` 也可能是 0。
+2. **看程序放在哪个目录**。本机实测：`F:\ysh_loc_office\frp_0.61.0\` 这个目录下的可执行文件**一律注册不上托盘**（Electron 31 / 45、原生 `Shell_NotifyIconW` 对照、同一份文件换目录即恢复，清通知区缓存与调 ACL 都无效），而同一程序复制到 C 盘或 `F:\electron45-copy` 就完全正常。这是该目录被管控软件特殊对待所致，**不是程序 bug**。解决办法是把程序安装/移动到该目录之外，例如默认安装位置 `%LOCALAPPDATA%\Programs\frp-console`。
+3. 需要自行复现时，用 `npx electron tools/tray-hold.cjs --no-sandbox --enable-logging` 看 `getBounds()` 是否全 0（`--enable-logging` 会打印 `notify_icon.cc: Unable to create status tray icon`），再用 `python tools/tray_native_probe.py` 做原生对照；`npx electron tools/screen-crop.cjs --no-sandbox` 可以把通知区放大截图。
+4. 若怀疑是 Windows 通知区缓存损坏，可备份后删除 `HKCU\SOFTWARE\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\TrayNotify` 下的 `IconStreams` 与 `PastIconsStream`，再重启资源管理器。**注意这会让其他应用的托盘图标也暂时消失**，需要重启那些应用（或注销重登）才会重新注册。
+
 ## 管理 API
 
 控制台通过 frpc 自带的 Admin API（默认 `127.0.0.1:7400`，账号 `admin/admin`）读取代理状态并触发热重载。该监听只在 `webServer.addr = "127.0.0.1"` 时对本机开放；「设置 → 管理 API」可以一键补全。若修改了端口或账号，请在设置中同步。
