@@ -11,7 +11,7 @@ const DEFAULT_SETTINGS = {
   frpcPath: '',
   configPath: '',
   frpsDashboardUrl: '',
-  serviceName: 'nssmfrpc',
+  serviceName: 'frpc',
   serviceAutoDetect: true,
   runMode: 'auto',
   adminPort: 7400,

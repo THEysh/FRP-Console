@@ -40,11 +40,12 @@ async function main() {
   const pending = new Map();
   const problems = [];
 
-  const send = (method, params = {}) => new Promise((resolve, reject) => {
+  // 截图超时单独放宽：桌面会话断开/远程桌面最小化时，Chromium 合成一帧可能要几十秒。
+  const send = (method, params = {}, timeout = 20000) => new Promise((resolve, reject) => {
     const id = ++seq;
     pending.set(id, { resolve, reject });
     ws.send(JSON.stringify({ id, method, params }));
-    setTimeout(() => { if (pending.has(id)) { pending.delete(id); reject(new Error(`${method} timeout`)); } }, 20000);
+    setTimeout(() => { if (pending.has(id)) { pending.delete(id); reject(new Error(`${method} timeout`)); } }, timeout);
   });
 
   ws.addEventListener('message', (event) => {
@@ -87,6 +88,15 @@ async function main() {
     await sleep(500);
   }
 
+  // 窗口被最小化/遮挡、或合成器停摆时渲染进程不再产帧，captureScreenshot 会一直挂住。
+  // 统一按视口尺寸做一次 metrics 覆盖，强制按视口重新合成，截图才稳定。
+  let nudged = false;
+  {
+    const size = await evaluate('({ width: window.innerWidth, height: window.innerHeight })');
+    await send('Emulation.setDeviceMetricsOverride', { ...size, deviceScaleFactor: 1, mobile: false });
+    nudged = true;
+  }
+
   for (const view of VIEWS) {
     await evaluate(`(() => {
       const btn = document.querySelector('.nav-item[data-view="${view}"]');
@@ -126,11 +136,22 @@ async function main() {
     })()`);
     console.log('[view]', info);
 
-    const shot = await send('Page.captureScreenshot', { format: 'png' });
+    // 窗口被最小化/遮挡、或合成器停摆时渲染进程不再产帧，captureScreenshot 会一直挂住。
+    // 统一按视口尺寸做一次 metrics 覆盖，强制按视口重新合成，截图才稳定。
+    let shot;
+    try {
+      shot = await send('Page.captureScreenshot', { format: 'png' }, 90000);
+    } catch {
+      const size = await evaluate('({ width: window.innerWidth, height: window.innerHeight })');
+      await send('Emulation.setDeviceMetricsOverride', { ...size, deviceScaleFactor: 1, mobile: false });
+      shot = await send('Page.captureScreenshot', { format: 'png' }, 90000);
+      await send('Emulation.clearDeviceMetricsOverride');
+    }
     fs.writeFileSync(path.join(OUT_DIR, `${view}.png`), Buffer.from(shot.data, 'base64'));
   }
 
   console.log('[problems]', problems.length ? JSON.stringify(problems, null, 2) : '无');
+  if (nudged) await send('Emulation.clearDeviceMetricsOverride').catch(() => {});
   ws.close();
   process.exit(0);
 }

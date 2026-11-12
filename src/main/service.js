@@ -72,7 +72,7 @@ async function queryService(name) {
   };
 }
 
-async function detectServiceName(preferred = 'nssmfrpc') {
+async function detectServiceName(preferred = 'frpc') {
   const q = await queryService(preferred);
   if (q.installed) return preferred;
   const script = [

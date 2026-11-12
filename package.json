@@ -6,10 +6,27 @@
   "main": "src/main/index.js",
   "author": "杨盛晖",
   "license": "MIT",
-  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/THEysh/FRP-Console.git"
+  },
+  "homepage": "https://github.com/THEysh/FRP-Console",
+  "bugs": {
+    "url": "https://github.com/THEysh/FRP-Console/issues"
+  },
+  "keywords": [
+    "frp",
+    "frpc",
+    "frps",
+    "electron",
+    "内网穿透",
+    "反向代理",
+    "windows"
+  ],
   "scripts": {
-    "start": "electron . --no-sandbox",
-    "dev": "electron . --no-sandbox",
+    "start": "electron .",
+    "dev": "electron .",
+    "dev:nosandbox": "electron . --no-sandbox",
     "dist": "electron-builder --win nsis --x64 && node tools/after-build.cjs",
     "dist:portable": "electron-builder --win portable --x64 && node tools/after-build.cjs",
     "dist:dir": "electron-builder --win dir --x64 && node tools/after-build.cjs",

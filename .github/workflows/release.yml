@@ -1,0 +1,53 @@
+name: release
+
+# 打 tag（v1.1.0 这种）时自动构建 Windows 安装包并挂到 Release。
+# 也可以在 Actions 页面手动触发，构建产物只作为 artifact 上传，不发 Release。
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 打包 NSIS 安装包
+        run: npm run dist
+
+      - name: 打包便携版
+        run: npm run dist:portable
+
+      - name: 收集产物
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          Get-ChildItem dist -Filter *.exe | Where-Object { $_.Name -notlike '*unpacked*' } | Copy-Item -Destination out
+          Get-ChildItem out | Select-Object Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-build
+          path: out/*.exe
+          if-no-files-found: error
+
+      - name: 发布到 Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/*.exe
+          generate_release_notes: true
+          draft: false

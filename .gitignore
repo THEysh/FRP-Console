@@ -23,6 +23,8 @@ desktop.ini
 .workbuddy/
 # UI 自动化截图输出
 .shots/
+# 截图演示用的隔离数据目录
+.demo/
 
 # 打包时的工作目录残留
 __pycache__/

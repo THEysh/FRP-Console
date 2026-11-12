@@ -2609,7 +2609,7 @@ function renderSettings(force = false) {
           </div>
           <div class="service-box">
             <div class="sb-state">
-              <span class="sb-name">${esc(service.name || settings.serviceName || 'nssmfrpc')}</span>
+              <span class="sb-name">${esc(service.name || settings.serviceName || 'frpc')}</span>
               <span class="sb-desc">${esc(service.installed ? `${serviceStateText(service.state)}${service.pid ? ` · PID ${service.pid}` : ''}` : '未检测到该服务')}</span>
             </div>
             <select class="select" data-act="service.autostart" ${!service.installed ? 'disabled' : ''} style="max-width:150px">
