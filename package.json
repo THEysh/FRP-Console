@@ -1,0 +1,81 @@
+{
+  "name": "frp-console",
+  "productName": "FRP控制台",
+  "version": "1.1.0",
+  "description": "FRP 内网穿透图形控制台：代理管理、本机端口扫描、frps 远程管理、热重载与实时日志",
+  "main": "src/main/index.js",
+  "author": "杨盛晖",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "start": "electron . --no-sandbox",
+    "dev": "electron . --no-sandbox",
+    "dist": "electron-builder --win nsis --x64 && node tools/after-build.cjs",
+    "dist:portable": "electron-builder --win portable --x64 && node tools/after-build.cjs",
+    "dist:dir": "electron-builder --win dir --x64 && node tools/after-build.cjs"
+  },
+  "dependencies": {
+    "smol-toml": "^1.9.1",
+    "ssh2": "^1.16.0"
+  },
+  "devDependencies": {
+    "electron": "31.7.7",
+    "electron-builder": "26.18.0"
+  },
+  "build": {
+    "appId": "cn.ysh.frp-console",
+    "productName": "FRP控制台",
+    "executableName": "FRP-Console",
+    "directories": {
+      "output": "dist",
+      "buildResources": "assets"
+    },
+    "files": [
+      "src/**/*",
+      "assets/icon.png",
+      "assets/icon.ico",
+      "assets/tray.png",
+      "package.json"
+    ],
+    "asar": true,
+    "extraResources": [
+      {
+        "from": "resources/frps",
+        "to": "frps",
+        "filter": [
+          "**/frps"
+        ]
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "assets/icon.ico",
+      "artifactName": "FRP-Console-Setup-${version}-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "allowElevation": false,
+      "runAfterFinish": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "FRP 控制台",
+      "artifactName": "FRP-Console-Setup-${version}-${arch}.${ext}",
+      "include": "build/installer.nsh",
+      "deleteAppDataOnUninstall": false,
+      "uninstallDisplayName": "FRP 控制台"
+    },
+    "portable": {
+      "artifactName": "FRP-Console-${version}.${ext}",
+      "requestExecutionLevel": "user"
+    },
+    "compression": "normal"
+  }
+}

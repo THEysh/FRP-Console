@@ -1,0 +1,26 @@
+# 依赖与构建产物
+node_modules/
+npm-debug.log*
+dist/
+dist-new/
+dist-*/
+.npm-cache/
+
+# 运行期数据（便携版会在 exe 同级生成）
+frp-console-data/
+frp-console-backups/
+
+# 本地日志与临时文件
+*.log
+*.tmp
+*.bak
+Thumbs.db
+desktop.ini
+
+# 编辑器 / 工具
+.vscode/
+.idea/
+.workbuddy/
+
+# 打包时的工作目录残留
+__pycache__/

@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'; font-src 'self'" />
+  <title>FRP 控制台</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="window">
+    <div class="titlebar">
+      <div class="tb-left">
+        <span class="tb-logo" id="tb-logo" aria-hidden="true"></span>
+        <span class="tb-title">FRP 控制台</span>
+        <span class="tb-crumb" id="tb-crumb">概览</span>
+      </div>
+      <div class="tb-right">
+        <button class="status-pill" id="tb-status" type="button" title="查看运行状态">
+          <span class="dot"></span><span class="label">正在初始化</span>
+        </button>
+        <div class="win-btns">
+          <button class="win-btn" id="win-min" type="button" aria-label="最小化"></button>
+          <button class="win-btn" id="win-max" type="button" aria-label="最大化"></button>
+          <button class="win-btn win-close" id="win-close" type="button" aria-label="关闭"></button>
+        </div>
+      </div>
+    </div>
+
+    <div class="shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <rect x="1" y="1" width="46" height="46" rx="13" fill="url(#brandGrad)"/>
+              <path d="M14 31.5V17.2c0-.8.6-1.4 1.4-1.4h8.2c1.5 0 2.7 1.2 2.7 2.7 0 1.5-1.2 2.7-2.7 2.7h-5.6" stroke="#0b1018" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"/>
+              <path d="M25.6 16.4h6.6c.8 0 1.4.6 1.4 1.4v6.4m0 0-3-3m3 3 3-3" stroke="#0b1018" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"/>
+              <circle cx="34.6" cy="32.6" r="3.1" fill="#0b1018"/>
+              <defs>
+                <linearGradient id="brandGrad" x1="4" y1="4" x2="44" y2="44" gradientUnits="userSpaceOnUse">
+                  <stop stop-color="#6ee7ff"/>
+                  <stop offset="1" stop-color="#7c6cff"/>
+                </linearGradient>
+              </defs>
+            </svg>
+          </div>
+          <div class="brand-text">
+            <strong>FRP 控制台</strong>
+            <span>内网穿透 · 本地服务发布</span>
+          </div>
+        </div>
+
+        <nav class="nav" id="nav"></nav>
+
+        <div class="sidebar-foot">
+          <div class="mini-status" id="mini-status">
+            <span class="mini-dot"></span>
+            <div class="mini-text">
+              <span class="mini-title">检测中…</span>
+              <span class="mini-sub">正在读取隧道状态</span>
+            </div>
+          </div>
+          <div class="side-meta">
+            <span id="side-version">FRP 控制台</span>
+            <span id="side-frpc">frpc ·</span>
+          </div>
+        </div>
+      </aside>
+
+      <main class="main" id="view">
+        <div class="boot">
+          <div class="boot-spinner"></div>
+          <p>正在连接本地 frpc…</p>
+        </div>
+      </main>
+    </div>
+  </div>
+
+  <div id="toast-root" class="toast-root"></div>
+  <div id="modal-root" class="modal-root"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
