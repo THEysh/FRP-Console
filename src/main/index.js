@@ -41,6 +41,7 @@ const service = require('./service');
 const netport = require('./netport');
 const { ServerSession } = require('./ssh');
 const frpsConfig = require('./frpsconfig');
+const { TrayPanel } = require('./tray-panel');
 const { execFileP, tcpCheck, httpProbe, hashText, formatDuration } = require('./util');
 
 const assetsDir = path.join(__dirname, '..', '..', 'assets');
@@ -59,9 +60,10 @@ function bundledFrpsPath(arch) {
 let win = null;
 let tray = null;
 let isQuitting = false;
-// 托盘菜单上次渲染时的“状态签名”。每 3 秒的状态轮询都会调 refreshTray，
-// 签名没变就不重建菜单——否则右键菜单开着的时候会被不停替换，点哪一项都容易点空。
-let trayKey = '';
+/* 自绘托盘面板（src/main/tray-panel.js）。右键时懒创建，之后复用。 */
+let trayPanel = null;
+/* 面板里每个 id 对应的动作，随状态刷新一起更新，避免闭包拿到旧设置。 */
+let trayActions = {};
 // 首次最小化到托盘只提示一次，免得每次关窗口都弹。
 let trayHintShown = false;
 // 当前托盘图标的色调，避免状态轮询里反复 setImage。
@@ -277,8 +279,12 @@ function hintTrayOnce() {
   });
 }
 
-function buildTrayMenu(runtime) {
+/* 托盘菜单只在一处定义，两处消费：自绘面板（tray-panel.js）和原生菜单
+ * （透明窗口建不出来时的兜底）。改菜单只改这里。 */
+function trayMenuSpec(runtime) {
   const status = trayStatusLine(runtime);
+  const iconTone = trayTone(runtime);
+  const tone = iconTone === 'error' ? 'error' : runtime.mode === 'starting' || runtime.pending ? 'starting' : iconTone;
   const managed = settings.runMode !== 'service';
   const canStart = !runtime.loggedIn && !(manager && manager.isChildAlive);
   const canStop = !!(runtime.connected || (manager && manager.isChildAlive));
@@ -289,97 +295,157 @@ function buildTrayMenu(runtime) {
     return st && st.status === 'running';
   }).length;
 
-  // 用几何符号而不是 emoji：Windows 托盘菜单的字体（Segoe UI）对 emoji 支持不稳，
-  // 经常渲染成方块。
-  const mark = runtime.loggedIn ? '●' : runtime.loginFailed || runtime.connectFailed ? '✕' : runtime.mode === 'starting' || runtime.pending ? '◐' : '○';
+  const visible = !!(win && !win.isDestroyed() && win.isVisible());
 
-  const template = [
-    { label: `${mark} ${status.label}`, enabled: false },
-    { label: `    ${addr} · ${proxies.length} 个代理${proxies.length ? `（在线 ${onlineCount}）` : ''}`, enabled: false },
-    { type: 'separator' },
-    { label: '显示主界面', default: true, click: () => showMainWindow() },
-    {
-      label: '隐藏到托盘',
-      enabled: !!(win && !win.isDestroyed() && win.isVisible()),
-      click: () => hideMainWindow(),
-    },
-    { type: 'separator' },
-    {
-      label: '启动隧道',
-      enabled: canStart,
-      click: async () => {
-        const result = await manager.start({ runMode: settings.runMode });
-        notify(result.ok ? 'info' : 'error', result.ok ? '隧道已启动' : '启动失败', result.error || '');
-        await manager.refresh().catch(() => {});
-        pushState();
-        refreshTray(true);
+  const sections = [
+    [
+      { id: 'win.show', label: '显示主界面', enabled: !(visible && !win.isMinimized()) },
+      { id: 'win.hide', label: '隐藏到托盘', enabled: visible },
+    ],
+    [
+      { id: 'tun.start', label: '启动隧道', enabled: canStart },
+      { id: 'tun.stop', label: '停止隧道', enabled: canStop },
+      { id: 'tun.restart', label: '重启隧道', enabled: !!runtime.running },
+      { id: 'tun.reload', label: '热重载配置', enabled: !!runtime.connected },
+    ],
+    [
+      { id: 'open.dashboard', label: '打开服务器面板', enabled: !!dashboardUrl() },
+      { id: 'open.config', label: '打开 frpc.toml', enabled: !!paths.configPath },
+      { id: 'open.logdir', label: '打开日志目录', enabled: !!paths.logPath },
+    ],
+    [
+      { id: 'opt.closeToTray', label: '关闭窗口时最小化到托盘', checked: settings.closeToTray !== false },
+      { id: 'opt.launchOnStart', label: '启动时自动连接隧道', checked: !!settings.launchTunnelOnStart },
+    ],
+    [
+      {
+        id: 'app.quit',
+        label: '退出 FRP 控制台',
+        kind: 'danger',
+        tag: managed ? '并停掉托管隧道' : '',
       },
-    },
-    {
-      label: '停止隧道',
-      enabled: canStop,
-      click: async () => {
-        suppressExitUntil = Date.now() + 12000;
-        const result = await manager.stop({ runMode: settings.runMode });
-        notify(result.ok ? 'info' : 'error', result.ok ? '隧道已停止' : '停止失败', result.error || '');
-        await manager.refresh().catch(() => {});
-        pushState();
-        refreshTray(true);
-      },
-    },
-    {
-      label: '重启隧道',
-      enabled: !!runtime.running,
-      click: async () => {
-        suppressExitUntil = Date.now() + 15000;
-        const result = await manager.restart({ runMode: settings.runMode });
-        notify(result.ok ? 'info' : 'error', result.ok ? '隧道已重启' : '重启失败', result.error || '');
-        await manager.refresh().catch(() => {});
-        pushState();
-        refreshTray(true);
-      },
-    },
-    {
-      label: '热重载配置',
-      enabled: !!runtime.connected,
-      click: async () => {
-        const result = await manager.reload().catch((e) => ({ ok: false, error: e.message }));
-        notify(result && result.ok ? 'info' : 'error', result && result.ok ? '配置已重载' : '重载失败', (result && result.error) || '');
-        refreshTray(true);
-      },
-    },
-    { type: 'separator' },
-    { label: '打开服务器面板', enabled: !!dashboardUrl(), click: () => shell.openExternal(dashboardUrl()) },
-    { label: '打开 frpc.toml', enabled: !!paths.configPath, click: () => revealPathSafe('config') },
-    { label: '打开日志目录', enabled: !!paths.logPath, click: () => revealPathSafe('log') },
-    { type: 'separator' },
-    {
-      label: '关闭窗口时最小化到托盘',
-      type: 'checkbox',
-      checked: settings.closeToTray !== false,
-      click: (item) => {
-        settings = settingsModule.save({ closeToTray: !!item.checked });
-        pushState();
-        refreshTray(true);
-      },
-    },
-    {
-      label: '启动时自动连接隧道',
-      type: 'checkbox',
-      checked: !!settings.launchTunnelOnStart,
-      click: (item) => {
-        settings = settingsModule.save({ launchTunnelOnStart: !!item.checked });
-        pushState();
-        refreshTray(true);
-      },
-    },
-    { type: 'separator' },
-    {
-      label: managed ? '退出 FRP 控制台（停掉托管的隧道）' : '退出 FRP 控制台',
-      click: () => quitApp({ reason: 'tray' }),
-    },
+    ],
   ];
+
+  const actions = {
+    'win.show': () => showMainWindow(),
+    'win.hide': () => hideMainWindow(),
+    'tun.start': async () => {
+      const result = await manager.start({ runMode: settings.runMode });
+      notify(result.ok ? 'info' : 'error', result.ok ? '隧道已启动' : '启动失败', result.error || '');
+      await manager.refresh().catch(() => {});
+      pushState();
+      refreshTray();
+    },
+    'tun.stop': async () => {
+      suppressExitUntil = Date.now() + 12000;
+      const result = await manager.stop({ runMode: settings.runMode });
+      notify(result.ok ? 'info' : 'error', result.ok ? '隧道已停止' : '停止失败', result.error || '');
+      await manager.refresh().catch(() => {});
+      pushState();
+      refreshTray();
+    },
+    'tun.restart': async () => {
+      suppressExitUntil = Date.now() + 15000;
+      const result = await manager.restart({ runMode: settings.runMode });
+      notify(result.ok ? 'info' : 'error', result.ok ? '隧道已重启' : '重启失败', result.error || '');
+      await manager.refresh().catch(() => {});
+      pushState();
+      refreshTray();
+    },
+    'tun.reload': async () => {
+      const result = await manager.reload().catch((e) => ({ ok: false, error: e.message }));
+      notify(result && result.ok ? 'info' : 'error', result && result.ok ? '配置已重载' : '重载失败', (result && result.error) || '');
+      refreshTray();
+    },
+    'open.dashboard': () => shell.openExternal(dashboardUrl()),
+    'open.config': () => revealPathSafe('config'),
+    'open.logdir': () => revealPathSafe('log'),
+    // 勾选状态以当前设置为准再取反：自绘面板和原生复选框都走这一条，不会因为
+    // 两边的 item.checked 语义不同而出现“点一次不生效”。
+    'opt.closeToTray': () => {
+      settings = settingsModule.save({ closeToTray: settings.closeToTray === false });
+      pushState();
+      refreshTray();
+    },
+    'opt.launchOnStart': () => {
+      settings = settingsModule.save({ launchTunnelOnStart: !settings.launchTunnelOnStart });
+      pushState();
+      refreshTray();
+    },
+    'app.quit': () => quitApp({ reason: 'tray' }),
+  };
+
+  return {
+    tone,
+    label: status.label,
+    addr,
+    proxyLine: proxies.length ? `${proxies.length} 个代理 · 在线 ${onlineCount}` : '还没有代理',
+    sections,
+    actions,
+    mark: runtime.loggedIn ? '●' : runtime.loginFailed || runtime.connectFailed ? '✕' : runtime.mode === 'starting' || runtime.pending ? '◐' : '○',
+  };
+}
+
+function panelModel(spec) {
+  return {
+    tone: spec.tone,
+    label: spec.label,
+    addr: spec.addr,
+    proxyLine: spec.proxyLine,
+    sections: spec.sections.map((section) => section.map(({ id, label, enabled, checked, kind, tag }) => ({
+      id, label, enabled, checked, kind, tag,
+    }))),
+  };
+}
+
+function nativeTrayTemplate(spec) {
+  const template = [
+    { label: `${spec.mark} ${spec.label}`, enabled: false },
+    { label: `    ${spec.addr} · ${spec.proxyLine}`, enabled: false },
+  ];
+  for (const section of spec.sections) {
+    template.push({ type: 'separator' });
+    for (const item of section) {
+      const row = { label: item.label, enabled: item.enabled !== false, click: () => spec.actions[item.id] && spec.actions[item.id]() };
+      if (typeof item.checked === 'boolean') {
+        row.type = 'checkbox';
+        row.checked = item.checked;
+      }
+      template.push(row);
+    }
+  }
   return template;
+}
+
+/* 右键托盘：优先弹自绘面板；面板建不出来（例如透明窗口被策略拦住）再退回原生菜单。 */
+function openTrayPanel() {
+  if (!tray) return;
+  const runtime = manager
+    ? runtimeView(manager.snapshot())
+    : { running: false, connected: false, loggedIn: false, loginFailed: false, connectFailed: false, mode: 'stopped' };
+  const spec = trayMenuSpec(runtime);
+  trayActions = spec.actions;
+  try {
+    if (!trayPanel) {
+      trayPanel = new TrayPanel({
+        preloadPath: path.join(__dirname, 'tray-preload.js'),
+        rendererPath: path.join(__dirname, '..', 'renderer', 'tray.html'),
+        onInvoke: (id) => {
+          const fn = trayActions[id];
+          if (fn) fn();
+        },
+      });
+    }
+    let bounds = null;
+    try { bounds = tray.getBounds(); } catch { bounds = null; }
+    trayPanel.open(panelModel(spec), bounds).catch(() => {
+      try { tray.popUpContextMenu(Menu.buildFromTemplate(nativeTrayTemplate(spec))); } catch { /* ignore */ }
+    });
+  } catch (e) {
+    console.warn('[tray] 自绘面板不可用，回退原生菜单', e && e.message);
+    try { tray.popUpContextMenu(Menu.buildFromTemplate(nativeTrayTemplate(spec))); } catch { /* ignore */ }
+  }
 }
 
 function revealPathSafe(which) {
@@ -411,7 +477,7 @@ function probeTray() {
   }
   if (shown) {
     trayProbeFails = 0;
-    if (!trayUsable) { trayUsable = true; refreshTray(true); }
+    if (!trayUsable) { trayUsable = true; refreshTray(); }
     return;
   }
   trayProbeFails += 1;
@@ -419,10 +485,10 @@ function probeTray() {
   trayUsable = false;
   console.warn('[tray] 系统未显示托盘图标（getBounds 全 0），关闭窗口将直接退出而不是收进托盘');
   if (win && !win.isDestroyed() && !win.isVisible()) showMainWindow();
-  refreshTray(true);
+  refreshTray();
 }
 
-function refreshTray(force = false) {
+function refreshTray() {
   probeTray();
   if (!tray || !settings) return;
   const runtime = manager
@@ -444,28 +510,12 @@ function refreshTray(force = false) {
     }
   }
 
-  // 签名里带上所有会影响菜单 enabled/checked 的字段，避免菜单开着被重建
-  const key = JSON.stringify({
-    tone,
-    label: status.label,
-    loggedIn: !!runtime.loggedIn,
-    connected: !!runtime.connected,
-    running: !!runtime.running,
-    child: !!(manager && manager.isChildAlive),
-    addr: model ? `${model.serverAddr}:${model.serverPort}` : '',
-    proxies: ((model && model.proxies) || []).length,
-    visible: !!(win && !win.isDestroyed() && win.isVisible()),
-    tray: settings.closeToTray !== false,
-    auto: !!settings.launchTunnelOnStart,
-    runMode: settings.runMode,
-    dash: dashboardUrl(),
-  });
-  if (!force && key === trayKey) return;
-  trayKey = key;
-  try {
-    tray.setContextMenu(Menu.buildFromTemplate(buildTrayMenu(runtime)));
-  } catch {
-    /* 菜单构建失败不影响托盘图标本身 */
+  // 面板开着的时候状态还会变（隧道起来、在线数变化），直接推一份新的进去，
+  // 不用关掉重开；重建 12 行 DOM 比维护签名便宜，也不会漏字段。
+  const spec = trayMenuSpec(runtime);
+  trayActions = spec.actions;
+  if (trayPanel && trayPanel.isOpen()) {
+    trayPanel.refresh(panelModel(spec)).catch(() => {});
   }
 }
 
@@ -547,12 +597,12 @@ function createWindow() {
     event.preventDefault();
     win.hide();
     hintTrayOnce();
-    refreshTray(true);
+    refreshTray();
   });
-  win.on('show', () => refreshTray(true));
-  win.on('hide', () => refreshTray(true));
-  win.on('minimize', () => refreshTray(true));
-  win.on('restore', () => refreshTray(true));
+  win.on('show', () => refreshTray());
+  win.on('hide', () => refreshTray());
+  win.on('minimize', () => refreshTray());
+  win.on('restore', () => refreshTray());
   win.on('closed', () => {
     win = null;
   });
@@ -578,7 +628,9 @@ function createTray() {
   tray.on('click', () => toggleMainWindow());
   tray.on('double-click', () => showMainWindow());
   tray.on('balloon-click', () => showMainWindow());
-  refreshTray(true);
+  // 右键不交给系统菜单，弹自绘面板（样式和主界面一致）
+  tray.on('right-click', () => openTrayPanel());
+  refreshTray();
   return true;
 }
 
@@ -910,8 +962,9 @@ async function tick({ force = false } = {}) {
     }
     pushState();
     refreshTray();
-  } catch {
-    /* ignore */
+  } catch (e) {
+    // 轮询出错不打断下一次，但调试时要看得见，否则菜单/状态出问题会完全无声。
+    if (process.env.FRP_CONSOLE_DEBUG) console.warn('[tick]', e && e.stack ? e.stack.split('\n')[0] : e);
   } finally {
     tickBusy = false;
   }
@@ -1864,7 +1917,7 @@ function registerIpc() {
     } else if (action === 'show') {
       showMainWindow();
     } else if (action === 'close') win.close();
-    refreshTray(true);
+    refreshTray();
     return ok({ maximized: win.isMaximized(), visible: win.isVisible() });
   });
 
@@ -2155,6 +2208,11 @@ function startApp() {
         if (win && !win.isDestroyed()) win.webContents.executeJavaScript('JSON.stringify({views: document.querySelectorAll(".view").length, nodes: document.querySelectorAll(".view *").length, title: (document.querySelector(".hero-titles h2")||{}).textContent || "", status: (document.querySelector(".status-pill .label")||{}).textContent || "", nav: document.querySelectorAll(".nav-item").length, toast: document.querySelectorAll(".toast").length})').then((v) => console.log(`[smoke] ${v}`)).catch((e) => console.log(`[smoke] error ${e.message}`)).finally(() => { quitAllowed = true; app.quit(); });
       }, 7000);
     }
+    /* 托盘右键没法用脚本点，只能真机试；打开这个开关会在启动后直接弹一次面板，
+     * 配合 --remote-debugging-port 截图核对样式与点击回传。 */
+    if (process.env.FRP_TRAY_PANEL_SMOKE === '1') {
+      setTimeout(() => openTrayPanel(), 3500);
+    }
     app.on('activate', () => {
       if (win) win.show();
     });
@@ -2167,7 +2225,7 @@ if (!gotLock) {
   app.on('second-instance', () => {
     // 已经有一个在跑：把它的窗口叫出来，本进程立刻退出（不会留下第二个托盘图标）。
     focusMainWindow();
-    refreshTray(true);
+    refreshTray();
   });
 
   claimInstanceChannel().then(async (claimed) => {
