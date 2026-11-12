@@ -42,20 +42,12 @@ const netport = require('./netport');
 const { ServerSession } = require('./ssh');
 const frpsConfig = require('./frpsconfig');
 const { TrayPanel } = require('./tray-panel');
+const frpsBinary = require('./frpsBinary');
 const { execFileP, tcpCheck, httpProbe, hashText, formatDuration } = require('./util');
 
 const assetsDir = path.join(__dirname, '..', '..', 'assets');
 const preloadPath = path.join(__dirname, 'preload.js');
 const rendererPath = path.join(__dirname, '..', 'renderer', 'index.html');
-
-function bundledFrpsPath(arch) {
-  const folder = arch === 'arm64' ? 'linux-arm64' : arch === 'amd64' ? 'linux-amd64' : '';
-  if (!folder) return '';
-  const candidates = app.isPackaged
-    ? [path.join(process.resourcesPath, 'frps', folder, 'frps')]
-    : [path.join(app.getAppPath(), 'resources', 'frps', folder, 'frps')];
-  return candidates.find((candidate) => fs.existsSync(candidate)) || '';
-}
 
 let win = null;
 let tray = null;
@@ -1811,9 +1803,18 @@ function registerIpc() {
     }
     const rawArch = String((serverSession.info && serverSession.info.arch) || '').toLowerCase();
     const arch = ['x86_64', 'amd64', 'x64'].includes(rawArch) ? 'amd64' : ['aarch64', 'arm64'].includes(rawArch) ? 'arm64' : rawArch;
-    const localBinary = bundledFrpsPath(arch);
-    if (!localBinary && !(serverSession.info && serverSession.info.frpsInstalled)) {
-      return fail(`本机缺少 ${arch || '未知架构'} 版 frps 安装包，无法自动安装`);
+    const sendProgress = (step) => {
+      try { event.sender.send('server:install-progress', step); } catch { /* window closed */ }
+    };
+    /* 服务器上已经有 frps 时不需要上传，也就不用下载；没有才去按架构取一份。
+     * 二进制不再打进安装包，首次「从零初始化」时现下（约 18 MB），之后走缓存。 */
+    let localBinary = '';
+    if (!(serverSession.info && serverSession.info.frpsInstalled)) {
+      const binary = await frpsBinary.ensure(arch, {
+        onProgress: ({ text, percent }) => sendProgress({ stage: 'download', text, percent }),
+      });
+      if (!binary.ok) return fail(binary.error);
+      localBinary = binary.path;
     }
     const configPath = serverSession.configPath || '/etc/frp/frps.toml';
     const unitName = (serverSession.info && serverSession.info.hasUnit && serverSession.info.serviceName) || 'frps';
@@ -1822,9 +1823,7 @@ function registerIpc() {
       localBinary,
       configPath,
       unitName,
-      onProgress: (step) => {
-        try { event.sender.send('server:install-progress', step); } catch { /* window closed */ }
-      },
+      onProgress: sendProgress,
     });
     if (!result.ok) return fail(result.error, { steps: result.steps || [] });
     // 初始化过程可能长达几十秒，期间切了档案就不再改写任何本机状态。

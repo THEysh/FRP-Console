@@ -343,7 +343,9 @@ class ServerSession {
     const sudo = await this.detectSudo();
     if (!sudo.ok) return { ok: false, error: sudo.error, steps };
     const prefix = sudo.prefix;
-    report('check', '检查服务器权限与架构', 3);
+    // 进度条区间：下载 1-8（在 server:bootstrap 里）→ 检查 10 → 上传 12-60 →
+    // 安装 62 → 配置 72 → 服务 80-84 → 启动 90 → 验证 95 → 100。
+    report('check', '检查服务器权限与架构', 10);
 
     const arch = normalizeArch((this.info && this.info.arch) || '');
     let binary = firstLine((await this.exec('command -v frps 2>/dev/null || true', 6000)).stdout);
@@ -354,14 +356,14 @@ class ServerSession {
         return { ok: false, error: `暂不支持服务器架构 ${arch || 'unknown'}，仅支持 amd64 / arm64`, steps };
       }
       if (!localBinary || !fs.existsSync(localBinary)) {
-        return { ok: false, error: `本机未找到 ${arch} 版 frps 安装包，无法自动上传`, steps };
+        return { ok: false, error: `本机没有可用的 ${arch} 版 frps 二进制，无法自动上传`, steps };
       }
       const remoteTmp = `/tmp/frps-console-frps-${Date.now()}`;
-      report('upload', `上传内置 frps（${arch}，约 ${Math.max(1, Math.round(fs.statSync(localBinary).size / 1048576))} MB）`, 5);
+      report('upload', `上传 frps（${arch}，约 ${Math.max(1, Math.round(fs.statSync(localBinary).size / 1048576))} MB）`, 12);
       let lastPercent = -1;
       let lastMb = -1;
       const upload = await this.uploadFile(localBinary, remoteTmp, (transferred, total) => {
-        const percent = total ? 5 + Math.round((transferred / total) * 55) : 5;
+        const percent = total ? 12 + Math.round((transferred / total) * 48) : 12;
         const mb = Math.round(transferred / 1048576);
         if (percent === lastPercent && mb === lastMb) return;
         lastPercent = percent;
@@ -381,7 +383,7 @@ class ServerSession {
       }
       binary = '/usr/local/bin/frps';
     } else {
-      report('check', `检测到已安装 frps：${binary}`, 20);
+      report('check', `检测到已安装 frps：${binary}`, 10);
     }
 
     const configDir = configPath.replace(/\/[^/]+$/, '') || '/etc/frp';

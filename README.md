@@ -51,7 +51,7 @@
 | `FRP-Console-Setup-<版本>-x64.exe` | NSIS 一键安装，装到 `%LOCALAPPDATA%\Programs\frp-console`，自动建桌面与开始菜单快捷方式 |
 | `FRP-Console-<版本>.exe` | 单文件便携版，数据写在 exe 同级的 `frp-console-data\` |
 
-安装包只装控制台，**不含 frpc**——请自行从 [frp Releases](https://github.com/fatedier/frp/releases) 下载 `frpc.exe`，放在控制台能找到的位置（建议与控制台同目录），或在「设置 → 可执行文件与路径」里手动选择。
+安装包只装控制台，**不含 frpc，也不含 frps**——`frpc.exe` 请自行从 [frp Releases](https://github.com/fatedier/frp/releases) 下载，放在控制台能找到的位置（建议与控制台同目录），或在「设置 → 可执行文件与路径」里手动选择。服务端的 `frps` 会在首次「一键初始化」时按服务器架构自动下载（约 18 MB，只下一次），详见 [frps 服务端控制台](#frps-服务端控制台)。
 
 ### 系统要求
 
@@ -123,7 +123,8 @@ npm install --cache .\.npm-cache
 
 - **状态识别**：同时检查 systemd 服务、`frps` 进程、Docker 容器与监听端口，避免"实际在跑却显示已停止"；版本优先从 PATH、进程可执行文件或镜像识别。
 - **快速配置向导**：模板有 基础穿透 / 带鉴权 / 带鉴权 + 面板 / HTTPS 域名 / 自定义，右侧实时生成 `frps.toml` 预览。写入前本机校验 TOML，服务器上若存在 `frps` 还会先跑 `frps verify`，通过后备份为 `.bak-时间戳` 再覆盖。
-- **一键初始化**：服务器上还没有 frps 也能从零开始——按架构（amd64 / arm64）上传内置的 frps 0.61.0、写配置、注册 `frps.service`（无 systemd 时回退后台进程）、清掉旧的裸进程避免 7000 冲突。可选「同时把本机 frpc 的地址与 Token 改为本次配置」。
+- **一键初始化**：服务器上还没有 frps 也能从零开始——按架构（amd64 / arm64）**下载** frps 0.61.0（约 18 MB，只下一次，缓存复用）、上传、写配置、注册 `frps.service`（无 systemd 时回退后台进程）、清掉旧的裸进程避免 7000 冲突。可选「同时把本机 frpc 的地址与 Token 改为本次配置」。
+  > 二进制不进安装包：两份 frps 会让安装包从 81 MB 涨到 95 MB。下载失败时见 [常见问题](#常见问题) 的手动放置办法。
 - **结构化日志**：把 `journalctl -u frps`、`docker logs` 或 `frps.log` 解析成时间 / 级别 / 内容三列，汇总启动时间、客户端连接数与错误数。
 
 > 需要目标机器已开 SSH，并使用 root 或具备 `systemctl` / `docker` 权限的账户。非 root 但配了免密 `sudo` 时，控制命令会自动改用 `sudo -n`。Docker 启动的 frps 会改用 `docker start/stop/restart` 操作。
@@ -165,6 +166,7 @@ npm install --cache .\.npm-cache
 - **换了服务器地址但仍连旧服务器**：frpc 的 reload 不会重建服务器连接，必须重启隧道（「保存并重启」或概览页「重启」）。
 - **公网端口不通**：先在代理列表点「测试公网端口」；仍不通就检查服务端安全组 / 防火墙是否放行该端口，以及代理是否为 `running`。
 - **服务启停弹 UAC**：Windows 服务需要管理员权限；取消授权不影响已有隧道。
+- **一键初始化卡在「下载 frps」**：程序要从 GitHub 取 `frp_0.61.0_linux_<arch>.tar.gz`。连不上时手动下载解压，把 `frps` 放到 `%LOCALAPPDATA%\frp-console\frps-cache\frp_0.61.0_linux_amd64\frps`（或程序目录 `resources\frps\linux-amd64\frps`），再点一次初始化即可走本地文件；也可以设环境变量 `FRP_DOWNLOAD_MIRROR=https://ghproxy.net/` 之类的前缀走代理。
 - **开了「开机自动启动」但重启后没自动运行**：这条设置写在当前用户的启动项里（`HKCU\...\Run`，不需要管理员权限）。被安全软件或组策略拦下时保存会直接报错、开关不会假装打开；这种情况可以在 `shell:startup`（Win+R 输入后回车打开的那个文件夹）里放一个控制台的快捷方式代替。另外建议同时打开「以最小化状态启动」，免得每次开机都弹窗。
 - **看到两个控制台窗口**：不会。单实例锁 + 固定端口 47823 双保险，后启动的副本会叫出已有窗口后退出。
 - **启动即退出 / 白屏**：程序会依次尝试 exe 同级 `frp-console-data`、`%LOCALAPPDATA%\frp-console`、程序目录下的数据目录；都不可写时会失败，请换到有写权限的位置。
@@ -228,11 +230,11 @@ node tools/cdp-shot.cjs .proxy-row out.png # 按选择器截单个元素
 
 - SSH 密码与本机 Token 使用 Windows DPAPI 加密后存在用户数据目录，**不会明文落盘**；解密绑定当前 Windows 账户，拷到别的机器上无效。
 - 安装包里**不含任何服务器地址、Token 或作者的个人配置**：装完全新的环境里服务器档案是空的，一切都由你自己填。
-- 控制台不向外发包，所有连接都是你显式发起的（本机 frpc、frpc Admin API、你填的 SSH 主机）。
+- 控制台不向外发包：所有连接都是你显式发起的（本机 frpc、frpc Admin API、你填的 SSH 主机）。**唯一的例外**是「从零初始化」时从 `github.com/fatedier/frp` 下载 frps 二进制（只在服务器已装 frps 时不发生，且可用本地文件代替，见 [resources/frps](resources/frps/README.md)）。
 - frps 初始化会写入 `/etc/frp/frps.toml`、注册系统服务并重启 frps；**若服务器上原有的 frps 正在服务其他隧道，这会短暂中断并替换其配置**，执行前请确认影响范围。
 
 ## 许可证
 
 [MIT](LICENSE)
 
-frp 本身由 [fatedier/frp](https://github.com/fatedier/frp) 开发，遵循 Apache-2.0；`resources/frps/` 下是 frp 0.61.0 的官方二进制，仅用于「一键初始化」上传到你的服务器。
+frp 本身由 [fatedier/frp](https://github.com/fatedier/frp) 开发，遵循 Apache-2.0。安装包**不再内置** frps 二进制：需要时从上游官方 Releases 下载 frp 0.61.0 的 `frps`（仅解压上传到你的服务器，不再分发），以减小安装包体积并避免与二进制的版本绑定。
