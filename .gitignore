@@ -21,6 +21,8 @@ desktop.ini
 .vscode/
 .idea/
 .workbuddy/
+# UI 自动化截图输出
+.shots/
 
 # 打包时的工作目录残留
 __pycache__/

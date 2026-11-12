@@ -28,20 +28,7 @@ async function listListeners() {
     entries.get(port).hosts.add(host);
   }
 
-  // 用 PowerShell 按 PID 精确取进程名。tasklist 在部分受限进程环境下会漏进程，
-  // Get-Process 走系统 API，结果更完整。
-  const pidToName = new Map();
-  const pids = [...new Set([...entries.values()].map((item) => item.pid).filter(Boolean))];
-  if (pids.length) {
-    const script = `Get-Process -Id ${pids.join(',')} -ErrorAction SilentlyContinue | ForEach-Object { "$($_.Id)=$($_.ProcessName)" }`;
-    const r = await powershell(script, { timeout: 12000 });
-    if (r.ok) {
-      for (const line of r.stdout.split(/\r?\n/)) {
-        const match = /^(\d+)=(.+)$/.exec(line.trim());
-        if (match) pidToName.set(Number(match[1]), match[2]);
-      }
-    }
-  }
+  const { names: pidToName, error: processError } = await processNames();
 
   const listeners = [...entries.values()].map((item) => {
     const hosts = [...item.hosts].sort();
@@ -55,7 +42,49 @@ async function listListeners() {
     };
   });
   listeners.sort((a, b) => a.port - b.port);
-  return { ok: true, listeners };
+  return { ok: true, listeners, processError };
+}
+
+/**
+ * PID → 进程名。
+ * 注意：这里**不能用 Get-Process**。在 Electron（GUI 子系统、无控制台）里派生 powershell 时，
+ * Get-Process 会直接以退出码 1 静默失败（没有 stdout、也没有错误记录），
+ * 于是“进程”列永远显示“未知”。
+ *
+ * 而且单一来源会漏：.NET 的 GetProcesses() 只看得到 70 来个进程（另一个会话/权限更高的
+ * 进程拿不到），tasklist 更全但个别受限进程会缺。两个来源合并，才能把监听端口对上号。
+ */
+async function processNames() {
+  const names = new Map();
+  const psError = [];
+
+  const tasklist = await execFileP('tasklist.exe', ['/FO', 'CSV', '/NH'], { timeout: 15000 });
+  if (tasklist.ok) {
+    for (const line of tasklist.stdout.split(/\r?\n/)) {
+      const cells = line.match(/"([^"]*)"/g);
+      if (!cells || cells.length < 2) continue;
+      const name = cells[0].replace(/"/g, '');
+      const pid = Number(cells[1].replace(/"/g, ''));
+      if (pid) names.set(pid, name.replace(/\.exe$/i, ''));
+    }
+  } else {
+    psError.push('tasklist 不可用');
+  }
+
+  const script = '[System.Diagnostics.Process]::GetProcesses() | ForEach-Object { try { "$($_.Id)=$($_.ProcessName)" } catch { } }';
+  const ps = await powershell(script, { timeout: 20000 });
+  if (ps.ok) {
+    for (const line of ps.stdout.split(/\r?\n/)) {
+      const match = /^(\d+)=(.+)$/.exec(line.trim());
+      if (match && !names.has(Number(match[1]))) names.set(Number(match[1]), match[2].trim());
+    }
+  } else {
+    const reason = (ps.stderr || '').split(/\r?\n/).map((s) => s.trim())
+      .filter((line) => line && !line.startsWith('#< CLIXML'))[0] || `退出码 ${ps.code}`;
+    psError.push(reason.slice(0, 80));
+  }
+
+  return { names, error: names.size ? '' : `读不到进程名：${psError.join('；')}` };
 }
 
 module.exports = { listListeners };

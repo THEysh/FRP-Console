@@ -145,13 +145,19 @@ a { color: var(--accent); text-decoration: none; }
 .win-btn {
   width: 40px; height: 30px;
   display: grid; place-items: center;
-  border: 0; background: transparent; color: var(--text-3);
+  border: 0; background: transparent; color: var(--text-2);
   border-radius: 7px;
+  cursor: default;
   transition: background 0.16s, color 0.16s;
 }
 .win-btn:hover { background: rgba(148, 163, 184, 0.12); color: var(--text); }
+.win-btn:active { background: rgba(148, 163, 184, 0.2); }
 .win-btn.win-close:hover { background: #e5484d; color: #fff; }
-.win-btn svg { width: 13px; height: 13px; }
+.win-btn svg { width: 13px; height: 13px; display: block; }
+/* 最大化 / 还原两个字形同时存在，靠按钮上的 is-max 切换，避免每次去改 innerHTML */
+.win-btn .ico-restore { display: none; }
+.win-btn.is-max .ico-max { display: none; }
+.win-btn.is-max .ico-restore { display: block; }
 
 /* ---------------- 侧边栏 ---------------- */
 .shell {

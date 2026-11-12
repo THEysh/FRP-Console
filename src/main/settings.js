@@ -19,6 +19,8 @@ const DEFAULT_SETTINGS = {
   adminPassword: 'admin',
   autoReload: true,
   pollIntervalMs: 3000,
+  // 默认不把系统 HTTP_PROXY 传给 frpc：frp 会拿它去代理 TCP 握手，多半被网关 502 拒掉。
+  stripProxyEnv: true,
   closeToTray: true,
   startMinimized: false,
   launchTunnelOnStart: false,

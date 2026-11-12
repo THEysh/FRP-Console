@@ -31,9 +31,15 @@ function execFileP(file, args = [], options = {}) {
 }
 
 function powershell(script, options = {}) {
+  /* 用 -EncodedCommand 传脚本，而不是 -Command。
+   * execFile 在 Windows 上要把参数拼成一条命令行交给 CreateProcess，
+   * 脚本里一旦出现 " { } | $ 这类字符（Get-Process ... ForEach-Object { "$($_.Id)=..." }）
+   * 就会被二次解析，表现为“命令失败”且没有任何输出。
+   * Base64(UTF-16LE) 之后命令行里只剩字母数字，彻底没有转义问题。 */
+  const encoded = Buffer.from(String(script || ''), 'utf16le').toString('base64');
   return execFileP(
     'powershell.exe',
-    ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
+    ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded],
     { timeout: 60000, ...options },
   );
 }

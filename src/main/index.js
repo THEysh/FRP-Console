@@ -369,10 +369,22 @@ function configForState() {
 // frpc 连不上服务器的原因就写在日志里（连接被拒 / 超时 / Token 不对）。
 // 概览页直接把它说出来，用户才不用去猜是本地服务、隧道还是公网的问题。
 function connectProblemKind(text) {
+  // 顺序有讲究：Token 相关的报错里也常带 “failed”，先判鉴权再判网络。
+  if (/authorization failed|token in login|doesn't match|authentication failed|invalid token/i.test(text)) return 'auth';
   if (/actively refused|ECONNREFUSED|拒绝/i.test(text)) return 'refused';
-  if (/timeout|timed out|unreachable|ECONNRESET|network is unreachable|EOF/i.test(text)) return 'unreachable';
-  if (/authorization failed|token in login|doesn't match|login to server failed|authentication/i.test(text)) return 'auth';
+  if (/proxy|StatusCode|50[234]/i.test(text)) return 'proxy';
+  if (/timeout|timed out|unreachable|ECONNRESET|network is unreachable|EOF|no such host|NXDOMAIN/i.test(text)) return 'unreachable';
   return 'unknown';
+}
+
+const CONNECT_FAIL_RE = /connect to server error|login to (?:the )?server failed|authorization failed|token in login|doesn't match|DialTcp|proxy connect/i;
+
+// 去掉行首时间戳和 [I] [client/xxx.go:298] 前缀，同一错误重试时字符串不变，避免整页重绘。
+function cleanProblemText(raw) {
+  return String(raw || '')
+    .replace(/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d+\s*/, '')
+    .replace(/^\[[A-Z]\]\s*\[[^\]]*\]\s*/, '')
+    .trim();
 }
 
 // 把 tcpCheck 的 errno 翻成一句人话，切换前探测失败时直接给用户看。
@@ -388,37 +400,72 @@ function reachHint(code) {
 function lastConnectProblem() {
   const lines = (follower && follower.lines) || [];
   const floor = Math.max(0, lines.length - 300);
+  let fileProblem = null;
   for (let i = lines.length - 1; i >= floor; i -= 1) {
     const text = String((lines[i] && lines[i].text) || '');
     if (!text) continue;
     // 先遇到“登录/代理成功”说明之前的失败已经翻篇了，别把旧错误当现状。
-    if (/login to server success|start proxy success|login to the server success/i.test(text)) return null;
-    if (!/connect to server error|login to server failed|authorization failed|token in login|doesn't match/i.test(text)) continue;
-    // 去掉行首时间戳，避免同样的错误每次重试都变成“新文案”触发整页重绘。
-    const clean = text.replace(/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d+\s*/, '').trim();
-    return { text: clean.slice(0, 200), kind: connectProblemKind(clean) };
+    if (/login to (?:the )?server success|start proxy success/i.test(text)) return null;
+    if (!CONNECT_FAIL_RE.test(text)) continue;
+    const clean = cleanProblemText(text);
+    fileProblem = { text: clean.slice(0, 200), kind: connectProblemKind(clean) };
+    break;
   }
-  return null;
+  if (fileProblem && fileProblem.kind !== 'unknown') return fileProblem;
+
+  /* 再补一刀：看 frpc 进程自己的输出。
+   * loginFailExit = true 时 frpc 连不上就直接退出，而且**连日志文件都不会创建**，
+   * 唯一的原因只出现在子进程的 stdout/stderr 里（lastExit 存了最后几行）。
+   * 只看日志文件的话，这种最常见的失败永远判不出来。
+   * stdoutTail 每次 spawn 都会清空，所以不会把上一次启动的残留当现状。 */
+  if (manager) {
+    const tail = [
+      manager.lastExit && manager.lastExit.error,
+      manager.stderrTail,
+      manager.stdoutTail,
+    ].filter(Boolean).join('\n');
+    const hit = tail.split(/\r?\n/).map((s) => s.trim()).filter(Boolean).reverse()
+      .find((line) => CONNECT_FAIL_RE.test(line));
+    if (hit) {
+      const clean = cleanProblemText(hit);
+      return { text: clean.slice(0, 200), kind: connectProblemKind(clean) };
+    }
+  }
+  return fileProblem;
 }
 
 function runtimeView(runtime) {
   const apiOk = !!runtime.connected;
   const declared = model ? (model.proxies || []).length : 0;
   const registered = manager ? manager.proxyStatus.size : 0;
-  const problem = lastConnectProblem();
+  /* 只在“本该连着”的时候去翻失败记录：
+   * 隧道是活的（进程/服务/API 任一在），或者刚异常退出（lastExit.error 非空）。
+   * 否则用户明明是手动停掉的，hero 却因为日志缓冲里那几行旧报错继续显示“连不上服务器”。 */
+  const logsRelevant = !!runtime.running || !!(runtime.lastExit && runtime.lastExit.error);
+  const problem = logsRelevant ? lastConnectProblem() : null;
   /* 注意：frpc 的管理 API 在自己连不上 frps 时照样回 200，只是返回空表。
-   * 所以“API 可达”不等于“已登录 frps”。只有日志里确实记着连接失败、且一个代理都没注册上，
-   * 才判定为“没连上服务器”，避免刚启动那一瞬间误报。 */
-  const loginFailed = apiOk && !!problem && problem.kind !== 'unknown' && declared > 0 && registered === 0;
+   * 所以“API 可达”不等于“已登录 frps”。判定分两路：
+   *   1) 日志/子进程输出里抓到了明确的连接失败（problem）；
+   *   2) 配置里明明有代理，但 /api/status 里一个都没注册上——这条比日志更可靠，
+   *      因为登录失败时 frpc 可能根本不建日志文件（loginFailExit=true 直接退出），
+   *      或者用户把 log.to 指到了别处，此时只剩这一条线索。 */
+  const notRegistered = declared > 0 && registered === 0;
+  // 刚拉起的一两秒内代理还没注册，别急着报错，否则启动瞬间会闪一下红色。
+  const settled = !runtime.childStartedAt || Date.now() - runtime.childStartedAt > 6000;
+  const loginFailed = apiOk && notRegistered && (!!problem || settled);
   const detected = !!problem && problem.kind !== 'unknown';
+  // 有“没注册上”的结论、却抓不到具体报错文本：照样要报出来，只是原因说不细。
+  const unconfirmed = loginFailed && !detected;
   return {
     ...runtime,
     loggedIn: apiOk && !loginFailed,
     loginFailed,
+    // 管理 API 通了、但代理还没注册上，且还没到判定超时的时候：这叫“正在登录”，别急着报错。
+    pending: apiOk && notRegistered && !loginFailed,
     // 连不上服务器（不管 frpc 进程还在不在：loginFailExit=true 时它会直接退出）
-    connectFailed: detected,
-    connectError: detected ? problem.text : '',
-    connectKind: detected ? problem.kind : '',
+    connectFailed: detected || unconfirmed,
+    connectError: detected ? problem.text : unconfirmed ? '管理 API 可达，但服务器上没有任何代理注册成功' : '',
+    connectKind: detected ? problem.kind : unconfirmed ? 'unconfirmed' : '',
   };
 }
 
@@ -788,6 +835,8 @@ function registerIpc() {
         platform: process.platform,
         dataDir: settingsModule.dataDir(),
         settingsFile: settingsModule.settingsFile(),
+        // 让渲染层一开始就能画出正确的“最大化 / 还原”字形
+        maximized: !!(win && !win.isDestroyed() && win.isMaximized()),
       },
     });
   });
@@ -802,6 +851,7 @@ function registerIpc() {
       'frpcPath', 'configPath', 'frpsDashboardUrl', 'serviceName', 'runMode',
       'adminPort', 'adminUser', 'adminPassword', 'autoReload', 'pollIntervalMs', 'closeToTray',
       'startMinimized', 'launchTunnelOnStart', 'serviceAutoDetect', 'logBuffer', 'confirmStopService',
+      'stripProxyEnv',
     ];
     const clean = {};
     for (const key of allowed) if (patch && Object.prototype.hasOwnProperty.call(patch, key)) clean[key] = patch[key];
@@ -814,6 +864,12 @@ function registerIpc() {
       if (follower.lines.length > follower.maxLines) follower.lines.splice(0, follower.lines.length - follower.maxLines);
     }
     if (clean.runMode && !['auto', 'service', 'managed'].includes(clean.runMode)) delete clean.runMode;
+    if (clean.configPath !== undefined) {
+      const wanted = String(clean.configPath || '').trim();
+      // 填了但文件不存在就直接报错。否则 refreshPaths 会悄悄换回旧路径，
+      // 用户以为“保存成功了”，实际用的还是另一个配置文件。
+      if (wanted && !fs.existsSync(wanted)) return fail(`配置文件不存在：${wanted}`);
+    }
     settings = settingsModule.save(clean);
     const previousConfig = paths.configPath;
     const previousFrpc = paths.frpcPath;
@@ -1029,7 +1085,7 @@ function registerIpc() {
   ipcMain.handle('listen:scan', async () => {
     const result = await netport.listListeners();
     if (!result.ok) return fail(result.error, { listeners: [] });
-    return ok({ listeners: result.listeners });
+    return ok({ listeners: result.listeners, processError: result.processError || '' });
   });
 
   function applyPortStatus(info, summary) {
@@ -1676,11 +1732,13 @@ async function bootstrap() {
     pushState();
     refreshTray();
     if (Date.now() > suppressExitUntil) {
-      const unexpected = info && info.code !== 0;
+      // 判“意外”看的是有没有错误文本，而不是退出码：
+      // 用户主动停止时 frpc 可能返回 1（停止时代理还没登录上），那不是故障。
+      const unexpected = !!(info && info.error);
       send('notify', {
         kind: unexpected ? 'error' : 'info',
         title: unexpected ? '隧道意外停止' : '隧道已停止',
-        message: (info && info.error) || (info && info.code !== null ? `frpc 退出（代码 ${info.code}）` : ''),
+        message: (info && info.error) || 'frpc 已退出',
       });
     }
   });

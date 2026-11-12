@@ -7,6 +7,22 @@ const { tcpCheck } = require('./util');
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/* 这些环境变量会让 frpc 把到 frps 的 TCP 握手交给 HTTP 代理去做，
+ * 而绝大多数代理只代理 HTTP(S)，于是报 `DialTcpByHttpProxy error, StatusCode [502]`，
+ * 表现为“连不上服务器”但端口、Token 都正常。控制台默认把它们摘掉。 */
+const PROXY_ENV_KEYS = [
+  'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'FTP_PROXY', 'NO_PROXY',
+  'http_proxy', 'https_proxy', 'all_proxy', 'ftp_proxy', 'no_proxy',
+];
+
+function childEnv(settings) {
+  const inherit = !settings || settings.stripProxyEnv === false;
+  if (inherit) return process.env;
+  const env = { ...process.env };
+  for (const key of PROXY_ENV_KEYS) delete env[key];
+  return env;
+}
+
 class FrpcManager extends EventEmitter {
   constructor(ctx) {
     super();
@@ -20,6 +36,7 @@ class FrpcManager extends EventEmitter {
     this.apiOk = false;
     this.apiError = null;
     this.apiData = null;
+    this.stopping = false;
     this.proxyStatus = new Map();
     this.serviceState = { installed: false, state: 'unknown' };
     this.connectedAt = null;
@@ -115,9 +132,12 @@ class FrpcManager extends EventEmitter {
 
   describeApiError(error) {
     const message = String((error && error.message) || error || '');
-    if (/401|403/.test(message)) return '管理 API 认证失败，请检查 webServer.user / password';
-    if (/ECONNREFUSED|connect/i.test(message)) return '管理 API 未启动';
-    if (/timeout|aborted/i.test(message)) return '管理 API 响应超时';
+    // Node 的 fetch 只会抛一句 “fetch failed”，真正的原因（ECONNREFUSED 等）藏在 cause 里。
+    const cause = error && error.cause ? String(error.cause.code || error.cause.message || '') : '';
+    const text = `${message} ${cause}`.trim();
+    if (/401|403/.test(text)) return '管理 API 认证失败，请检查 webServer.user / password';
+    if (/ECONNREFUSED|fetch failed|ENOTFOUND|EAI_AGAIN|connect/i.test(text)) return '管理 API 未启动';
+    if (/timeout|aborted/i.test(text)) return '管理 API 响应超时';
     return message || '无法连接管理 API';
   }
 
@@ -213,6 +233,7 @@ class FrpcManager extends EventEmitter {
     if (!ensured.ok) return ensured;
 
     this.lastExit = null;
+    this.stopping = false;
     this.stdoutTail = '';
     this.stderrTail = '';
     this.childStartedAt = Date.now();
@@ -221,6 +242,7 @@ class FrpcManager extends EventEmitter {
     try {
       child = spawn(frpcPath, ['-c', configPath], {
         cwd,
+        env: childEnv(this.settings),
         windowsHide: true,
         stdio: ['ignore', 'pipe', 'pipe'],
       });
@@ -246,6 +268,11 @@ class FrpcManager extends EventEmitter {
       this.refresh().catch(() => {});
     });
     child.once('exit', (code, signal) => {
+      /* frpc 被 /api/stop 停下时，如果当时还没登录上 frps，会以 code 1 退出并打印
+       * “login to the server failed…”。这是用户主动停的，不是故障——不记成 error，
+       * 否则概览会一直停在“连不上服务器”，看不出隧道其实已经停了。 */
+      const intentional = this.stopping;
+      this.stopping = false;
       this.child = null;
       this.childPid = null;
       this.childStartedAt = null;
@@ -255,7 +282,7 @@ class FrpcManager extends EventEmitter {
         code,
         signal,
         at: Date.now(),
-        error: code === 0 || signal ? null : (stderr || stdout || `frpc 退出（代码 ${code}）`).split(/\r?\n/).slice(-3).join(' '),
+        error: intentional || code === 0 || signal ? null : (stderr || stdout || `frpc 退出（代码 ${code}）`).split(/\r?\n/).slice(-3).join(' '),
       };
       this.emit('exit', this.lastExit);
       this.refresh().catch(() => {});
@@ -275,6 +302,8 @@ class FrpcManager extends EventEmitter {
 
   async stopManaged() {
     if (!this.isChildAlive) return { ok: true, already: true };
+    // 标记“这次退出是我们要的”，交给 exit 处理器判断要不要记成故障。
+    this.stopping = true;
     try {
       await this.api('/api/stop', { method: 'POST', timeout: 4000 });
     } catch {
@@ -294,6 +323,8 @@ class FrpcManager extends EventEmitter {
       /* ignore */
     }
     await sleep(300);
+    // 进程居然还活着，说明这次没停成，别把“主动停止”的标记留给下一次真正的崩溃。
+    if (this.isChildAlive) this.stopping = false;
     this.apiOk = false;
     return { ok: true, forced: true };
   }

@@ -192,17 +192,21 @@ function runtimeInfo() {
   const state = S.state || {};
   const r = state.runtime || {};
   const service = state.service || {};
+  const runMode = (state.settings || {}).runMode || 'auto';
   // connected 只代表本机管理 API 有响应，不代表已登录 frps。
   const online = !!r.connected && !r.loginFailed;
   const running = !!r.connected;
-  const starting = r.mode === 'starting';
+  const starting = r.mode === 'starting' || !!r.pending;
   const external = r.mode === 'external';
-  const serviceDown = service.installed && !online && (service.state === 'stopped' || service.state === 'paused' || service.state === 'stop-pending');
+  // 只有在“本来该由系统服务提供隧道”的模式下，服务停了才值得单独提示。
+  // 托管模式下服务停着是常态，再报“系统服务未运行”只会把人引偏。
+  const wantsService = runMode === 'auto' || runMode === 'service';
+  const serviceDown = wantsService && service.installed && !online && (service.state === 'stopped' || service.state === 'paused' || service.state === 'stop-pending');
   let tone = 'warn';
   let label = '未连接';
   let title = '隧道未运行';
   let desc = '';
-  if (online) {
+  if (online && !starting) {
     tone = 'online';
     label = '隧道在线';
     title = '隧道已连接';
@@ -211,30 +215,33 @@ function runtimeInfo() {
     tone = 'warn';
     label = '连接中…';
     title = '正在连接服务器';
-    desc = '等待管理 API 就绪';
+    desc = r.pending ? 'frpc 正在登录 frps，代理尚未注册' : '等待管理 API 就绪';
   } else if (external) {
     tone = 'warn';
     label = '外部进程';
     title = '检测到外部 frpc 进程';
     desc = '隧道可能由其他方式启动';
+  } else if (r.loginFailed || r.connectFailed) {
+    // frpc 起来了但没登录上 frps，或连不上后直接退出——都不能显示成“已连接”。
+    // 这个分支必须排在“服务已停止”前面：装了服务但没连上时，只报“服务未运行”会把人引去启服务，
+    // 而真正的原因（端口没开 / Token 不对 / 被代理拦）就藏在下面的日志里。
+    const why = { refused: '端口未监听', unreachable: '网络不可达', auth: 'Token 校验失败', proxy: '被代理/网关拦截', unconfirmed: '服务器未确认代理' }[r.connectKind] || '连接失败';
+    tone = 'error';
+    label = '未连上服务器';
+    title = 'frpc 连不上 frps';
+    // 概览页标题下方本来就会打印 serverAddr:serverPort，这里只说原因，免得地址重复两遍。
+    desc = why;
   } else if (serviceDown) {
     tone = 'error';
     label = '服务已停止';
     title = '系统服务未运行';
-    desc = modeLabel('service');
-  } else if (r.loginFailed || r.connectFailed) {
-    // frpc 起来了但没登录上 frps，或连不上后直接退出——都不能显示成“已连接”。
-    const addr = state.config && state.config.serverAddr ? `${state.config.serverAddr}:${state.config.serverPort}` : '服务器';
-    const why = { refused: '端口未监听', unreachable: '网络不可达', auth: 'Token 校验失败' }[r.connectKind] || '连接失败';
-    tone = 'error';
-    label = '未连上服务器';
-    title = 'frpc 连不上 frps';
-    desc = `${addr} · ${why}`;
+    desc = 'frpc 服务已停止';
   } else {
     tone = 'error';
     label = '未连接';
     title = '隧道未运行';
-    desc = r.apiError ? String(r.apiError) : '点击“启动隧道”建立连接';
+    // 这里没有任何进程在跑，apiError（“管理 API 未启动”）对用户毫无信息量，只留操作提示。
+    desc = '点击“启动隧道”建立连接';
   }
   return { tone, label, title, desc, online, running, starting, external, r, service };
 }
@@ -276,7 +283,7 @@ function updateChrome() {
   if (pill) {
     pill.className = `status-pill ${info.tone}`;
     pill.querySelector('.label').textContent = info.label;
-    pill.title = info.desc || info.title;
+    pill.title = info.desc ? `${info.title} · ${info.desc}` : info.title;
   }
   const mini = $('#mini-status');
   if (mini) {
@@ -425,6 +432,8 @@ function renderOverview(force = false) {
       refused: `服务器上的 frps 没在 ${config.serverPort || 7000} 端口监听：服务没启动、端口改过，或被防火墙拒绝。`,
       unreachable: '连不到服务器端口：网络 / 安全组把它丢了，也可能本机的代理、VPN 在拦截。',
       auth: 'frps 在线，但 Token 校验没过：档案里的 Token 与服务端 auth.token 不一致。',
+      proxy: '本机到服务器的链路走了 HTTP 代理，请求被网关挡回 502/503。到「设置 → 运行模式与行为」打开“不继承系统代理”，或让代理放行该端口。',
+      unconfirmed: 'frpc 进程起来了，但配置里的代理一个都没在服务器上注册成功，说明还没登录上 frps（端口不对、Token 不符或被网络挡了）。',
       unknown: '具体原因见概览下方的 frpc 日志。',
     }[runtime.connectKind] || '具体原因见概览下方的 frpc 日志。';
     issues.push(`<div class="note error">${icon('alert')}<div><strong>隧道没连上 ${esc(target)}</strong><br>${esc(why)}${runtime.connectError ? `<br><span class="mono" style="font-size:11px;opacity:.75">${esc(runtime.connectError)}</span>` : ''}<br><span style="opacity:.75">本地服务（如 localhost:8080）通不通都不影响这一步——先把隧道连上，公网才会有转发。</span></div></div>`);
@@ -707,7 +716,7 @@ function renderDiscovery(force = false) {
 
       <div class="note" style="margin-top:14px">
         ${icon('info')}
-        <div>扫描结果来自 netstat，本机运行的服务及其监听端口都会出现在这里。找到要穿透的端口后点“添加代理”。进程名显示“未知”时，可按 PID 在任务管理器里对照。</div>
+        <div>扫描结果来自 netstat，本机运行的服务及其监听端口都会出现在这里。找到要穿透的端口后点“添加代理”。进程名显示“未知”时，可按 PID 在任务管理器里对照。${S.listenersError ? `<br><span style="opacity:.7">进程名读取失败：${esc(S.listenersError)}</span>` : ''}</div>
       </div>
     </div>`;
 
@@ -2544,6 +2553,7 @@ function renderSettings(force = false) {
                 ${switchRow('启动时自动启动隧道', '控制台启动后立即建立 frpc 连接', 'launchTunnelOnStart', !!settings.launchTunnelOnStart)}
                 ${switchRow('以最小化状态启动', '仅显示托盘图标', 'startMinimized', !!settings.startMinimized)}
                 ${switchRow('停止/重启服务前确认', '需要管理员权限时弹出 UAC 提示', 'confirmStopService', settings.confirmStopService !== false)}
+                ${switchRow('不继承系统代理', '启动 frpc 时摘掉 HTTP_PROXY 等变量。系统开着代理时，frp 会把 TCP 握手交给代理，常见是被网关挡回 502（对系统服务模式无效）', 'stripProxyEnv', settings.stripProxyEnv !== false)}
               </div>
             </div>
           </form>
@@ -3100,7 +3110,7 @@ function openProxyEditor({ mode, proxy = null, preset = null }) {
         <div class="form-error hidden" id="pf-error">${icon('alert')}<span></span></div>
       </form>
       <div class="modal-foot">
-        <span class="mf-left">${mode === 'edit' ? '保存后会写入 frpc.toml 并尝试热重载' : '保存后会写入 frpc.toml 并尝试热重载'}</span>
+        <span class="mf-left">保存后会写入 frpc.toml，隧道在运行时再尽力热重载</span>
         <button class="btn" type="button" data-act="modal.close">取消</button>
         <button class="btn primary" type="button" id="pf-submit">${icon('check')}<span>${mode === 'edit' ? '保存修改' : '创建代理'}</span></button>
       </div>
@@ -3193,7 +3203,13 @@ async function submitProxyForm(form, mode) {
   }
   if (res.data && res.data.state) S.state = res.data.state;
   closeModal();
-  toast('success', mode === 'edit' ? '代理已更新' : '代理已创建', `${name} · 配置已写入并热重载`);
+  // 隧道没运行时不会真的热重载（没有管理 API），别在这种时候说“已热重载”。
+  const reloaded = !!(res.data && res.data.reloaded);
+  toast(
+    'success',
+    mode === 'edit' ? '代理已更新' : '代理已创建',
+    `${name} · 配置已写入${reloaded ? '并已热重载' : '，隧道启动后生效'}`,
+  );
   S.lastKeys.proxies = '';
   S.lastKeys.overview = '';
   renderCurrent({ force: true });
@@ -3204,7 +3220,7 @@ function confirmDeleteProxy(name) {
     <div class="modal" style="width:440px">
       <div class="modal-head">
         <div class="mh-icon" style="color:var(--red)">${icon('trash')}</div>
-        <div class="grow"><h3>删除代理</h3><p>此操作会从 frpc.toml 中移除该映射并热重载。</p></div>
+        <div class="grow"><h3>删除代理</h3><p>此操作会从 frpc.toml 中移除该映射（隧道运行时会一并热重载）。</p></div>
         <button class="icon-btn modal-close" type="button" data-act="modal.close">${icon('x')}</button>
       </div>
       <div class="modal-body">
@@ -3320,6 +3336,7 @@ async function saveBehavior(btn) {
     launchTunnelOnStart: isOn('launchTunnelOnStart'),
     startMinimized: isOn('startMinimized'),
     confirmStopService: isOn('confirmStopService'),
+    stripProxyEnv: isOn('stripProxyEnv'),
   };
   await withBusy(btn, async () => {
     const res = await FRP.saveSettings(patch);
@@ -3341,6 +3358,7 @@ async function scanListeners({ silent = false } = {}) {
     const res = await FRP.scanListeners();
     if (res && res.ok) {
       S.listeners = res.data.listeners || [];
+      S.listenersError = res.data.processError || '';
       if (!silent) toast('success', '端口扫描完成', `发现 ${S.listeners.length} 个 TCP 监听`);
     } else if (res && !res.ok) {
       toast('error', '端口扫描失败', res.error);
@@ -3354,6 +3372,15 @@ async function scanListeners({ silent = false } = {}) {
 }
 
 /* ----------------------------- 启动 ------------------------------ */
+
+// 最大化与还原用两个字形，只切 class 不动 DOM。
+function setMaximizedState(maximized) {
+  const btn = $('#win-max');
+  if (!btn) return;
+  btn.classList.toggle('is-max', !!maximized);
+  btn.title = maximized ? '还原' : '最大化';
+  btn.setAttribute('aria-label', maximized ? '还原' : '最大化');
+}
 
 function bindStaticEvents() {
   document.addEventListener('click', (e) => {
@@ -3396,7 +3423,6 @@ function bindStaticEvents() {
   if (min) min.addEventListener('click', () => FRP.windowControl('minimize'));
   if (max) max.addEventListener('click', () => FRP.windowControl('maximize'));
   if (close) close.addEventListener('click', () => FRP.windowControl('close'));
-
   const titlebar = $('.titlebar');
   if (titlebar) {
     titlebar.addEventListener('dblclick', (e) => {
@@ -3428,6 +3454,8 @@ async function boot() {
     S.state = res.data.state;
     S.app = res.data.app;
     S.logs = res.data.logs || [];
+    // 窗口启动时可能就是最大化状态（上次退出前最大化），按钮字形要跟着对。
+    setMaximizedState(S.app && S.app.maximized);
     S.ready = true;
     buildNav();
     setView('overview');
@@ -3485,10 +3513,7 @@ async function boot() {
       if (!payload) return;
       toast(payload.kind === 'error' ? 'error' : payload.kind === 'warn' ? 'warn' : 'info', payload.title || '提示', payload.message || '');
     });
-    FRP.on('window:maximized', (maximized) => {
-      const btn = $('#win-max');
-      if (btn) btn.title = maximized ? '还原' : '最大化';
-    });
+    FRP.on('window:maximized', (maximized) => setMaximizedState(maximized));
   } catch (e) {
     showBootError(e && e.message ? e.message : String(e));
   }

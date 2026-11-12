@@ -40,7 +40,13 @@ class LogFollower extends EventEmitter {
     const wasStarted = this.started;
     this.stop();
     this.file = file;
-    if (wasStarted) this.start();
+    /* 换文件必须清空旧内容：否则日志页会一直显示上一份配置的日志，
+     * 概览页判定“连不上服务器”时也会拿过期错误当现状。 */
+    this.lines = [];
+    this.seq = 0;
+    if (wasStarted) this.start(); // start() 内部会 bootstrap 新文件的尾部
+    // 放在 bootstrap 之后发，监听方才能拿到新文件的日志而不是空数组。
+    this.emit('reset');
   }
 
   start() {
