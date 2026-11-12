@@ -19,23 +19,62 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
 
-      - name: 安装依赖
-        run: npm ci
+      # electron-builder 要额外下载 electron 压缩包和 nsis / winCodeSign 组件，
+      # 这些都在 %LOCALAPPDATA% 的缓存里。缓存下来既快，也能少踩一次下载失败。
+      - name: 缓存打包器二进制
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~\AppData\Local\electron\Cache
+            ~\AppData\Local\electron-builder\Cache
+          key: eb-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: eb-${{ runner.os }}-
 
+      - name: 安装依赖
+        run: npm ci --no-audit --no-fund
+
+      # 下载类失败绝大多数是网络抖动，重试一次基本就过了；两次都失败就把错误原样抛出。
       - name: 打包 NSIS 安装包
-        run: npm run dist
+        shell: pwsh
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: |
+          for ($i = 1; $i -le 2; $i++) {
+            npx electron-builder --win nsis --x64 --publish never
+            if ($LASTEXITCODE -eq 0) { exit 0 }
+            if ($i -eq 1) {
+              Write-Host "::warning::第 1 次打包失败，30 秒后重试"
+              Start-Sleep -Seconds 30
+            }
+          }
+          throw "electron-builder 连续两次失败"
 
       - name: 打包便携版
-        run: npm run dist:portable
+        shell: pwsh
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: |
+          for ($i = 1; $i -le 2; $i++) {
+            npx electron-builder --win portable --x64 --publish never
+            if ($LASTEXITCODE -eq 0) { exit 0 }
+            if ($i -eq 1) {
+              Write-Host "::warning::第 1 次打包失败，30 秒后重试"
+              Start-Sleep -Seconds 30
+            }
+          }
+          throw "electron-builder 连续两次失败"
 
       - name: 收集产物
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path out | Out-Null
-          Get-ChildItem dist -Filter *.exe | Where-Object { $_.Name -notlike '*unpacked*' } | Copy-Item -Destination out
+          # __uninstaller.exe 是 NSIS 的中间产物，unpacked 目录是免安装调试目录，都不要
+          Get-ChildItem dist -Filter *.exe |
+            Where-Object { $_.Name -notmatch '__uninstaller|unpacked' } |
+            Copy-Item -Destination out
           Get-ChildItem out | Select-Object Name, Length
 
       - uses: actions/upload-artifact@v4
