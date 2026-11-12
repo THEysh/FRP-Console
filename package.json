@@ -12,7 +12,8 @@
     "dev": "electron . --no-sandbox",
     "dist": "electron-builder --win nsis --x64 && node tools/after-build.cjs",
     "dist:portable": "electron-builder --win portable --x64 && node tools/after-build.cjs",
-    "dist:dir": "electron-builder --win dir --x64 && node tools/after-build.cjs"
+    "dist:dir": "electron-builder --win dir --x64 && node tools/after-build.cjs",
+    "tray-icons": "node tools/make-tray-icons.cjs"
   },
   "dependencies": {
     "smol-toml": "^1.9.1",
@@ -32,9 +33,8 @@
     },
     "files": [
       "src/**/*",
-      "assets/icon.png",
-      "assets/icon.ico",
-      "assets/tray.png",
+      "assets/*.png",
+      "assets/*.ico",
       "package.json"
     ],
     "asar": true,

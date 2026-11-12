@@ -344,6 +344,32 @@ const FLOWS = {
     return out;
   },
 
+  async tray({ send }) {
+    const out = [];
+    out.push(['托盘状态', await run(send, `return (await FRP.trayState()).data`)]);
+    await run(send, `window.__t.nav('settings'); return true`);
+    await sleep(800);
+
+    // 收进托盘
+    await run(send, `window.__t.click(window.__t.act('app.tray.hide')); return true`);
+    await sleep(900);
+    out.push(['点「收进托盘」', await run(send, `return { state: (await FRP.trayState()).data, toasts: window.__t.toasts() }`)]);
+
+    // 叫回来
+    await run(send, `await FRP.windowControl('show'); return true`);
+    await sleep(600);
+    out.push(['叫回窗口', await run(send, `return (await FRP.trayState()).data`)]);
+
+    // 「完全退出」应弹确认框，取消后进程还在
+    await run(send, `window.__t.click(window.__t.act('app.quit')); return true`);
+    await sleep(600);
+    out.push(['点「完全退出」', await run(send, `return { modal: window.__t.modal().slice(0, 120) }`)]);
+    await run(send, `const b = document.querySelector('#cd-cancel'); if (b) b.click(); return !!b`);
+    await sleep(500);
+    out.push(['点取消', await run(send, `return { modal: window.__t.modal(), state: (await FRP.trayState()).data }`)]);
+    return out;
+  },
+
   async winctl({ send }) {
     const out = [];
     out.push(['初始窗口状态', await run(send, `

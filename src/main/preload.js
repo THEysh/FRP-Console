@@ -83,6 +83,7 @@ contextBridge.exposeInMainWorld('FRP', {
   openUrl: (url) => invoke('shell:open', url),
   windowControl: (action) => invoke('window:control', action),
   quit: () => invoke('app:quit'),
+  trayState: () => invoke('app:tray-state'),
   notify: (kind, title, message) => invoke('app:notification', { kind, title, message }),
   createShortcut: () => invoke('app:create-shortcut'),
   on,

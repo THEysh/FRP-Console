@@ -76,6 +76,7 @@ const ICON_PATHS = {
   link: '<path d="M9.5 14.5 14.5 9.5"/><path d="M7.6 16.4a4 4 0 0 1 0-5.5l2-2a4 4 0 0 1 5.5 5.5"/><path d="M16.4 7.6a4 4 0 0 1 0 5.5l-2 2a4 4 0 0 1-5.5-5.5"/>',
   box: '<path d="M3.5 8.5 12 4l8.5 4.5v7L12 20l-8.5-4.5z"/><path d="m3.5 8.5 8.5 4.5 8.5-4.5M12 13v7"/>',
   terminal: '<rect x="3.5" y="5" width="17" height="14" rx="2.5"/><path d="m7.5 9.5 3 2.5-3 2.5M13 15h3.5"/>',
+  power: '<path d="M12 3.8v7.4"/><path d="M7.6 6.6a7.6 7.6 0 1 0 8.8 0"/>',
   server: '<rect x="3.5" y="4" width="17" height="6.5" rx="2"/><rect x="3.5" y="13.5" width="17" height="6.5" rx="2"/><circle cx="7.5" cy="7.2" r="1"/><circle cx="7.5" cy="16.7" r="1"/>',
   gear: '<circle cx="12" cy="12" r="3.2"/><path d="M19.4 13.6a7.6 7.6 0 0 0 .1-3.2l2-1.5-2-3.4-2.4 1a7.6 7.6 0 0 0-2.7-1.6L14 2.4h-4l-.4 2.5A7.6 7.6 0 0 0 6.9 6.5l-2.4-1-2 3.4 2 1.5a7.6 7.6 0 0 0-.1 3.2l-2 1.5 2 3.4 2.4-1a7.6 7.6 0 0 0 2.7 1.6l.4 2.4h4l.4-2.4a7.6 7.6 0 0 0 2.7-1.6l2.4 1 2-3.4-2-1.5z"/>',
   play: '<path d="M8 5.5v13l11-6.5z"/>',
@@ -2521,6 +2522,31 @@ function renderSettings(force = false) {
 
         <section class="card section">
           <div class="section-head">
+            <div class="section-title"><strong>托盘与退出</strong><span>控制台是常驻托盘的应用：关窗口只是收起来，退出要显式点。</span></div>
+            <div class="section-actions">
+              <button class="btn small" type="button" data-act="app.tray.hide">${icon('box')}<span>收进托盘</span></button>
+              <button class="btn small danger" type="button" data-act="app.quit">${icon('power')}<span>完全退出</span></button>
+            </div>
+          </div>
+          <div class="stack" style="gap:10px">
+            <div class="path-row">
+              <div class="path-display grow">
+                <span class="p-label">托盘图标</span>
+                <span class="p-value mono">${S.app && S.app.tray ? '已创建，右键可退出' : '未创建'}</span>
+                <span class="tag ${S.app && S.app.tray ? 'ok' : 'bad'}">${S.app && S.app.tray ? '可用' : '不可用'}</span>
+              </div>
+            </div>
+            <div class="field-hint">
+              关闭窗口（X）${settings.closeToTray !== false ? '会收进托盘，隧道继续跑' : '会直接退出程序'}；
+              「完全退出」会先停掉控制台自己拉起的 frpc，再结束进程。
+              系统服务模式的隧道不受影响——那是单独的常驻服务。
+            </div>
+            ${S.app && S.app.tray ? '' : `<div class="note warn">${icon('alert')}<div>托盘图标没能创建（assets 下的 tray-*.png 缺失或被拦截）。此时关闭窗口会<strong>直接退出程序</strong>，不会藏起来，避免窗口消失后叫不回来。</div></div>`}
+          </div>
+        </section>
+
+        <section class="card section">
+          <div class="section-head">
             <div class="section-title"><strong>系统集成</strong><span>生成带 --no-sandbox 的桌面与开始菜单快捷方式。</span></div>
             <button class="btn" type="button" data-act="app.shortcut">${icon('box')}<span>创建快捷方式</span></button>
           </div>
@@ -2926,6 +2952,23 @@ async function handleAction(act, dataset, btn) {
           } else toastResult(res);
         });
         break;
+      case 'app.tray.hide': {
+        // 走窗口控制，效果和点标题栏的“最小化到托盘”一致
+        const res = await FRP.windowControl('hide');
+        if (res && res.ok) toast('info', '已收进托盘', '右键托盘图标可以显示界面或完全退出');
+        else toastResult(res);
+        break;
+      }
+      case 'app.quit': {
+        const okQuit = await confirmDialog({
+          title: '完全退出 FRP 控制台',
+          body: '会先停掉控制台自己拉起的 frpc，再结束进程。<br>系统服务模式的隧道不受影响。',
+          confirmText: '退出',
+          danger: true,
+        });
+        if (okQuit) await FRP.quit();
+        break;
+      }
       case 'settings.save.conn':
         await saveConnectionConfig(btn);
         break;
@@ -3213,6 +3256,40 @@ async function submitProxyForm(form, mode) {
   S.lastKeys.proxies = '';
   S.lastKeys.overview = '';
   renderCurrent({ force: true });
+}
+
+/* 通用确认框：返回 Promise<boolean>。取消 / 点 X / 点遮罩都算 false。 */
+function confirmDialog({ title = '确认', body = '', confirmText = '确定', cancelText = '取消', danger = false } = {}) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      closeModal();
+      resolve(value);
+    };
+    openModal(`
+      <div class="modal" style="width:460px">
+        <div class="modal-head">
+          <div class="mh-icon" style="color:${danger ? 'var(--red)' : 'var(--accent)'}">${icon(danger ? 'alert' : 'check')}</div>
+          <div class="grow"><h3>${esc(title)}</h3></div>
+          <button class="icon-btn modal-close" type="button" id="cd-x">${icon('x')}</button>
+        </div>
+        <div class="modal-body"><div class="note ${danger ? 'warn' : ''}">${icon(danger ? 'alert' : 'check')}<div>${body}</div></div></div>
+        <div class="modal-foot">
+          <span class="mf-left"></span>
+          <button class="btn" type="button" id="cd-cancel">${esc(cancelText)}</button>
+          <button class="btn ${danger ? 'danger' : 'primary'}" type="button" id="cd-ok">${esc(confirmText)}</button>
+        </div>
+      </div>`);
+    const on = (id, value) => {
+      const el = $(`#${id}`);
+      if (el) el.addEventListener('click', () => finish(value));
+    };
+    on('cd-ok', true);
+    on('cd-cancel', false);
+    on('cd-x', false);
+  });
 }
 
 function confirmDeleteProxy(name) {

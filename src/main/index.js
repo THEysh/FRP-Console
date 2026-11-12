@@ -6,6 +6,9 @@ const net = require('node:net');
 const { app, BrowserWindow, ipcMain, dialog, shell, clipboard, Tray, Menu, nativeImage, Notification } = require('electron');
 
 app.setName('frp-console');
+/* 和 package.json 的 build.appId 保持一致：Windows 靠它把通知、托盘气泡、
+ * 任务栏图标归到同一个应用下。不一致时通知会被静默丢弃或挂到 electron 名下。 */
+if (process.platform === 'win32') app.setAppUserModelId('cn.ysh.frp-console');
 
 /*
  * 先确保 userData 目录存在，再交给 Electron：
@@ -56,6 +59,13 @@ function bundledFrpsPath(arch) {
 let win = null;
 let tray = null;
 let isQuitting = false;
+// 托盘菜单上次渲染时的“状态签名”。每 3 秒的状态轮询都会调 refreshTray，
+// 签名没变就不重建菜单——否则右键菜单开着的时候会被不停替换，点哪一项都容易点空。
+let trayKey = '';
+// 首次最小化到托盘只提示一次，免得每次关窗口都弹。
+let trayHintShown = false;
+// 当前托盘图标的色调，避免状态轮询里反复 setImage。
+let trayToneCache = '';
 let settings = null;
 let paths = { frpcPath: '', configPath: '', logPath: '' };
 let model = null;
@@ -205,57 +215,221 @@ function upsertServerProfile(input, { activate = false } = {}) {
   return findServerProfile(merged.id);
 }
 
-function refreshTray() {
-  if (!tray) return;
-  // 托盘文字要跟界面上的一致性：光有管理 API 不等于隧道通了。
-  const runtime = manager
-    ? runtimeView(manager.snapshot())
-    : { running: false, connected: false, loggedIn: false, loginFailed: false, connectFailed: false, mode: 'stopped' };
-  const offline = runtime.loginFailed || runtime.connectFailed;
-  const statusText = offline ? '连不上服务器' : runtime.loggedIn ? '已连接' : runtime.mode === 'starting' ? '连接中' : '未连接';
-  tray.setToolTip(`FRP 控制台 · ${statusText}`);
-  const menu = Menu.buildFromTemplate([
-    { label: runtime.loggedIn ? `隧道在线 · ${statusText}` : `隧道未连接 · ${statusText}`, enabled: false },
+/* --------------------------- 托盘 --------------------------- */
+
+const TRAY_ICON = {
+  online: 'tray-online.png',
+  idle: 'tray-idle.png',
+  error: 'tray-error.png',
+};
+
+function trayTone(runtime) {
+  if (runtime.loginFailed || runtime.connectFailed) return 'error';
+  if (runtime.loggedIn) return 'online';
+  return 'idle';
+}
+
+function trayStatusLine(runtime) {
+  if (runtime.loginFailed || runtime.connectFailed) return { label: '连不上服务器', tip: '连不上服务器' };
+  if (runtime.loggedIn) return { label: '隧道在线', tip: `已连接 ${model ? `${model.serverAddr}:${model.serverPort}` : ''}`.trim() };
+  if (runtime.mode === 'starting' || runtime.pending) return { label: '正在连接', tip: '正在连接服务器' };
+  if (runtime.running) return { label: '隧道运行中（未登录）', tip: '隧道进程在跑，但还没登录上 frps' };
+  return { label: '隧道未运行', tip: '未连接' };
+}
+
+function showMainWindow() {
+  if (!win || win.isDestroyed()) {
+    createWindow();
+    return;
+  }
+  if (win.isMinimized()) win.restore();
+  win.show();
+  win.focus();
+}
+
+function hideMainWindow() {
+  if (!win || win.isDestroyed()) return;
+  win.hide();
+  hintTrayOnce();
+}
+
+function toggleMainWindow() {
+  if (win && !win.isDestroyed() && win.isVisible() && !win.isMinimized()) hideMainWindow();
+  else showMainWindow();
+}
+
+/* 第一次“关到托盘”时告诉用户程序还在：否则大多数人会以为已经关掉了，
+ * 然后在任务管理器里看到 FRP-Console 还在，误判成“关不掉”。 */
+function hintTrayOnce() {
+  if (trayHintShown || !tray) return;
+  trayHintShown = true;
+  tray.displayBalloon({
+    title: 'FRP 控制台仍在后台运行',
+    content: '隧道还在。右键托盘图标可以显示界面或完全退出。',
+    iconType: 'info',
+    noSound: true,
+  });
+}
+
+function buildTrayMenu(runtime) {
+  const status = trayStatusLine(runtime);
+  const managed = settings.runMode !== 'service';
+  const canStart = !runtime.loggedIn && !(manager && manager.isChildAlive);
+  const canStop = !!(runtime.connected || (manager && manager.isChildAlive));
+  const addr = model && model.serverAddr ? `${model.serverAddr}:${model.serverPort || 7000}` : '未配置服务器';
+  const proxies = (model && model.proxies) || [];
+  const onlineCount = proxies.filter((p) => {
+    const st = manager && manager.proxyStatus.get(p.name);
+    return st && st.status === 'running';
+  }).length;
+
+  // 用几何符号而不是 emoji：Windows 托盘菜单的字体（Segoe UI）对 emoji 支持不稳，
+  // 经常渲染成方块。
+  const mark = runtime.loggedIn ? '●' : runtime.loginFailed || runtime.connectFailed ? '✕' : runtime.mode === 'starting' || runtime.pending ? '◐' : '○';
+
+  const template = [
+    { label: `${mark} ${status.label}`, enabled: false },
+    { label: `    ${addr} · ${proxies.length} 个代理${proxies.length ? `（在线 ${onlineCount}）` : ''}`, enabled: false },
+    { type: 'separator' },
+    { label: '显示主界面', default: true, click: () => showMainWindow() },
+    {
+      label: '隐藏到托盘',
+      enabled: !!(win && !win.isDestroyed() && win.isVisible()),
+      click: () => hideMainWindow(),
+    },
     { type: 'separator' },
     {
-      label: '显示控制台',
-      click: () => {
-        if (!win) return;
-        win.show();
-        win.focus();
-      },
-    },
-    {
       label: '启动隧道',
-      enabled: !runtime.loggedIn,
+      enabled: canStart,
       click: async () => {
         const result = await manager.start({ runMode: settings.runMode });
         notify(result.ok ? 'info' : 'error', result.ok ? '隧道已启动' : '启动失败', result.error || '');
-        await manager.refresh();
+        await manager.refresh().catch(() => {});
         pushState();
+        refreshTray(true);
       },
     },
     {
       label: '停止隧道',
-      enabled: !!runtime.connected || !!(manager && manager.isChildAlive),
+      enabled: canStop,
       click: async () => {
         suppressExitUntil = Date.now() + 12000;
         const result = await manager.stop({ runMode: settings.runMode });
         notify(result.ok ? 'info' : 'error', result.ok ? '隧道已停止' : '停止失败', result.error || '');
-        await manager.refresh();
+        await manager.refresh().catch(() => {});
         pushState();
+        refreshTray(true);
+      },
+    },
+    {
+      label: '重启隧道',
+      enabled: !!runtime.running,
+      click: async () => {
+        suppressExitUntil = Date.now() + 15000;
+        const result = await manager.restart({ runMode: settings.runMode });
+        notify(result.ok ? 'info' : 'error', result.ok ? '隧道已重启' : '重启失败', result.error || '');
+        await manager.refresh().catch(() => {});
+        pushState();
+        refreshTray(true);
+      },
+    },
+    {
+      label: '热重载配置',
+      enabled: !!runtime.connected,
+      click: async () => {
+        const result = await manager.reload().catch((e) => ({ ok: false, error: e.message }));
+        notify(result && result.ok ? 'info' : 'error', result && result.ok ? '配置已重载' : '重载失败', (result && result.error) || '');
+        refreshTray(true);
+      },
+    },
+    { type: 'separator' },
+    { label: '打开服务器面板', enabled: !!dashboardUrl(), click: () => shell.openExternal(dashboardUrl()) },
+    { label: '打开 frpc.toml', enabled: !!paths.configPath, click: () => revealPathSafe('config') },
+    { label: '打开日志目录', enabled: !!paths.logPath, click: () => revealPathSafe('log') },
+    { type: 'separator' },
+    {
+      label: '关闭窗口时最小化到托盘',
+      type: 'checkbox',
+      checked: settings.closeToTray !== false,
+      click: (item) => {
+        settings = settingsModule.save({ closeToTray: !!item.checked });
+        pushState();
+        refreshTray(true);
+      },
+    },
+    {
+      label: '启动时自动连接隧道',
+      type: 'checkbox',
+      checked: !!settings.launchTunnelOnStart,
+      click: (item) => {
+        settings = settingsModule.save({ launchTunnelOnStart: !!item.checked });
+        pushState();
+        refreshTray(true);
       },
     },
     { type: 'separator' },
     {
-      label: '退出',
-      click: () => {
-        isQuitting = true;
-        app.quit();
-      },
+      label: managed ? '退出 FRP 控制台（停掉托管的隧道）' : '退出 FRP 控制台',
+      click: () => quitApp({ reason: 'tray' }),
     },
-  ]);
-  tray.setContextMenu(menu);
+  ];
+  return template;
+}
+
+function revealPathSafe(which) {
+  const target = which === 'log' ? paths.logPath : which === 'config' ? paths.configPath : paths.frpcPath;
+  if (!target) return;
+  try {
+    shell.showItemInFolder(target);
+  } catch {
+    /* ignore */
+  }
+}
+
+function refreshTray(force = false) {
+  if (!tray || !settings) return;
+  const runtime = manager
+    ? runtimeView(manager.snapshot())
+    : { running: false, connected: false, loggedIn: false, loginFailed: false, connectFailed: false, mode: 'stopped' };
+  const status = trayStatusLine(runtime);
+  tray.setToolTip(`FRP 控制台 · ${status.tip}`);
+
+  const tone = trayTone(runtime);
+  // 图标别每 3 秒重建一次；只有色调变了才换图。
+  if (tone !== trayToneCache) {
+    const file = iconPath(TRAY_ICON[tone]);
+    if (file) {
+      const img = nativeImage.createFromPath(file);
+      if (!img.isEmpty()) {
+        tray.setImage(img);
+        trayToneCache = tone;
+      }
+    }
+  }
+
+  // 签名里带上所有会影响菜单 enabled/checked 的字段，避免菜单开着被重建
+  const key = JSON.stringify({
+    tone,
+    label: status.label,
+    loggedIn: !!runtime.loggedIn,
+    connected: !!runtime.connected,
+    running: !!runtime.running,
+    child: !!(manager && manager.isChildAlive),
+    addr: model ? `${model.serverAddr}:${model.serverPort}` : '',
+    proxies: ((model && model.proxies) || []).length,
+    visible: !!(win && !win.isDestroyed() && win.isVisible()),
+    tray: settings.closeToTray !== false,
+    auto: !!settings.launchTunnelOnStart,
+    runMode: settings.runMode,
+    dash: dashboardUrl(),
+  });
+  if (!force && key === trayKey) return;
+  trayKey = key;
+  try {
+    tray.setContextMenu(Menu.buildFromTemplate(buildTrayMenu(runtime)));
+  } catch {
+    /* 菜单构建失败不影响托盘图标本身 */
+  }
 }
 
 function notify(kind, title, message = '') {
@@ -311,7 +485,8 @@ function createWindow() {
   }
 
   win.once('ready-to-show', () => {
-    if (!settings.startMinimized) win.show();
+    // 托盘都没建出来时不能真的静默启动，否则窗口永远叫不出来。
+    if (!settings.startMinimized || !tray) win.show();
   });
 
   const persistBounds = () => {
@@ -329,26 +504,45 @@ function createWindow() {
   win.on('unmaximize', () => send('window:maximized', false));
 
   win.on('close', (event) => {
-    if (!isQuitting && settings.closeToTray) {
-      event.preventDefault();
-      win.hide();
-    }
+    if (isQuitting) return; // 走退出流程，正常销毁
+    // 没有托盘就不能藏：藏了就再也找不回来，只能杀进程。
+    if (settings.closeToTray === false || !tray) return;
+    event.preventDefault();
+    win.hide();
+    hintTrayOnce();
+    refreshTray(true);
   });
+  win.on('show', () => refreshTray(true));
+  win.on('hide', () => refreshTray(true));
+  win.on('minimize', () => refreshTray(true));
+  win.on('restore', () => refreshTray(true));
   win.on('closed', () => {
     win = null;
   });
 }
 
 function createTray() {
-  const icon = iconPath('tray.png') || iconPath('icon.png');
-  if (!icon) return;
-  tray = new Tray(nativeImage.createFromPath(icon).resize({ width: 16, height: 16 }));
-  tray.on('click', () => {
-    if (!win) return;
-    if (win.isVisible()) win.focus();
-    else win.show();
-  });
-  refreshTray();
+  /* 没图标就当没有托盘。这一条很关键：closeToTray 打开、但托盘又创建不出来时，
+   * 点 X 会把窗口藏起来且再也叫不回来，用户只能去任务管理器杀进程——
+   * 这正是“程序关不掉”的来源。下面 close 事件会按 tray 是否存在决定要不要拦截。 */
+  const icon = iconPath(TRAY_ICON.idle) || iconPath('tray.png') || iconPath('icon.png');
+  if (!icon) {
+    tray = null;
+    return false;
+  }
+  try {
+    tray = new Tray(icon);
+  } catch {
+    tray = null;
+    return false;
+  }
+  tray.setToolTip('FRP 控制台');
+  // 单击切换显示/隐藏（Windows 习惯），双击直接叫到前台
+  tray.on('click', () => toggleMainWindow());
+  tray.on('double-click', () => showMainWindow());
+  tray.on('balloon-click', () => showMainWindow());
+  refreshTray(true);
+  return true;
 }
 
 function send(channel, payload) {
@@ -510,6 +704,8 @@ function buildState() {
       arch: process.arch,
       uptime: runtime.since ? Date.now() - runtime.since : 0,
       uptimeLabel: runtime.since ? formatDuration(Date.now() - runtime.since) : '',
+      // 设置页据此提示“关闭窗口会不会真退出”
+      tray: !!tray,
     },
     settings: settingsForState(),
     paths: pathsForState(),
@@ -837,6 +1033,9 @@ function registerIpc() {
         settingsFile: settingsModule.settingsFile(),
         // 让渲染层一开始就能画出正确的“最大化 / 还原”字形
         maximized: !!(win && !win.isDestroyed() && win.isMaximized()),
+        // 托盘是否真的建出来了。建不出来时界面要提示：这时“关闭窗口”会直接退出，
+        // 而不是像往常那样收进托盘（否则窗口会消失且叫不回来）。
+        tray: !!tray,
       },
     });
   });
@@ -1618,19 +1817,35 @@ function registerIpc() {
     else if (action === 'maximize') {
       if (win.isMaximized()) win.unmaximize();
       else win.maximize();
+    } else if (action === 'hide') {
+      // 没有托盘就别藏，否则窗口再也叫不回来。
+      if (!tray) return fail('托盘不可用，无法隐藏窗口');
+      win.hide();
+      hintTrayOnce();
+    } else if (action === 'show') {
+      showMainWindow();
     } else if (action === 'close') win.close();
-    return ok({ maximized: win.isMaximized() });
+    refreshTray(true);
+    return ok({ maximized: win.isMaximized(), visible: win.isVisible() });
   });
 
   ipcMain.handle('app:quit', async () => {
-    isQuitting = true;
-    if (manager && manager.isChildAlive) {
-      try { await manager.stopManaged(); } catch { /* ignore */ }
-    }
-    serverSession.disconnect();
-    app.quit();
+    // 不在这里直接 app.quit()：统一交给 quitApp，保证托管隧道先停干净。
+    quitApp({ source: 'renderer' });
     return ok({ quitting: true });
   });
+
+  // 排障用：托盘到底建出来没有、窗口是显示还是收起来了、退出流程走到哪一步。
+  // 设置页会把它显示出来，也方便自动化测试断言。
+  ipcMain.handle('app:tray-state', async () => ok({
+    tray: !!tray,
+    tone: trayToneCache || '',
+    windowVisible: !!(win && !win.isDestroyed() && win.isVisible()),
+    windowDestroyed: !win || win.isDestroyed(),
+    closeToTray: settings ? settings.closeToTray !== false : null,
+    quitting: quitFlowStarted,
+    pid: process.pid,
+  }));
 
   ipcMain.handle('app:notification', async (event, payload) => {
     notify((payload && payload.kind) || 'info', (payload && payload.title) || 'FRP 控制台', (payload && payload.message) || '');
@@ -1755,6 +1970,66 @@ async function bootstrap() {
 
 const gotLock = app.requestSingleInstanceLock();
 
+/* ------------------------- 退出流程（唯一入口） -------------------------
+ * 以前退出就是一句 app.quit()：before-quit 里 child.kill() 是异步的，主进程往往
+ * 先没了，frpc 变成孤儿继续跑；托盘点“退出”看起来关了，任务管理器里还剩一堆。
+ * 现在统一走这里：先优雅停掉“控制台自己拉起的”frpc，再放行 app.quit()，
+ * 最后还有 8 秒硬超时兜底（app.exit 不触发任何事件，一定能退）。
+ */
+let quitFlowStarted = false;
+let quitAllowed = false;
+
+async function quitApp({ source = 'user' } = {}) {
+  if (quitAllowed) return;
+  if (quitFlowStarted) return; // 正在退，别重复
+  quitFlowStarted = true;
+  isQuitting = true;
+
+  const hardExit = setTimeout(() => {
+    // eslint-disable-next-line no-console
+    console.log(`[quit] ${source} 清理超时，强制退出`);
+    app.exit(0);
+  }, 8000);
+  if (hardExit.unref) hardExit.unref();
+
+  try {
+    if (pollTimer) clearInterval(pollTimer);
+    follower.stop();
+  } catch { /* ignore */ }
+
+  try {
+    /* 只停“控制台自己拉起来的” frpc。系统服务模式下去停服务是越权行为：
+     * 那是用户单独安装的常驻隧道，关掉控制台不该把它带下来。 */
+    if (manager && manager.isChildAlive) {
+      await Promise.race([
+        manager.stop({ runMode: settings.runMode }).catch(() => ({ ok: false })),
+        new Promise((resolve) => setTimeout(resolve, 5000)),
+      ]);
+    }
+  } catch { /* ignore */ }
+
+  if (manager && manager.isChildAlive) {
+    try { manager.child.kill(); } catch { /* ignore */ }
+    await new Promise((resolve) => setTimeout(resolve, 400));
+  }
+
+  try { serverSession.disconnect(); } catch { /* ignore */ }
+  if (instanceChannel) {
+    try { instanceChannel.close(); } catch { /* ignore */ }
+    instanceChannel = null;
+  }
+  if (tray) {
+    try { tray.destroy(); } catch { /* ignore */ }
+    tray = null;
+  }
+
+  clearTimeout(hardExit);
+  quitAllowed = true;
+  app.quit();
+  // 双保险：quit 之后若还活着（有窗口阻止关闭），2 秒后直接 exit
+  setTimeout(() => app.exit(0), 2000).unref?.();
+}
+
 function focusMainWindow() {
   if (!win || win.isDestroyed()) return;
   if (win.isMinimized()) win.restore();
@@ -1823,8 +2098,9 @@ function startApp() {
       send('notify', { kind: 'error', title: '初始化失败', message: e.message });
     });
     registerIpc();
-    createWindow();
+    // 先建托盘再建窗口：ready-to-show 里要判断“托盘是否可用”来决定能不能静默启动。
     createTray();
+    createWindow();
     // bootstrap() 第一句就同步载入 settings，这里可以安全读取启动偏好。
     if (settings.launchTunnelOnStart) {
       bootstrapReady
@@ -1835,7 +2111,7 @@ function startApp() {
     }
     if (process.env.FRP_CONSOLE_SMOKE === '1') {
       setTimeout(() => {
-        if (win && !win.isDestroyed()) win.webContents.executeJavaScript('JSON.stringify({views: document.querySelectorAll(".view").length, nodes: document.querySelectorAll(".view *").length, title: (document.querySelector(".hero-titles h2")||{}).textContent || "", status: (document.querySelector(".status-pill .label")||{}).textContent || "", nav: document.querySelectorAll(".nav-item").length, toast: document.querySelectorAll(".toast").length})').then((v) => console.log(`[smoke] ${v}`)).catch((e) => console.log(`[smoke] error ${e.message}`)).finally(() => { isQuitting = true; app.quit(); });
+        if (win && !win.isDestroyed()) win.webContents.executeJavaScript('JSON.stringify({views: document.querySelectorAll(".view").length, nodes: document.querySelectorAll(".view *").length, title: (document.querySelector(".hero-titles h2")||{}).textContent || "", status: (document.querySelector(".status-pill .label")||{}).textContent || "", nav: document.querySelectorAll(".nav-item").length, toast: document.querySelectorAll(".toast").length})').then((v) => console.log(`[smoke] ${v}`)).catch((e) => console.log(`[smoke] error ${e.message}`)).finally(() => { quitAllowed = true; app.quit(); });
       }, 7000);
     }
     app.on('activate', () => {
@@ -1847,7 +2123,11 @@ function startApp() {
 if (!gotLock) {
   app.quit();
 } else {
-  app.on('second-instance', () => focusMainWindow());
+  app.on('second-instance', () => {
+    // 已经有一个在跑：把它的窗口叫出来，本进程立刻退出（不会留下第二个托盘图标）。
+    focusMainWindow();
+    refreshTray(true);
+  });
 
   claimInstanceChannel().then(async (claimed) => {
     if (claimed) {
@@ -1856,15 +2136,31 @@ if (!gotLock) {
     }
     // 端口被占：先确认对面是已经跑着的控制台（握手回 "ok"），是就聚焦它并退出；
     // 若只是别的程序临时占了这个端口，不能因此拒绝启动。
-    const existing = await notifyExistingInstance();
+    // 重试 3 次：对面可能正在启动/正在退出的半路上，单次 700ms 的超时容易误判成“没人”，
+    // 于是第二个实例也起来了——这正是“莫名其妙开了两个”的来源。
+    let existing = false;
+    for (let i = 0; i < 3 && !existing; i += 1) {
+      existing = await notifyExistingInstance();
+      if (!existing) await new Promise((resolve) => setTimeout(resolve, 350));
+    }
     if (!existing) {
       startApp();
       return;
     }
-    setTimeout(() => app.quit(), 250);
+    // 第二个实例必须干净退场：不建窗口、不建托盘、不碰隧道。
+    quitAllowed = true;
+    setTimeout(() => app.exit(0), 250);
   });
 
-  app.on('before-quit', () => {
+  app.on('before-quit', (event) => {
+    /* 无论从哪来（托盘、界面按钮、系统关机），都收敛到同一条退出流程：
+     * 先停托管隧道，再真正退出。quitAllowed 由 quitApp 在清理完成后置位；
+     * 没置位就拦下来去做清理，否则主进程先走、frpc 变孤儿——看起来就是“关不干净”。 */
+    if (!quitAllowed) {
+      event.preventDefault();
+      quitApp({ source: 'before-quit' });
+      return;
+    }
     isQuitting = true;
     if (pollTimer) clearInterval(pollTimer);
     follower.stop();
@@ -1876,16 +2172,14 @@ if (!gotLock) {
         /* ignore */
       }
     }
-    if (manager && manager.isChildAlive) {
-      try {
-        manager.child.kill();
-      } catch {
-        /* ignore */
-      }
-    }
   });
 
+  /* 窗口全没了就该退干净。
+   * 有托盘时窗口只会被 hide（close 事件被拦），这个回调根本不会触发；
+   * 能走到这里的只有两种情况：① 托盘不可用；② 用户关掉了“关闭窗口时最小化到托盘”。
+   * 两种都意味着“用户以为关了”，所以必须真的退出，不能留个托盘图标在后台。 */
   app.on('window-all-closed', () => {
-    if (!tray) app.quit();
+    quitAllowed = false; // 让 before-quit 走一遍完整清理
+    app.quit();
   });
 }
