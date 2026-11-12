@@ -3,7 +3,7 @@
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 const { EventEmitter } = require('node:events');
-const { execFileP, tcpCheck } = require('./util');
+const { tcpCheck } = require('./util');
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -25,7 +25,6 @@ class FrpcManager extends EventEmitter {
     this.connectedAt = null;
     this.lastRefreshAt = 0;
     this.refreshing = null;
-    this.externalProcess = false;
   }
 
   get settings() {
@@ -78,19 +77,11 @@ class FrpcManager extends EventEmitter {
     this.serviceState = state || { installed: false, state: 'unknown' };
   }
 
-  async checkExternalProcess() {
-    const r = await execFileP('tasklist.exe', ['/FI', 'IMAGENAME eq frpc.exe', '/FO', 'CSV', '/NH'], { timeout: 8000 });
-    const lines = r.ok ? r.stdout.split(/\r?\n/).filter((l) => l.trim().startsWith('"frpc.exe"')) : [];
-    this.externalProcess = lines.length > 0 && !this.isChildAlive;
-    return lines.length;
-  }
-
   async refresh() {
     if (this.refreshing) return this.refreshing;
     this.refreshing = (async () => {
       const previousOk = this.apiOk;
       let apiData = null;
-      let error = null;
       try {
         const r = await this.api('/api/status', { timeout: 1800 });
         apiData = JSON.parse(r.text || '{}');
@@ -155,7 +146,6 @@ class FrpcManager extends EventEmitter {
       since: this.connectedAt,
       childStartedAt: this.childStartedAt,
       service: this.serviceState,
-      externalProcess: this.externalProcess,
       proxies: [...this.proxyStatus.values()],
       lastRefreshAt: this.lastRefreshAt,
       lastExit: this.lastExit,

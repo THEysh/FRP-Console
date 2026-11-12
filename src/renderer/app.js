@@ -38,7 +38,6 @@ const S = {
     profiles: [],
     activeServerId: '',
     clientServerId: '',
-    tokenMatchesActive: true,
     tunnel: null,
     // 请求序号：异步返回时序号已变，说明用户在等待期间切了档案，结果直接丢弃。
     seq: 0,
@@ -894,7 +893,6 @@ function applyServerState(data, seq) {
   S.server.profiles = Array.isArray(data.profiles) ? data.profiles : [];
   S.server.activeServerId = data.activeServerId || '';
   S.server.clientServerId = data.clientServerId || '';
-  S.server.tokenMatchesActive = data.tokenMatchesActive !== false;
   S.server.tunnel = data.tunnel || null;
   S.server.sessionServerId = data.sessionServerId || data.serverId || '';
   S.server.client = data.client || null;
@@ -3006,7 +3004,6 @@ async function withBusy(btn, fn) {
   if (btn) {
     btn.disabled = true;
     const original = btn.innerHTML;
-    btn.dataset.original = original;
     btn.innerHTML = `<span class="spinner-sm"></span><span>处理中…</span>`;
     try {
       await fn();

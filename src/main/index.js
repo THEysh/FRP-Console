@@ -1092,7 +1092,6 @@ function registerIpc() {
       profiles,
       activeServerId: settings.activeServerId || '',
       clientServerId: settings.clientServerId || '',
-      tokenMatchesActive: !!(active && model && active.clientToken && active.clientToken === ((model.auth && model.auth.token) || '')),
       tunnel: tunnelBindingView(),
       serverId: sessionServerId,
       sessionServerId,
