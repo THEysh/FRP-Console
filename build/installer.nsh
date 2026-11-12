@@ -1,25 +1,13 @@
 ; FRP 控制台 · NSIS 自定义安装脚本
 ;
-; 为什么需要这个文件：
-;   本机（管理员账户 + 受限桌面）里 Chromium 沙箱初始化会失败，进程在进入 main 进程
-;   代码之前就以退出码 3 结束，界面完全没有提示；`app.commandLine.appendSwitch` 此时
-;   还没执行，所以只能由命令行参数传入 --no-sandbox。
-;   electron-builder 默认生成的快捷方式不带参数，导致“装完双击没反应”。
-;   这里把桌面与开始菜单的快捷方式覆盖成带 --no-sandbox 的版本。
-;
 ; 变量说明：
-;   ${APP_EXECUTABLE_FILENAME} 由 electron-builder 注入（= FRP控制台.exe）
+;   ${APP_EXECUTABLE_FILENAME} 由 electron-builder 注入（= FRP-Console.exe）
 ;   ${SHORTCUT_NAME}           由 electron-builder 注入（= shortcutName 配置）
-
-!macro customInstall
-  CreateShortCut "$DESKTOP\${SHORTCUT_NAME}.lnk" "$INSTDIR\${APP_EXECUTABLE_FILENAME}" "--no-sandbox" "$INSTDIR\${APP_EXECUTABLE_FILENAME}" 0
-  CreateShortCut "$SMPROGRAMS\${SHORTCUT_NAME}.lnk" "$INSTDIR\${APP_EXECUTABLE_FILENAME}" "--no-sandbox" "$INSTDIR\${APP_EXECUTABLE_FILENAME}" 0
-!macroend
-
-!macro customUnInstall
-  Delete "$DESKTOP\${SHORTCUT_NAME}.lnk"
-  Delete "$SMPROGRAMS\${SHORTCUT_NAME}.lnk"
-!macroend
+;
+; 快捷方式保留 electron-builder 的默认行为（不带任何命令行参数）。
+; 只有在受限桌面（管理员账户 + 沙箱初始化失败的会话）里双击 exe 才会
+; 没有任何反应——那是环境问题，需要给快捷方式手动补 --no-sandbox，
+; 不应该默认给所有用户关掉 Chromium 沙箱。
 
 ; 覆盖 electron-builder 默认的“检测应用是否在运行”。
 ;
