@@ -24,6 +24,8 @@ const DEFAULT_SETTINGS = {
   closeToTray: true,
   startMinimized: false,
   launchTunnelOnStart: false,
+  // 登录 Windows 后自动启动控制台（写 HKCU 的 Run 项，不需要管理员权限）。
+  launchAtLogin: false,
   confirmStopService: true,
   logBuffer: 600,
   // 统一模型：所有 frps 服务器都是档案；activeServerId 是当前查看的档案，

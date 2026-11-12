@@ -266,6 +266,73 @@ function toggleMainWindow() {
   else showMainWindow();
 }
 
+/* ------------------------- 开机自启 ------------------------- */
+/*
+ * 用 Electron 的 setLoginItemSettings：Windows 上就是在 HKCU\Software\Microsoft\
+ * Windows\CurrentVersion\Run 里写一条记录，不碰系统服务，也不需要管理员权限。
+ *
+ * 三个坑：
+ *  1) 开发模式下 process.execPath 是 electron.exe，必须把项目目录作为参数带上，
+ *     否则登录后只会打开一个空白的 Electron 窗口。
+ *  2) 便携版的 execPath 指向 %TEMP% 里解出来的副本，必须用 PORTABLE_EXECUTABLE_FILE
+ *     指回用户双击的那个 exe，否则重启后路径就失效了。
+ *  3) 用户在任务管理器里可以单独禁用启动项，所以「设置里开着」不等于「系统里生效」，
+ *     对外一律以 getLoginItemSettings() 的结果为准。
+ */
+function loginItemOptions(enabled) {
+  const opts = { openAtLogin: !!enabled };
+  if (process.platform !== 'win32') return opts; // macOS/Linux 走各自默认实现
+  if (process.env.PORTABLE_EXECUTABLE_FILE) {
+    opts.path = process.env.PORTABLE_EXECUTABLE_FILE;
+    opts.args = [];
+  } else if (!app.isPackaged) {
+    opts.path = process.execPath;
+    opts.args = [app.getAppPath()];
+  }
+  return opts;
+}
+
+function launchAtLoginState() {
+  try {
+    // Windows 上查询必须带上和写入时相同的 path/args，否则永远查不到那条记录。
+    const opts = loginItemOptions(true);
+    const query = process.platform === 'win32'
+      ? { ...(opts.path ? { path: opts.path } : {}), ...(opts.args ? { args: opts.args } : {}) }
+      : {};
+    return !!app.getLoginItemSettings(query).openAtLogin;
+  } catch {
+    return false;
+  }
+}
+
+function applyLaunchAtLogin(enabled) {
+  try {
+    app.setLoginItemSettings(loginItemOptions(enabled));
+  } catch (e) {
+    return { ok: false, error: `写入开机启动项失败：${e.message || e}` };
+  }
+  const actual = launchAtLoginState();
+  if (actual !== !!enabled) {
+    // 组策略 / 安全软件拦截时设置会静默失败，别让界面显示成已开启
+    return {
+      ok: false,
+      error: '系统拒绝了开机启动设置（可能被组策略或安全软件拦截），可以改用 shell:startup 文件夹里的快捷方式',
+      actual,
+    };
+  }
+  return { ok: true, actual };
+}
+
+/* 启动时对账：设置里开着但系统里没有（重装、移动目录、被任务管理器禁用过）就补写，
+ * 设置里关着但系统里还留着就清掉。 */
+function syncLaunchAtLogin() {
+  if (!settings) return;
+  const want = settings.launchAtLogin === true;
+  if (want === launchAtLoginState()) return;
+  const result = applyLaunchAtLogin(want);
+  if (!result.ok) console.warn('[startup]', result.error);
+}
+
 /* 第一次“关到托盘”时告诉用户程序还在：否则大多数人会以为已经关掉了，
  * 然后在任务管理器里看到 FRP-Console 还在，误判成“关不掉”。 */
 function hintTrayOnce() {
@@ -796,6 +863,8 @@ function buildState() {
       // 设置页据此提示“关闭窗口会不会真退出”
       tray: canHideToTray(),
       trayCreated: !!tray,
+      // 系统里的真实开机启动状态（用户可能在任务管理器里手动关掉过）
+      launchAtLogin: launchAtLoginState(),
     },
     settings: settingsForState(),
     paths: pathsForState(),
@@ -1128,6 +1197,7 @@ function registerIpc() {
         // 而不是像往常那样收进托盘（否则窗口会消失且叫不回来）。
         tray: canHideToTray(),
         trayCreated: !!tray,
+        launchAtLogin: launchAtLoginState(),
       },
     });
   });
@@ -1142,10 +1212,16 @@ function registerIpc() {
       'frpcPath', 'configPath', 'frpsDashboardUrl', 'serviceName', 'runMode',
       'adminPort', 'adminUser', 'adminPassword', 'autoReload', 'pollIntervalMs', 'closeToTray',
       'startMinimized', 'launchTunnelOnStart', 'serviceAutoDetect', 'logBuffer', 'confirmStopService',
-      'stripProxyEnv',
+      'stripProxyEnv', 'launchAtLogin',
     ];
     const clean = {};
     for (const key of allowed) if (patch && Object.prototype.hasOwnProperty.call(patch, key)) clean[key] = patch[key];
+    // 开机自启要真的写进系统，写不进去就别保存，免得界面显示“已开启”但重启无效。
+    if (clean.launchAtLogin !== undefined) {
+      const result = applyLaunchAtLogin(!!clean.launchAtLogin);
+      if (!result.ok) return fail(result.error);
+      clean.launchAtLogin = !!result.actual;
+    }
     if (clean.pollIntervalMs) clean.pollIntervalMs = Math.min(30000, Math.max(1000, Number(clean.pollIntervalMs) || 3000));
     if (clean.adminPort) clean.adminPort = Math.min(65535, Math.max(1, Number(clean.adminPort) || 7400));
     if (clean.logBuffer) clean.logBuffer = Math.min(2000, Math.max(100, Number(clean.logBuffer) || 600));
@@ -2195,6 +2271,8 @@ function startApp() {
     // 先建托盘再建窗口：ready-to-show 里要判断“托盘是否可用”来决定能不能静默启动。
     createTray();
     createWindow();
+    // 系统里的启动项和设置对不上时补一次（重装、移动目录、被任务管理器禁用过）
+    syncLaunchAtLogin();
     // bootstrap() 第一句就同步载入 settings，这里可以安全读取启动偏好。
     if (settings.launchTunnelOnStart) {
       bootstrapReady

@@ -2579,6 +2579,7 @@ function renderSettings(force = false) {
                 ${switchRow('自动热重载', '检测到配置文件被外部修改后自动调用管理 API 重载', 'autoReload', settings.autoReload !== false)}
                 ${switchRow('关闭窗口时最小化到托盘', '退出请使用托盘菜单中的“退出”', 'closeToTray', settings.closeToTray !== false)}
                 ${switchRow('启动时自动启动隧道', '控制台启动后立即建立 frpc 连接', 'launchTunnelOnStart', !!settings.launchTunnelOnStart)}
+                ${switchRow('开机自动启动', '登录 Windows 后自动运行控制台（写当前用户的启动项，不需要管理员权限）', 'launchAtLogin', !!settings.launchAtLogin)}
                 ${switchRow('以最小化状态启动', '仅显示托盘图标', 'startMinimized', !!settings.startMinimized)}
                 ${switchRow('停止/重启服务前确认', '需要管理员权限时弹出 UAC 提示', 'confirmStopService', settings.confirmStopService !== false)}
                 ${switchRow('不继承系统代理', '启动 frpc 时摘掉 HTTP_PROXY 等变量。系统开着代理时，frp 会把 TCP 握手交给代理，常见是被网关挡回 502（对系统服务模式无效）', 'stripProxyEnv', settings.stripProxyEnv !== false)}
@@ -3413,6 +3414,7 @@ async function saveBehavior(btn) {
     autoReload: isOn('autoReload'),
     closeToTray: isOn('closeToTray'),
     launchTunnelOnStart: isOn('launchTunnelOnStart'),
+    launchAtLogin: isOn('launchAtLogin'),
     startMinimized: isOn('startMinimized'),
     confirmStopService: isOn('confirmStopService'),
     stripProxyEnv: isOn('stripProxyEnv'),
@@ -3423,7 +3425,11 @@ async function saveBehavior(btn) {
       if (res.data && res.data.state) S.state = res.data.state;
       S.lastKeys.settings = '';
       toast('success', '行为设置已保存');
-    } else toastResult(res);
+    } else {
+      toastResult(res);
+      // 保存失败时把开关拨回系统里的真实状态（例如启动项被组策略拦下）
+      renderSettings(true);
+    }
   });
 }
 
