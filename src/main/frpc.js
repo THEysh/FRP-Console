@@ -142,14 +142,16 @@ class FrpcManager extends EventEmitter {
   }
 
   snapshot() {
+    const serviceRunning = !!(this.serviceState && this.serviceState.installed && this.serviceState.state === 'running');
     return {
       mode: this.runtimeMode(),
-      running: this.apiOk,
+      // running 指“frpc 进程或服务在跑”，connected 指“本机管理 API 有响应”。
+      // 两者不再混为一谈：frpc 连不上 frps 时 api 仍然能有响应，但隧道其实没通。
+      running: this.isChildAlive || serviceRunning || this.apiOk,
       connected: this.apiOk,
-      loginOk: this.apiOk,
       adminPort: this.admin.port,
       apiError: this.apiError,
-      pid: this.isChildAlive ? this.child.pid : this.serviceState && this.serviceState.state === 'running' ? this.serviceState.pid : null,
+      pid: this.isChildAlive ? this.child.pid : serviceRunning ? this.serviceState.pid : null,
       since: this.connectedAt,
       childStartedAt: this.childStartedAt,
       service: this.serviceState,

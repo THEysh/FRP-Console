@@ -1147,12 +1147,12 @@ function serverProxyRows() {
     const failed = health && !health.ok;
     const tone = ok ? 'green' : failed ? 'red' : 'amber';
     const text = ok ? '三层连通' : failed ? (health.reason || '链路异常') : '待检测';
-    const target = p.type === 'http' || p.type === 'https' ? (p.publicAddress || '-') : `${p.serverAddr ? '' : ''}${p.remotePort || '-'}`;
+    const target = p.publicAddress || (p.remotePort ? `${(S.state.config && S.state.config.serverAddr) || ''}:${p.remotePort}` : '-');
     return `
       <tr>
         <td><div class="name-cell"><strong>${esc(p.name)}</strong><small>${esc((p.type || '').toUpperCase())}</small></div></td>
         <td class="mono">127.0.0.1:${esc(p.localPort || '-')}</td>
-        <td class="mono">${p.type === 'http' || p.type === 'https' ? esc(target) : `${esc((S.state.config && S.state.config.serverAddr) || '')}:${esc(p.remotePort || '-')}`}</td>
+        <td class="mono">${esc(target)}</td>
         <td><span class="badge ${tone}" title="${esc(healthTip(health))}"><span class="bdot"></span>${esc(text)}</span></td>
         <td style="text-align:right">
           <button class="icon-btn" type="button" data-act="copy" data-text="${esc(p.publicAddress || '')}" title="复制公网地址">${icon('copy')}</button>
@@ -3448,17 +3448,18 @@ async function boot() {
       } else if (S.view === 'overview' && prevKey !== nextKey) {
         renderOverview(true);
       }
-      if (S.view === 'settings') {
-        const btn = $('#form-behavior');
-        if (btn) {
-          // 只在未编辑时同步极少数动态内容（保持表单输入）
-          const runtimeHint = $('#runtime-hint');
-          if (runtimeHint) runtimeHint.textContent = st.runtime && st.runtime.connected ? '管理 API 可用' : '管理 API 不可用';
-        }
-      }
       if (S.view === 'server' && S.server.connected) {
-        const body = $('#server-proxies tbody');
-        if (body) body.innerHTML = serverProxyRows();
+        // 服务器页的“映射表”读的是本机 state.proxies，要跟着状态更新；
+        // 但每 3 秒无条件重写 tbody 会让徽标里的脉冲小点重新开始动画，看起来像屏闪。
+        const rowsKey = JSON.stringify({
+          addr: (st.config && st.config.serverAddr) || '',
+          list: (st.proxies || []).map((p) => [p.name, p.status, p.publicAddress, p.remotePort, p.localPort, p.health && p.health.ok, p.health && p.health.reason]),
+        });
+        if (S.lastKeys.serverProxies !== rowsKey) {
+          S.lastKeys.serverProxies = rowsKey;
+          const body = $('#server-proxies tbody');
+          if (body) body.innerHTML = serverProxyRows();
+        }
       }
       // 本机隧道目标被别处改动（设置页保存、外部编辑 frpc.toml）时，
       // 服务器页的档案栏必须跟着重算，否则会一直显示旧的绑定关系。

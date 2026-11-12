@@ -106,6 +106,9 @@ class ServerSession {
     this.client = null;
     this.connected = false;
     this.info = null;
+    // 配置路径属于“这台服务器”，断开后必须清掉：
+    // 否则换一台没有 frps.toml 的机器时，会拿上一台服务器的路径去读 / 写。
+    this.configPath = '';
   }
 
   exec(command, timeout = 15000) {
@@ -541,6 +544,7 @@ class ServerSession {
       const verify = await this.exec(verifyCommand, 12000);
       const message = `${verify.stdout}\n${verify.stderr}`;
       if (!verify.ok && !/unknown command|not supported|no such file/i.test(message)) {
+        await this.exec(`rm -f ${remoteTmp} 2>/dev/null || true`, 6000);
         return { ok: false, error: `配置校验未通过：${(verify.stderr || verify.stdout || 'frps verify 失败').trim()}` };
       }
     }
@@ -548,9 +552,13 @@ class ServerSession {
     const stamp = await this.exec('date +%Y%m%d-%H%M%S', 8000);
     const backup = `${this.configPath}.bak-${(stamp.stdout || '').trim() || 'manual'}`;
     const backupResult = await this.exec(`cp -p ${shellQuote(this.configPath)} ${shellQuote(backup)}`, 10000);
-    if (!backupResult.ok) return { ok: false, error: `备份失败：${backupResult.stderr || '未知错误'}` };
+    if (!backupResult.ok) {
+      await this.exec(`rm -f ${remoteTmp} 2>/dev/null || true`, 6000);
+      return { ok: false, error: `备份失败：${backupResult.stderr || '未知错误'}` };
+    }
 
     const moveResult = await this.exec(`cp ${remoteTmp} ${shellQuote(this.configPath)}`, 10000);
+    await this.exec(`rm -f ${remoteTmp} 2>/dev/null || true`, 6000);
     if (!moveResult.ok) return { ok: false, error: `写入失败：${moveResult.stderr || '未知错误'}` };
 
     let restarted = null;
@@ -569,7 +577,7 @@ class ServerSession {
       const result = await this.dockerCommand(action, info.docker.name);
       if (!result.ok) return { ok: false, error: `Docker ${actionText}失败：${(result.stderr || result.stdout || '未知错误').trim()}` };
       const after = await this.inspect();
-      return { ok: true, via: 'docker', container: info.docker.name, before, after: after.info };
+      return { ok: true, via: 'docker', container: info.docker.name, before, after: after.info || null };
     }
 
     if (info.hasUnit && info.serviceName) {
@@ -578,17 +586,19 @@ class ServerSession {
         return { ok: false, error: `${actionText}失败：${(result.stderr || result.stdout || '请确认当前账户有 systemctl 权限').trim()}` };
       }
       const after = await this.inspect();
-      return { ok: true, via: 'systemd', service: info.serviceName, before, after: after.info };
+      return { ok: true, via: 'systemd', service: info.serviceName, before, after: after.info || null };
     }
 
     if (action === 'stop' || action === 'restart') {
       if (!info.processAlive || !info.pids || !info.pids.length) {
         return { ok: false, error: '未检测到 frps 进程或 systemd 服务，无法停止' };
       }
-      const kill = await this.exec(`kill ${info.pids.join(' ')} 2>/dev/null || true`, 8000);
+      await this.exec(`kill ${info.pids.join(' ')} 2>/dev/null || true`, 8000);
       if (action === 'stop') {
         const after = await this.inspect();
-        return { ok: true, via: 'process', stopped: !after.info.processAlive, after: after.info };
+        // inspect() 失败时 info 为 undefined，不能直接取属性。
+        const stopped = !(after.ok && after.info && after.info.processAlive);
+        return { ok: true, via: 'process', stopped, after: after.info || null };
       }
       // restart: 等旧进程退出后再拉起
       await new Promise((r) => setTimeout(r, 1200));
@@ -606,14 +616,10 @@ class ServerSession {
       if (!result.ok) return { ok: false, error: `启动失败：${(result.stderr || result.stdout || '请确认 frps 路径与配置').trim()}` };
       await new Promise((r) => setTimeout(r, 1200));
       const after = await this.inspect();
-      return { ok: true, via: 'process', pid: after.info.pids, after: after.info };
+      return { ok: true, via: 'process', pid: (after.info && after.info.pids) || [], after: after.info || null };
     }
 
     return { ok: false, error: '没有可用的启动方式' };
-  }
-
-  async restart() {
-    return this.control('restart');
   }
 
   async logs(lines = 200) {

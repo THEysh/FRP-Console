@@ -4,18 +4,39 @@ const { contextBridge, ipcRenderer } = require('electron');
 
 const invoke = (channel, ...args) => ipcRenderer.invoke(channel, ...args);
 
-const listeners = new Map();
+/*
+ * 每个频道可以有多个订阅者。
+ * 早先的实现用 Map 只记住“第一个”回调，第二个订阅同一频道会静默失效；
+ * 这里改成按频道挂一个转发器 + 回调集合，退订只摘掉自己那一个。
+ */
+const bridges = new Map();
+
 function on(channel, callback) {
-  if (!listeners.has(channel)) {
-    const handler = (event, payload) => callback(payload);
-    ipcRenderer.on(channel, handler);
-    listeners.set(channel, handler);
+  if (typeof callback !== 'function') return () => {};
+  let bridge = bridges.get(channel);
+  if (!bridge) {
+    bridge = { callbacks: new Set(), handler: null };
+    bridge.handler = (event, payload) => {
+      for (const cb of [...bridge.callbacks]) {
+        try {
+          cb(payload);
+        } catch (e) {
+          // 单个订阅者出错不能拖垮其它订阅者 / IPC 事件循环
+          console.error(`[preload] ${channel} 回调异常`, e);
+        }
+      }
+    };
+    ipcRenderer.on(channel, bridge.handler);
+    bridges.set(channel, bridge);
   }
+  bridge.callbacks.add(callback);
   return () => {
-    const handler = listeners.get(channel);
-    if (handler) {
-      ipcRenderer.removeListener(channel, handler);
-      listeners.delete(channel);
+    const current = bridges.get(channel);
+    if (!current) return;
+    current.callbacks.delete(callback);
+    if (!current.callbacks.size) {
+      ipcRenderer.removeListener(channel, current.handler);
+      bridges.delete(channel);
     }
   };
 }

@@ -207,11 +207,15 @@ function upsertServerProfile(input, { activate = false } = {}) {
 
 function refreshTray() {
   if (!tray) return;
-  const runtime = manager ? manager.snapshot() : { running: false, mode: 'stopped' };
-  const statusText = runtime.connected ? '已连接' : runtime.mode === 'starting' ? '连接中' : '未连接';
+  // 托盘文字要跟界面上的一致性：光有管理 API 不等于隧道通了。
+  const runtime = manager
+    ? runtimeView(manager.snapshot())
+    : { running: false, connected: false, loggedIn: false, loginFailed: false, connectFailed: false, mode: 'stopped' };
+  const offline = runtime.loginFailed || runtime.connectFailed;
+  const statusText = offline ? '连不上服务器' : runtime.loggedIn ? '已连接' : runtime.mode === 'starting' ? '连接中' : '未连接';
   tray.setToolTip(`FRP 控制台 · ${statusText}`);
   const menu = Menu.buildFromTemplate([
-    { label: runtime.connected ? `隧道在线 · ${statusText}` : `隧道未连接 · ${statusText}`, enabled: false },
+    { label: runtime.loggedIn ? `隧道在线 · ${statusText}` : `隧道未连接 · ${statusText}`, enabled: false },
     { type: 'separator' },
     {
       label: '显示控制台',
@@ -223,7 +227,7 @@ function refreshTray() {
     },
     {
       label: '启动隧道',
-      enabled: !runtime.connected,
+      enabled: !runtime.loggedIn,
       click: async () => {
         const result = await manager.start({ runMode: settings.runMode });
         notify(result.ok ? 'info' : 'error', result.ok ? '隧道已启动' : '启动失败', result.error || '');
@@ -233,7 +237,7 @@ function refreshTray() {
     },
     {
       label: '停止隧道',
-      enabled: runtime.connected || !!(manager && manager.isChildAlive),
+      enabled: !!runtime.connected || !!(manager && manager.isChildAlive),
       click: async () => {
         suppressExitUntil = Date.now() + 12000;
         const result = await manager.stop({ runMode: settings.runMode });
@@ -432,7 +436,10 @@ function buildState() {
       proxies: [],
     };
   }
-  const runtime = manager.snapshot();
+  /* 注意：这里必须先算好 runtimeView 再映射代理。
+   * runtime.connected 只代表“管理 API 有响应”，frpc 连不上 frps 时它照样是 true，
+   * 代理表会一直显示“同步中”。用登录状态判定才会落回“未同步”。 */
+  const runtime = runtimeView(manager.snapshot());
   const validation = model ? configModule.validate(model) : { errors: [], warnings: [] };
   const proxies = (model ? model.proxies : []).map((proxy) => {
     const st = manager.proxyStatus.get(proxy.name) || null;
@@ -440,7 +447,7 @@ function buildState() {
     return {
       ...proxy,
       publicAddress: configModule.publicAddressFor(model, proxy),
-      status: st && st.status ? st.status : runtime.connected ? 'pending' : 'unknown',
+      status: st && st.status ? st.status : runtime.loggedIn ? 'pending' : 'unknown',
       statusError: st && st.err ? st.err : '',
       runtimeLocal: st ? st.local_addr : '',
       runtimeRemote: st ? st.remote_addr : '',
@@ -462,7 +469,7 @@ function buildState() {
     config: configForState(),
     configError,
     validation,
-    runtime: runtimeView(runtime),
+    runtime,
     service: serviceCache,
     proxies,
     counts: (() => {
@@ -801,6 +808,11 @@ function registerIpc() {
     if (clean.pollIntervalMs) clean.pollIntervalMs = Math.min(30000, Math.max(1000, Number(clean.pollIntervalMs) || 3000));
     if (clean.adminPort) clean.adminPort = Math.min(65535, Math.max(1, Number(clean.adminPort) || 7400));
     if (clean.logBuffer) clean.logBuffer = Math.min(2000, Math.max(100, Number(clean.logBuffer) || 600));
+    // 日志缓冲上限要立刻作用到正在跑的 LogFollower，否则要等下次启动才生效。
+    if (clean.logBuffer) {
+      follower.maxLines = clean.logBuffer;
+      if (follower.lines.length > follower.maxLines) follower.lines.splice(0, follower.lines.length - follower.maxLines);
+    }
     if (clean.runMode && !['auto', 'service', 'managed'].includes(clean.runMode)) delete clean.runMode;
     settings = settingsModule.save(clean);
     const previousConfig = paths.configPath;
@@ -1498,7 +1510,8 @@ function registerIpc() {
     return ok({ source: result.source, content: result.content, serverId: sessionServerId });
   });
 
-  ipcMain.handle('probe:tcp', async (event, payload) => {    const host = String((payload && payload.host) || '').trim();
+  ipcMain.handle('probe:tcp', async (event, payload) => {
+    const host = String((payload && payload.host) || '').trim();
     const port = Number(payload && payload.port);
     if (!host || !Number.isInteger(port) || port < 1 || port > 65535) return fail('主机或端口无效');
     return ok(await tcpCheck(host, port, payload.timeout || 3000));
@@ -1507,7 +1520,8 @@ function registerIpc() {
   ipcMain.handle('logs:get', async (event, payload = {}) => {
     const limit = Math.min(2000, Math.max(1, Number(payload.limit) || 500));
     const since = Number(payload.since) || 0;
-    const lines = since ? follower.lines.filter((l) => l.id > since) : follower.recent(limit);
+    // since 用于增量拉取，但也要受 limit 约束，避免一次把上千行推给渲染层。
+    const lines = since ? follower.lines.filter((l) => l.id > since).slice(-limit) : follower.recent(limit);
     return ok({ lines, file: paths.logPath, exists: fs.existsSync(paths.logPath || '') });
   });
 
@@ -1754,11 +1768,14 @@ function startApp() {
     registerIpc();
     createWindow();
     createTray();
-    app.whenReady().then(() => {
-      if (settings.launchTunnelOnStart) {
-        bootstrapReady.then(() => manager.start({ runMode: settings.runMode }).then(() => manager.refresh()).then(pushState).catch(() => {}));
-      }
-    });
+    // bootstrap() 第一句就同步载入 settings，这里可以安全读取启动偏好。
+    if (settings.launchTunnelOnStart) {
+      bootstrapReady
+        .then(() => manager.start({ runMode: settings.runMode }))
+        .then(() => manager.refresh())
+        .then(() => pushState())
+        .catch(() => {});
+    }
     if (process.env.FRP_CONSOLE_SMOKE === '1') {
       setTimeout(() => {
         if (win && !win.isDestroyed()) win.webContents.executeJavaScript('JSON.stringify({views: document.querySelectorAll(".view").length, nodes: document.querySelectorAll(".view *").length, title: (document.querySelector(".hero-titles h2")||{}).textContent || "", status: (document.querySelector(".status-pill .label")||{}).textContent || "", nav: document.querySelectorAll(".nav-item").length, toast: document.querySelectorAll(".toast").length})').then((v) => console.log(`[smoke] ${v}`)).catch((e) => console.log(`[smoke] error ${e.message}`)).finally(() => { isQuitting = true; app.quit(); });
