@@ -49,7 +49,7 @@
 | 文件 | 说明 |
 | --- | --- |
 | `FRP-Console-Setup-<版本>-x64.exe` | NSIS 一键安装，装到 `%LOCALAPPDATA%\Programs\frp-console`，自动建桌面与开始菜单快捷方式 |
-| `FRP-Console-<版本>.exe` | 单文件便携版（如已提供），数据写在 exe 同级的 `frp-console-data\` |
+| `FRP-Console-<版本>.exe` | 单文件便携版，数据写在 exe 同级的 `frp-console-data\` |
 
 安装包只装控制台，**不含 frpc**——请自行从 [frp Releases](https://github.com/fatedier/frp/releases) 下载 `frpc.exe`，放在控制台能找到的位置（建议与控制台同目录），或在「设置 → 可执行文件与路径」里手动选择。
 
