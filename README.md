@@ -208,6 +208,13 @@ npm run dist:dir       # 只生成免打包目录（dist/win-unpacked），便�
 > 可执行文件名固定为 `FRP-Console.exe`（`build.executableName`），保持 ASCII：`.cmd` 由 cmd.exe 按 OEM 代码页解析，中文 exe 名会被读成乱码而报“找不到文件”。
 > `npm run dist:dir` 产出的免安装目录里仍会生成 `启动 FRP 控制台.cmd`（由 `tools/after-build.cjs` 生成），供免安装方式使用。
 
+**打包卡在 `packaging platform=win32` 不动时**：electron-builder 解包 Electron 前要在 `%TEMP%` 里拿一把下载锁（`eb-dl-*.lock.lock`）。上一次构建被强行中断就会留下这把锁，之后每次都会一直等它，表现为日志停在 `packaging`、`dist/win-unpacked.tmp` 不再增长。删掉锁目录再重跑即可：
+
+```powershell
+Remove-Item "$env:TEMP\eb-dl-*.lock.lock" -Recurse -Force
+npm run dist
+```
+
 如果安装器所在的机器上无法创建快捷方式（例如受限会话），可以改用部署脚本自行铺开：
 
 ```bash

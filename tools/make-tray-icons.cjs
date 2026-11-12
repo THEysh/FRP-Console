@@ -150,16 +150,17 @@ function drawF(buf, size) {
   rect(9.5, 14.6, 9, 3.6); // 中横
 }
 
-function makeIcon(state) {
-  const buf = makeCanvas(SIZE);
+function makeIcon(state, size = SIZE) {
+  const buf = makeCanvas(size);
+  const s = size / SIZE;
   // 底：稍大一圈的深色描边 + 主体
-  roundRect(buf, SIZE, 1, 1, SIZE - 2, SIZE - 2, RADIUS, COLORS.bgEdge);
-  roundRect(buf, SIZE, 2, 2, SIZE - 4, SIZE - 4, RADIUS - 1, COLORS.bg);
-  drawF(buf, SIZE);
+  roundRect(buf, size, Math.round(1 * s), Math.round(1 * s), Math.round((SIZE - 2) * s), Math.round((SIZE - 2) * s), Math.max(1, Math.round(RADIUS * s)), COLORS.bgEdge);
+  roundRect(buf, size, Math.round(2 * s), Math.round(2 * s), Math.round((SIZE - 4) * s), Math.round((SIZE - 4) * s), Math.max(1, Math.round((RADIUS - 1) * s)), COLORS.bg);
+  drawF(buf, size);
   // 右下角状态点：先挖一圈底色当描边，再画实心
-  disc(buf, SIZE, 24, 24, 7.2, COLORS.ring);
-  disc(buf, SIZE, 24, 24, 5.2, COLORS[state]);
-  return encodePng(SIZE, SIZE, buf);
+  disc(buf, size, 24 * s, 24 * s, 7.2 * s, COLORS.ring);
+  disc(buf, size, 24 * s, 24 * s, 5.2 * s, COLORS[state]);
+  return encodePng(size, size, buf);
 }
 
 const outDir = path.join(__dirname, '..', 'assets');
@@ -167,4 +168,16 @@ for (const state of ['online', 'idle', 'error']) {
   const file = path.join(outDir, `tray-${state}.png`);
   fs.writeFileSync(file, makeIcon(state));
   console.log(`[tray] ${path.relative(path.join(__dirname, '..'), file)} ${fs.statSync(file).size}B`);
+}
+
+// 16px 版只看不进包：托盘在 100% DPI 下就是 16×16，
+// 改图标后跑 `node tools/make-tray-icons.cjs 16` 生成到 .shots/ 里肉眼确认可读性。
+if (process.argv[2] === '16') {
+  const shotDir = path.join(__dirname, '..', '.shots');
+  fs.mkdirSync(shotDir, { recursive: true });
+  for (const state of ['online', 'idle', 'error']) {
+    const file = path.join(shotDir, `tray16-${state}.png`);
+    fs.writeFileSync(file, makeIcon(state, 16));
+    console.log(`[tray] ${path.relative(path.join(__dirname, '..'), file)} (16px 预览)`);
+  }
 }
