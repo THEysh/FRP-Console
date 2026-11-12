@@ -345,7 +345,7 @@ function overviewKey() {
   return JSON.stringify({
     m: r.mode, c: r.connected, p: r.pid, since: r.since, api: r.apiError,
     // 连接失败原因（已去掉时间戳，同一错误重试时字符串不变，不会引起频繁重渲染）
-    ce: r.connectKind || '', cx: r.connectError ? 1 : 0, lf: r.loginFailed ? 1 : 0,
+    ce: r.connectKind || '', cx: r.connectError ? 1 : 0, lf: r.loginFailed ? 1 : 0, pd: r.pending ? 1 : 0,
     svc: svc.state, svcType: svc.startType,
     counts: s.counts, cfgErr: s.configError,
     val: s.validation && s.validation.errors ? s.validation.errors.length : 0,
