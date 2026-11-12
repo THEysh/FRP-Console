@@ -235,6 +235,23 @@ git revert <commit>      # 撤销某次提交（保留历史）
 因此 `git clone` 后需要先 `npm install`；`resources/frps/` 下的两个 frps 二进制（amd64 / arm64）
 是「一键配置」的必需输入，已随仓库跟踪，不要删除。
 
+### 本地测试
+
+`tools/` 下有一套基于 CDP 的自动化脚本，用独立的 userData 目录跑，不会碰到你正在用的实例：
+
+```bash
+FRP_INSTANCE_PORT=47827 PORTABLE_EXECUTABLE_DIR=/tmp/frpsmoke2 \
+  npx electron . --no-sandbox --remote-debugging-port=9333
+
+node tools/ui-test.cjs              # 逐页自检 + 截图（溢出、越界、console.error）
+node tools/ui-flow.cjs settings     # 交互流程：settings / logs / proxies / server / tunnel / misc / winctl
+node tools/cdp-eval.cjs "document.title"   # 在渲染层执行任意表达式
+node tools/cdp-probe.cjs            # 截右上角，核对三个窗口按钮图标
+```
+
+`FRP_INSTANCE_PORT` 让测试实例使用独立单实例锁，`PORTABLE_EXECUTABLE_DIR` 让它把设置写到
+别处；两者缺一，测试实例会被正在运行的正式实例挡掉或改到你的真实配置。
+
 ## 常见问题
 
 - **双击 exe 没有窗口 / 进程一闪就退出**：本机（以及多数以管理员身份运行的受限桌面）里 Chromium 沙箱初始化会失败，进程在进入主进程代码之前就以退出码 `3` 结束，所以界面上完全没有提示。命令行参数是唯一生效的方式：装完后请从**桌面 / 开始菜单快捷方式**启动（安装器已把 `--no-sandbox` 写进快捷方式）；如果你手动建的快捷方式或免安装目录，需要自行在「属性 → 目标」末尾补 ` --no-sandbox`，或改用同目录的 `启动 FRP 控制台.cmd`（内容为纯 ASCII，中文路径也不会乱码）。开发时 `npm run dev` 已内置该参数。

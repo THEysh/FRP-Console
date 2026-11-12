@@ -246,6 +246,66 @@ const FLOWS = {
     return out;
   },
 
+  async proxyedit({ send }) {
+    const out = [];
+    await run(send, `window.__t.nav('proxies'); return true`);
+    await sleep(800);
+
+    // 新增一个代理
+    await run(send, `window.__t.click(window.__t.act('proxy.add')); return true`);
+    await sleep(500);
+    out.push(['新增弹窗字段', await run(send, `return [...document.querySelectorAll('.modal [name]')].map(e => e.name)`)]);
+    out.push(['填写并保存', await run(send, `
+      const set = (n, v) => { const el = document.querySelector('.modal [name="' + n + '"]'); if (el) { el.value = v; el.dispatchEvent(new Event('input', { bubbles: true })); } };
+      set('name', 'ui-test-tcp');
+      set('localPort', '9100');
+      set('remotePort', '29123');
+      const save = document.querySelector('#pf-submit');
+      if (!save) return '没找到 #pf-submit';
+      save.click();
+      return 'clicked';
+    `)]);
+    await sleep(2200);
+    out.push(['保存结果', await run(send, `return { toasts: window.__t.toasts(), rows: document.querySelectorAll('#view tbody tr').length, modal: window.__t.modal() }`)]);
+
+    // 重名应该被拒
+    await run(send, `window.__t.click(window.__t.act('proxy.add')); return true`);
+    await sleep(400);
+    await run(send, `
+      const set = (n, v) => { const el = document.querySelector('.modal [name="' + n + '"]'); if (el) { el.value = v; el.dispatchEvent(new Event('input', { bubbles: true })); } };
+      set('name', 'ui-test-tcp');
+      set('localPort', '9101');
+      set('remotePort', '29124');
+      const save = document.querySelector('#pf-submit');
+      if (save) save.click();
+      return true;
+    `);
+    await sleep(1800);
+    out.push(['重名应被拒', await run(send, `return { toasts: window.__t.toasts(), modalOpen: !!window.__t.modal() }`)]);
+    await run(send, `const c = window.__t.act('modal.close'); if (c) c.click(); return !!c`);
+    await sleep(400);
+
+    // 删除刚建的代理
+    out.push(['删除', await run(send, `
+      const row = [...document.querySelectorAll('#view tbody tr')].find((tr) => tr.textContent.includes('ui-test-tcp'));
+      if (!row) return '没找到行';
+      const del = row.querySelector('[data-act="proxy.delete"]') || [...row.querySelectorAll('[data-act]')].find((e) => e.dataset.act === 'proxy.delete');
+      if (!del) return '行内没有删除按钮：' + [...row.querySelectorAll('[data-act]')].map((e) => e.dataset.act).join(',');
+      del.click();
+      return true;
+    `)]);
+    await sleep(1200);
+    out.push(['删除确认弹窗', await run(send, `return window.__t.modal().slice(0, 80)`)]);
+    await run(send, `
+      const btn = [...document.querySelectorAll('.modal button')].find((e) => /^(删除|确定|确认)/.test((e.textContent || '').trim()));
+      if (btn) btn.click();
+      return !!btn;
+    `);
+    await sleep(2000);
+    out.push(['删除后', await run(send, `return { toasts: window.__t.toasts(), hasRow: [...document.querySelectorAll('#view tbody tr')].some((tr) => tr.textContent.includes('ui-test-tcp')) }`)]);
+    return out;
+  },
+
   async misc({ send }) {
     const out = [];
     // 服务发现 → 发布代理：预设值应带出端口
