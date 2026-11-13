@@ -1585,6 +1585,28 @@ function registerIpc() {
     return ok({ revealed: true });
   });
 
+  ipcMain.handle('config:backups', async () => {
+    if (!paths.configPath) return fail('配置路径尚未设置');
+    const result = configModule.listBackups(paths.configPath);
+    if (!result.ok) return fail(result.error);
+    return ok({ backups: result.backups, dir: result.dir });
+  });
+
+  ipcMain.handle('config:restore-backup', async (event, incoming) => {
+    if (!paths.configPath) return fail('配置路径尚未设置');
+    const file = String((incoming && incoming.file) || '').trim();
+    if (!file) return fail('请指定要还原的备份');
+    const restored = configModule.restoreBackup(paths.configPath, file);
+    if (!restored.ok) return fail(restored.error);
+    // 还原后重新从磁盘载入，并视情况热重载隧道。
+    loadConfigFromDisk();
+    pushState();
+    if (manager.apiOk && model) {
+      applyAndMaybeReload(model, { restartRecommended: true }).catch(() => {});
+    }
+    return ok({ restoredFrom: restored.restoredFrom });
+  });
+
   ipcMain.handle('config:save', async (event, incoming) => {
     if (!model) return fail('配置尚未载入');
     const clean = configModule.normalize({
@@ -2544,6 +2566,25 @@ function registerIpc() {
   /* 代理表单 / 健康检查共用的域名解析：只做软提示，不阻塞任何保存或判定。 */
   ipcMain.handle('dns:resolve', async (event, domain) => {
     return ok(await resolveDomainInfo(String(domain || '').trim()));
+  });
+
+  /* 域名向导「一键建解析」：给域名建/改 A 记录，指向 frps 服务器 IP。 */
+  ipcMain.handle('dns:set-a', async (event, payload = {}) => {
+    try {
+      const provider = currentDnsProvider();
+      if (!provider || !provider.setARecord) return fail('尚未配置 DNS 验证渠道（需要 Cloudflare token）');
+      const domain = String((payload && payload.domain) || '').trim();
+      if (!domain) return fail('请先输入域名');
+      // 目标 IP：显式传入优先；否则用活跃服务器档案的 host（SSH 公网 IP），再退回本机配置 serverAddr。
+      const explicit = String((payload && payload.ip) || '').trim();
+      const profile = activeServerProfile();
+      const ip = explicit || (profile && /^\d+\.\d+\.\d+\.\d+$/.test(profile.host || '') ? profile.host : '') || (model && /^\d+\.\d+\.\d+\.\d+$/.test(model.serverAddr || '') ? model.serverAddr : '');
+      if (!ip) return fail('无法确定 frps 服务器 IP：请先连接服务器，或手动填一个 IP');
+      const record = await provider.setARecord(domain, ip);
+      return ok(record);
+    } catch (e) {
+      return fail((e && e.message) || String(e));
+    }
   });
 
   ipcMain.handle('dns:save', async (event, payload = {}) => {

@@ -24,7 +24,7 @@ const S = {
   modalOpen: false,
   proxyEdit: null,
   update: null,
-  certs: { list: [], dns: { dnsProvider: '', hasToken: false, acmeEmail: '', acmeStaging: true }, loaded: false, busy: false, issuing: false },
+  certs: { list: [], dns: { dnsProvider: '', hasToken: false, acmeEmail: '', acmeStaging: true }, loaded: false, busy: false, issuing: false, wizard: { domain: '', checking: false, dns: null, setA: false, result: null } },
   lastKeys: {},
   viewScroll: {},
   busy: new Set(),
@@ -69,6 +69,7 @@ const S = {
     installProgress: null,
     error: '',
   },
+  backups: { list: [], dir: '', loaded: false, loading: false, busy: false },
 };
 
 /* ----------------------------- 图标 ------------------------------ */
@@ -121,6 +122,11 @@ function esc(value) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
+}
+
+/* 术语：给小白解释黑话，悬停显示说明。 */
+function term(text, tip) {
+  return `<span class="term" data-tip="${esc(tip)}">${esc(text)}</span>`;
 }
 
 function fmtTime(ts) {
@@ -418,6 +424,58 @@ function layerFailText(counts) {
   return '存在隧道或公网检查失败';
 }
 
+/* 隧道就绪进度链：把“frpc 起来 → 登录 frps → 代理注册 → 公网能访问”这四步
+ * 画成一条链。小白不用懂 managed/pending/loggedIn 这些词，只看哪一步卡住。 */
+function tunnelProgress(state) {
+  const r = state.runtime || {};
+  const counts = state.counts || {};
+  const config = state.config || {};
+  const hasProxies = counts.total > 0;
+  const registered = (r.proxies || []).filter((p) => p.status === 'running').length;
+  const frpcUp = !!(r.connected || r.mode === 'external' || r.mode === 'foreign');
+  const loggedIn = !!r.loggedIn;
+  const blocked = !!(r.loginFailed || r.connectFailed);
+
+  const step1 = frpcUp ? 'done' : (config.serverAddr ? 'fail' : 'idle');
+  const step2 = step1 !== 'done' ? 'idle' : (loggedIn ? 'done' : (blocked ? 'fail' : 'wait'));
+  // 后续步骤是「级联」：前一步没到位，后面的还没轮到（不报红，免得把根因淹掉）。
+  const step3 = step2 !== 'done' ? 'idle' : (!hasProxies ? 'na' : (registered > 0 ? 'done' : 'fail'));
+  const step4 = step3 === 'na' ? 'na' : (step3 !== 'done' ? 'idle' : (counts.online > 0 ? 'done' : (counts.unhealthy > 0 ? 'fail' : 'wait')));
+
+  return [
+    { label: '本机 frpc', tip: 'frpc 是「客户端」程序，装在你电脑上，负责把本地服务连到服务器。', state: step1, text: frpcUp ? '运行中' : (config.serverAddr ? '未启动' : '还没配置') },
+    { label: '连上服务器', tip: 'frpc 用服务器地址、端口和 Token 登录到 frps（服务器端程序）。', state: step2, text: loggedIn ? '已登录' : (blocked ? '未连上' : (frpcUp ? '连接中' : '—')) },
+    { label: '代理已注册', tip: '你配置的每一条映射（如把本机 8080 暴露成公网端口）都已在服务器上登记。', state: step3, text: !hasProxies ? '暂无代理' : (step3 === 'idle' ? '—' : (registered > 0 ? `${registered} 条已注册` : '未注册')) },
+    { label: '公网可访问', tip: '通过公网地址真正访问一次，确认「本地服务 → 隧道 → 公网」整条链路都通。', state: step4, text: !hasProxies ? '暂无代理' : (step4 === 'idle' ? '—' : (counts.online > 0 ? `在线 ${counts.online} 条` : '未通过')) },
+  ];
+}
+
+function tunnelProgressHtml(state) {
+  const glyph = { done: '✓', fail: '✗', wait: '…', idle: '·', na: '—' };
+  return `<div class="tunnel-progress">${tunnelProgress(state).map((s, i) => `
+    ${i ? '<span class="tp-arrow">→</span>' : ''}
+    <span class="tp-step tp-${s.state}"><span class="tp-dot">${glyph[s.state]}</span><span class="tp-body"><span class="tp-label">${s.tip ? term(s.label, s.tip) : esc(s.label)}</span><small>${esc(s.text)}</small></span></span>
+  `).join('')}</div>`;
+}
+
+/* 首跑欢迎引导：小白只有一台服务器账号密码，把它变成能用的隧道，一共三步。 */
+function welcomeGuideHtml() {
+  const step = (n, title, desc) => `
+    <div class="wg-step">
+      <span class="wg-num">${n}</span>
+      <div class="wg-body"><strong>${esc(title)}</strong><span>${desc}</span></div>
+    </div>`;
+  return `<div class="note welcome-guide">${icon('shield')}<div>
+      <strong>欢迎！三步把你的服务放到公网</strong>
+      <div class="wg-steps">
+        ${step(1, '连接服务器', '到「服务器」页填 IP 与 SSH 账号密码，连上后控制台会自动摸清服务器状态。')}
+        ${step(2, '一键初始化 frps', '点「一键初始化并启动」，自动装 frps、写配置、启动服务、放行防火墙，再把地址和 Token 写回本机。')}
+        ${step(3, '加代理、启动隧道', '去「代理映射」加一条穿透规则，回来点「启动隧道」，看上面进度链变绿即可。')}
+      </div>
+      <div style="margin-top:12px"><button class="btn primary" type="button" data-act="nav" data-view="server">${icon('server')}<span>开始配置</span></button></div>
+    </div></div>`;
+}
+
 /* 隧道还在跑、但它连的服务器在本机已经没有档案了。
  *
  * 这时候三层检查是真的全绿（frpc 确实还在正常登录 frps），所以不能简单把状态改红
@@ -505,7 +563,7 @@ function renderOverview(force = false) {
     issues.push(`<div class="note error">${icon('alert')}<div><strong>管理端口 ${esc(port)} 上跑着另一个 frpc</strong><br>它连的服务器或代理名单跟这份配置对不上（多半是另一份配置、另一个控制台实例，或手工开的 frpc）。本配置的隧道没有在跑，这里也不能停它。<br><span style="opacity:.75">到「设置 → 运行模式与行为」换一个管理 API 端口，或先把那个 frpc 关掉。</span></div></div>`);
   }
   if (onlyMissingServer) {
-    issues.push(`<div class="note">${icon('alert')}<div><strong>还没有连上服务器</strong><br>到「服务器」页新建一个档案，填 IP 和 SSH 密码，连上后一键初始化 frps——地址与 Token 会自动写进本机配置，不用手填。<br><span style="opacity:.75">服务器就绪后，去「代理映射」加一条穿透规则，回来这里看三层是否全绿。</span></div></div>`);
+    issues.push(welcomeGuideHtml());
   } else if (validationErrors.length) {
     issues.push(`<div class="note error">${icon('alert')}<div><strong>配置存在 ${validationErrors.length} 处错误</strong><br>${esc(validationErrors[0].message)}</div></div>`);
   }
@@ -524,14 +582,25 @@ function renderOverview(force = false) {
       unconfirmed: 'frpc 进程起来了，但配置里的代理一个都没在服务器上注册成功，说明还没登录上 frps（端口不对、Token 不符或被网络挡了）。',
       unknown: '具体原因见概览下方的 frpc 日志。',
     }[runtime.connectKind] || '具体原因见概览下方的 frpc 日志。';
-    issues.push(`<div class="note error">${icon('alert')}<div><strong>隧道没连上 ${esc(target)}</strong><br>${esc(why)}${runtime.connectError ? `<br><span class="mono" style="font-size:11px;opacity:.75">${esc(runtime.connectError)}</span>` : ''}<br><span style="opacity:.75">本地服务（如 localhost:8080）通不通都不影响这一步——先把隧道连上，公网才会有转发。</span></div></div>`);
+    const offlineAct = {
+      auth: `<button class="btn small primary" type="button" data-act="nav" data-view="server">${icon('server')}<span>去服务器页同步 Token</span></button>`,
+      refused: `<button class="btn small primary" type="button" data-act="nav" data-view="server">${icon('server')}<span>去服务器页检查 frps</span></button>`,
+      unreachable: `<button class="btn small primary" type="button" data-act="nav" data-view="server">${icon('server')}<span>去服务器页检查端口</span></button>`,
+      unconfirmed: `<button class="btn small primary" type="button" data-act="nav" data-view="server">${icon('server')}<span>去服务器页核对配置</span></button>`,
+      proxy: `<button class="btn small primary" type="button" data-act="nav" data-view="settings">${icon('gear')}<span>打开设置关系统代理</span></button>`,
+    }[runtime.connectKind] || `<button class="btn small" type="button" data-act="nav" data-view="logs">${icon('terminal')}<span>查看 frpc 日志</span></button>`;
+    issues.push(`<div class="note error">${icon('alert')}<div><strong>隧道没连上 ${esc(target)}</strong><br>${esc(why)}${runtime.connectError ? `<br><span class="mono" style="font-size:11px;opacity:.75">${esc(runtime.connectError)}</span>` : ''}<br><span style="opacity:.75">本地服务（如 localhost:8080）通不通都不影响这一步——先把隧道连上，公网才会有转发。</span>
+      <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">${offlineAct}<button class="btn small" type="button" data-act="tunnel.restart">${icon('restart')}<span>重试连接</span></button></div>
+    </div></div>`);
   } else if (counts.unhealthy > 0) {
     const parts = [];
     if (counts.unhealthyLocal) parts.push(`本地服务不通 ${counts.unhealthyLocal} 个`);
     if (counts.unhealthyTunnel) parts.push(`隧道未建立 ${counts.unhealthyTunnel} 个`);
     if (counts.unhealthyPublic) parts.push(`公网不可达 ${counts.unhealthyPublic} 个`);
     const detail = parts.length ? `（${parts.join('、')}）` : '';
-    issues.push(`<div class="note warn">${icon('alert')}<div>有 ${counts.unhealthy} 个代理未通过三层连通性检查${detail}，公网访问会失败。</div></div>`);
+    issues.push(`<div class="note warn">${icon('alert')}<div>有 ${counts.unhealthy} 个代理未通过三层连通性检查${detail}，公网访问会失败。
+      <div style="margin-top:10px"><button class="btn small" type="button" data-act="nav" data-view="proxies">${icon('link')}<span>去代理映射看是哪条</span></button></div>
+    </div></div>`);
   }
 
   $('#view').innerHTML = `
@@ -567,6 +636,8 @@ function renderOverview(force = false) {
         </div>
       </section>
 
+      ${tunnelProgressHtml(state)}
+
       <section class="metrics" style="margin-top:16px">
         <div class="card metric">
           <div class="metric-top"><span class="metric-label">代理总数</span><span class="metric-icon">${icon('link')}</span></div>
@@ -574,12 +645,12 @@ function renderOverview(force = false) {
           <div class="metric-foot"><span>已配置的穿透规则</span></div>
         </div>
         <div class="card metric">
-          <div class="metric-top"><span class="metric-label">在线代理</span><span class="metric-icon">${icon('activity')}</span></div>
+          <div class="metric-top"><span class="metric-label">${term('在线代理', '真正通过了「本地服务 → 隧道 → 公网」三层检测的映射；没测完的不算。')}</span><span class="metric-icon">${icon('activity')}</span></div>
           <div class="metric-value">${esc(counts.online)}<small> / ${esc(counts.total)}</small></div>
           <div class="metric-foot"><span class="${!config.serverAddr ? '' : (counts.online === counts.total && counts.total ? 'up' : counts.unchecked > 0 ? '' : 'down')}">${!config.serverAddr ? '配置服务器后自动检测' : !counts.total ? '暂无代理' : counts.online === counts.total ? '全部在线' : counts.unchecked > 0 && counts.unhealthy === 0 ? `${counts.unchecked} 条待检测` : `${counts.total - counts.online} 条未通过连通性检查`}</span></div>
         </div>
         <div class="card metric">
-          <div class="metric-top"><span class="metric-label">连通性异常</span><span class="metric-icon">${icon('cpu')}</span></div>
+          <div class="metric-top"><span class="metric-label">${term('连通性异常', '三层（本地服务 → 隧道 → 公网）中至少一层没通的映射数；点击可看是哪条、哪一层。')}</span><span class="metric-icon">${icon('cpu')}</span></div>
           <div class="metric-value">${config.serverAddr ? esc(counts.unhealthy || 0) : '—'}</div>
           <div class="metric-foot"><span class="${!config.serverAddr ? '' : counts.unhealthy ? 'down' : counts.unchecked > 0 ? '' : 'up'}">${!config.serverAddr ? '尚未开始检测' : counts.unhealthy ? layerFailText(counts) : counts.unchecked > 0 ? `${counts.unchecked} 条还没测完` : '全部代理三层全通（本地 → 隧道 → 公网）'}</span></div>
         </div>
@@ -2656,6 +2727,66 @@ function certRow(c) {
     </div>`;
 }
 
+/* ---------------- 域名就绪向导 ---------------- */
+/* 把「DNS 解析 → 签发证书 → 填进代理」这条链路做成可交互的四步，
+ * 小白不用懂 DNS/TXT/ACME：输入域名，缺哪步点哪步。 */
+function domainWizardHtml() {
+  const w = S.certs.wizard || {};
+  const dns = w.dns || null;
+  const hasToken = !!((S.certs.dns || {}).hasToken);
+  const checking = w.checking;
+  return `
+    <div class="domain-wizard">
+      <div class="dw-input-row">
+        <input class="input" id="dw-domain" placeholder="你的域名，如 app.example.com 或 *.example.com" value="${esc(w.domain || '')}" spellcheck="false" />
+        <button class="btn" type="button" data-act="dw.check" ${checking ? 'disabled' : ''}>${checking ? '<span class="spinner-sm"></span>' : icon('search')}<span>${checking ? '检测中…' : '检测'}</span></button>
+      </div>
+      <div class="dw-steps">
+        <div class="dw-step ${dns ? (dns.resolved && dns.pointsToServer ? 'ok' : 'warn') : 'idle'}">
+          <span class="dw-dot">${dns ? (dns.resolved && dns.pointsToServer ? '✓' : '!') : '1'}</span>
+          <div class="dw-body">
+            <strong>DNS 解析</strong>
+            <span>${dns
+              ? ((dns.resolved || []).length && dns.pointsToServer ? `已解析到服务器（${esc((dns.resolved || []).join(', '))}）`
+                : (dns.resolved || []).length ? `已解析到 ${esc((dns.resolved || []).join(', '))}，但没指向当前服务器`
+                : `还没解析${dns.error ? `（${esc(dns.error)}）` : ''}，公网访问不到`)
+              : '输入域名后点「检测」'}</span>
+          </div>
+          ${dns && !(dns.resolved && dns.pointsToServer)
+            ? `<button class="btn small" type="button" data-act="dw.set-a" ${hasToken ? '' : 'disabled'} title="${hasToken ? '' : '需要先配置 Cloudflare token'}">${icon('globe')}<span>${w.setA ? '处理中…' : '一键建解析'}</span></button>`
+            : ''}
+        </div>
+        <div class="dw-step ${(S.certs.list || []).length ? 'ok' : 'idle'}">
+          <span class="dw-dot">${(S.certs.list || []).length ? '✓' : '2'}</span>
+          <div class="dw-body"><strong>签发证书</strong><span>${(S.certs.list || []).length ? '已有证书（见下方列表）' : 'DNS 就绪后，在下方「签发新证书」一键签发'}</span></div>
+        </div>
+        <div class="dw-step idle">
+          <span class="dw-dot">3</span>
+          <div class="dw-body"><strong>填进代理</strong><span>新建 / 编辑 https 代理，插件选 https2http / https2https，在「从已签发证书选择」里选即可</span></div>
+          <button class="btn small" type="button" data-act="nav" data-view="proxies">${icon('link')}<span>去代理映射</span></button>
+        </div>
+      </div>
+      ${!hasToken ? `<div class="field-hint" style="margin-top:8px">还没有配置 DNS 验证渠道：先到下方「DNS 验证渠道」填 Cloudflare token，才能一键建解析、自动签发。</div>` : ''}
+    </div>`;
+}
+
+async function refreshDomainWizard() {
+  const w = S.certs.wizard;
+  const domain = String($('#dw-domain') ? $('#dw-domain').value : (w.domain || '')).trim();
+  if (!domain) { w.dns = null; w.domain = ''; if (S.view === 'certs') renderCerts(true); return; }
+  w.domain = domain;
+  w.checking = true;
+  if (S.view === 'certs') renderCerts(true);
+  const res = await FRP.dnsResolve(domain);
+  w.checking = false;
+  if (res && res.ok) {
+    w.dns = res.data;
+  } else {
+    w.dns = { resolved: [], pointsToServer: false, error: (res && res.error) || '解析失败' };
+  }
+  if (S.view === 'certs') renderCerts(true);
+}
+
 function renderCerts(force = false) {
   if (!force && S.lastKeys.certs === 'rendered') return;
   S.lastKeys.certs = 'rendered';
@@ -2677,7 +2808,14 @@ function renderCerts(force = false) {
 
       <section class="card section">
         <div class="section-head">
-          <div class="section-title"><strong>从 0 开始：给域名上 HTTPS</strong><span>按顺序走完即可；只想用隧道、不要域名，可跳过本页。</span></div>
+          <div class="section-title"><strong>域名就绪向导</strong><span>输入域名，缺哪步点哪步；只想用隧道、不要域名，可跳过本页。</span></div>
+        </div>
+        ${domainWizardHtml()}
+      </section>
+
+      <section class="card section">
+        <div class="section-head">
+          <div class="section-title"><strong>从 0 开始：给域名上 HTTPS</strong><span>手动版详细步骤，遇到问题照着做。</span></div>
         </div>
         <div class="guide-steps">
           <ol class="guide">
@@ -2758,6 +2896,45 @@ function renderCerts(force = false) {
 
 /* ----------------------------- 设置 ------------------------------ */
 
+async function loadBackups(force = false) {
+  if (S.backups.loading) return;
+  if (!force && S.backups.loaded) return;
+  S.backups.loading = true;
+  const res = await FRP.configBackups();
+  S.backups.loading = false;
+  if (res && res.ok) {
+    S.backups.list = res.data && res.data.backups || [];
+    S.backups.dir = (res.data && res.data.dir) || '';
+    S.backups.loaded = true;
+  }
+  if (S.view === 'settings') renderSettings(true);
+}
+
+function backupRowHtml(b, i) {
+  const d = new Date(b.mtime);
+  const when = Number.isNaN(d.getTime()) ? '' : d.toLocaleString('zh-CN', { hour12: false });
+  const kb = (b.size / 1024).toFixed(1);
+  return `<div class="backup-row">
+    <div class="grow">
+      <div class="backup-name mono">${esc(b.file)}</div>
+      <div class="backup-meta">${esc(when)} · ${kb} KB</div>
+    </div>
+    <button class="btn small" type="button" data-act="backups.restore" data-file="${esc(b.file)}" data-idx="${i}">${icon('reload')}<span>还原</span></button>
+  </div>`;
+}
+
+function renderBackups() {
+  const b = S.backups;
+  if (!b.loaded && !b.loading) loadBackups(true);
+  if (b.loading && !b.list.length) {
+    return `<div class="backup-list"><div class="muted">正在读取备份…</div></div>`;
+  }
+  if (!b.list.length) {
+    return `<div class="backup-list"><div class="muted">还没有备份。每次保存 <code>frpc.toml</code> 且内容有变化时，会自动在配置目录下的 <code>frp-console-backups</code> 里留一份（最多 30 份）。</div></div>`;
+  }
+  return `<div class="backup-list">${b.list.slice(0, 8).map((x, i) => backupRowHtml(x, i)).join('')}</div>`;
+}
+
 function renderSettings(force = false) {
   if (!force && S.lastKeys.settings === 'rendered') return;
   S.lastKeys.settings = 'rendered';
@@ -2803,6 +2980,17 @@ function renderSettings(force = false) {
               <button class="btn small" type="button" data-act="reveal.log">${icon('folder')}</button>
             </div>
           </div>
+        </section>
+
+        <section class="card section">
+          <div class="section-head">
+            <div class="section-title"><strong>配置备份</strong><span>每次保存 <code>frpc.toml</code> 且内容有变化时自动备份，最多保留 30 份。</span></div>
+            <div class="section-actions">
+              <button class="btn small" type="button" data-act="backups.refresh">${icon('reload')}<span>刷新</span></button>
+              <button class="btn small" type="button" data-act="backups.reveal">${icon('folder')}<span>打开备份目录</span></button>
+            </div>
+          </div>
+          ${renderBackups()}
         </section>
 
         <section class="card section">
@@ -3340,6 +3528,34 @@ async function handleAction(act, dataset, btn) {
       case 'settings.reveal':
         FRP.revealPath('config');
         break;
+      case 'backups.refresh':
+        S.backups.loaded = false;
+        await loadBackups(true);
+        break;
+      case 'backups.reveal':
+        FRP.revealPath('config');
+        break;
+      case 'backups.restore': {
+        const file = dataset.file || '';
+        if (!file) break;
+        const okRestore = await confirmDialog({
+          title: '还原这份备份？',
+          body: `会用 <code>${esc(file)}</code> 覆盖当前 <code>frpc.toml</code>（当前配置会先再备份一份）。`,
+          confirmText: '还原',
+          danger: true,
+        });
+        if (!okRestore) break;
+        await withBusy(btn, async () => {
+          const res = await FRP.configRestoreBackup(file);
+          if (res && res.ok) {
+            toast('success', '已还原配置', res.data && res.data.restoredFrom ? `来自 ${res.data.restoredFrom}` : '');
+            S.backups.loaded = false;
+            await loadBackups(true);
+            renderSettings(true);
+          } else toastResult(res);
+        });
+        break;
+      }
       case 'reveal.log':
         FRP.revealPath('log');
         break;
@@ -3484,6 +3700,24 @@ async function handleAction(act, dataset, btn) {
       case 'certs.refresh':
         await loadCerts();
         break;
+      case 'dw.check':
+        await refreshDomainWizard();
+        break;
+      case 'dw.set-a': {
+        const domain = String(S.certs.wizard.domain || '').trim();
+        if (!domain) { toast('error', '请先输入域名'); break; }
+        await withBusy(btn, async () => {
+          S.certs.wizard.setA = true;
+          renderCerts(true);
+          const res = await FRP.dnsSetA({ domain });
+          S.certs.wizard.setA = false;
+          if (res && res.ok) {
+            toast('success', '解析记录已就绪', `${res.data.name} → ${res.data.content}${res.data.updated ? '' : '（已存在，无需改动）'}`);
+          } else toastResult(res);
+          await refreshDomainWizard();
+        });
+        break;
+      }
       case 'certs.issue': {
         const domainsInput = $('#cert-domains') ? $('#cert-domains').value.trim() : '';
         if (!domainsInput) { toast('error', '请填写要签发的域名'); break; }

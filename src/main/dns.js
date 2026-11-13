@@ -130,6 +130,46 @@ class CloudflareDns {
     const records = (res.data && res.data.result) || [];
     return records.some((r) => String(r.content || '').includes(txtValue));
   }
+
+  /* 给某个名字建/改 A 记录，指向 frps 服务器 IP。域名向导「一键建解析」用。
+   * 名字不带通配符时就是 A 记录；带 *. 时 Cloudflare 存的名字本身就是 "*.x"。
+   * 已存在同名 A 记录则更新其 content，不存在才新建。 */
+  async setARecord(domain, ip) {
+    const name = stripWildcard(domain);
+    const zoneId = await this._zoneId(name);
+    const host = name === apexOf(name) ? name : name;
+    const list = await requestJson(`${this.base}/zones/${zoneId}/dns_records?type=A&name=${encodeURIComponent(host)}`, {
+      method: 'GET',
+      headers: this._headers(),
+    });
+    if (list.status !== 200 || !list.data || !list.data.success) {
+      throw new Error(cfError(list, `查询 A 记录 ${host} 失败`));
+    }
+    const existing = (list.data.result || [])[0];
+    if (existing) {
+      if (String(existing.content) === String(ip)) {
+        return { id: existing.id, name: existing.name, content: existing.content, updated: false };
+      }
+      const upd = await requestJson(`${this.base}/zones/${zoneId}/dns_records/${existing.id}`, {
+        method: 'PUT',
+        headers: this._headers(),
+        body: { type: 'A', name: existing.name, content: ip, ttl: 120, proxied: false },
+      });
+      if (upd.status !== 200 || !upd.data || !upd.data.success) {
+        throw new Error(cfError(upd, `更新 A 记录 ${host} 失败`));
+      }
+      return { id: upd.data.result.id, name: upd.data.result.name, content: upd.data.result.content, updated: true };
+    }
+    const create = await requestJson(`${this.base}/zones/${zoneId}/dns_records`, {
+      method: 'POST',
+      headers: this._headers(),
+      body: { type: 'A', name: host, content: ip, ttl: 120, proxied: false },
+    });
+    if (create.status !== 200 || !create.data || !create.data.success) {
+      throw new Error(cfError(create, `添加 A 记录 ${host} 失败`));
+    }
+    return { id: create.data.result.id, name: create.data.result.name, content: create.data.result.content, updated: true };
+  }
 }
 
 module.exports = {

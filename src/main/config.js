@@ -390,6 +390,49 @@ function backupConfig(configPath) {
   }
 }
 
+function backupsDir(configPath) {
+  return path.join(path.dirname(configPath), 'frp-console-backups');
+}
+
+/* 列出某份配置的历史备份（供设置页可视化，按时间倒序）。 */
+function listBackups(configPath) {
+  const dir = backupsDir(configPath);
+  try {
+    if (!fs.existsSync(dir)) return { ok: true, backups: [], dir };
+    const backups = fs.readdirSync(dir)
+      .filter((f) => f.endsWith('.toml'))
+      .map((f) => {
+        const full = path.join(dir, f);
+        const st = fs.statSync(full);
+        return { file: f, size: st.size, mtime: st.mtimeMs };
+      })
+      .sort((a, b) => b.mtime - a.mtime);
+    return { ok: true, backups, dir };
+  } catch (e) {
+    return { ok: false, error: `读取备份目录失败：${e.message}`, dir, backups: [] };
+  }
+}
+
+/* 把某个备份还原回配置路径；还原前会先把当前配置再备份一份，避免覆盖后回不去。 */
+function restoreBackup(configPath, file) {
+  try {
+    const dir = backupsDir(configPath);
+    const full = path.resolve(dir, file);
+    if (!full.startsWith(path.resolve(dir) + path.sep)) {
+      return { ok: false, error: '非法的备份文件名' };
+    }
+    if (!fs.existsSync(full)) return { ok: false, error: '备份文件不存在' };
+    // 先把要还原的内容读进内存，再做当前配置的备份——备份会按保留数裁剪，
+    // 若正在还原的是最老那份，备份动作可能把它删掉，所以这里必须先读走。
+    const content = fs.readFileSync(full);
+    const currentBackup = backupConfig(configPath);
+    fs.writeFileSync(configPath, content);
+    return { ok: true, backup: currentBackup, restoredFrom: file };
+  } catch (e) {
+    return { ok: false, error: `还原失败：${e.message}` };
+  }
+}
+
 /* 保存时写在文件头的“最近保存”时间戳不属于配置内容，
  * 比较时必须先抹掉，否则每分钟第一次保存都会判定“内容变了”，
  * 于是备份目录被相同的副本迅速灌满，真正的改动反而被挤出去。 */
@@ -578,6 +621,8 @@ module.exports = {
   serialize,
   writeConfig,
   backupConfig,
+  listBackups,
+  restoreBackup,
   probeTargetFor,
   firstDomainOf,
   vhostPortOf,

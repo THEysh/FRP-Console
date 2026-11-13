@@ -1,7 +1,7 @@
 {
   "name": "frp-console",
   "productName": "FRP控制台",
-  "version": "1.2.12",
+  "version": "1.2.13",
   "description": "FRP 内网穿透图形控制台：代理管理、本机端口扫描、frps 远程管理、热重载与实时日志",
   "main": "src/main/index.js",
   "author": "杨盛晖",
