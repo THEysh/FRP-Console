@@ -44,6 +44,8 @@ const frpsConfig = require('./frpsconfig');
 const { TrayPanel } = require('./tray-panel');
 const frpsBinary = require('./frpsBinary');
 const updateModule = require('./update');
+const { AcmeManager } = require('./acme');
+const { CloudflareDns } = require('./dns');
 const { execFileP, tcpCheck, httpProbe, hashText, randomToken, formatDuration } = require('./util');
 
 const assetsDir = path.join(__dirname, '..', '..', 'assets');
@@ -87,6 +89,7 @@ let lastServiceDetect = 0;
 
 const follower = new LogFollower('', { maxLines: 600 });
 let manager = null;
+const acmeManager = new AcmeManager({ userDataDir: settingsModule.dataDir() });
 const serverSession = new ServerSession();
 let serverConfig = { path: '', content: '', summary: null, error: '' };
 let sessionServerId = '';
@@ -971,6 +974,8 @@ function settingsForState() {
   return {
     ...rest,
     servers: (servers || []).map(({ clientToken, ...item }) => ({ ...item, hasToken: !!clientToken })),
+    // DNS 验证凭据同理：token 只留在主进程，界面只要“配没配”。
+    dnsHasToken: settingsModule.hasCloudflareToken(),
   };
 }
 
@@ -1402,6 +1407,7 @@ function registerIpc() {
       'adminPort', 'adminUser', 'adminPassword', 'autoReload', 'pollIntervalMs', 'closeToTray',
       'startMinimized', 'launchTunnelOnStart', 'serviceAutoDetect', 'logBuffer', 'confirmStopService',
       'stripProxyEnv', 'launchAtLogin', 'vhostHttpPort', 'vhostHttpsPort',
+      'acmeEmail', 'acmeStaging', 'dnsProvider',
     ];
     const clean = {};
     for (const key of allowed) if (patch && Object.prototype.hasOwnProperty.call(patch, key)) clean[key] = patch[key];
@@ -2400,6 +2406,97 @@ function registerIpc() {
     const port = Number(payload && payload.port);
     if (!host || !Number.isInteger(port) || port < 1 || port > 65535) return fail('主机或端口无效');
     return ok(await tcpCheck(host, port, payload.timeout || 3000));
+  });
+
+  /* ---- HTTPS 证书（Let's Encrypt / DNS-01）---- */
+
+  function currentDnsProvider() {
+    const provider = String(settings.dnsProvider || '').trim().toLowerCase();
+    if (provider === 'cloudflare') {
+      const token = settingsModule.readCloudflareToken();
+      if (!token) return { ok: false, error: '尚未配置 Cloudflare API token' };
+      return { ok: true, dns: new CloudflareDns({ token }) };
+    }
+    return { ok: false, error: '尚未配置 DNS 验证渠道（当前仅支持 Cloudflare）' };
+  }
+
+  ipcMain.handle('cert:list', async () => ok({ certs: acmeManager.list() }));
+
+  ipcMain.handle('cert:issue', async (event, payload = {}) => {
+    try {
+      const domains = payload.domains;
+      const email = String(payload.email || settings.acmeEmail || '').trim();
+      const staging = payload.staging !== undefined ? !!payload.staging : !!settings.acmeStaging;
+      const provider = currentDnsProvider();
+      if (!provider.ok) return fail(provider.error);
+      const result = await acmeManager.issue({ domains, email, staging, dns: provider.dns });
+      if (!result.ok) return fail(result.error);
+      pushState();
+      return ok(result);
+    } catch (e) {
+      return fail(String((e && e.message) || e));
+    }
+  });
+
+  ipcMain.handle('cert:renew', async (event, payload = {}) => {
+    try {
+      const domain = String((payload && payload.domain) || '').trim();
+      if (!domain) return fail('缺少域名');
+      const existing = acmeManager.get(domain);
+      const provider = currentDnsProvider();
+      if (!provider.ok) return fail(provider.error);
+      const email = existing && existing.email ? existing.email : String(settings.acmeEmail || '');
+      const staging = existing ? !!existing.staging : !!settings.acmeStaging;
+      const result = await acmeManager.renew(domain, { email, staging, dns: provider.dns });
+      if (!result.ok) return fail(result.error);
+      pushState();
+      return ok(result);
+    } catch (e) {
+      return fail(String((e && e.message) || e));
+    }
+  });
+
+  ipcMain.handle('cert:remove', async (event, payload = {}) => {
+    const domain = String((payload && payload.domain) || '').trim();
+    if (!domain) return fail('缺少域名');
+    const result = acmeManager.removeLocal(domain);
+    if (!result.ok) return fail(result.error);
+    pushState();
+    return ok({ removed: true });
+  });
+
+  ipcMain.handle('dns:state', async () => ok({
+    dnsProvider: settings.dnsProvider || '',
+    hasToken: settingsModule.hasCloudflareToken(),
+    acmeEmail: settings.acmeEmail || '',
+    acmeStaging: !!settings.acmeStaging,
+  }));
+
+  ipcMain.handle('dns:save', async (event, payload = {}) => {
+    try {
+      const provider = String((payload && payload.provider) || '').trim().toLowerCase();
+      if (!['', 'cloudflare'].includes(provider)) return fail('不支持的 DNS 服务商');
+      const patch = { dnsProvider: provider };
+      if (payload.acmeEmail !== undefined) patch.acmeEmail = String(payload.acmeEmail || '').trim();
+      if (payload.acmeStaging !== undefined) patch.acmeStaging = !!payload.acmeStaging;
+
+      if (provider === 'cloudflare') {
+        const token = String((payload && payload.token) || '').trim();
+        if (token) {
+          const saved = settingsModule.saveCloudflareToken(token);
+          if (!saved.ok) return fail(saved.error);
+        }
+      } else {
+        settingsModule.clearCloudflareToken();
+      }
+      if (payload.clearToken === true) settingsModule.clearCloudflareToken();
+
+      settings = settingsModule.save(patch);
+      pushState();
+      return ok({ state: buildState() });
+    } catch (e) {
+      return fail(String((e && e.message) || e));
+    }
   });
 
   ipcMain.handle('logs:get', async (event, payload = {}) => {

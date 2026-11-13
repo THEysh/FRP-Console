@@ -24,6 +24,7 @@ const S = {
   modalOpen: false,
   proxyEdit: null,
   update: null,
+  certs: { list: [], dns: { dnsProvider: '', hasToken: false, acmeEmail: '', acmeStaging: true }, loaded: false, busy: false, issuing: false },
   lastKeys: {},
   viewScroll: {},
   busy: new Set(),
@@ -276,6 +277,7 @@ const NAV_ITEMS = [
   { id: 'proxies', label: '代理映射', icon: 'link', sub: '穿透规则与公网地址' },
   { id: 'discovery', label: '服务发现', icon: 'box', sub: '本机端口扫描' },
   { id: 'server', label: '服务器', icon: 'server', sub: 'frps 远程管理' },
+  { id: 'certs', label: 'HTTPS 证书', icon: 'shield', sub: 'Let\'s Encrypt 证书签发与管理' },
   { id: 'logs', label: '实时日志', icon: 'terminal', sub: 'frpc 运行日志' },
   { id: 'settings', label: '设置', icon: 'gear', sub: '连接、路径与运行模式' },
 ];
@@ -352,6 +354,7 @@ function renderCurrent({ force = false } = {}) {
   else if (S.view === 'discovery') renderDiscovery(force);
   else if (S.view === 'logs') renderLogs(force);
   else if (S.view === 'server') renderServer(force);
+  else if (S.view === 'certs') renderCerts(force);
   else if (S.view === 'settings') renderSettings(force);
   if (S.view === 'server' && !S.server.loaded) loadServerState({ autoConnect: true }).catch(() => {});
 }
@@ -2579,6 +2582,152 @@ docker exec &lt;容器名&gt; frps -v</pre>
 }
 
 
+/* ----------------------------- HTTPS 证书 ------------------------------ */
+
+async function loadCerts({ silent = false } = {}) {
+  if (!silent) S.certs.busy = true;
+  try {
+    const [listRes, dnsRes] = await Promise.all([FRP.certList(), FRP.dnsState()]);
+    if (listRes && listRes.ok) S.certs.list = listRes.data.certs || [];
+    if (dnsRes && dnsRes.ok) S.certs.dns = dnsRes.data;
+    S.certs.loaded = true;
+  } finally {
+    S.certs.busy = false;
+  }
+  if (S.view === 'certs') renderCerts(true);
+}
+
+function certExpiryTone(days) {
+  if (days > 30) return 'ok';
+  if (days >= 15) return 'amber';
+  return 'bad';
+}
+
+function certRow(c) {
+  const tone = certExpiryTone(c.daysLeft);
+  return `
+    <div class="cert-row">
+      <div class="cert-main">
+        <div class="cert-title">
+          <strong>${esc(c.domain)}</strong>
+          ${c.staging ? '<span class="badge amber">STAGING</span>' : ''}
+          ${c.domain.startsWith('*.') ? '<span class="badge">通配符</span>' : ''}
+        </div>
+        <div class="cert-meta mono">
+          到期 ${c.notAfter ? new Date(c.notAfter).toLocaleString('zh-CN') : '—'}
+          · 剩余 <span class="tag ${tone}">${c.daysLeft} 天</span>
+          ${c.exists ? '' : ' · <span class="tag bad">文件缺失</span>'}
+        </div>
+        <div class="cert-paths mono">
+          <div>证书 <code>${esc(c.crtPath)}</code> <button class="icon-btn" type="button" data-act="copy" data-text="${esc(c.crtPath)}" title="复制路径">${icon('copy')}</button></div>
+          <div>私钥 <code>${esc(c.keyPath)}</code> <button class="icon-btn" type="button" data-act="copy" data-text="${esc(c.keyPath)}" title="复制路径">${icon('copy')}</button></div>
+        </div>
+      </div>
+      <div class="cert-actions">
+        <button class="btn small" type="button" data-act="certs.renew" data-domain="${esc(c.domain)}">${icon('reload')}<span>续期</span></button>
+        <button class="btn small danger-text" type="button" data-act="certs.remove" data-domain="${esc(c.domain)}">${icon('trash')}<span>删除</span></button>
+      </div>
+    </div>`;
+}
+
+function renderCerts(force = false) {
+  if (!force && S.lastKeys.certs === 'rendered') return;
+  S.lastKeys.certs = 'rendered';
+  const certs = S.certs.list || [];
+  const dns = S.certs.dns || {};
+  const hasToken = !!dns.hasToken;
+  const provider = dns.dnsProvider || '';
+
+  $('#view').innerHTML = `
+    <div class="view">
+      <div class="page-head">
+        <div class="page-title">
+          <h1>HTTPS 证书</h1>
+          <p>可选功能：用 Let's Encrypt 给自定义域名签发证书，供 https2http / https2https 代理交给 frps 终止 TLS。不配置也能正常使用隧道。</p>
+        </div>
+      </div>
+
+      <section class="card section">
+        <div class="section-head">
+          <div class="section-title"><strong>从 0 开始：给域名上 HTTPS</strong><span>按顺序走完即可；只想用隧道、不要域名，可跳过本页。</span></div>
+        </div>
+        <div class="guide-steps">
+          <ol class="guide">
+            <li><strong>确认域名托管在 Cloudflare</strong>（DNS 由 Cloudflare 管理）。frps 服务器需已开启 vhostHTTPPort / vhostHTTPSPort，可在「服务器」页查看。</li>
+            <li><strong>创建 API Token</strong>：Cloudflare 后台 →「我的配置」→「API Tokens」→「创建令牌」→ 选「编辑区域 DNS」模板；权限 <code>Zone.Zone:Read</code> + <code>Zone.DNS:Edit</code>，限定到你要签发的域名。</li>
+            <li><strong>粘贴 token 并保存</strong>：在下方「DNS 验证渠道」选 Cloudflare、粘贴 token、点保存。token 用 Windows DPAPI 加密存在本机。</li>
+            <li><strong>签发证书</strong>：在「签发新证书」填域名（通配符填 <code>*.你的域名.com</code>），先用 STAGING 验证流程，再关掉 STAGING 签真实证书。</li>
+            <li><strong>域名解析到 frps</strong>：在 Cloudflare 加一条 <code>A</code> 记录 <code>*.你的域名.com</code> 指向 frps 服务器的公网 IP，并点成灰云（DNS only），这样 frps 才会用你签的证书终止 TLS。</li>
+            <li><strong>填进代理</strong>：新建 / 编辑 http、https 代理，插件选 https2http / https2https，在「从已签发证书选择」里选证书，自定义域名填你的域名。</li>
+          </ol>
+        </div>
+      </section>
+
+      <section class="card section">
+        <div class="section-head">
+          <div class="section-title"><strong>已签发证书</strong><span>保存在本机 userData\\certs\\ 下，私钥只留在 frpc 这台机器上。</span></div>
+          <button class="btn small" type="button" data-act="certs.refresh">${icon('reload')}<span>刷新</span></button>
+        </div>
+        ${certs.length
+          ? `<div class="cert-list">${certs.map(certRow).join('')}</div>`
+          : `<div class="empty"><span class="spinner"></span><h3>还没有证书</h3><p>先配置下面的 DNS 验证，再签发第一张证书。签发后可在代理表单里一键填进 https2http / https2https 的 crtPath / keyPath。</p></div>`}
+      </section>
+
+      <section class="card section">
+        <div class="section-head">
+          <div class="section-title"><strong>签发新证书</strong><span>DNS-01 验证，无需开放 80/443 端口；通配符域名填 *.example.com。</span></div>
+        </div>
+        <form id="cert-issue-form" class="form-grid" autocomplete="off" onsubmit="return false">
+          <div class="field span-2">
+            <label>域名 <span class="req">*</span></label>
+            <input class="input" id="cert-domains" placeholder="example.com, *.example.com（逗号分隔）" />
+            <div class="field-hint">证书会覆盖列出的所有域名；第一项作为主域名。签发一张通配符证书即可覆盖所有子域名。</div>
+          </div>
+          <div class="field">
+            <label>联系邮箱</label>
+            <input class="input" id="cert-email" value="${esc(dns.acmeEmail || '')}" placeholder="用于 Let's Encrypt 到期提醒" />
+          </div>
+          <div class="field">
+            <div class="switch-row" style="justify-content:space-between">
+              <div class="sr-text"><strong>STAGING 环境</strong><span>先用假证书验证流程，再关掉签真实证书</span></div>
+              <button class="switch ${dns.acmeStaging !== false ? 'on' : ''}" type="button" data-act="toggle" data-field="cert-staging" aria-pressed="${dns.acmeStaging !== false}"></button>
+            </div>
+          </div>
+        </form>
+        <div style="padding:0 16px 16px">
+          <button class="btn primary" type="button" data-act="certs.issue" ${S.certs.issuing ? 'disabled' : ''}>${S.certs.issuing ? '<span class="spinner-sm"></span>' : icon('shield')}<span>${S.certs.issuing ? '签发中，请稍候…' : '签发证书'}</span></button>
+        </div>
+      </section>
+
+      <section class="card section">
+        <div class="section-head">
+          <div class="section-title"><strong>DNS 验证渠道</strong><span>签发时自动在域名解析里加 _acme-challenge 的 TXT 记录，验证后删除。</span></div>
+        </div>
+        <form id="cert-dns-form" class="form-grid" autocomplete="off" onsubmit="return false">
+          <div class="field">
+            <label>服务商</label>
+            <select class="select" id="cert-dns-provider">
+              <option value="" ${!provider ? 'selected' : ''}>未配置</option>
+              <option value="cloudflare" ${provider === 'cloudflare' ? 'selected' : ''}>Cloudflare</option>
+            </select>
+          </div>
+          <div class="field span-2">
+            <label>Cloudflare API Token ${hasToken ? '<span class="tag ok">已保存</span>' : ''}</label>
+            <div class="input-group">
+              <input class="input" id="cert-dns-token" type="password" placeholder="留空表示不改动已保存的 token" autocomplete="new-password" />
+              <button class="btn icon" type="button" data-act="certs.dns.eye" title="显示 / 隐藏">${icon('eye')}</button>
+            </div>
+            <div class="field-hint">权限至少需要 Zone.Zone:Read + Zone.DNS:Edit，范围限定到你自己要签发的域名。token 用 Windows DPAPI 加密保存在本机，绝不出现在配置或日志里。</div>
+          </div>
+        </form>
+        <div style="padding:0 16px 16px;display:flex;gap:8px">
+          <button class="btn primary" type="button" data-act="certs.dns.save">${icon('check')}<span>保存 DNS 设置</span></button>
+          ${hasToken ? `<button class="btn danger-text" type="button" data-act="certs.dns.clear">${icon('trash')}<span>清除 token</span></button>` : ''}
+        </div>
+      </section>
+    </div>`;
+}
+
 /* ----------------------------- 设置 ------------------------------ */
 
 function renderSettings(force = false) {
@@ -3284,6 +3433,122 @@ async function handleAction(act, dataset, btn) {
         setProxyPluginFields(dataset.plugin || '');
         break;
       }
+      case 'proxyform.cert.pick': {
+        const domain = $('#pf-plugin-cert-pick') ? $('#pf-plugin-cert-pick').value : '';
+        if (!domain) break;
+        const cert = (S.certs.list || []).find((c) => c.domain === domain);
+        if (cert) {
+          const crt = $('#pf-plugin-crt');
+          const key = $('#pf-plugin-key');
+          if (crt) crt.value = cert.crtPath;
+          if (key) key.value = cert.keyPath;
+          const domains = $('#pf-domains');
+          if (domains && !domains.value.trim()) {
+            domains.value = (cert.domains || []).filter((d) => !d.startsWith('*.')).join(', ') || cert.domain;
+          }
+          toast('success', '已填入证书路径', cert.domain);
+        }
+        break;
+      }
+      case 'certs.refresh':
+        await loadCerts();
+        break;
+      case 'certs.issue': {
+        const domainsInput = $('#cert-domains') ? $('#cert-domains').value.trim() : '';
+        if (!domainsInput) { toast('error', '请填写要签发的域名'); break; }
+        const domains = domainsInput.split(/[,，\s]+/).map((d) => d.trim()).filter(Boolean);
+        const email = $('#cert-email') ? $('#cert-email').value.trim() : '';
+        const stagingBtn = document.querySelector('#cert-issue-form [data-field="cert-staging"]');
+        const staging = stagingBtn ? stagingBtn.classList.contains('on') : true;
+        S.certs.issuing = true;
+        renderCerts(true);
+        try {
+          const res = await FRP.certIssue({ domains, email, staging });
+          if (res && res.ok) {
+            toast('success', '证书已签发', `${res.data.domain} · 剩余 ${res.data.daysLeft} 天`);
+            await loadCerts({ silent: true });
+          } else toastResult(res);
+        } catch (e) {
+          toast('error', '签发失败', e && e.message ? e.message : String(e));
+        } finally {
+          S.certs.issuing = false;
+          renderCerts(true);
+        }
+        break;
+      }
+      case 'certs.renew': {
+        await withBusy(btn, async () => {
+          const res = await FRP.certRenew(dataset.domain);
+          if (res && res.ok) {
+            toast('success', '证书已续期', `${res.data.domain} · 剩余 ${res.data.daysLeft} 天`);
+            await loadCerts({ silent: true });
+          } else toastResult(res);
+        });
+        break;
+      }
+      case 'certs.remove': {
+        const domain = dataset.domain;
+        openModal(`
+          <div class="modal" style="width:440px">
+            <div class="modal-head">
+              <div class="mh-icon" style="color:var(--red)">${icon('trash')}</div>
+              <div class="grow"><h3>删除证书</h3><p>只删除本机保存的证书与私钥，不会吊销 CA 侧已签发的证书。</p></div>
+              <button class="icon-btn modal-close" type="button" data-act="modal.close">${icon('x')}</button>
+            </div>
+            <div class="modal-body">
+              <div class="note warn">${icon('alert')}<div>删除后，引用 <strong>${esc(domain)}</strong> 证书的 https2http / https2https 代理会失去证书，公网访问会失败，直到重新签发并填回路径。</div></div>
+            </div>
+            <div class="modal-foot">
+              <span class="mf-left"></span>
+              <button class="btn" type="button" data-act="modal.close">取消</button>
+              <button class="btn danger" type="button" id="cert-del-confirm">${icon('trash')}<span>删除</span></button>
+            </div>
+          </div>`);
+        const delBtn = $('#cert-del-confirm');
+        if (delBtn) delBtn.addEventListener('click', async () => {
+          delBtn.disabled = true;
+          const res = await FRP.certRemove(domain);
+          if (res && res.ok) {
+            closeModal();
+            toast('success', '已删除证书', domain);
+            await loadCerts({ silent: true });
+          } else {
+            delBtn.disabled = false;
+            toastResult(res);
+          }
+        });
+        break;
+      }
+      case 'certs.dns.save': {
+        await withBusy(btn, async () => {
+          const provider = $('#cert-dns-provider') ? $('#cert-dns-provider').value : '';
+          const token = $('#cert-dns-token') ? $('#cert-dns-token').value.trim() : '';
+          const email = $('#cert-email') ? $('#cert-email').value.trim() : '';
+          const stagingBtn = document.querySelector('#cert-issue-form [data-field="cert-staging"]');
+          const staging = stagingBtn ? stagingBtn.classList.contains('on') : true;
+          const res = await FRP.dnsSave({ provider, token: token || undefined, acmeEmail: email, acmeStaging: staging });
+          if (res && res.ok) {
+            if (res.data && res.data.state) S.state = res.data.state;
+            toast('success', 'DNS 设置已保存');
+            await loadCerts({ silent: true });
+          } else toastResult(res);
+        });
+        break;
+      }
+      case 'certs.dns.clear': {
+        const res = await FRP.dnsSave({ provider: '', clearToken: true });
+        if (res && res.ok) {
+          if (res.data && res.data.state) S.state = res.data.state;
+          toast('success', '已清除 Cloudflare token');
+          await loadCerts({ silent: true });
+        } else toastResult(res);
+        break;
+      }
+      case 'certs.dns.eye': {
+        const input = $('#cert-dns-token');
+        if (input) input.type = input.type === 'password' ? 'text' : 'password';
+        break;
+      }
       case 'update.check': {
         S.update = { ...(S.update || {}), state: 'checking', message: '正在检查更新…' };
         renderUpdateBox();
@@ -3447,6 +3712,14 @@ function openProxyEditor({ mode, proxy = null, preset = null }) {
           </div>
           <div class="field span-2 hidden" id="pf-plugin-fields">
             <div class="stack" style="gap:10px">
+              <div class="field">
+                <label>从已签发证书选择</label>
+                <select class="select" id="pf-plugin-cert-pick">
+                  <option value="">手动填写路径…</option>
+                  ${(S.certs.list || []).map((c) => `<option value="${esc(c.domain)}">${esc(c.domain)}（剩余 ${c.daysLeft} 天）</option>`).join('')}
+                </select>
+                <div class="field-hint">选择「HTTPS 证书」页签发的证书后，自动填入下方 crtPath / keyPath。</div>
+              </div>
               <div class="field">
                 <label>证书文件（crtPath）<span class="req">*</span></label>
                 <input class="input" id="pf-plugin-crt" value="${esc(initial.pluginCrtPath)}" placeholder="C:\path\to\server.crt（绝对路径）" />
@@ -3882,6 +4155,8 @@ async function boot() {
     buildNav();
     setView('overview');
     updateChrome();
+    // 后台把已签发证书与 DNS 设置拉回来，供「证书」页与代理表单的证书下拉使用。
+    loadCerts({ silent: true }).catch(() => {});
 
     FRP.on('state:update', (st) => {
       if (!st) return;

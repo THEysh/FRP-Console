@@ -24,6 +24,11 @@ const DEFAULT_SETTINGS = {
   // 拼公网地址和做连通性检查都要用（不填就是 80/443）。
   vhostHttpPort: 80,
   vhostHttpsPort: 443,
+  // Let's Encrypt / HTTPS 证书：默认走 staging 签发假证书，避免误用生产配额；
+  // dnsProvider 为空表示还没配 DNS 验证渠道（cloudflare 或 manual）。
+  acmeEmail: '',
+  acmeStaging: true,
+  dnsProvider: '',
   autoReload: true,
   pollIntervalMs: 3000,
   // 默认不把系统 HTTP_PROXY 传给 frpc：frp 会拿它去代理 TCP 握手，多半被网关 502 拒掉。
@@ -218,6 +223,56 @@ function migrateLegacySecret(serverId) {
   }
 }
 
+/* DNS 验证凭据库（Cloudflare API token），结构与 server-secret.json 相同，
+ * 用 safeStorage（Windows DPAPI）加密，绝不进 settings.json 或日志。 */
+function dnsSecretFile() {
+  return path.join(dataDir(), 'dns-secret.json');
+}
+
+function readDnsSecretStore() {
+  const raw = readJson(dnsSecretFile(), null);
+  if (!raw || typeof raw !== 'object') return { v: 1, cloudflare: null };
+  return { v: 1, cloudflare: raw.cloudflare && raw.cloudflare.enc ? raw.cloudflare : null };
+}
+
+function writeDnsSecretStore(store) {
+  const payload = { v: 1 };
+  if (store.cloudflare && store.cloudflare.enc) payload.cloudflare = store.cloudflare;
+  writeJsonAtomic(dnsSecretFile(), payload);
+  return payload;
+}
+
+function readCloudflareToken() {
+  const store = readDnsSecretStore();
+  return decrypt(store.cloudflare);
+}
+
+function hasCloudflareToken() {
+  return !!readCloudflareToken();
+}
+
+function saveCloudflareToken(token) {
+  if (!token) return clearCloudflareToken();
+  if (!safeStorage.isEncryptionAvailable()) return { ok: false, error: '当前系统不支持加密存储，未保存 token' };
+  try {
+    const store = readDnsSecretStore();
+    store.cloudflare = { enc: safeStorage.encryptString(String(token)).toString('base64'), at: Date.now() };
+    writeDnsSecretStore(store);
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: String((error && error.message) || error) };
+  }
+}
+
+function clearCloudflareToken() {
+  try {
+    const store = readDnsSecretStore();
+    store.cloudflare = null;
+    writeDnsSecretStore(store);
+  } catch { /* ignore */ }
+  return { ok: true };
+}
+
 function save(patch) {
   cached = { ...load(), ...(patch || {}) };
   cached.version = 2;
@@ -360,4 +415,9 @@ module.exports = {
   migrateLegacySecret,
   serverSecretFile,
   legacyServerHost,
+  dnsSecretFile,
+  readCloudflareToken,
+  hasCloudflareToken,
+  saveCloudflareToken,
+  clearCloudflareToken,
 };

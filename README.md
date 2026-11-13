@@ -314,6 +314,19 @@ node tools/cdp-shot.cjs .proxy-row out.png # 按选择器截单个元素
 
 ## 更新日志
 
+### 1.2.8
+
+这一轮把「自定义域名 + HTTPS」推进到**可签发证书**这一大步（第一阶段：先支持 Cloudflare）：
+
+- **新增「HTTPS 证书」页**：用 Let's Encrypt 的 DNS-01 验证给自定义域名自动签发证书（无需开放 80/443 端口，通配符域名一次覆盖所有子域名）。签发 / 续期 / 删除 / 到期提醒都在这一页完成。
+- **从 0 开始的引导**：页面顶部是一份 6 步指引，一个域名托管在 Cloudflare 的用户照着走就能完成「建 token → 签发证书 → 域名解析到 frps → 填进代理」。
+- **证书一键填进代理**：新建 / 编辑 http、https 代理时，插件选 `https2http` / `https2https` 后，可直接从「已签发证书」下拉里选一张，自动填好 `crtPath` / `keyPath` 和自定义域名。
+- **Cloudflare API token 安全保存**：token 用 Windows DPAPI 加密存在本机 `userData`，绝不出现在配置或日志里；签发时只在域名解析里临时加 `_acme-challenge` TXT 记录、验证后删除。
+- **域名完全可选**：不配置证书 / DNS 不影响隧道正常使用，「HTTPS 证书」只是一个可选入口。
+- 修正几处把开发者自己的域名写进示例文案的问题（占位符与提示改为 `example.com`），任何用户看到的都是通用示例。
+
+> 说明：真实 Let's Encrypt 签发默认走 STAGING 环境（假证书），确认流程无误后再关闭 STAGING 签真实证书。当前这一版只适配了 Cloudflare，其它 DNS 服务商（阿里云 / 腾讯云 DNSPod / Route53 等）会在后续版本补上。
+
 ### 1.2.7
 
 这一轮继续补 https / 自定义域名这条路的第一段：
