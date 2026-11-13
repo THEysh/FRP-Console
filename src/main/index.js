@@ -1558,6 +1558,27 @@ function registerIpc() {
     return fail('已切换服务器档案，本次结果已丢弃', { stale: true, state: serverState() });
   }
 
+  /*
+   * 服务端已经有 auth.token 时，它就是这台服务器的事实来源。
+   *
+   * 新建档案会给一个随机 Token 作为占位（那时还没连上服务器、无从知道真实值）。
+   * 一读到线上的 frps.toml，就把档案的 Token / bindPort 对齐过去 —— 否则用户会
+   * 在「服务器就绪检查」第 4 步看到"Token 不一致"，还得自己回去把服务端那串
+   * 抄进档案。反过来（服务端没有 token）不动档案：那份随机值本来就是要写进
+   * 服务端配置向导的。
+   */
+  function adoptServerAuthFromConfig() {
+    if (!sessionServerId) return;
+    const summary = serverConfig.summary;
+    const owner = findServerProfile(sessionServerId);
+    if (!summary || !owner) return;
+    const nextToken = summary.authEnabled ? String(summary.token || '') : '';
+    const nextPort = Number(summary.bindPort) || owner.clientPort;
+    const nextPath = serverConfig.path || owner.configPath;
+    if (owner.clientToken === nextToken && Number(owner.clientPort) === nextPort && owner.configPath === nextPath) return;
+    upsertServerProfile({ id: owner.id, clientToken: nextToken, clientPort: nextPort, configPath: nextPath });
+  }
+
   async function loadServerSnapshot({ inspect = false, epoch = sessionEpoch } = {}) {
     if (inspect) {
       const inspected = await serverSession.inspect();
@@ -1577,7 +1598,10 @@ function registerIpc() {
     } else {
       serverConfig = { path: serverSession.configPath || '', content: '', summary: null, error: configResult.error || '' };
     }
-    if (serverConfig.summary) applyPortStatus(serverSession.info, serverConfig.summary);
+    if (serverConfig.summary) {
+      applyPortStatus(serverSession.info, serverConfig.summary);
+      adoptServerAuthFromConfig();
+    }
     return { ok: true };
   }
 
@@ -2055,17 +2079,20 @@ function registerIpc() {
     }
 
     if (layer === 'token') {
+      /* 比对对象必须是「这次会话连的那台」的档案。activeServerId 在极端情况下
+       * 可能已经指向别的档案（切换中），拿错了会报出莫名其妙的 Token 不一致。 */
+      const owner = findServerProfile(sessionServerId) || active;
       const serverToken = String((summary && summary.token) || '');
-      const clientToken = String((active && active.clientToken) || (model && model.auth && model.auth.token) || '');
-      const boundName = active ? active.name : '当前档案';
+      const clientToken = String((owner && owner.clientToken) || '');
+      const ownerName = owner ? owner.name : '当前档案';
       if (!serverToken && !clientToken) {
         return ok({ layer, ok: true, ms: Date.now() - startedAt, detail: '服务端与本机都没有启用 Token（auth 关闭）' });
       }
       if (!serverToken) {
-        return ok({ layer, ok: false, ms: Date.now() - startedAt, reason: '服务端未启用鉴权', detail: 'frps.toml 里没有 auth.token，但本机客户端配了 Token，登录会被拒' });
+        return ok({ layer, ok: false, ms: Date.now() - startedAt, reason: '服务端未启用鉴权', detail: 'frps.toml 里没有 auth.token，但档案里配了 Token，frpc 登录会被拒' });
       }
       if (!clientToken) {
-        return ok({ layer, ok: false, ms: Date.now() - startedAt, reason: '本机没有 Token', detail: `服务端已启用 Token，但档案「${boundName}」里没有，隧道登录会失败` });
+        return ok({ layer, ok: false, ms: Date.now() - startedAt, reason: '本机没有 Token', detail: `服务端已启用 Token，但档案「${ownerName}」里没有，隧道登录会失败` });
       }
       if (serverToken !== clientToken) {
         return ok({
@@ -2073,10 +2100,10 @@ function registerIpc() {
           ok: false,
           ms: Date.now() - startedAt,
           reason: 'Token 不一致',
-          detail: `服务端 ${serverToken.slice(0, 4)}… 与本机 ${clientToken.slice(0, 4)}… 不同，重新保存一次向导即可让两边自动对齐`,
+          detail: `服务端 ${serverToken.slice(0, 4)}… 与档案「${ownerName}」${clientToken.slice(0, 4)}… 不同。点右上「刷新」重新读一次；仍然不同就说明服务端配置刚被别处改过，把档案 Token 改成服务端那串即可`,
         });
       }
-      return ok({ layer, ok: true, ms: Date.now() - startedAt, detail: `服务端与本机 Token 一致（${serverToken.slice(0, 4)}…，${serverToken.length} 位）` });
+      return ok({ layer, ok: true, ms: Date.now() - startedAt, detail: `服务端与档案「${ownerName}」的 Token 一致（${serverToken.slice(0, 4)}…，${serverToken.length} 位）` });
     }
 
     return fail('未知的检测层');
@@ -2103,22 +2130,9 @@ function registerIpc() {
     const result = await serverSession.writeConfig(content, { restart: !!payload.restart });
     if (epoch !== sessionEpoch) return staleFail();
     if (!result.ok) return fail(result.error, { state: serverState() });
+    // 重新读快照：adoptServerAuthFromConfig 会把刚写下的 bindPort / Token 对齐到档案，
+    // 所以这里不需要再单独回写一次。
     await loadServerSnapshot({ inspect: true, epoch });
-    /* 刚写进服务器的 bindPort / Token 要回写到当前档案，否则「服务器就绪检查」的
-     * Token 那一层永远在拿旧值和线上配置比；档案更新后概览上的「切换隧道并重启」
-     * 也会自然亮起来，提示本机 frpc 还在用旧 Token。 */
-    const savedSummary = serverConfig.summary;
-    if (sessionServerId && savedSummary) {
-      const owner = findServerProfile(sessionServerId);
-      if (owner) {
-        upsertServerProfile({
-          id: owner.id,
-          clientPort: Number(savedSummary.bindPort) || owner.clientPort,
-          clientToken: savedSummary.authEnabled ? savedSummary.token : '',
-          configPath: result.configPath || serverConfig.path || owner.configPath,
-        });
-      }
-    }
     return ok({ backup: result.backup, restarted: result.restarted, serverId: sessionServerId, state: serverState() });
   });
 
