@@ -1283,14 +1283,15 @@ label .icon-btn svg { width: 13px; height: 13px; }
 .dw-input-row .input { flex: 1; }
 .dw-steps { display: flex; flex-direction: column; gap: 8px; }
 .dw-step {
-  display: flex; align-items: center; gap: 10px;
-  padding: 10px 12px;
+  display: flex; align-items: flex-start; gap: 10px;
+  padding: 12px 14px;
   border: 1px solid var(--line); border-radius: 9px;
   background: rgba(7, 11, 17, .28);
 }
 .dw-dot {
-  flex: 0 0 20px; height: 20px; border-radius: 50%;
+  flex: 0 0 22px; height: 22px; border-radius: 50%;
   display: grid; place-items: center;
+  margin-top: 1px;
   font-size: 11px; font-weight: 700;
   background: rgba(148, 163, 184, .14); color: var(--text-3);
 }
@@ -1298,9 +1299,12 @@ label .icon-btn svg { width: 13px; height: 13px; }
 .dw-step.ok .dw-dot { background: var(--green); color: #05271a; }
 .dw-step.warn { border-color: rgba(255, 184, 77, .3); background: rgba(255, 184, 77, .07); }
 .dw-step.warn .dw-dot { background: var(--amber); color: #2b1c05; }
-.dw-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
-.dw-body strong { font-size: 12px; color: var(--text-1); }
-.dw-body span { font-size: 11px; color: var(--text-3); line-height: 1.5; }
+.dw-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.dw-body strong { font-size: 12.5px; color: var(--text-1); }
+.dw-body > span { font-size: 11.5px; color: var(--text-3); line-height: 1.55; }
+.dw-inline-form { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 6px; }
+.dw-inline-form .input, .dw-inline-form .select { flex: 1 1 160px; min-width: 140px; }
+.dw-inline-form .switch-row { margin: 0 4px; }
 
 
 @media (max-width: 1180px) {

@@ -106,6 +106,7 @@ const ICON_PATHS = {
   eyeoff: '<path d="M4 4l16 16"/><path d="M9.5 9.6A3 3 0 0 0 12 15a3 3 0 0 0 2.4-1.2M6.6 6.8C4.6 8.3 3 12 3 12s3.5 6 9 6a10 10 0 0 0 4.2-.9M10.7 6.2A9 9 0 0 1 12 6c5.5 0 9 6 9 6a14 14 0 0 1-1.8 2.4"/>',
   clock: '<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/>',
   up: '<path d="M12 19V5M6 11l6-6 6 6"/>',
+  down: '<path d="M12 5v14M6 13l6 6 6-6"/>',
 };
 
 function icon(name, cls = '') {
@@ -2728,47 +2729,111 @@ function certRow(c) {
 }
 
 /* ---------------- 域名就绪向导 ---------------- */
-/* 把「DNS 解析 → 签发证书 → 填进代理」这条链路做成可交互的四步，
- * 小白不用懂 DNS/TXT/ACME：输入域名，缺哪步点哪步。 */
+/* 把「配置渠道 → DNS 解析 → 签发证书 → 填进代理」做成可交互四步，
+ * 每步内联对应表单，小白不用懂 DNS/TXT/ACME：从上到下一条流水线。 */
 function domainWizardHtml() {
   const w = S.certs.wizard || {};
   const dns = w.dns || null;
-  const hasToken = !!((S.certs.dns || {}).hasToken);
+  const dnsCfg = S.certs.dns || {};
+  const hasToken = !!dnsCfg.hasToken;
+  const provider = dnsCfg.dnsProvider || '';
   const checking = w.checking;
+  const domain = String(w.domain || '').trim().toLowerCase();
+  const certs = S.certs.list || [];
+
+  // 当前输入域名是否已有证书覆盖（按域名本身 + SAN 逐一判断）
+  const certCovers = !!domain && certs.some((c) => {
+    const names = [c.domain, ...(c.domains || [])].map((d) => String(d).trim().toLowerCase()).filter(Boolean);
+    return names.some((n) => n === domain || coversDomain(n, domain));
+  });
+
+  const dnsOk = !!(dns && (dns.resolved || []).length && dns.pointsToServer);
+  const dnsResolvedOther = !!(dns && (dns.resolved || []).length && !dns.pointsToServer);
+
+  const step1 = hasToken ? 'ok' : 'warn';
+  const step2 = dns ? (dnsOk ? 'ok' : 'warn') : 'idle';
+  const step3 = domain ? (certCovers ? 'ok' : 'warn') : 'idle';
+  const step4 = 'idle'; // 填进代理在代理页完成，这里只做跳转提示
+
   return `
     <div class="domain-wizard">
       <div class="dw-input-row">
         <input class="input" id="dw-domain" placeholder="你的域名，如 app.example.com 或 *.example.com" value="${esc(w.domain || '')}" spellcheck="false" />
         <button class="btn" type="button" data-act="dw.check" ${checking ? 'disabled' : ''}>${checking ? '<span class="spinner-sm"></span>' : icon('search')}<span>${checking ? '检测中…' : '检测'}</span></button>
       </div>
+
       <div class="dw-steps">
-        <div class="dw-step ${dns ? (dns.resolved && dns.pointsToServer ? 'ok' : 'warn') : 'idle'}">
-          <span class="dw-dot">${dns ? (dns.resolved && dns.pointsToServer ? '✓' : '!') : '1'}</span>
+        <div class="dw-step ${step1}">
+          <span class="dw-dot">${step1 === 'ok' ? '✓' : '1'}</span>
           <div class="dw-body">
-            <strong>DNS 解析</strong>
-            <span>${dns
-              ? ((dns.resolved || []).length && dns.pointsToServer ? `已解析到服务器（${esc((dns.resolved || []).join(', '))}）`
-                : (dns.resolved || []).length ? `已解析到 ${esc((dns.resolved || []).join(', '))}，但没指向当前服务器`
-                : `还没解析${dns.error ? `（${esc(dns.error)}）` : ''}，公网访问不到`)
-              : '输入域名后点「检测」'}</span>
+            <strong>配置 DNS 验证渠道</strong>
+            <span>${hasToken ? '已配置 Cloudflare：域名解析、签发、续期都能自动完成。' : '配好 Cloudflare token 后，下面几步都能自动做；也可以先跳过（手动 DNS，只是不能一键建解析和自动续期）。'}</span>
+            <div class="dw-inline-form">
+              <select class="select" id="cert-dns-provider">
+                <option value="" ${!provider ? 'selected' : ''}>未配置</option>
+                <option value="cloudflare" ${provider === 'cloudflare' ? 'selected' : ''}>Cloudflare</option>
+              </select>
+              <input class="input" id="cert-dns-token" type="password" placeholder="${hasToken ? '已保存（留空不改动）' : 'Cloudflare API Token'}" autocomplete="new-password" />
+              <button class="btn icon" type="button" data-act="certs.dns.eye" title="显示 / 隐藏">${icon('eye')}</button>
+              <button class="btn primary" type="button" data-act="certs.dns.save">${icon('check')}<span>保存</span></button>
+              ${hasToken ? `<button class="btn danger-text" type="button" data-act="certs.dns.clear">${icon('trash')}<span>清除</span></button>` : ''}
+            </div>
+            <span style="font-size:11px">权限至少需要 <code>Zone.Zone:Read</code> + <code>Zone.DNS:Edit</code>，范围限定到你自己的域名；token 用 Windows DPAPI 加密存在本机，绝不出现在配置或日志里。</span>
           </div>
-          ${dns && !(dns.resolved && dns.pointsToServer)
-            ? `<button class="btn small" type="button" data-act="dw.set-a" ${hasToken ? '' : 'disabled'} title="${hasToken ? '' : '需要先配置 Cloudflare token'}">${icon('globe')}<span>${w.setA ? '处理中…' : '一键建解析'}</span></button>`
-            : ''}
         </div>
-        <div class="dw-step ${(S.certs.list || []).length ? 'ok' : 'idle'}">
-          <span class="dw-dot">${(S.certs.list || []).length ? '✓' : '2'}</span>
-          <div class="dw-body"><strong>签发证书</strong><span>${(S.certs.list || []).length ? '已有证书（见下方列表）' : 'DNS 就绪后，在下方「签发新证书」一键签发'}</span></div>
+
+        <div class="dw-step ${step2}">
+          <span class="dw-dot">${step2 === 'ok' ? '✓' : (step2 === 'warn' ? '!' : '2')}</span>
+          <div class="dw-body">
+            <strong>域名解析到服务器</strong>
+            <span>${dns
+              ? (dnsOk ? `已解析到服务器（${esc((dns.resolved || []).join(', '))}），公网能访问。`
+                : dnsResolvedOther ? `已解析到 ${esc((dns.resolved || []).join(', '))}，但没指向当前服务器。`
+                : `还没解析${dns.error ? `（${esc(dns.error)}）` : ''}，公网访问不到。`)
+              : '输入上面的域名，点「检测」。'}</span>
+            ${dns && !dnsOk
+              ? `<div class="dw-inline-form">
+                  <button class="btn small" type="button" data-act="dw.set-a" ${hasToken ? '' : 'disabled'} title="${hasToken ? '' : '需要先配置 Cloudflare token'}">${icon('globe')}<span>${w.setA ? '处理中…' : '一键建解析'}</span></button>
+                  <button class="btn small" type="button" data-act="dw.check">${icon('reload')}<span>重新检测</span></button>
+                </div>`
+              : ''}
+          </div>
         </div>
-        <div class="dw-step idle">
-          <span class="dw-dot">3</span>
-          <div class="dw-body"><strong>填进代理</strong><span>新建 / 编辑 https 代理，插件选 https2http / https2https，在「从已签发证书选择」里选即可</span></div>
-          <button class="btn small" type="button" data-act="nav" data-view="proxies">${icon('link')}<span>去代理映射</span></button>
+
+        <div class="dw-step ${step3}">
+          <span class="dw-dot">${step3 === 'ok' ? '✓' : (step3 === 'warn' ? '!' : '3')}</span>
+          <div class="dw-body">
+            <strong>签发证书</strong>
+            <span>${domain
+              ? (certCovers ? `已有证书覆盖 ${esc(domain)}（见下方列表，可直接填进代理）。` : `还没有覆盖 ${esc(domain)} 的证书，在下面签发一张。`)
+              : 'DNS 就绪后，在这里签发。'}</span>
+            <div class="dw-inline-form">
+              <input class="input" id="cert-domains" placeholder="example.com, *.example.com（逗号分隔）" value="${esc(w.domain || '')}" />
+              <input class="input" id="cert-email" value="${esc(dnsCfg.acmeEmail || '')}" placeholder="联系邮箱（用于到期提醒）" />
+              <div class="switch-row">
+                <div class="sr-text"><strong>STAGING</strong><span>先用假证书试</span></div>
+                <button class="switch ${dnsCfg.acmeStaging !== false ? 'on' : ''}" type="button" data-act="toggle" data-field="cert-staging" aria-pressed="${dnsCfg.acmeStaging !== false}"></button>
+              </div>
+              <button class="btn primary" type="button" data-act="certs.issue" ${S.certs.issuing ? 'disabled' : ''}>${S.certs.issuing ? '<span class="spinner-sm"></span>' : icon('shield')}<span>${S.certs.issuing ? '签发中，请稍候…' : '签发证书'}</span></button>
+            </div>
+            <span style="font-size:11px">第一项作为主域名；通配符填 <code>*.example.com</code>。建议先用 STAGING 验证流程，再关掉签真实证书。</span>
+          </div>
+        </div>
+
+        <div class="dw-step ${step4}">
+          <span class="dw-dot">4</span>
+          <div class="dw-body">
+            <strong>填进代理</strong>
+            <span>新建 / 编辑 http、https 代理，插件选 https2http / https2https，在「从已签发证书选择」里选证书，自定义域名填${domain ? ` <code>${esc(domain)}</code>` : '你的域名'}。</span>
+            <div class="dw-inline-form">
+              <button class="btn small" type="button" data-act="nav" data-view="proxies">${icon('link')}<span>去代理映射</span></button>
+            </div>
+          </div>
         </div>
       </div>
-      ${!hasToken ? `<div class="field-hint" style="margin-top:8px">还没有配置 DNS 验证渠道：先到下方「DNS 验证渠道」填 Cloudflare token，才能一键建解析、自动签发。</div>` : ''}
     </div>`;
 }
+
 
 async function refreshDomainWizard() {
   const w = S.certs.wizard;
@@ -2793,9 +2858,11 @@ function renderCerts(force = false) {
   const certs = S.certs.list || [];
   const dns = S.certs.dns || {};
   const hasToken = !!dns.hasToken;
-  const provider = dns.dnsProvider || '';
+  const w = S.certs.wizard || {};
   const coveredDomains = Array.from(new Set((certs || []).flatMap((c) => c.domains || []).map((d) => String(d).trim()).filter(Boolean)));
   const coveredText = coveredDomains.join('、');
+  // 自动折叠：没手动点过「展开/收起」时，token 与证书都齐了就默认收起向导
+  const expanded = w.expanded === undefined ? !(hasToken && certs.length) : w.expanded;
 
   $('#view').innerHTML = `
     <div class="view">
@@ -2808,25 +2875,10 @@ function renderCerts(force = false) {
 
       <section class="card section">
         <div class="section-head">
-          <div class="section-title"><strong>域名就绪向导</strong><span>输入域名，缺哪步点哪步；只想用隧道、不要域名，可跳过本页。</span></div>
+          <div class="section-title"><strong>域名就绪向导</strong><span>从上到下一条流水线：填 token → 建解析 → 签证书 → 填进代理。只想用隧道、不要域名，可跳过本页。</span></div>
+          <button class="btn small" type="button" data-act="dw.toggle">${expanded ? icon('up') : icon('down')}<span>${expanded ? '收起' : '展开'}</span></button>
         </div>
-        ${domainWizardHtml()}
-      </section>
-
-      <section class="card section">
-        <div class="section-head">
-          <div class="section-title"><strong>从 0 开始：给域名上 HTTPS</strong><span>手动版详细步骤，遇到问题照着做。</span></div>
-        </div>
-        <div class="guide-steps">
-          <ol class="guide">
-            <li><strong>确认域名托管在 Cloudflare</strong>（DNS 由 Cloudflare 管理）。frps 服务器需已开启 vhostHTTPPort / vhostHTTPSPort，可在「服务器」页查看。</li>
-            <li><strong>创建 API Token</strong>：Cloudflare 后台 →「我的配置」→「API Tokens」→「创建令牌」→ 选「编辑区域 DNS」模板；权限 <code>Zone.Zone:Read</code> + <code>Zone.DNS:Edit</code>，限定到你要签发的域名。</li>
-            <li><strong>粘贴 token 并保存</strong>：在下方「DNS 验证渠道」选 Cloudflare、粘贴 token、点保存。token 用 Windows DPAPI 加密存在本机。</li>
-            <li><strong>签发证书</strong>：在「签发新证书」填域名（通配符填 <code>*.你的域名.com</code>），先用 STAGING 验证流程，再关掉 STAGING 签真实证书。</li>
-            <li><strong>域名解析到 frps</strong>：在 Cloudflare 加一条 <code>A</code> 记录 <code>*.你的域名.com</code> 指向 frps 服务器的公网 IP，并点成灰云（DNS only），这样 frps 才会用你签的证书终止 TLS。</li>
-            <li><strong>填进代理</strong>：新建 / 编辑 http、https 代理，插件选 https2http / https2https，在「从已签发证书选择」里选证书，自定义域名填你的域名。</li>
-          </ol>
-        </div>
+        ${expanded ? domainWizardHtml() : `<div class="field-hint" style="padding:0 16px 12px">${hasToken && certs.length ? '✓ DNS 验证渠道已配置，且已有证书。需要时点「展开」按步骤操作。' : '点「展开」按步骤配置域名、签发证书。'}</div>`}
       </section>
 
       <section class="card section">
@@ -2836,60 +2888,7 @@ function renderCerts(force = false) {
         </div>
         ${certs.length
           ? `<div class="cert-list">${certs.map(certRow).join('')}</div>`
-          : `<div class="empty"><span class="spinner"></span><h3>还没有证书</h3><p>先配置下面的 DNS 验证，再签发第一张证书。签发后可在代理表单里一键填进 https2http / https2https 的 crtPath / keyPath。</p></div>`}
-      </section>
-
-      <section class="card section">
-        <div class="section-head">
-          <div class="section-title"><strong>签发新证书</strong><span>DNS-01 验证，无需开放 80/443 端口；通配符域名填 *.example.com。</span></div>
-        </div>
-        <form id="cert-issue-form" class="form-grid" autocomplete="off" onsubmit="return false">
-          <div class="field span-2">
-            <label>域名 <span class="req">*</span></label>
-            <input class="input" id="cert-domains" placeholder="example.com, *.example.com（逗号分隔）" />
-            <div class="field-hint">证书会覆盖列出的所有域名；第一项作为主域名。签发一张通配符证书即可覆盖所有子域名。</div>
-          </div>
-          <div class="field">
-            <label>联系邮箱</label>
-            <input class="input" id="cert-email" value="${esc(dns.acmeEmail || '')}" placeholder="用于 Let's Encrypt 到期提醒" />
-          </div>
-          <div class="field">
-            <div class="switch-row" style="justify-content:space-between">
-              <div class="sr-text"><strong>STAGING 环境</strong><span>先用假证书验证流程，再关掉签真实证书</span></div>
-              <button class="switch ${dns.acmeStaging !== false ? 'on' : ''}" type="button" data-act="toggle" data-field="cert-staging" aria-pressed="${dns.acmeStaging !== false}"></button>
-            </div>
-          </div>
-        </form>
-        <div style="padding:0 16px 16px">
-          <button class="btn primary" type="button" data-act="certs.issue" ${S.certs.issuing ? 'disabled' : ''}>${S.certs.issuing ? '<span class="spinner-sm"></span>' : icon('shield')}<span>${S.certs.issuing ? '签发中，请稍候…' : '签发证书'}</span></button>
-        </div>
-      </section>
-
-      <section class="card section">
-        <div class="section-head">
-          <div class="section-title"><strong>DNS 验证渠道</strong><span>签发时自动在域名解析里加 _acme-challenge 的 TXT 记录，验证后删除。</span></div>
-        </div>
-        <form id="cert-dns-form" class="form-grid" autocomplete="off" onsubmit="return false">
-          <div class="field">
-            <label>服务商</label>
-            <select class="select" id="cert-dns-provider">
-              <option value="" ${!provider ? 'selected' : ''}>未配置</option>
-              <option value="cloudflare" ${provider === 'cloudflare' ? 'selected' : ''}>Cloudflare</option>
-            </select>
-          </div>
-          <div class="field span-2">
-            <label>Cloudflare API Token ${hasToken ? '<span class="tag ok">已保存</span>' : ''}</label>
-            <div class="input-group">
-              <input class="input" id="cert-dns-token" type="password" placeholder="留空表示不改动已保存的 token" autocomplete="new-password" />
-              <button class="btn icon" type="button" data-act="certs.dns.eye" title="显示 / 隐藏">${icon('eye')}</button>
-            </div>
-            <div class="field-hint">权限至少需要 Zone.Zone:Read + Zone.DNS:Edit，范围限定到你自己要签发的域名。token 用 Windows DPAPI 加密保存在本机，绝不出现在配置或日志里。</div>
-          </div>
-        </form>
-        <div style="padding:0 16px 16px;display:flex;gap:8px">
-          <button class="btn primary" type="button" data-act="certs.dns.save">${icon('check')}<span>保存 DNS 设置</span></button>
-          ${hasToken ? `<button class="btn danger-text" type="button" data-act="certs.dns.clear">${icon('trash')}<span>清除 token</span></button>` : ''}
-        </div>
+          : `<div class="empty"><span class="spinner"></span><h3>还没有证书</h3><p>照上面向导「签发证书」一步签发第一张。签发后可在代理表单里一键填进 https2http / https2https 的 crtPath / keyPath。</p></div>`}
       </section>
     </div>`;
 }
@@ -3703,6 +3702,15 @@ async function handleAction(act, dataset, btn) {
       case 'dw.check':
         await refreshDomainWizard();
         break;
+      case 'dw.toggle': {
+        const w = S.certs.wizard;
+        const hasToken = !!((S.certs.dns || {}).hasToken);
+        const certsLen = (S.certs.list || []).length;
+        const cur = w.expanded === undefined ? !(hasToken && certsLen) : w.expanded;
+        w.expanded = !cur;
+        renderCerts(true);
+        break;
+      }
       case 'dw.set-a': {
         const domain = String(S.certs.wizard.domain || '').trim();
         if (!domain) { toast('error', '请先输入域名'); break; }
@@ -3723,14 +3731,17 @@ async function handleAction(act, dataset, btn) {
         if (!domainsInput) { toast('error', '请填写要签发的域名'); break; }
         const domains = domainsInput.split(/[,，\s]+/).map((d) => d.trim()).filter(Boolean);
         const email = $('#cert-email') ? $('#cert-email').value.trim() : '';
-        const stagingBtn = document.querySelector('#cert-issue-form [data-field="cert-staging"]');
+        const stagingBtn = document.querySelector('[data-field="cert-staging"]');
         const staging = stagingBtn ? stagingBtn.classList.contains('on') : true;
+        // 记住邮箱与 STAGING 偏好（供下次进入与自动续期使用）
+        try { await FRP.saveSettings({ acmeEmail: email, acmeStaging: staging }); } catch (_) { /* 不影响签发 */ }
         S.certs.issuing = true;
         renderCerts(true);
         try {
           const res = await FRP.certIssue({ domains, email, staging });
           if (res && res.ok) {
             toast('success', '证书已签发', `${res.data.domain} · 剩余 ${res.data.daysLeft} 天`);
+            S.certs.wizard.expanded = true; // 签发后保持展开，让用户接着看「填进代理」
             await loadCerts({ silent: true });
           } else toastResult(res);
         } catch (e) {
@@ -3790,10 +3801,7 @@ async function handleAction(act, dataset, btn) {
         await withBusy(btn, async () => {
           const provider = $('#cert-dns-provider') ? $('#cert-dns-provider').value : '';
           const token = $('#cert-dns-token') ? $('#cert-dns-token').value.trim() : '';
-          const email = $('#cert-email') ? $('#cert-email').value.trim() : '';
-          const stagingBtn = document.querySelector('#cert-issue-form [data-field="cert-staging"]');
-          const staging = stagingBtn ? stagingBtn.classList.contains('on') : true;
-          const res = await FRP.dnsSave({ provider, token: token || undefined, acmeEmail: email, acmeStaging: staging });
+          const res = await FRP.dnsSave({ provider, token: token || undefined });
           if (res && res.ok) {
             if (res.data && res.data.state) S.state = res.data.state;
             toast('success', 'DNS 设置已保存');
