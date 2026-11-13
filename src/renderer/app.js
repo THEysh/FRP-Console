@@ -4100,6 +4100,11 @@ function bindStaticEvents() {
       selectServerProfile(profileSelect.value).catch((error) => toast('error', '切换档案失败', String(error && error.message || error)));
       return;
     }
+    const certPick = e.target.closest('#pf-plugin-cert-pick');
+    if (certPick) {
+      handleAction('proxyform.cert.pick', {}, certPick);
+      return;
+    }
     if (!e.target.closest('#wizard-form')) return;
     toggleWizardGroups();
     schedulePreview();

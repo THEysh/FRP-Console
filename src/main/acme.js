@@ -20,6 +20,24 @@ const acme = require('acme-client');
 const { readJson, writeJsonAtomic, ensureDir } = require('./util');
 const { dns01Name } = require('./dns');
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/* 等 TXT 记录真正发布到权威 DNS。用系统解析器轮询（尽力而为）：
+ * Cloudflare 建完记录后到权威 NS 可见通常只要几秒，但 Let's Encrypt 有时查得太快会撞上 NXDOMAIN。 */
+async function waitForTxt(name, expected, { timeoutMs = 30000, intervalMs = 4000 } = {}) {
+  const dnsPromises = require('node:dns').promises;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const records = await dnsPromises.resolveTxt(name);
+      const flat = (records || []).flat();
+      if (flat.includes(expected)) return true;
+    } catch { /* NXDOMAIN 或解析器暂时不可用，继续等 */ }
+    await sleep(intervalMs);
+  }
+  return false;
+}
+
 function certFolder(domain) {
   /* "*." 在 Windows 目录名里合法，但容易和字面量混淆，改成 wildcard. 前缀。 */
   return String(domain || '').replace(/^\*\./, 'wildcard.').replace(/[\\/:*?"<>|]/g, '_');
@@ -43,18 +61,29 @@ class AcmeManager {
   async loadAccount() {
     const existing = readJson(this.accountFile, null);
     if (existing && existing.accountKey && typeof existing.accountKey === 'string') {
-      return { accountKey: existing.accountKey, accountUrl: String(existing.accountUrl || '') };
+      // accountUrls 按目录（staging/production）分开存：两个目录的账户 URL 不能混用，
+      // 否则签完 staging 再签 production 会拿 staging 的账户 ID 去 production 目录。
+      const urls = (existing.accountUrls && typeof existing.accountUrls === 'object')
+        ? existing.accountUrls
+        : {};
+      return {
+        accountKey: existing.accountKey,
+        accountUrls: {
+          staging: String(urls.staging || ''),
+          production: String(urls.production || ''),
+        },
+      };
     }
     // 首次：本地生成一把 2048 位 RSA 账户密钥（ACME 账户密钥，与证书密钥无关）。
     const accountKey = (await acme.crypto.createPrivateKey(2048)).toString('utf8');
-    const account = { accountKey, accountUrl: '' };
+    const account = { accountKey, accountUrls: { staging: '', production: '' } };
     writeJsonAtomic(this.accountFile, account);
     return account;
   }
 
-  async saveAccountUrl(accountUrl) {
+  async saveAccountUrl(accountUrl, staging) {
     const account = await this.loadAccount();
-    account.accountUrl = String(accountUrl || '');
+    account.accountUrls[staging ? 'staging' : 'production'] = String(accountUrl || '');
     writeJsonAtomic(this.accountFile, account);
   }
 
@@ -63,10 +92,11 @@ class AcmeManager {
     const directoryUrl = staging
       ? acme.directory.letsencrypt.staging
       : acme.directory.letsencrypt.production;
+    const urlKey = staging ? 'staging' : 'production';
     const client = new acme.Client({
       directoryUrl,
       accountKey: account.accountKey,
-      accountUrl: account.accountUrl || undefined,
+      accountUrl: account.accountUrls[urlKey] || undefined,
       backoffAttempts: 20,
       backoffMin: 2000,
       backoffMax: 10000,
@@ -94,10 +124,11 @@ class AcmeManager {
     const commonName = unique[0];
 
     const { client, account } = await this.clientFor({ staging, email });
+    const urlKey = staging ? 'staging' : 'production';
+    const beforeUrl = account.accountUrls[urlKey] || '';
 
     try {
       // auto() 内部会在没有 accountUrl 时自动注册账户；这里拿它保存下来复用。
-      const beforeUrl = account.accountUrl;
       const [key, csr] = await acme.crypto.createCsr({
         keySize: 2048,
         commonName,
@@ -123,6 +154,9 @@ class AcmeManager {
           const identifier = authz.identifier && authz.identifier.value ? authz.identifier.value : commonName;
           const rec = await dns.create(identifier, keyAuthorization);
           challengeRecords.set(identifier, rec);
+          // 等 TXT 真正发布到权威 DNS 再让 Let's Encrypt 验证（Cloudflare 通常几秒内，
+          // 但 LE 可能查太快撞上 NXDOMAIN）。用系统解析器尽力轮询。
+          await waitForTxt(dns01Name(identifier), keyAuthorization);
         },
         challengeRemoveFn: async (authz) => {
           const identifier = authz.identifier && authz.identifier.value ? authz.identifier.value : commonName;
@@ -133,7 +167,7 @@ class AcmeManager {
       });
 
       if (!beforeUrl) {
-        await this.saveAccountUrl(client.getAccountUrl());
+        await this.saveAccountUrl(client.getAccountUrl(), staging);
       }
 
       return this.storeCertificate({ fullchain, key, domains: unique, email, staging });

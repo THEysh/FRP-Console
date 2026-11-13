@@ -314,6 +314,16 @@ node tools/cdp-shot.cjs .proxy-row out.png # 按选择器截单个元素
 
 ## 更新日志
 
+### 1.2.9
+
+这一轮在真实 Cloudflare + 真实 Let's Encrypt 上把「签发证书」从头到尾跑通，并修掉三个会卡住真实签发 / 使用的问题：
+
+- **DNS TXT 还没发布就被验证，导致签发报 `NXDOMAIN`**：Cloudflare 建完 `_acme-challenge` TXT 后到权威 DNS 可见通常要几秒，但 Let's Encrypt 有时查得太快。现在建完 TXT 会等它真正出现在 DNS 解析里，再让 Let's Encrypt 验证。
+- **先签 STAGING 再签真实证书会失败**：ACME 账户 URL 之前只存一份，而 STAGING 和生产目录的账户 URL 不能混用——签完 STAGING 再签生产会拿 STAGING 的账户 ID 去生产目录注册。现在两个目录的账户 URL 分开保存。
+- **代理表单里「从已签发证书选择」下拉选了没反应**：下拉的 change 事件没接上，选证书不会自动填 `crtPath` / `keyPath` / 自定义域名。现在接好了。
+
+> 本轮已在真实环境验证：`*.theysh.cn` 通配符证书 STAGING 与生产目录都签发成功，生产证书链到 ISRG Root X1、有效期 90 天；证书列表、到期天数、一键填进 https2http/https2https 代理全部走通。
+
 ### 1.2.8
 
 这一轮把「自定义域名 + HTTPS」推进到**可签发证书**这一大步（第一阶段：先支持 Cloudflare）：
