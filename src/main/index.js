@@ -1582,17 +1582,38 @@ function registerIpc() {
    * 在「服务器就绪检查」第 4 步看到"Token 不一致"，还得自己回去把服务端那串
    * 抄进档案。反过来（服务端没有 token）不动档案：那份随机值本来就是要写进
    * 服务端配置向导的。
+   *
+   * 光对齐档案还不够：真正拿 Token 去登录的是本机 frpc.toml。本机配置如果已经
+   * 指向同一台服务器（地址 + 端口都一样），那它里面那串旧 Token 注定登录失败，
+   * 这里一并改掉 —— 只是把「本来就连这台」的凭据修正成服务端认可的值，
+   * 不会改变隧道指向。改完返回 tokenSynced，由调用方决定要不要重启隧道。
    */
   function adoptServerAuthFromConfig() {
-    if (!sessionServerId) return;
+    if (!sessionServerId) return { tokenSynced: false };
     const summary = serverConfig.summary;
     const owner = findServerProfile(sessionServerId);
-    if (!summary || !owner) return;
+    if (!summary || !owner) return { tokenSynced: false };
     const nextToken = summary.authEnabled ? String(summary.token || '') : '';
     const nextPort = Number(summary.bindPort) || owner.clientPort;
     const nextPath = serverConfig.path || owner.configPath;
-    if (owner.clientToken === nextToken && Number(owner.clientPort) === nextPort && owner.configPath === nextPath) return;
-    upsertServerProfile({ id: owner.id, clientToken: nextToken, clientPort: nextPort, configPath: nextPath });
+    if (owner.clientToken !== nextToken || Number(owner.clientPort) !== nextPort || owner.configPath !== nextPath) {
+      upsertServerProfile({ id: owner.id, clientToken: nextToken, clientPort: nextPort, configPath: nextPath });
+    }
+
+    if (!model || !model.serverAddr) return { tokenSynced: false };
+    const sameTarget = String(model.serverAddr).toLowerCase() === String(owner.host).toLowerCase()
+      && Number(model.serverPort) === nextPort;
+    if (!sameTarget) return { tokenSynced: false };
+    const localToken = String((model.auth && model.auth.token) || '');
+    if (localToken === nextToken) return { tokenSynced: false };
+    const next = structuredClone(model);
+    next.auth = { ...(next.auth || {}), method: 'token', token: nextToken };
+    const saved = persistModel(next, { reload: false });
+    if (!saved.ok) return { tokenSynced: false, error: saved.error || '写入本机 frpc 配置失败' };
+    /* 地址 + 端口 + Token 都对上了，本机这份配置就是这台服务器的：顺手把「隧道目标」
+     * 记到它头上，服务器页才不会一边用着它、一边说「本机隧道还没归属到任何档案」。 */
+    if (settings.clientServerId !== owner.id) settings = settingsModule.save({ clientServerId: owner.id });
+    return { tokenSynced: true };
   }
 
   async function loadServerSnapshot({ inspect = false, epoch = sessionEpoch } = {}) {
@@ -1616,7 +1637,26 @@ function registerIpc() {
     }
     if (serverConfig.summary) {
       applyPortStatus(serverSession.info, serverConfig.summary);
-      adoptServerAuthFromConfig();
+      const sync = adoptServerAuthFromConfig();
+      if (epoch !== sessionEpoch) return { ok: false, stale: true };
+      if (sync.tokenSynced && manager) {
+        /* 本机 frpc.toml 刚被改成服务端认可的那串 Token。隧道还开着的话，它手里
+         * 仍是旧值，放着不管用户就会在概览看到「Token 校验失败」——正是刚才那种
+         * 「四步全绿但隧道连不上」。旧 Token 本来就登录不上，重启不会打断正常业务。 */
+        const rt = manager.snapshot();
+        if (rt.running || rt.connected) {
+          await manager.restart({ runMode: settings.runMode }).catch(() => ({}));
+          await manager.refresh().catch(() => {});
+          healthCache.clear();
+          scheduleHealth(1200);
+          send('notify', {
+            kind: 'info',
+            title: '已对齐本机 Token',
+            message: '服务端的 auth.token 与本机 frpc.toml 不一致，已按服务端改正并重启隧道。',
+          });
+          pushState();
+        }
+      }
     }
     return { ok: true };
   }
@@ -2099,27 +2139,38 @@ function registerIpc() {
        * 可能已经指向别的档案（切换中），拿错了会报出莫名其妙的 Token 不一致。 */
       const owner = findServerProfile(sessionServerId) || active;
       const serverToken = String((summary && summary.token) || '');
-      const clientToken = String((owner && owner.clientToken) || '');
+      const profileToken = String((owner && owner.clientToken) || '');
       const ownerName = owner ? owner.name : '当前档案';
+      /* 真正拿 Token 去登录的是本机 frpc.toml。本机已经指向这台服务器时，比对的
+       * 必须是它里面那串 —— 只比档案会得出「检查说一致，隧道却报 Token 校验失败」
+       * 的自相矛盾结论（档案是"打算用的值"，frpc.toml 才是"实际在用的值"）。 */
+      const liveTarget = !!(model && owner && model.serverAddr && owner.host)
+        && String(model.serverAddr).toLowerCase() === String(owner.host).toLowerCase()
+        && Number(model.serverPort) === (Number(summary && summary.bindPort) || Number(owner.clientPort) || 7000);
+      const clientToken = liveTarget ? String((model.auth && model.auth.token) || '') : profileToken;
+      const tokenSource = liveTarget ? '本机 frpc.toml' : `档案「${ownerName}」`;
       if (!serverToken && !clientToken) {
         return ok({ layer, ok: true, ms: Date.now() - startedAt, detail: '服务端与本机都没有启用 Token（auth 关闭）' });
       }
       if (!serverToken) {
-        return ok({ layer, ok: false, ms: Date.now() - startedAt, reason: '服务端未启用鉴权', detail: 'frps.toml 里没有 auth.token，但档案里配了 Token，frpc 登录会被拒' });
+        return ok({ layer, ok: false, ms: Date.now() - startedAt, reason: '服务端未启用鉴权', detail: `${tokenSource} 里配了 Token，但 frps.toml 里没有 auth.token，frpc 登录会被拒` });
       }
       if (!clientToken) {
-        return ok({ layer, ok: false, ms: Date.now() - startedAt, reason: '本机没有 Token', detail: `服务端已启用 Token，但档案「${ownerName}」里没有，隧道登录会失败` });
+        return ok({ layer, ok: false, ms: Date.now() - startedAt, reason: '本机没有 Token', detail: `服务端已启用 Token，但${tokenSource}里没有，隧道登录会失败` });
       }
       if (serverToken !== clientToken) {
+        const gap = liveTarget
+          ? '点「切换隧道并重启」把档案里的值写到本机配置，或点右上「刷新」让应用自动对齐'
+          : '点右上「刷新」重新读一次；仍然不同就说明服务端配置刚被别处改过，把档案 Token 改成服务端那串即可';
         return ok({
           layer,
           ok: false,
           ms: Date.now() - startedAt,
           reason: 'Token 不一致',
-          detail: `服务端 ${serverToken.slice(0, 4)}… 与档案「${ownerName}」${clientToken.slice(0, 4)}… 不同。点右上「刷新」重新读一次；仍然不同就说明服务端配置刚被别处改过，把档案 Token 改成服务端那串即可`,
+          detail: `服务端 ${serverToken.slice(0, 4)}… 与${tokenSource}的 ${clientToken.slice(0, 4)}… 不同。${gap}`,
         });
       }
-      return ok({ layer, ok: true, ms: Date.now() - startedAt, detail: `服务端与档案「${ownerName}」的 Token 一致（${serverToken.slice(0, 4)}…，${serverToken.length} 位）` });
+      return ok({ layer, ok: true, ms: Date.now() - startedAt, detail: `服务端与${tokenSource}的 Token 一致（${serverToken.slice(0, 4)}…，${serverToken.length} 位）` });
     }
 
     return fail('未知的检测层');
