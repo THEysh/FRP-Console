@@ -1392,16 +1392,29 @@ function registerIpc() {
     if (!model) return fail('配置尚未载入');
     const { mode = 'add', originalName = '', proxy: input } = payload || {};
     if (!input) return fail('缺少代理参数');
+    /* 全新安装时本机 frpc.toml 里还是空的：用户在服务器页刚把 frps 配好，转头来加第一条
+     * 隧道，不该被「服务器地址不能为空」顶回去 —— 那是我们自己没把目标填上，不是他漏填。
+     * 只在地址为空时补，一律取「当前 SSH 会话那台」，没有会话才退到当前档案；
+     * 已经配好的地址绝不覆盖。 */
+    const seed = !model.serverAddr ? (findServerProfile(sessionServerId) || activeServerProfile()) : null;
+    const base = seed && seed.host
+      ? {
+        ...model,
+        serverAddr: seed.host,
+        serverPort: Number(seed.clientPort) || 7000,
+        auth: { ...(model.auth || {}), method: 'token', token: seed.clientToken || '' },
+      }
+      : model;
     const proxy = configModule.makeProxy(input);
     const next = configModule.normalize({
-      ...model._extra,
-      serverAddr: model.serverAddr,
-      serverPort: model.serverPort,
-      loginFailExit: model.loginFailExit,
-      auth: model.auth,
-      log: model.log,
-      transport: model.transport,
-      webServer: model.webServer,
+      ...base._extra,
+      serverAddr: base.serverAddr,
+      serverPort: base.serverPort,
+      loginFailExit: base.loginFailExit,
+      auth: base.auth,
+      log: base.log,
+      transport: base.transport,
+      webServer: base.webServer,
       proxies: mode === 'edit'
         ? model.proxies.map((p) => (p.name === originalName ? { ...proxy, ...(p.secretKey && !proxy.secretKey ? { secretKey: p.secretKey } : {}) } : p))
         : [...model.proxies, proxy],
@@ -1416,8 +1429,11 @@ function registerIpc() {
     }
     const result = await applyAndMaybeReload(next);
     if (!result.ok) return result;
+    // 地址是这次现填的：顺手把「本机隧道目标」记到这个档案上，概览和服务器页才不会
+    // 出现「本机隧道还没有归属到任何档案」。
+    if (seed) settings = settingsModule.save({ clientServerId: seed.id });
     pushState();
-    return ok({ state: result.state, reloaded: result.reloaded, proxy });
+    return ok({ state: result.state, reloaded: result.reloaded, proxy, seededFrom: seed ? seed.name : '' });
   });
 
   ipcMain.handle('proxy:delete', async (event, name) => {
