@@ -137,6 +137,26 @@ npm install --cache .\.npm-cache
 | **应用托管进程** | 控制台直接拉起 `frpc.exe -c frpc.toml`，退出控制台会一并结束 |
 | **自动** | 优先使用已安装的 Windows 服务，没有再托管进程 |
 
+## 开机自启与重启验收
+
+「现在能通」和「重启后还能通」是两件事，分开验才不会误判：
+
+| 位置 | 靠什么活着 | 验收命令 / 看哪里 |
+| --- | --- | --- |
+| 本机 frpc | Windows 服务的启动类型 | `Get-Service frpc \| Select-Object Status,StartType` → `Running / Automatic` |
+| 服务器 frps | systemd 的 `is-enabled`，或容器的 RestartPolicy | `systemctl is-enabled frps; systemctl is-active frps` |
+| 控制台窗口 | 当前用户的登录项（`HKCU\...\Run`） | 设置页开关；任务管理器「启动」里是否为「已启用」 |
+
+几个必须知道的边界：
+
+- **控制台是「登录后启动」，不是「开机启动」**。`Run` 项要等用户登录 + explorer 起来才执行（常见 10–60 秒）。无人值守重启时控制台不会出现——但**隧道不受影响**，服务模式下 frpc 由系统服务拉起，跟控制台无关。
+- **任务管理器里禁用过启动项时**，Windows 不删 `Run` 键，只把 `StartupApproved\Run` 里的状态改成「已禁用」。控制台会读这个状态：设置页显示黄色提示，并把开关同步为关闭，不会偷偷再加回去。想恢复就在任务管理器里设为「已启用」。
+- **只有服务模式（或 auto 命中服务）才谈得上「重启后隧道自己回来」**。`应用托管进程` 模式下 frpc 是控制台的子进程，控制台一退隧道就断；选这个模式时设置页会明确提示。
+- **服务器端开机自启是控制台初始化后回读的**：`systemctl enable` 之后会再查一次 `systemctl is-enabled`，没到 `enabled` 就在「服务器」页状态卡标黄并给出修复命令，不会像以前那样把失败吞掉报「成功」。没有 systemd 的机器用 `nohup` 临时启动，页面会直说「重启后不会自动运行」。
+- 托管的 Docker 版 frps 会读 `docker inspect` 的 `RestartPolicy`：`no` 的容器重启后不会自己起来，同样会在状态卡提示。
+
+生成的内置 `frpc.toml` 模板里，`loginFailExit = false`：开机时网络可能还没就绪，让 frpc 自己退避重连，比"连不上就退出、等 nssm 反复拉起"更干净。
+
 ## 托盘与退出
 
 **关窗口 ≠ 退出**：

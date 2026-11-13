@@ -268,8 +268,9 @@ function toggleMainWindow() {
  *     否则登录后只会打开一个空白的 Electron 窗口。
  *  2) 便携版的 execPath 指向 %TEMP% 里解出来的副本，必须用 PORTABLE_EXECUTABLE_FILE
  *     指回用户双击的那个 exe，否则重启后路径就失效了。
- *  3) 用户在任务管理器里可以单独禁用启动项，所以「设置里开着」不等于「系统里生效」，
- *     对外一律以 getLoginItemSettings() 的结果为准。
+ *  3) 用户在任务管理器里禁用启动项时，Windows 不删 Run 键，而是在
+ *     Explorer\StartupApproved\Run 里把状态改成「已禁用」。所以只看 openAtLogin
+ *     会得到「已开启」的假象——必须再看 executableWillLaunchAtLogin / launchItems。
  */
 function loginItemOptions(enabled) {
   const opts = { openAtLogin: !!enabled };
@@ -284,17 +285,49 @@ function loginItemOptions(enabled) {
   return opts;
 }
 
-function launchAtLoginState() {
+function sameExe(a, b) {
+  if (!a || !b) return false;
+  try {
+    return path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();
+  } catch {
+    return String(a).toLowerCase() === String(b).toLowerCase();
+  }
+}
+
+/* 返回 { registered, enabled, blocked, error }：
+ *   registered  启动项存在（Run 键里有）
+ *   enabled     重启后真的会启动（没被任务管理器禁用）
+ *   blocked     已注册但被禁用——这正是「设置里显示开着、重启却不启动」的原因 */
+function launchAtLoginSnapshot() {
+  const opts = loginItemOptions(true);
+  const query = process.platform === 'win32'
+    ? { ...(opts.path ? { path: opts.path } : {}), ...(opts.args ? { args: opts.args } : {}) }
+    : { path: undefined, args: undefined };
+  let result;
   try {
     // Windows 上查询必须带上和写入时相同的 path/args，否则永远查不到那条记录。
-    const opts = loginItemOptions(true);
-    const query = process.platform === 'win32'
-      ? { ...(opts.path ? { path: opts.path } : {}), ...(opts.args ? { args: opts.args } : {}) }
-      : {};
-    return !!app.getLoginItemSettings(query).openAtLogin;
-  } catch {
-    return false;
+    result = app.getLoginItemSettings(process.platform === 'win32' ? query : {});
+  } catch (e) {
+    return { registered: false, enabled: false, blocked: false, error: String((e && e.message) || e) };
   }
+  if (process.platform !== 'win32') {
+    const on = !!result.openAtLogin;
+    return { registered: on, enabled: on, blocked: false, error: '' };
+  }
+  const registered = !!result.openAtLogin;
+  if (!registered) return { registered: false, enabled: false, blocked: false, error: '' };
+  // launchItems 里带 enabled，是唯一能反映「任务管理器里被禁用」的字段。
+  const items = Array.isArray(result.launchItems) ? result.launchItems : [];
+  const mine = items.find((item) => sameExe(item && item.path, opts.path)) || (items.length === 1 ? items[0] : null);
+  let enabled;
+  if (mine && typeof mine.enabled === 'boolean') enabled = mine.enabled;
+  else if (typeof result.executableWillLaunchAtLogin === 'boolean') enabled = result.executableWillLaunchAtLogin;
+  else enabled = registered;
+  return { registered: true, enabled, blocked: !enabled, error: '' };
+}
+
+function launchAtLoginState() {
+  return launchAtLoginSnapshot().enabled;
 }
 
 function applyLaunchAtLogin(enabled) {
@@ -303,24 +336,39 @@ function applyLaunchAtLogin(enabled) {
   } catch (e) {
     return { ok: false, error: `写入开机启动项失败：${e.message || e}` };
   }
-  const actual = launchAtLoginState();
-  if (actual !== !!enabled) {
+  const state = launchAtLoginSnapshot();
+  if (!!enabled && state.blocked) {
+    return {
+      ok: false,
+      blocked: true,
+      actual: false,
+      error: '启动项已写入系统，但它在「任务管理器 → 启动」里处于“已禁用”，重启后不会运行。请到那里把它设为“已启用”。',
+    };
+  }
+  if (state.enabled !== !!enabled) {
     // 组策略 / 安全软件拦截时设置会静默失败，别让界面显示成已开启
     return {
       ok: false,
+      actual: state.enabled,
       error: '系统拒绝了开机启动设置（可能被组策略或安全软件拦截），可以改用 shell:startup 文件夹里的快捷方式',
-      actual,
     };
   }
-  return { ok: true, actual };
+  return { ok: true, actual: state.enabled };
 }
 
-/* 启动时对账：设置里开着但系统里没有（重装、移动目录、被任务管理器禁用过）就补写，
- * 设置里关着但系统里还留着就清掉。 */
+/* 启动时对账：设置里开着但系统里没有（重装、移动目录）就补写，
+ * 设置里关着但系统里还留着就清掉。
+ * 任务管理器里被禁用的，尊重用户的选择：把设置也关掉，不再偷偷加回去。 */
 function syncLaunchAtLogin() {
   if (!settings) return;
   const want = settings.launchAtLogin === true;
-  if (want === launchAtLoginState()) return;
+  const state = launchAtLoginSnapshot();
+  if (want && state.blocked) {
+    settings = settingsModule.save({ launchAtLogin: false });
+    console.warn('[startup] 启动项被用户在任务管理器里禁用，已把设置同步为关闭');
+    return;
+  }
+  if (want === state.enabled) return;
   const result = applyLaunchAtLogin(want);
   if (!result.ok) console.warn('[startup]', result.error);
 }
@@ -857,6 +905,9 @@ function buildState() {
       trayCreated: !!tray,
       // 系统里的真实开机启动状态（用户可能在任务管理器里手动关掉过）
       launchAtLogin: launchAtLoginState(),
+      // 启动项写进去了但被任务管理器禁用：界面要能把这句话说出来，
+      // 否则用户看到“已开启”却在重启后发现没启动。
+      launchAtLoginBlocked: launchAtLoginSnapshot().blocked,
     },
     settings: settingsForState(),
     paths: pathsForState(),
@@ -1209,6 +1260,7 @@ function registerIpc() {
         tray: canHideToTray(),
         trayCreated: !!tray,
         launchAtLogin: launchAtLoginState(),
+        launchAtLoginBlocked: launchAtLoginSnapshot().blocked,
       },
     });
   });

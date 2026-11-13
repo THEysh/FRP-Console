@@ -270,6 +270,36 @@ class ServerSession {
     const status = abnormal ? 'abnormal' : running ? 'running' : 'stopped';
     const source = processAlive ? 'process' : dockerRunning ? 'docker' : unitActive === 'active' ? 'systemd' : 'none';
 
+    /* 「现在在跑」和「重启后还会自己跑」是两件事。前者看 is-active，后者看：
+     *   systemd  → is-enabled（enabled / disabled / masked / static …）
+     *   docker   → 容器的 RestartPolicy（no 的话重启后不会起来）
+     *   裸进程    → 没有任何守护，重启即丢 */
+    let unitEnabled = '';
+    if (hasUnit) {
+      const enabledResult = await this.exec(`systemctl is-enabled -- ${shellQuote(serviceName)} 2>/dev/null || true`, 8000);
+      unitEnabled = firstLine(enabledResult.stdout);
+    }
+    let dockerRestart = '';
+    if (docker && docker.name) {
+      const policy = await this.exec(`docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' ${shellQuote(docker.name)} 2>/dev/null || true`, 8000);
+      dockerRestart = firstLine(policy.stdout);
+    }
+    const boot = (() => {
+      if (hasUnit) {
+        if (!unitEnabled) return { boot: 'unknown', bootText: '无法读取 systemd 开机自启状态' };
+        if (unitEnabled === 'enabled') return { boot: 'enabled', bootText: '已设为开机自启（systemd）' };
+        return { boot: 'disabled', bootText: `未设为开机自启（${unitEnabled}）` };
+      }
+      if (docker && docker.name) {
+        const policy = String(dockerRestart || 'no').toLowerCase();
+        return ['always', 'unless-stopped'].includes(policy)
+          ? { boot: 'enabled', bootText: `容器会自动重启（${policy}）` }
+          : { boot: 'disabled', bootText: `容器重启后不会自动运行（RestartPolicy=${policy}）` };
+      }
+      if (processAlive) return { boot: 'ephemeral', bootText: '临时进程，服务器重启后不会自动运行' };
+      return { boot: 'unknown', bootText: '未检测到持久化方式' };
+    })();
+
     this.configPath = configPath;
     this.info = {
       hostname: text('HOSTNAME'),
@@ -279,6 +309,10 @@ class ServerSession {
       serviceName: serviceName || 'frps',
       hasUnit,
       unitActive,
+      unitEnabled,
+      dockerRestart,
+      boot: boot.boot,
+      bootText: boot.bootText,
       processAlive,
       pids,
       binaryPath,
@@ -437,12 +471,17 @@ class ServerSession {
     }
 
     report('service', '配置 frps 系统服务', 84);
+    /* 「启动成功」不等于「重启后还在」。enable 的返回值以前被 `|| true` 吞掉，
+     * 结果是装完一切正常、直到某天服务器重启才发现 7000 不通。 */
+    let bootWarning = '';
+    let enabledState = '';
     if (systemdOk) {
       // 始终重写 unit，修正历史上错误的 ExecStart（例如把 echo 当成配置路径）
       const unit = [
         '[Unit]',
         'Description=frp server',
-        'After=network.target',
+        'After=network-online.target',
+        'Wants=network-online.target',
         '',
         '[Service]',
         'Type=simple',
@@ -459,7 +498,12 @@ class ServerSession {
       result = await this.exec(`printf %s ${unitB64} | base64 -d > ${tmpUnit} && ${prefix}install -m 644 ${tmpUnit} /etc/systemd/system/${serviceName}.service && rm -f ${tmpUnit}`, 15000);
       if (!result.ok) return { ok: false, error: `创建 systemd 服务失败：${(result.stderr || '权限不足').trim()}`, steps };
       await this.exec(`${prefix}systemctl daemon-reload`, 15000);
-      await this.exec(`${prefix}systemctl enable ${shellQuote(serviceName)} 2>/dev/null || true`, 15000);
+      const enable = await this.exec(`${prefix}systemctl enable -- ${shellQuote(serviceName)} 2>&1`, 15000);
+      enabledState = firstLine((await this.exec(`${prefix}systemctl is-enabled -- ${shellQuote(serviceName)} 2>/dev/null || true`, 8000)).stdout);
+      if (enabledState !== 'enabled') {
+        const why = (enable.stderr || enable.stdout || '').trim().split(/\r?\n/).filter(Boolean)[0] || '';
+        bootWarning = `frps 已在运行，但没能设成开机自启（systemctl is-enabled = ${enabledState || 'unknown'}）${why ? `：${why}` : ''}。服务器重启后需要手动执行 systemctl start ${serviceName}`;
+      }
 
       report('start', `启动 ${serviceName}.service`, 90);
       const start = await this.sudoSystemctl('restart', shellQuote(serviceName));
@@ -467,6 +511,7 @@ class ServerSession {
         return { ok: false, error: `启动 frps 失败：${(start.stderr || start.stdout || 'systemctl 执行失败').trim()}`, steps };
       }
     } else {
+      bootWarning = '当前系统没有 systemd，frps 以 nohup 方式临时运行——服务器重启后不会自动启动。建议改用 systemd 或用 docker --restart=always 托管。';
       report('start', '以 nohup 方式启动 frps', 90);
       const command = `setsid nohup ${shellQuote(binary)} -c ${shellQuote(configPath)} >> /var/log/frps.log 2>&1 < /dev/null & echo started`;
       const start = await this.exec(command, 12000);
@@ -508,6 +553,9 @@ class ServerSession {
       backup,
       serviceName,
       via: systemdOk ? 'systemd' : 'nohup',
+      // 开机自启是否真的设上了：true 才算「重启后隧道会自己回来」
+      bootEnabled: systemdOk ? enabledState === 'enabled' : false,
+      bootWarning,
       steps,
       info: after.info,
     };

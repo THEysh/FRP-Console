@@ -1252,6 +1252,14 @@ function renderServer(force = false) {
   const canStart = status.key !== 'running';
   const canStop = status.key !== 'stopped' || info.processAlive || info.dockerRunning;
   const needsBootstrap = !info.dockerRunning && ((!info.frpsInstalled && info.version === 'unknown') || !s.configPath || info.configExists === false);
+  /* 「正在运行」和「重启后还能自己起来」是两回事，状态卡上分开说。 */
+  const boot = (() => {
+    const key = info.boot || 'unknown';
+    if (key === 'enabled') return { key, label: '已启用', sub: info.bootText || '重启服务器后会自动启动', cls: '' };
+    if (key === 'ephemeral') return { key, label: '临时进程', sub: info.bootText || '重启后不会自动运行', cls: 'warn' };
+    if (key === 'disabled') return { key, label: '未启用', sub: info.bootText || '重启后不会自动运行', cls: 'warn' };
+    return { key, label: '未知', sub: info.bootText || '无法判断', cls: 'muted' };
+  })();
 
   $('#view').innerHTML = `
     <div class="view server-view">
@@ -1290,11 +1298,16 @@ function renderServer(force = false) {
 
       ${needsBootstrap ? bootstrapCardMarkup(info, s) : ''}
 
+      ${boot.key === 'disabled' || boot.key === 'ephemeral'
+        ? `<div class="note warn">${icon('alert')}<div><strong>服务器重启后 frps 不会自己起来</strong><br>${esc(info.bootText || '')}。${info.hasUnit ? `执行 <code>sudo systemctl enable --now ${esc(info.serviceName || 'frps')}</code> 可以修好。` : '建议改为 systemd 服务或用 docker --restart=always 托管。'}</div></div>`
+        : ''}
+
       <section class="srv-metrics">
         ${metricCard('frps 版本', info.version || 'unknown', info.versionSource || '', info.version === 'unknown' ? 'warn' : '')}
         ${metricCard('bindPort', summary.bindPort || '—', summary.bindAddr || '', '')}
         ${metricCard('Dashboard', summary.webPort ? `:${summary.webPort}` : '未启用', summary.webPort ? (summary.webUser || 'admin') : 'webServer 未配置', !summary.webPort ? 'muted' : '')}
         ${metricCard('鉴权 Token', summary.authEnabled ? '已设置' : '未启用', summary.authEnabled ? '客户端需一致' : '不校验 token', !summary.authEnabled ? 'warn' : '')}
+        ${metricCard('开机自启', boot.label, boot.sub, boot.cls)}
       </section>
 
       <section class="card selftest-card" id="selftest-panel">${selftestMarkup()}</section>
@@ -2301,9 +2314,13 @@ async function runServerBootstrap(btn) {
   S.server.wizardDirty = false;
   S.server.installProgress = { percent: 100, text: '初始化完成，frps 已运行' };
   const via = res.data && res.data.via === 'systemd' ? '已注册 systemd 服务' : '已以后台进程方式启动';
+  const bootWarning = (res.data && res.data.bootWarning) || '';
   const sync = res.data && res.data.localSync;
   if (sync && !sync.ok) {
     toast('warn', 'frps 已初始化，但本机隧道同步失败', sync.error || '请在概览页手动重启隧道');
+  } else if (bootWarning) {
+    // 服务起来了，但「重启后还会不会起来」没设上：这比装成功更值得说一句。
+    toast('warn', 'frps 已启动，但开机自启没设上', bootWarning);
   } else if (sync && sync.ok) {
     toast('success', 'frps 已初始化，本机隧道已同步并重启', `${via} · ${(res.data && res.data.configPath) || ''}`);
   } else {
@@ -2576,7 +2593,9 @@ function renderSettings(force = false) {
                 <option value="service" ${settings.runMode === 'service' ? 'selected' : ''}>Windows 服务</option>
                 <option value="managed" ${settings.runMode === 'managed' ? 'selected' : ''}>应用托管进程</option>
               </select>
-              <div class="field-hint">服务模式可开机自启；托管模式由控制台直接拉起 frpc.exe。</div>
+              <div class="field-hint">${settings.runMode === 'managed'
+                ? '托管模式下隧道是控制台的子进程：控制台退出即断开，不建议用于无人值守。'
+                : '服务模式可开机自启；托管模式由控制台直接拉起 frpc.exe。'}</div>
             </div>
             <div class="field">
               <label>状态刷新间隔（毫秒）</label>
@@ -2588,6 +2607,8 @@ function renderSettings(force = false) {
                 ${switchRow('关闭窗口时最小化到托盘', '退出请使用托盘菜单中的“退出”', 'closeToTray', settings.closeToTray !== false)}
                 ${switchRow('启动时自动启动隧道', '控制台启动后立即建立 frpc 连接', 'launchTunnelOnStart', !!settings.launchTunnelOnStart)}
                 ${switchRow('开机自动启动', '登录 Windows 后自动运行控制台（写当前用户的启动项，不需要管理员权限）', 'launchAtLogin', !!settings.launchAtLogin)}
+                ${app.launchAtLoginBlocked ? `<div class="note warn" style="margin:2px 0 10px">${icon('alert')}<div>启动项已被系统「任务管理器 → 启动」禁用，重启后不会运行。要恢复请到那里把「FRP 控制台」设为「已启用」；或者换个办法：把快捷方式放进 <code>shell:startup</code>。</div></div>` : ''}
+                ${settings.launchAtLogin && settings.runMode === 'managed' ? `<div class="note warn" style="margin:2px 0 10px">${icon('alert')}<div>当前是「应用托管进程」模式：开机只会自动打开控制台，隧道要等控制台把 frpc 拉起来才算通；控制台一退隧道就断。要“开机即通”，请改用 Windows 服务模式。</div></div>` : ''}
                 ${switchRow('以最小化状态启动', '仅显示托盘图标', 'startMinimized', !!settings.startMinimized)}
                 ${switchRow('停止/重启服务前确认', '需要管理员权限时弹出 UAC 提示', 'confirmStopService', settings.confirmStopService !== false)}
                 ${switchRow('不继承系统代理', '启动 frpc 时摘掉 HTTP_PROXY 等变量。系统开着代理时，frp 会把 TCP 握手交给代理，常见是被网关挡回 502（对系统服务模式无效）', 'stripProxyEnv', settings.stripProxyEnv !== false)}
