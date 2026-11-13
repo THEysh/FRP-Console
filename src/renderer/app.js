@@ -143,6 +143,21 @@ function modeLabel(mode) {
 const TYPE_LABEL = { tcp: 'TCP', udp: 'UDP', http: 'HTTP', https: 'HTTPS', stcp: 'STCP', sudp: 'SUDP', xtcp: 'XTCP', tcpmux: 'TCPMUX' };
 const SCOPE_LABEL = { loopback: '回环', all: '全网', docker: 'Docker', lan: '内网', public: '公网', other: '其它' };
 
+/* 通配符覆盖判定（渲染层副本，主进程 acme.js 里还有一份）。 */
+function coversDomain(pattern, host) {
+  const p = String(pattern || '').trim().toLowerCase();
+  const h = String(host || '').trim().toLowerCase();
+  if (!p || !h) return false;
+  if (p === h) return true;
+  if (p.startsWith('*.')) {
+    const suffix = p.slice(1);
+    if (!h.endsWith(suffix)) return false;
+    const label = h.slice(0, h.length - suffix.length);
+    return label && !label.includes('.');
+  }
+  return false;
+}
+
 function healthTip(h) {
   if (!h || !h.layers) return '';
   const label = (name, layer) => {
@@ -723,6 +738,16 @@ function proxyRowHtml(p) {
       ? `<span class="health-hint" title="${esc(tip)}">${icon('check')}三层连通 · ${esc(p.health.ms)}ms</span>`
       : `<span class="health-hint bad" title="${esc(tip)}">${icon('alert')}${esc(p.health.reason || p.health.error || '链路异常')}</span>`)
     : '';
+  // DNS 软检查：不参与三层判定，只给 http/https 代理一个「域名没解析/没指向服务器」的提醒。
+  const dnsLayer = p.health && p.health.layers && p.health.layers.dns;
+  let dnsHint = '';
+  if (dnsLayer && !dnsLayer.skipped) {
+    if (!dnsLayer.ok) {
+      dnsHint = `<span class="health-hint" title="${esc(dnsLayer.error || '域名未解析')}">${icon('alert')}域名未解析</span>`;
+    } else if (!dnsLayer.pointsToServer) {
+      dnsHint = `<span class="health-hint" title="域名已解析，但未指向当前服务器">${icon('alert')}域名未指向服务器</span>`;
+    }
+  }
   const publicCell = p.publicAddress
     ? `<div class="pub-cell">
         <code title="${esc(p.publicAddress)}">${esc(p.publicAddress)}</code>
@@ -740,6 +765,7 @@ function proxyRowHtml(p) {
       <td>
         <div class="mono">${esc(p.localIP || '127.0.0.1')}:${esc(p.localPort)}</div>
         ${health}
+        ${dnsHint}
         ${p.statusError ? `<div class="health-hint bad">${icon('alert')}${esc(p.statusError)}</div>` : ''}
       </td>
       <td>${publicCell}</td>
@@ -2637,6 +2663,8 @@ function renderCerts(force = false) {
   const dns = S.certs.dns || {};
   const hasToken = !!dns.hasToken;
   const provider = dns.dnsProvider || '';
+  const coveredDomains = Array.from(new Set((certs || []).flatMap((c) => c.domains || []).map((d) => String(d).trim()).filter(Boolean)));
+  const coveredText = coveredDomains.join('、');
 
   $('#view').innerHTML = `
     <div class="view">
@@ -2665,7 +2693,7 @@ function renderCerts(force = false) {
 
       <section class="card section">
         <div class="section-head">
-          <div class="section-title"><strong>已签发证书</strong><span>保存在本机 userData\\certs\\ 下，私钥只留在 frpc 这台机器上。</span></div>
+          <div class="section-title"><strong>已签发证书</strong><span>${coveredDomains.length ? `已覆盖域名：${esc(coveredText)} · ` : ''}保存在本机 userData\\certs\\ 下，私钥只留在 frpc 这台机器上。</span></div>
           <button class="btn small" type="button" data-act="certs.refresh">${icon('reload')}<span>刷新</span></button>
         </div>
         ${certs.length
@@ -3427,10 +3455,12 @@ async function handleAction(act, dataset, btn) {
       }
       case 'proxyform.type': {
         setProxyFormType(dataset.type);
+        refreshDomainReadiness();
         break;
       }
       case 'proxyform.plugin': {
         setProxyPluginFields(dataset.plugin || '');
+        refreshDomainReadiness();
         break;
       }
       case 'proxyform.cert.pick': {
@@ -3446,6 +3476,7 @@ async function handleAction(act, dataset, btn) {
           if (domains && !domains.value.trim()) {
             domains.value = (cert.domains || []).filter((d) => !d.startsWith('*.')).join(', ') || cert.domain;
           }
+          refreshDomainReadiness();
           toast('success', '已填入证书路径', cert.domain);
         }
         break;
@@ -3702,6 +3733,7 @@ function openProxyEditor({ mode, proxy = null, preset = null }) {
             <label>自定义域名（逗号分隔）</label>
             <input class="input" id="pf-domains" name="customDomains" value="${esc(initial.customDomains)}" placeholder="example.com, sub.example.com" />
             <div class="field-hint">HTTP/HTTPS 类型必填；使用 frps 的 vhost 域名转发。</div>
+            <div class="field-hint" id="pf-domain-readiness" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:4px"></div>
           </div>
           <div class="field span-2 hidden" id="pf-plugin-field">
             <label>HTTPS 证书 / TLS 终止</label>
@@ -3755,6 +3787,7 @@ function openProxyEditor({ mode, proxy = null, preset = null }) {
     </div>`);
 
   setProxyFormType(initial.type);
+  refreshDomainReadiness();
   const form = $('#proxy-form');
   const submit = $('#pf-submit');
   if (submit) submit.addEventListener('click', () => submitProxyForm(form, mode));
@@ -3765,6 +3798,14 @@ function openProxyEditor({ mode, proxy = null, preset = null }) {
     if (!initial.remotePort && (initial.type === 'tcp' || initial.type === 'udp') && !proxy) {
       suggestRemotePort(initial.type);
     }
+  }
+  const domainsInput = $('#pf-domains');
+  if (domainsInput) {
+    let readyTimer = null;
+    domainsInput.addEventListener('input', () => {
+      clearTimeout(readyTimer);
+      readyTimer = setTimeout(() => refreshDomainReadiness(), 350);
+    });
   }
   setTimeout(() => { const name = $('#pf-name'); if (name) name.focus(); }, 30);
 }
@@ -3809,6 +3850,93 @@ function setProxyFormType(type) {
   else refreshProxyPluginFields();
   const remoteInput = $('#pf-remote');
   if (needsRemote && remoteInput && !remoteInput.value) suggestRemotePort(type);
+}
+
+/* ---------- 域名就绪提示（A/C） ----------
+ * 在代理表单里，输入域名时实时给出「证书覆盖 / vhost 端口 / DNS 解析」三个软提示，
+ * 全部只是提醒，不拦截保存。这样用户不会把没签证书、没解析的域名填进去后
+ * 等隧道跑起来才发现公网访问不了。 */
+
+function domainBadge(label, text, tone) {
+  const cls = tone === 'ok' ? 'tag ok' : tone === 'bad' ? 'tag bad' : tone === 'amber' ? 'tag amber' : 'tag';
+  return `<span class="${cls}">${esc(label)} · ${esc(text)}</span>`;
+}
+
+function vhostBadgeFor(type) {
+  const settings = (S.state && S.state.settings) || {};
+  const serverSummary = S.server && S.server.summary;
+  if (type === 'http') {
+    if (serverSummary && typeof serverSummary.vhostHTTPPort === 'number') {
+      return serverSummary.vhostHTTPPort
+        ? domainBadge('vhost', `服务器已开 HTTP 端口 ${serverSummary.vhostHTTPPort}`, 'ok')
+        : domainBadge('vhost', '服务器未开 vhostHTTPPort，http 代理会失败', 'bad');
+    }
+    return domainBadge('vhost', `按客户端设定 HTTP 端口 ${Number(settings.vhostHttpPort) || 80}`, '');
+  }
+  if (type === 'https') {
+    if (serverSummary && typeof serverSummary.vhostHTTPSPort === 'number') {
+      return serverSummary.vhostHTTPSPort
+        ? domainBadge('vhost', `服务器已开 HTTPS 端口 ${serverSummary.vhostHTTPSPort}`, 'ok')
+        : domainBadge('vhost', '服务器未开 vhostHTTPSPort，https 代理会失败', 'bad');
+    }
+    return domainBadge('vhost', `按客户端设定 HTTPS 端口 ${Number(settings.vhostHttpsPort) || 443}`, '');
+  }
+  return '';
+}
+
+function certBadgeFor(primary, pluginType) {
+  if (!pluginType) return '';
+  if (!primary) return domainBadge('证书', '填好域名后校验', '');
+  const certs = S.certs.list || [];
+  const covering = certs.filter((c) => (c.domains || []).some((pattern) => coversDomain(pattern, primary)));
+  if (covering.length) return domainBadge('证书', `已覆盖：${covering.map((c) => c.domain).join('、')}`, 'ok');
+  return domainBadge('证书', '未签发匹配证书', 'bad');
+}
+
+function renderDomainReadiness(badges) {
+  const box = $('#pf-domain-readiness');
+  if (box) box.innerHTML = badges.filter(Boolean).join('');
+}
+
+function refreshDomainReadiness() {
+  const box = $('#pf-domain-readiness');
+  if (!box) return;
+  const typeEl = $('#pf-type');
+  const type = typeEl ? typeEl.value : '';
+  if (type !== 'http' && type !== 'https') { renderDomainReadiness([]); return; }
+  const domainsInput = $('#pf-domains');
+  const domainsText = domainsInput ? domainsInput.value.trim() : '';
+  const domains = domainsText.split(/[,，\s]+/).map((d) => d.trim()).filter(Boolean);
+  const primary = domains[0] || '';
+  const pluginType = currentProxyPlugin();
+
+  const syncBadges = [primary ? vhostBadgeFor(type) : '', certBadgeFor(primary, pluginType)];
+  if (!primary) { renderDomainReadiness(syncBadges); return; }
+
+  syncBadges.push(domainBadge('DNS', '解析中…', ''));
+  renderDomainReadiness(syncBadges);
+
+  FRP.dnsResolve(primary).then((res) => {
+    const cur = $('#pf-domain-readiness');
+    if (!cur) return;
+    const nowType = $('#pf-type') ? $('#pf-type').value : '';
+    if (nowType !== 'http' && nowType !== 'https') { renderDomainReadiness([]); return; }
+    const nowText = ($('#pf-domains') ? $('#pf-domains').value.trim() : '');
+    const nowDomains = nowText.split(/[,，\s]+/).map((d) => d.trim()).filter(Boolean);
+    if (nowDomains[0] !== primary) return;
+    const info = (res && res.ok && res.data) ? res.data : { resolved: [], pointsToServer: false, error: '查询失败' };
+    const dnsBadge = (() => {
+      if (!info.resolved || !info.resolved.length) return domainBadge('DNS', '未解析（可能还没建 A 记录）', 'amber');
+      const server = (S.state && S.state.config && S.state.config.serverAddr) || '';
+      const addrText = info.resolved.slice(0, 3).join('、');
+      if (info.pointsToServer) return domainBadge('DNS', `已解析到 ${addrText}（指向服务器）`, 'ok');
+      return domainBadge('DNS', `已解析到 ${addrText}${server ? `（未指向服务器 ${server}）` : ''}`, 'amber');
+    })();
+    renderDomainReadiness([vhostBadgeFor(nowType), certBadgeFor(primary, currentProxyPlugin()), dnsBadge]);
+  }).catch(() => {
+    const cur = $('#pf-domain-readiness');
+    if (cur) renderDomainReadiness([vhostBadgeFor(type), certBadgeFor(primary, pluginType), domainBadge('DNS', '解析失败', 'amber')]);
+  });
 }
 
 async function submitProxyForm(form, mode) {
@@ -3883,6 +4011,8 @@ async function submitProxyForm(form, mode) {
     mode === 'edit' ? '代理已更新' : '代理已创建',
     `${name} · 配置已写入${reloaded ? '并已热重载' : '，隧道启动后生效'}`,
   );
+  const warnings = (res.data && res.data.warnings) || [];
+  if (warnings.length) toast('warn', '代理已保存，但请注意', warnings[0]);
   S.lastKeys.proxies = '';
   S.lastKeys.overview = '';
   renderCurrent({ force: true });

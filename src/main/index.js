@@ -44,7 +44,7 @@ const frpsConfig = require('./frpsconfig');
 const { TrayPanel } = require('./tray-panel');
 const frpsBinary = require('./frpsBinary');
 const updateModule = require('./update');
-const { AcmeManager } = require('./acme');
+const { AcmeManager, coversDomain, readCertCoverage } = require('./acme');
 const { CloudflareDns } = require('./dns');
 const { execFileP, tcpCheck, httpProbe, hashText, randomToken, formatDuration } = require('./util');
 
@@ -1167,6 +1167,57 @@ function scheduleHealth(delay = 1200) {
 const HEALTH_CONCURRENCY = 6;
 const HEALTH_BUDGET_MS = 7000;
 
+/* 判断一个字符串是不是 IPv4 字面量。 */
+function isIpLike(text) {
+  return /^\d{1,3}(?:\.\d{1,3}){3}$/.test(String(text || '').trim());
+}
+
+/* 解析域名的 A/AAAA 记录，并判断是否指向当前 frps 服务器（只对 IPv4 serverAddr 可靠）。
+ * 用于 http/https 代理的「域名解析」软检查：不参与三层判定，只是给用户一个提示。 */
+async function resolveDomainInfo(domain) {
+  const clean = String(domain || '').trim().toLowerCase().replace(/^\*\./, '');
+  if (!clean) return { resolved: [], pointsToServer: false, error: '缺少域名' };
+  try {
+    const dns = require('node:dns').promises;
+    const [a4, a6] = await Promise.allSettled([dns.resolve4(clean), dns.resolve6(clean)]);
+    const resolved = [];
+    if (a4.status === 'fulfilled') resolved.push(...a4.value);
+    if (a6.status === 'fulfilled') resolved.push(...a6.value);
+    let error = '';
+    if (!resolved.length) {
+      const reason = a4.status === 'rejected' ? a4.reason : (a6.status === 'rejected' ? a6.reason : null);
+      error = String((reason && (reason.code || reason.message)) || '无解析记录');
+    }
+    const server = String((model && model.serverAddr) || '').trim().toLowerCase();
+    let pointsToServer = false;
+    if (resolved.length && server && isIpLike(server)) {
+      pointsToServer = resolved.some((ip) => String(ip).toLowerCase() === server);
+    }
+    return { resolved, pointsToServer, error };
+  } catch (e) {
+    return { resolved: [], pointsToServer: false, error: String((e && (e.code || e.message)) || e) };
+  }
+}
+
+/* http/https + https2http/https2https 代理：证书实际覆盖的域名与代理绑定的域名是否一致。
+ * 只是软提示，不拦截保存（证书可能之后才补，或用户有意用不匹配的自签证书做测试）。 */
+function certCoverageWarnings(proxy) {
+  if (!proxy || !proxy.plugin || !proxy.plugin.crtPath) return [];
+  const domains = [];
+  if (Array.isArray(proxy.customDomains)) domains.push(...proxy.customDomains);
+  if (proxy.subdomain) domains.push(String(proxy.subdomain));
+  const unique = Array.from(new Set(domains.map((d) => String(d).trim().toLowerCase()).filter(Boolean)));
+  if (!unique.length) return [];
+  const coverage = readCertCoverage(proxy.plugin.crtPath);
+  if (!coverage.ok) return [`无法读取证书 ${proxy.plugin.crtPath}：${coverage.error}`];
+  const certDomains = coverage.domains || [];
+  const uncovered = unique.filter((d) => !certDomains.some((pattern) => coversDomain(pattern, d)));
+  if (uncovered.length) {
+    return [`证书不覆盖域名「${uncovered.join('、')}」（证书覆盖：${certDomains.join('、') || '(空)'}），浏览器会提示证书与域名不匹配`];
+  }
+  return [];
+}
+
 /* 限制并发的 map：结果按输入顺序返回，超出时间预算的条目留 null 给下一轮 */
 async function mapLimit(items, limit, worker) {
   const out = new Array(items.length).fill(null);
@@ -1217,7 +1268,15 @@ async function checkProxyHealth(p, ctx) {
     return [p.name, { ok: true, reason: null, ms: (local.ms || 0) + (server.ms || 0), error: null, layers, at }];
   }
   let pub;
-  const target = configModule.probeTargetFor(model, p, settings);
+  // vhost 端口是 frps 侧的配置。用户连过服务器、读到过 frps.toml 后，就该按服务器
+  // 实际的 vhost 端口探测；没连过（summary 为 null）或服务器没配（0）才退回客户端设定。
+  const srvSummary = serverConfig.summary || null;
+  const vhostOpts = {
+    ...settings,
+    vhostHttpPort: (srvSummary && srvSummary.vhostHTTPPort) || settings.vhostHttpPort,
+    vhostHttpsPort: (srvSummary && srvSummary.vhostHTTPSPort) || settings.vhostHttpsPort,
+  };
+  const target = configModule.probeTargetFor(model, p, vhostOpts);
   if (!target) {
     pub = { ok: false, ms: 0, error: type === 'http' || type === 'https' ? '缺少公网域名' : '缺少公网端口' };
     layers.public = { ok: false, ms: 0, error: pub.error, skipped: true };
@@ -1230,6 +1289,13 @@ async function checkProxyHealth(p, ctx) {
   } else {
     pub = await tcpCheck(target.host, target.port, 2500);
     layers.public = { ok: !!pub.ok, ms: pub.ms || 0, error: pub.error || null };
+  }
+  if (type === 'http' || type === 'https') {
+    const domain = configModule.firstDomainOf(p);
+    if (domain) {
+      const dnsInfo = await resolveDomainInfo(domain);
+      layers.dns = { ok: dnsInfo.resolved.length > 0, skipped: false, resolved: dnsInfo.resolved, pointsToServer: dnsInfo.pointsToServer, error: dnsInfo.error };
+    }
   }
   if (!pub.ok) {
     return [p.name, { ok: false, reason: '公网不可达', ms: (local.ms || 0) + (server.ms || 0) + (layers.public.ms || 0), error: pub.error || null, layers, at }];
@@ -1587,13 +1653,14 @@ function registerIpc() {
     if (validation.errors.length) {
       return { ok: false, error: validation.errors[0].message, errors: validation.errors, validation };
     }
+    const proxyWarnings = certCoverageWarnings(proxy);
     const result = await applyAndMaybeReload(next);
     if (!result.ok) return result;
     // 地址是这次现填的：顺手把「本机隧道目标」记到这个档案上，概览和服务器页才不会
     // 出现「本机隧道还没有归属到任何档案」。
     if (seed) settings = settingsModule.save({ clientServerId: seed.id });
     pushState();
-    return ok({ state: result.state, reloaded: result.reloaded, proxy, seededFrom: seed ? seed.name : '' });
+    return ok({ state: result.state, reloaded: result.reloaded, proxy, seededFrom: seed ? seed.name : '', warnings: proxyWarnings });
   });
 
   ipcMain.handle('proxy:delete', async (event, name) => {
@@ -2473,6 +2540,11 @@ function registerIpc() {
     acmeEmail: settings.acmeEmail || '',
     acmeStaging: !!settings.acmeStaging,
   }));
+
+  /* 代理表单 / 健康检查共用的域名解析：只做软提示，不阻塞任何保存或判定。 */
+  ipcMain.handle('dns:resolve', async (event, domain) => {
+    return ok(await resolveDomainInfo(String(domain || '').trim()));
+  });
 
   ipcMain.handle('dns:save', async (event, payload = {}) => {
     try {

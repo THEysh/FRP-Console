@@ -51,10 +51,41 @@ function certFolderFor(domain, staging) {
   return staging ? `${base}.staging` : base;
 }
 
+/* 通配符覆盖判定：`*.example.com` 覆盖 `app.example.com`，但不覆盖 `example.com` 本身、
+ * 也不覆盖 `a.b.example.com`（只吃一层标签）。用于「填写的域名是否已被某张证书覆盖」的软提示。 */
+function coversDomain(pattern, host) {
+  const p = String(pattern || '').trim().toLowerCase();
+  const h = String(host || '').trim().toLowerCase();
+  if (!p || !h) return false;
+  if (p === h) return true;
+  if (p.startsWith('*.')) {
+    const suffix = p.slice(1); // ".example.com"
+    if (!h.endsWith(suffix)) return false;
+    const label = h.slice(0, h.length - suffix.length); // "app"
+    return label && !label.includes('.');
+  }
+  return false;
+}
+
 function daysLeft(notAfter) {
   const t = new Date(notAfter).getTime();
   if (!t) return 0;
   return Math.max(0, Math.floor((t - Date.now()) / 86400000));
+}
+
+/* 读一张证书文件（crtPath 通常指向 fullchain.pem）实际覆盖的域名（SAN/CN），
+ * 返回扁平数组。用于「代理里填的域名和证书绑定的域名是否一致」的软校验。 */
+function readCertCoverage(crtPath) {
+  try {
+    const pem = fs.readFileSync(String(crtPath || ''), 'utf8');
+    const info = acme.crypto.readCertificateInfo(pem);
+    const cn = info.domains && info.domains.commonName;
+    const sans = (info.domains && Array.isArray(info.domains.altNames)) ? info.domains.altNames : [];
+    const domains = [cn, ...sans].filter(Boolean).map((d) => String(d));
+    return { ok: true, domains };
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e) };
+  }
 }
 
 class AcmeManager {
@@ -312,4 +343,4 @@ class AcmeManager {
   }
 }
 
-module.exports = { AcmeManager, daysLeft, certFolder, certFolderFor, dns01Name };
+module.exports = { AcmeManager, daysLeft, certFolder, certFolderFor, coversDomain, readCertCoverage, dns01Name };
