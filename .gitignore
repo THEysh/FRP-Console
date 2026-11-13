@@ -14,6 +14,9 @@ frp-console-backups/
 # 本机常驻的 frpc 运行时（frpc.exe + 含 token 的 frpc.toml，绝不入库）
 runtime/
 
+# 打包前自动下载的 frpc.exe（18 MB，由 tools/fetch-frpc.cjs 现取现用）
+vendor/frpc/
+
 # 本地日志与临时文件
 *.log
 *.tmp

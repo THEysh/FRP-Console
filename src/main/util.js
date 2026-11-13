@@ -121,6 +121,17 @@ function hashText(text) {
   return crypto.createHash('sha1').update(text).digest('hex');
 }
 
+/* 生成 auth.token / 面板密码这类“机器自己配对用”的密钥。
+ * 只用小写字母数字：避免 0/O、1/l/I 在需要人工抄写时看错。 */
+function randomToken(length = 24) {
+  const alphabet = 'abcdefghijkmnpqrstuvwxyz23456789';
+  const size = Math.min(64, Math.max(8, Number(length) || 24));
+  const bytes = crypto.randomBytes(size);
+  let out = '';
+  for (let i = 0; i < size; i += 1) out += alphabet[bytes[i] % alphabet.length];
+  return out;
+}
+
 function formatDuration(ms) {
   if (!ms || ms < 0) return '0 秒';
   const sec = Math.floor(ms / 1000);
@@ -166,6 +177,7 @@ module.exports = {
   readJson,
   writeJsonAtomic,
   hashText,
+  randomToken,
   formatDuration,
   parseTimestamp,
   logLevelOf,

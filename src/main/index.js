@@ -44,7 +44,7 @@ const frpsConfig = require('./frpsconfig');
 const { TrayPanel } = require('./tray-panel');
 const frpsBinary = require('./frpsBinary');
 const updateModule = require('./update');
-const { execFileP, tcpCheck, httpProbe, hashText, formatDuration } = require('./util');
+const { execFileP, tcpCheck, httpProbe, hashText, randomToken, formatDuration } = require('./util');
 
 const assetsDir = path.join(__dirname, '..', '..', 'assets');
 const preloadPath = path.join(__dirname, 'preload.js');
@@ -121,6 +121,10 @@ function serverProfileView(profile) {
     username: profile.username,
     clientPort: profile.clientPort,
     hasToken: !!profile.clientToken,
+    /* Token 只是这台机器和它自己的 frps 之间的共享密钥，和 frpc.toml 里的明文
+     * 是同一个值（「高级编辑」里本来就看得见）。给渲染层是为了让「服务端配置
+     * 向导」默认就用这个值，服务端和客户端天然一致，用户不用手抄。 */
+    token: profile.clientToken || '',
     configPath: profile.configPath,
     serviceName: profile.serviceName,
     dashboardUrl: profile.dashboardUrl,
@@ -1651,9 +1655,17 @@ function registerIpc() {
     // 编辑时留空表示保持原值；显式 clearToken 才允许清空。
     if (payload.clearToken) patch.clientToken = '';
     else if (payload.clientToken !== undefined) patch.clientToken = payload.clientToken;
-    // 新建档案没填 Token 时沿用本机 frpc.toml 的 Token：同一个 frps 上本来就是同一个。
-    if (!payload.id && !patch.clientToken && model && model.auth && model.auth.token) {
-      patch.clientToken = model.auth.token;
+    /* 新建档案没填 Token：
+     *  - 同一台 frps 上已经有档案 → 沿用那台的 Token（它们本来就该一致）；
+     *  - 全新的服务器 → 现场生成一个随机 Token。这个值会作为「服务端配置向导」
+     *    的默认 token，保存时同时写进 frps.toml 和本机 frpc.toml，
+     *    所以用户从头到尾不需要自己编 Token，也不需要人工核对两边是否一致。 */
+    if (!payload.id && !patch.clientToken) {
+      const sibling = serverProfiles().find((item) => item.host.toLowerCase() === host.toLowerCase()
+        && Number(item.clientPort) === (Number(patch.clientPort) || 7000)
+        && item.clientToken);
+      patch.clientToken = (sibling && sibling.clientToken) || randomToken(24);
+      patch.tokenGenerated = !sibling;
     }
     const profile = upsertServerProfile(patch, { activate: true });
     const password = String(payload.password || '');
@@ -1666,13 +1678,29 @@ function registerIpc() {
     // 改了地址就不再沿用旧主机的密码，避免“换了 IP 但还拿老密码去登录”的死循环。
     const hostChanged = !!(before && before.host.toLowerCase() !== profile.host.toLowerCase());
     if (hostChanged && !password) settingsModule.clearServerSecret(profile.id);
-    if (serverSession.connected && sessionServerId === profile.id && hostChanged) {
+    /* 新建档案 = 切换了「当前要配置的服务器」。SSH 会话还停在上一台上时，
+     * 页面会继续显示上一台的 frps 状态，看起来像“新建完没反应”，
+     * 还会顺手提示“本机隧道指向其他服务器”。这里直接断开，
+     * 让页面立刻变成这台新服务器的连接表单。 */
+    let disconnected = '';
+    const sessionElsewhere = serverSession.connected && sessionServerId && sessionServerId !== profile.id;
+    if (sessionElsewhere || (serverSession.connected && sessionServerId === profile.id && hostChanged)) {
+      if (sessionElsewhere) {
+        const previous = findServerProfile(sessionServerId);
+        disconnected = (previous && previous.name) || serverSession.host || '上一台服务器';
+      }
       serverSession.disconnect();
       sessionServerId = '';
       serverConfig = { path: '', content: '', summary: null, error: '' };
       bumpSessionEpoch();
     }
-    return ok({ ...serverState(), hostChanged });
+    return ok({
+      ...serverState(),
+      hostChanged,
+      disconnected,
+      created: !payload.id,
+      tokenGenerated: !!patch.tokenGenerated,
+    });
   });
 
   ipcMain.handle('server:profile-delete', async (event, payload = {}) => {
@@ -1932,57 +1960,125 @@ function registerIpc() {
     return ok({ ...result, localSync, state: serverState(), appState: buildState() });
   });
 
+  /*
+   * 服务器页的检查是「服务器侧就绪」判定，不是全链路检测。
+   *
+   * 分工：
+   *   这里（服务器页）  → SSH 通、frps 在跑、bindPort 在服务器本机监听、Token 与本机一致。
+   *                       全绿只代表「这台服务器已经准备好接收客户端」。
+   *   概览 / 代理映射   → local → tunnel → public 三层，代表「用户实际能不能访问」。
+   *
+   * 以前这里做的是三层，和概览页重复，而且「本地服务」这一层在还没建代理时
+   * 必然是红的，用户会误以为服务器配置失败。
+   */
   ipcMain.handle('server:selftest', async (event, payload = {}) => {
     const layer = String(payload.layer || '');
     const startedAt = Date.now();
-    if (layer === 'local') {
-      const snapshot = manager ? manager.snapshot() : null;
-      const proxies = model ? model.proxies || [] : [];
-      const ports = [...new Set(proxies.map((proxy) => Number(proxy.localPort)).filter((port) => port > 0))];
-      if (snapshot && snapshot.connected && ports.length) {
-        let reachable = 0;
-        const failedPorts = [];
-        for (const port of ports.slice(0, 8)) {
-          const probe = await tcpCheck('127.0.0.1', port, 1800);
-          if (probe.ok) reachable += 1;
-          else failedPorts.push(port);
-        }
-        if (reachable === ports.length) {
-          return ok({ layer, ok: true, ms: Date.now() - startedAt, detail: `frpc 已连接，本地端口 ${reachable}/${ports.length} 可达` });
-        }
+    if (!serverSession.connected) {
+      return ok({ layer, ok: false, ms: 0, reason: 'SSH 未连接', detail: '先连接服务器再做检查' });
+    }
+    const epoch = sessionEpoch;
+    const active = activeServerProfile();
+    const summary = serverConfig.summary || null;
+    const bindPort = Number((summary && summary.bindPort) || (active && active.clientPort) || 0);
+
+    if (layer === 'ssh') {
+      const result = await serverSession.exec('echo ok', 6000);
+      if (epoch !== sessionEpoch) return staleFail();
+      if (result.ok && /ok/.test(result.stdout || '')) {
+        return ok({ layer, ok: true, ms: Date.now() - startedAt, detail: `SSH 已登录 ${serverSession.username}@${serverSession.host}，命令往返 ${Date.now() - startedAt} ms` });
+      }
+      return ok({ layer, ok: false, ms: Date.now() - startedAt, reason: 'SSH 通道异常', detail: (result.stderr || '命令执行失败').trim().slice(0, 160) });
+    }
+
+    if (layer === 'service') {
+      /* 一条脚本读三种托管方式，免得为了“在不在跑”来回 SSH 三趟。 */
+      const rawUnit = (active && active.serviceName) || (serverSession.info && serverSession.info.serviceName) || 'frps';
+      // 单元名会拼进 shell 命令，只放行 systemd 允许的字符，避免带引号的名字造成注入。
+      const unit = /^[A-Za-z0-9_.@-]+$/.test(rawUnit) ? rawUnit : 'frps';
+      const script = [
+        `echo @@ACTIVE; systemctl is-active -- ${unit} 2>/dev/null || true`,
+        `echo @@ENABLED; systemctl is-enabled -- ${unit} 2>/dev/null || true`,
+        "echo @@PROC; for d in /proc/[0-9]*; do [ \"$(cat $d/comm 2>/dev/null)\" = frps ] && echo \"$d\"; done | head -n 1",
+        "echo @@DOCKER; docker ps --format '{{.Names}}\\t{{.Status}}' 2>/dev/null | grep -i frp | head -n 1",
+      ].join('; ');
+      const result = await serverSession.exec(script, 12000);
+      if (epoch !== sessionEpoch) return staleFail();
+      const sections = {};
+      let current = '';
+      for (const line of String(result.stdout || '').split(/\r?\n/)) {
+        const mark = /^@@(\w+)$/.exec(line.trim());
+        if (mark) { current = mark[1]; sections[current] = []; continue; }
+        if (current) sections[current].push(line.trim());
+      }
+      const pick = (key) => (sections[key] || []).filter(Boolean)[0] || '';
+      const unitActive = pick('ACTIVE');
+      const unitEnabled = pick('ENABLED');
+      const pid = pick('PROC').replace(/^\/proc\//, '');
+      const dockerLine = pick('DOCKER');
+      const dockerParts = dockerLine ? dockerLine.split('\t') : [];
+      const dockerUp = !!dockerLine && /up|healthy|running/i.test(dockerParts[1] || '') && !/unhealthy|restarting|dead/i.test(dockerParts[1] || '');
+      if (unitActive === 'active' || pid || dockerUp) {
+        const where = unitActive === 'active' ? `${unit}.service 正在运行` : dockerUp ? `容器 ${dockerParts[0]} 正在运行` : `frps 进程运行中（PID ${pid || '—'}）`;
+        const boot = unitEnabled === 'enabled' ? '，已设为开机自启' : '';
+        return ok({ layer, ok: true, ms: Date.now() - startedAt, detail: `${where}${boot}` });
+      }
+      return ok({
+        layer,
+        ok: false,
+        ms: Date.now() - startedAt,
+        reason: 'frps 没有运行',
+        detail: unitActive === 'failed' ? `${unit}.service 处于 failed，展开实时日志看原因` : `没有找到运行的 frps（${unit}.service 未激活，也没有 frps 进程或容器）`,
+      });
+    }
+
+    if (layer === 'bindPort') {
+      if (!bindPort) return ok({ layer, ok: false, ms: Date.now() - startedAt, reason: 'bindPort 未知', detail: '服务器上没有可读的 frps 配置，先在向导里生成一份' });
+      const result = await serverSession.exec(
+        `echo @@SS; (ss -lntH 2>/dev/null || ss -lnt 2>/dev/null || netstat -lnt 2>/dev/null) | grep -E '[:.]${bindPort}([[:space:]]|$)' | head -n 3`,
+        12000,
+      );
+      if (epoch !== sessionEpoch) return staleFail();
+      const body = String(result.stdout || '');
+      const ssPart = (/@@SS([\s\S]*?)(?:@@|$)/.exec(body) || [])[1] || '';
+      const listenLine = ssPart.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)[0] || '';
+      if (listenLine) {
+        return ok({ layer, ok: true, ms: Date.now() - startedAt, detail: `服务器本机已在 ${bindPort} 上监听（${listenLine.replace(/\s+/g, ' ').slice(0, 90)}）` });
+      }
+      return ok({
+        layer,
+        ok: false,
+        ms: Date.now() - startedAt,
+        reason: 'bindPort 未监听',
+        detail: `ss/netstat 里没有 ${bindPort}。常见原因：frps 用了别的 bindPort，或配置改完没有重启 frps`,
+      });
+    }
+
+    if (layer === 'token') {
+      const serverToken = String((summary && summary.token) || '');
+      const clientToken = String((active && active.clientToken) || (model && model.auth && model.auth.token) || '');
+      const boundName = active ? active.name : '当前档案';
+      if (!serverToken && !clientToken) {
+        return ok({ layer, ok: true, ms: Date.now() - startedAt, detail: '服务端与本机都没有启用 Token（auth 关闭）' });
+      }
+      if (!serverToken) {
+        return ok({ layer, ok: false, ms: Date.now() - startedAt, reason: '服务端未启用鉴权', detail: 'frps.toml 里没有 auth.token，但本机客户端配了 Token，登录会被拒' });
+      }
+      if (!clientToken) {
+        return ok({ layer, ok: false, ms: Date.now() - startedAt, reason: '本机没有 Token', detail: `服务端已启用 Token，但档案「${boundName}」里没有，隧道登录会失败` });
+      }
+      if (serverToken !== clientToken) {
         return ok({
           layer,
           ok: false,
           ms: Date.now() - startedAt,
-          reason: '本地服务不通',
-          detail: `frpc 已连接，本地端口 ${reachable}/${ports.length} 可达${failedPorts.length ? `，不通：${failedPorts.join(', ')}` : ''}`,
+          reason: 'Token 不一致',
+          detail: `服务端 ${serverToken.slice(0, 4)}… 与本机 ${clientToken.slice(0, 4)}… 不同，重新保存一次向导即可让两边自动对齐`,
         });
       }
-      if (serverSession.connected) {
-        return ok({ layer, ok: true, ms: Date.now() - startedAt, detail: 'SSH 通道可达（未检测到本地 frpc 代理）' });
-      }
-      return ok({ layer, ok: false, ms: Date.now() - startedAt, reason: '本地服务不通', detail: 'SSH 通道断开' });
+      return ok({ layer, ok: true, ms: Date.now() - startedAt, detail: `服务端与本机 Token 一致（${serverToken.slice(0, 4)}…，${serverToken.length} 位）` });
     }
-    if (layer === 'tunnel') {
-      const host = (model && model.serverAddr) || '';
-      const port = Number((model && model.serverPort) || 0);
-      if (!host || !port) return ok({ layer, ok: false, ms: Date.now() - startedAt, reason: '本地到服务器不可达', detail: '未配置 frps 地址或端口' });
-      const probe = await tcpCheck(host, port, 3000);
-      if (!probe.ok) return ok({ layer, ok: false, ms: probe.ms, reason: '本地到服务器不可达', detail: `${host}:${port} TCP 握手失败` });
-      return ok({ layer, ok: true, ms: probe.ms, detail: `${host}:${port} TCP 握手成功` });
-    }
-    if (layer === 'public') {
-      if (!serverSession.connected) return ok({ layer, ok: false, ms: Date.now() - startedAt, reason: '公网不可达', detail: 'SSH 未连接' });
-      const epoch = sessionEpoch;
-      const result = await serverSession.exec(
-        "curl -sS --max-time 10 https://ifconfig.me 2>/dev/null || wget -qO- --timeout=10 https://ifconfig.me 2>/dev/null || true",
-        14000,
-      );
-      if (epoch !== sessionEpoch) return staleFail();
-      const egress = (result.stdout || '').trim().split(/\s+/)[0];
-      if (egress) return ok({ layer, ok: true, ms: Date.now() - startedAt, detail: `服务器出口 IP ${egress}` });
-      return ok({ layer, ok: false, ms: Date.now() - startedAt, reason: '公网不可达', detail: '服务器无法访问外网或缺少 curl/wget' });
-    }
+
     return fail('未知的检测层');
   });
 
@@ -2008,6 +2104,21 @@ function registerIpc() {
     if (epoch !== sessionEpoch) return staleFail();
     if (!result.ok) return fail(result.error, { state: serverState() });
     await loadServerSnapshot({ inspect: true, epoch });
+    /* 刚写进服务器的 bindPort / Token 要回写到当前档案，否则「服务器就绪检查」的
+     * Token 那一层永远在拿旧值和线上配置比；档案更新后概览上的「切换隧道并重启」
+     * 也会自然亮起来，提示本机 frpc 还在用旧 Token。 */
+    const savedSummary = serverConfig.summary;
+    if (sessionServerId && savedSummary) {
+      const owner = findServerProfile(sessionServerId);
+      if (owner) {
+        upsertServerProfile({
+          id: owner.id,
+          clientPort: Number(savedSummary.bindPort) || owner.clientPort,
+          clientToken: savedSummary.authEnabled ? savedSummary.token : '',
+          configPath: result.configPath || serverConfig.path || owner.configPath,
+        });
+      }
+    }
     return ok({ backup: result.backup, restarted: result.restarted, serverId: sessionServerId, state: serverState() });
   });
 
@@ -2163,12 +2274,14 @@ function startPolling() {
 follower.on('lines', (lines) => send('logs:append', lines));
 follower.on('reset', () => send('logs:reset', { lines: follower.recent(300) }));
 
-/* 首次运行（哪儿都找不到 frpc.toml）时给一份能直接改的模板：服务器地址留空，
- * 只带一条 Windows-RDP 代理。新手不用从零写 TOML，包里也不会夹带任何人的服务器。
- * 只生成一次：用户之后自己删掉，也不会再冒出来。 */
+/* 首次运行（哪儿都找不到 frpc.toml）时给一份骨架：服务器地址与 Token 留空，
+ * **不带任何代理**。以前这里预置了一条 Windows-RDP，结果新用户装完就在概览看到
+ * 一条红色的「本地服务不通」——那台机器的 3389 根本没开，看起来像程序坏了。
+ * 现在隧道里没有代理，等用户自己加，加一条绿一条。 */
 const STARTER_CONFIG = [
   '# FRP 控制台生成的默认配置。',
-  '# 把 serverAddr / auth.token 换成你自己服务器的，再到「设置 → 服务器连接」点「保存并重启」。',
+  '# 服务器地址和 Token 会在「服务器」页连上服务器后自动写入，通常不需要手改这里。',
+  '# 要加穿透规则，去「代理映射」新增，或到「服务发现」扫本机端口直接发布。',
   'serverAddr = ""',
   'serverPort = 7000',
   'loginFailExit = false',
@@ -2179,21 +2292,30 @@ const STARTER_CONFIG = [
   'log.to = "./frpc.log"',
   'log.level = "info"',
   '',
-  '[[proxies]]',
-  'name = "Windows-RDP"',
-  'type = "tcp"',
-  'localIP = "127.0.0.1"',
-  'localPort = 3389',
-  'remotePort = 13389',
-  '',
 ].join('\n');
+
+/* 安装目录里的东西（含 resources/frpc 下内置的 frpc.exe）在一次升级中会被
+ * 「先卸载旧版再装新版」整体删掉，配置文件绝不能放在那里。
+ * 开发/便携解压运行时 app.getAppPath() 也在临时/解压目录里，同样不能放配置。 */
+function isInsideInstallDir(dir) {
+  if (!dir) return false;
+  const target = path.resolve(dir).toLowerCase();
+  const roots = [];
+  try { roots.push(path.resolve(path.dirname(process.execPath)).toLowerCase()); } catch { /* ignore */ }
+  try { roots.push(path.resolve(process.resourcesPath).toLowerCase()); } catch { /* ignore */ }
+  try { roots.push(path.resolve(app.getAppPath()).toLowerCase()); } catch { /* ignore */ }
+  return roots.some((root) => target === root || target.startsWith(`${root}${path.sep}`));
+}
 
 function ensureStarterConfig() {
   if (paths.configPath && fs.existsSync(paths.configPath)) return false;
   if (settings.starterConfigCreated) return false;
-  // 优先放在 frpc.exe 同目录（和 frp 官方压缩包的习惯一致）；不可写时退回数据目录。
+  /* 优先放在 frpc.exe 同目录（和 frp 官方压缩包的习惯一致），但那必须是一个
+   * 升级不会清掉的位置 —— 内置 frpc.exe 在安装目录里，同目录写配置等于每次
+   * 升级都丢一次。安装目录里的 frpc 一律把配置放到用户数据目录。 */
   const candidates = [];
-  if (paths.frpcPath) candidates.push(path.join(path.dirname(paths.frpcPath), 'frpc.toml'));
+  const frpcDir = paths.frpcPath ? path.dirname(paths.frpcPath) : '';
+  if (frpcDir && !isInsideInstallDir(frpcDir)) candidates.push(path.join(frpcDir, 'frpc.toml'));
   candidates.push(path.join(settingsModule.dataDir(), 'frpc.toml'));
   for (const file of candidates) {
     try {

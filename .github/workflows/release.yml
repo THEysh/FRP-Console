@@ -36,6 +36,25 @@ jobs:
       - name: 安装依赖
         run: npm ci --no-audit --no-fund
 
+      # 安装包要内置 frpc.exe（extraResources 从 vendor/frpc 取）。这里显式下载并校验，
+      # 而不是靠 npm script：CI 跑的是 npx electron-builder，不会经过 dist 脚本。
+      # 下载失败必须让流水线红掉——否则打出来的包缺 frpc，用户装完直接不可用。
+      - name: 准备内置 frpc.exe
+        shell: pwsh
+        env:
+          FRP_DOWNLOAD_MIRROR: ${{ vars.FRP_DOWNLOAD_MIRROR }}
+        run: |
+          for ($i = 1; $i -le 3; $i++) {
+            node tools/fetch-frpc.cjs
+            if ($LASTEXITCODE -eq 0 -and (Test-Path vendor/frpc/frpc.exe)) { break }
+            if ($i -lt 3) {
+              Write-Host "::warning::第 $i 次获取 frpc 失败，20 秒后重试"
+              Start-Sleep -Seconds 20
+            }
+          }
+          if (-not (Test-Path vendor/frpc/frpc.exe)) { throw "未拿到 vendor/frpc/frpc.exe，安装包会缺少内置 frpc" }
+          Get-Item vendor/frpc/frpc.exe | Select-Object Name, Length
+
       # 下载类失败绝大多数是网络抖动，重试一次基本就过了；两次都失败就把错误原样抛出。
       - name: 打包 NSIS 安装包
         shell: pwsh

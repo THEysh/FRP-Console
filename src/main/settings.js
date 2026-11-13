@@ -226,6 +226,18 @@ function save(patch) {
   return cached;
 }
 
+function bundledFrpcDir() {
+  // 安装包内置的 frpc.exe：electron-builder 的 extraResources 把它放在
+  // <安装目录>/resources/frpc/。它永远和安装包同一个版本，优先级高于
+  // “用户自己在别处放了一份”的猜测。
+  try {
+    if (!app.isPackaged) return '';
+    return path.join(process.resourcesPath, 'frpc');
+  } catch {
+    return '';
+  }
+}
+
 function candidateDirs(settings) {
   const dirs = [];
   const add = (dir) => {
@@ -233,12 +245,17 @@ function candidateDirs(settings) {
     const resolved = path.resolve(dir);
     if (!dirs.includes(resolved)) dirs.push(resolved);
   };
+  add(bundledFrpcDir());
   add(process.env.PORTABLE_EXECUTABLE_DIR);
   add(path.dirname(process.execPath));
   add(process.cwd());
   try {
     add(app.getAppPath());
     add(path.dirname(app.getAppPath()));
+    // 开发/解压运行的便利位置：npm run fetch:frpc 会把 frpc.exe 放到这里。
+    // 只加这个（内含 exe、不含配置），不加仓库里的 runtime/ —— 那会把开发者
+    // 自己正在用的 frpc.toml 连带真实 Token 一起认成“用户配置”。
+    add(path.join(app.getAppPath(), 'vendor', 'frpc'));
   } catch {
     /* ignore */
   }
@@ -321,6 +338,7 @@ module.exports = {
   refreshPaths,
   discoverFrpc,
   discoverConfig,
+  bundledFrpcDir,
   settingsFile,
   dataDir,
   logPathFromConfig,

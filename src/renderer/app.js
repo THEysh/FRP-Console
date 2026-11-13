@@ -427,7 +427,7 @@ function renderOverview(force = false) {
   const issues = [];
   if (state.configError) issues.push(`<div class="note error">${icon('alert')}<div>${esc(state.configError)}</div></div>`);
   if (onlyMissingServer) {
-    issues.push(`<div class="note">${icon('alert')}<div><strong>还没有配置服务器</strong><br>到「设置 → 服务器连接」填你自己的 frps 地址与 Token，保存后点“启动隧道”即可。<br><span style="opacity:.75">下面这条 Windows-RDP 是自带的示例代理，本地端口 3389 可直接用。</span></div></div>`);
+    issues.push(`<div class="note">${icon('alert')}<div><strong>还没有连上服务器</strong><br>到「服务器」页新建一个档案，填 IP 和 SSH 密码，连上后一键初始化 frps——地址与 Token 会自动写进本机配置，不用手填。<br><span style="opacity:.75">服务器就绪后，去「代理映射」加一条穿透规则，回来这里看三层是否全绿。</span></div></div>`);
   } else if (validationErrors.length) {
     issues.push(`<div class="note error">${icon('alert')}<div><strong>配置存在 ${validationErrors.length} 处错误</strong><br>${esc(validationErrors[0].message)}</div></div>`);
   }
@@ -503,7 +503,7 @@ function renderOverview(force = false) {
         <div class="card metric">
           <div class="metric-top"><span class="metric-label">连通性异常</span><span class="metric-icon">${icon('cpu')}</span></div>
           <div class="metric-value">${config.serverAddr ? esc(counts.unhealthy || 0) : '—'}</div>
-          <div class="metric-foot"><span class="${!config.serverAddr ? '' : counts.unhealthy ? 'down' : 'up'}">${!config.serverAddr ? '尚未开始检测' : counts.unhealthy ? layerFailText(counts) : '三层检查均通过'}</span></div>
+          <div class="metric-foot"><span class="${!config.serverAddr ? '' : counts.unhealthy ? 'down' : 'up'}">${!config.serverAddr ? '尚未开始检测' : counts.unhealthy ? layerFailText(counts) : '全部代理三层全通（本地 → 隧道 → 公网）'}</span></div>
         </div>
         <div class="card metric">
           <div class="metric-top"><span class="metric-label">运行时长</span><span class="metric-icon">${icon('clock')}</span></div>
@@ -523,10 +523,10 @@ function renderOverview(force = false) {
 
         <div class="stack">
           <section class="card">
-            <div class="card-head">
-              <div class="card-title">${icon('server', 'ct-icon')}<span>连接信息</span></div>
-              <button class="btn ghost small" type="button" data-act="nav" data-view="settings">设置</button>
-            </div>
+          <div class="card-head">
+            <div class="card-title">${icon('server', 'ct-icon')}<span>连接信息</span></div>
+            <button class="btn ghost small" type="button" data-act="nav" data-view="server">服务器页</button>
+          </div>
             <div class="card-pad" style="padding-top:0">
               <div class="detail-list">
                 ${detailRow('服务器', config.serverAddr ? `${config.serverAddr}:${config.serverPort}` : '未配置')}
@@ -919,7 +919,15 @@ function applyServerState(data, seq) {
     S.server.wizard = wizardFromSummary(data.summary);
     S.server.previewText = '';
   } else if (!data.summary && !S.server.wizard && !S.server.wizardDirty) {
-    S.server.wizard = { ...wizardDefaults(), token: randomToken(20), webPassword: randomToken(14) };
+    /* 服务器上还没有 frps.toml：向导直接沿用档案里那把已经自动生成的 Token。
+     * 这样「一键初始化」写进服务端的 token 和本机 frpc.toml 的 token 一开始就是
+     * 同一个值，用户完全不需要关心它。 */
+    const activeProfile = (S.server.profiles || []).find((p) => p.id === S.server.activeServerId);
+    S.server.wizard = {
+      ...wizardDefaults(),
+      token: (activeProfile && activeProfile.token) || randomToken(20),
+      webPassword: randomToken(14),
+    };
     S.server.previewText = '';
   }
   return true;
@@ -1021,21 +1029,23 @@ function selftestMarkup() {
   const st = S.server.selftest || {};
   const steps = st.steps || {};
   const conclusion = st.conclusion || '';
-  const tone = conclusion === '全链路通' ? 'green' : conclusion ? 'red' : 'muted';
+  const tone = conclusion === SELFTEST_OK ? 'green' : conclusion ? 'red' : 'muted';
   return `
     <div class="card-head">
       <div class="ch-icon">${icon('activity')}</div>
-      <div class="grow"><h3>全链路检测</h3><p>本地服务 → 本地到 frps → 服务器到公网，任一层失败立即短路。</p></div>
+      <div class="grow"><h3>服务器就绪检查</h3><p>只判断这台服务器是否准备好接收客户端：SSH → frps 运行 → bindPort 监听 → Token 一致。任一层失败立即短路。</p></div>
       <div class="page-actions">
         ${conclusion ? `<span class="badge ${tone}"><span class="bdot"></span>${esc(conclusion)}</span>` : ''}
-        <button class="btn primary" type="button" data-act="server.selftest" ${st.busy ? 'disabled' : ''}>${icon('activity')}<span>${st.busy ? '检测中…' : '开始检测'}</span></button>
+        <button class="btn primary" type="button" data-act="server.selftest" ${st.busy ? 'disabled' : ''}>${icon('activity')}<span>${st.busy ? '检查中…' : '检查服务器'}</span></button>
       </div>
     </div>
     <div class="st-steps">
-      ${selftestStepMarkup(steps, 'local', '①', '本地服务', '检查本机 frpc 与业务端口，或 SSH 通道是否可达')}
-      ${selftestStepMarkup(steps, 'tunnel', '②', '本地 → 远程服务器', '对 frps bindPort 做 TCP 握手')}
-      ${selftestStepMarkup(steps, 'public', '③', '远程服务器 → 公网', '让服务器访问外网并回显出口 IP')}
-    </div>`;
+      ${selftestStepMarkup(steps, 'ssh', '①', 'SSH 通道', '用一条最小命令确认还能在服务器上执行操作')}
+      ${selftestStepMarkup(steps, 'service', '②', 'frps 运行状态', '进程 / systemd / Docker 任一种在跑，并顺带确认开机自启')}
+      ${selftestStepMarkup(steps, 'bindPort', '③', 'bindPort 监听', '服务器本机 ss / netstat 里能否看到 frps 的 bindPort')}
+      ${selftestStepMarkup(steps, 'token', '④', 'Token 一致', '服务端 auth.token 与本机档案里的 Token 是否完全相同')}
+    </div>
+    <p class="st-foot">服务器就绪 ≠ 隧道可用。真正的「本地 → 隧道 → 公网」三层连通性在概览与代理映射页检查。</p>`;
 }
 
 function wizardField(label, name, value, opts = '') {
@@ -1416,7 +1426,8 @@ function tunnelDiff(active, tunnel) {
   return rows;
 }
 
-function profileBarMarkup() {
+function profileBarMarkup(options = {}) {
+  const showDiff = options.showDiff !== false;
   const s = S.server;
   const profiles = s.profiles || [];
   const active = activeServerProfile();
@@ -1424,24 +1435,28 @@ function profileBarMarkup() {
   const rows = tunnelDiff(active, tunnel);
   const boundToActive = !!(active && tunnel && tunnel.profileId === active.id);
   const synced = boundToActive && !rows.length;
-  const options = profiles.map((p) => `<option value="${esc(p.id)}" ${p.id === s.activeServerId ? 'selected' : ''}>${esc(p.name || p.host)}${p.host ? ` · ${esc(p.host)}` : ''}${p.id === s.clientServerId ? '（本机隧道）' : ''}</option>`).join('');
+  const profileOptions = profiles.map((p) => `<option value="${esc(p.id)}" ${p.id === s.activeServerId ? 'selected' : ''}>${esc(p.name || p.host)}${p.host ? ` · ${esc(p.host)}` : ''}${p.id === s.clientServerId ? '（本机隧道）' : ''}</option>`).join('');
 
+  /* 还没连上这台服务器时，讲“本机隧道指向别处”只会让人以为出错了。
+   * 这时候该说的是下一步动作：连上去。 */
   const badge = !active
     ? ''
-    : synced
-      ? `<span class="badge green"><span class="bdot"></span>本机隧道正指向此档案</span>`
-      : boundToActive
-        ? `<span class="badge amber"><span class="bdot"></span>档案已修改，本机隧道还是旧配置</span>`
-        : tunnel && tunnel.unarchived
-          ? `<span class="badge amber"><span class="bdot"></span>本机隧道尚未归档到任何档案</span>`
-          : `<span class="badge amber"><span class="bdot"></span>本机隧道指向${tunnel && tunnel.profileName ? `「${esc(tunnel.profileName)}」` : '其他服务器'}</span>`;
+    : !showDiff
+      ? `<span class="badge muted"><span class="bdot"></span>尚未连接，连接后会自动对齐本机隧道</span>`
+      : synced
+        ? `<span class="badge green"><span class="bdot"></span>本机隧道正指向此档案</span>`
+        : boundToActive
+          ? `<span class="badge amber"><span class="bdot"></span>档案已修改，本机隧道还是旧配置</span>`
+          : tunnel && tunnel.unarchived
+            ? `<span class="badge amber"><span class="bdot"></span>本机隧道尚未归档到任何档案</span>`
+            : `<span class="badge amber"><span class="bdot"></span>本机隧道指向${tunnel && tunnel.profileName ? `「${esc(tunnel.profileName)}」` : '其他服务器'}</span>`;
 
   const clientLine = tunnel && tunnel.addr
     ? `本机 frpc 当前连接 <code>${esc(tunnel.addr)}:${esc(tunnel.port || '—')}</code>`
     : '本机 frpc 还没有配置服务器地址';
 
   return `
-    <section class="card profile-card${active && !synced ? ' attention' : ''}">
+    <section class="card profile-card${active && showDiff && !synced ? ' attention' : ''}">
       <div class="profile-row">
         <div class="profile-heading">
           <div class="ch-icon">${icon('server')}</div>
@@ -1452,7 +1467,7 @@ function profileBarMarkup() {
         </div>
         <div class="profile-controls">
           <select class="input profile-select" id="server-profile-select" ${profiles.length ? '' : 'disabled'} ${s.switching ? 'disabled' : ''}>
-            ${options || '<option value="">还没有档案</option>'}
+            ${profileOptions || '<option value="">还没有档案</option>'}
           </select>
           <button class="btn" type="button" data-act="server.profile.new">${icon('plus')}<span>新建</span></button>
           <button class="btn ghost" type="button" data-act="server.profile.edit" ${active ? '' : 'disabled'}>${icon('edit')}<span>编辑</span></button>
@@ -1464,11 +1479,11 @@ function profileBarMarkup() {
           ${badge}
           <span class="profile-fact">SSH ${esc(active.username)}@${esc(active.host)}:${esc(active.port)}</span>
           <span class="profile-fact">frps 端口 ${esc(active.clientPort)}</span>
-          <span class="profile-fact">Token ${active.hasToken ? '已保存' : '未设置'}</span>
+          <span class="profile-fact">Token ${active.hasToken ? '已生成' : '未设置'}</span>
           ${active.hasPassword ? `<span class="profile-fact">${icon('shield')} 密码已保存</span>` : `<span class="profile-fact muted">${icon('shield')} 密码未保存</span>`}
-        ` : `<span class="profile-fact">先新建一个服务器档案，填入 IP、SSH 密码和 frps Token。</span>`}
+        ` : `<span class="profile-fact">先新建一个服务器档案，填入 IP 和 SSH 密码即可。</span>`}
       </div>
-      ${active && !synced ? `
+      ${active && showDiff && !synced ? `
         <div class="profile-diff">
           <div class="pd-head">
             <div class="pd-title">${icon('alert')}<span>${boundToActive ? '这个档案改过，但本机隧道仍在用旧参数' : (tunnel && tunnel.unarchived ? '本机隧道还没有归属到任何档案' : '当前查看的档案不是本机隧道目标')}</span></div>
@@ -1526,33 +1541,30 @@ function openServerProfileModal(mode = 'new') {
   const tunnel = s.tunnel || {};
   const profile = p || {
     name: '', host: '', port: 22, username: 'root', clientPort: 7000,
-    clientToken: '', configPath: '', dashboardUrl: '', hasPassword: false,
+    token: '', configPath: '', dashboardUrl: '', hasPassword: false,
   };
   const canFillFromClient = mode === 'new' && !!tunnel.addr;
-  /* 同一个 frps 上的档案用的都是同一个 Token。新建时直接把本机 frpc.toml 现有的
-   * Token 带出来，省掉“建完档案发现连不上、再回去翻配置”这一趟。可以随时改写。 */
-  const localToken = ((S.state && S.state.config && S.state.config.auth && S.state.config.auth.token) || '');
-  const prefillToken = mode === 'new' ? localToken : (profile.hasToken ? '' : localToken);
-  const tokenHint = prefillToken
-    ? '<span class="field-hint">已填入本机 Token</span>'
-    : (profile.hasToken ? '<span class="field-hint">已保存，留空保持不变</span>' : '');
+  /* Token 不再由用户填写：新建时由主进程生成一个随机值，作为「服务端配置向导」
+   * 的默认 token —— 保存 frps.toml 和写本机 frpc.toml 用的是同一个值，
+   * 两边天然一致。只有想接管已有 frps（它的 token 已经定死）时才需要动它。 */
+  const tokenLine = mode === 'edit'
+    ? (profile.hasToken
+      ? `<span class="field-hint">已生成（${esc(String(profile.token || '').slice(0, 4))}…，${String(profile.token || '').length} 位）· 与服务端 auth.token 一致</span>`
+      : '<span class="field-hint">未设置 · 保存后会自动生成</span>')
+    : '<span class="field-hint">保存后自动生成随机值，无需填写</span>';
   openModal(`
     <div class="modal" style="width:680px">
       <div class="modal-head">
         <div class="mh-icon">${icon('server')}</div>
         <div class="grow">
           <h3>${mode === 'edit' ? '编辑服务器档案' : '新建服务器档案'}</h3>
-          <p>SSH 信息用于管理 frps；frps 端口和 Token 用于本机 frpc 的隧道。</p>
+          <p>只需要服务器地址和 SSH 密码；frps 端口与 Token 控制台会自己处理。</p>
         </div>
         <button class="icon-btn modal-close" type="button" data-act="modal.close">${icon('x')}</button>
       </div>
       <form id="server-profile-form" class="modal-body" autocomplete="off" data-id="${esc(profile.id || '')}">
         ${canFillFromClient ? `<div class="pd-fill"><span>本机 frpc 正在连接 <code>${esc(tunnel.addr)}:${esc(tunnel.port || '—')}</code></span><button class="btn ghost small" type="button" id="profile-fill-client">${icon('download')}<span>用本机配置填入</span></button></div>` : ''}
         <div class="form-grid">
-          <div class="field span-2">
-            <label>档案名称</label>
-            <input class="input" name="name" value="${esc(profile.name || '')}" placeholder="例如 香港 frps、家里的服务器">
-          </div>
           <div class="field span-2">
             <label>服务器 IP / 域名 <span class="req">*</span></label>
             <input class="input" name="host" value="${esc(profile.host || '')}" placeholder="例如 frps.example.com" spellcheck="false">
@@ -1565,14 +1577,6 @@ function openServerProfileModal(mode = 'new') {
             <label>SSH 用户名</label>
             <input class="input" name="username" value="${esc(profile.username || 'root')}" spellcheck="false">
           </div>
-          <div class="field">
-            <label>frps 端口</label>
-            <input class="input" name="clientPort" type="number" min="1" max="65535" value="${esc(profile.clientPort || 7000)}">
-          </div>
-          <div class="field">
-            <label>frps Token ${tokenHint}</label>
-            <input class="input" name="clientToken" value="${esc(prefillToken)}" placeholder="${profile.hasToken ? '已保存，留空保持不变' : '与服务端 auth.token 一致'}" spellcheck="false">
-          </div>
           <div class="field span-2">
             <label>SSH 密码 ${profile.hasPassword ? '<span class="field-hint">已保存，留空保持不变</span>' : '<span class="field-hint">可留空，连接时再输入</span>'}</label>
             <div class="input-group">
@@ -1581,21 +1585,40 @@ function openServerProfileModal(mode = 'new') {
             </div>
             ${profile.hasPassword ? `<span class="field-hint"><a href="#" id="profile-forget-password">清除已保存的密码</a></span>` : ''}
           </div>
-          <div class="field">
-            <label>远程配置路径</label>
-            <input class="input" name="configPath" value="${esc(profile.configPath || '')}" placeholder="/etc/frp/frps.toml" spellcheck="false">
-          </div>
-          <div class="field">
-            <label>面板地址（可选）</label>
-            <input class="input" name="dashboardUrl" value="${esc(profile.dashboardUrl || '')}" placeholder="http://IP:4096" spellcheck="false">
+          <div class="field span-2">
+            <label>档案名称</label>
+            <input class="input" name="name" value="${esc(profile.name || '')}" placeholder="留空就用服务器地址，例如 香港 frps">
           </div>
         </div>
-        <div class="note">${icon('shield')}<div>每个档案独立保存 SSH 密码（Windows DPAPI 加密）。切换档案不会自动改本机隧道。</div></div>
+        <details class="adv-block" ${mode === 'edit' ? '' : ''}>
+          <summary>高级选项（一般不用改）</summary>
+          <div class="form-grid">
+            <div class="field">
+              <label>frps 端口 bindPort</label>
+              <input class="input" name="clientPort" type="number" min="1" max="65535" value="${esc(profile.clientPort || 7000)}">
+              <div class="field-hint">本机 frpc 连服务端用的端口，默认 7000</div>
+            </div>
+            <div class="field">
+              <label>frps Token</label>
+              <input class="input" name="clientToken" value="" placeholder="${mode === 'edit' ? '留空保持不变' : '留空自动生成'}" spellcheck="false">
+              ${tokenLine}
+            </div>
+            <div class="field">
+              <label>远程配置路径</label>
+              <input class="input" name="configPath" value="${esc(profile.configPath || '')}" placeholder="/etc/frp/frps.toml" spellcheck="false">
+            </div>
+            <div class="field">
+              <label>面板地址（可选）</label>
+              <input class="input" name="dashboardUrl" value="${esc(profile.dashboardUrl || '')}" placeholder="http://IP:4096" spellcheck="false">
+            </div>
+          </div>
+        </details>
+        <div class="note">${icon('shield')}<div>每个档案独立保存 SSH 密码（Windows DPAPI 加密）。保存后会自动连上去读取状态；服务器还没装 frps 时可以直接一键初始化。</div></div>
       </form>
       <div class="modal-foot">
         <span class="mf-left"></span>
         <button class="btn" type="button" data-act="modal.close">取消</button>
-        <button class="btn primary" type="button" data-act="server.profile.modal.save">${icon('check')}<span>保存档案</span></button>
+        <button class="btn primary" type="button" data-act="server.profile.modal.save">${icon('check')}<span>保存并连接</span></button>
       </div>
     </div>`);
 
@@ -1611,13 +1634,8 @@ function openServerProfileModal(mode = 'new') {
       setValue('name', tunnel.profileName || tunnel.addr || '');
       setValue('host', tunnel.addr || '');
       setValue('clientPort', tunnel.port || 7000);
-      setValue('clientToken', localToken || '');
       const hint = fill.parentElement;
-      if (hint) {
-        hint.innerHTML = localToken
-          ? '<span class="field-hint">已填入本机 frpc 的地址、端口与 Token。</span>'
-          : '<span class="field-hint">已填入地址与端口；本机 frpc.toml 里还没有 Token，请手动补上或连接服务器后自动写入。</span>';
-      }
+      if (hint) hint.innerHTML = '<span class="field-hint">已填入本机 frpc 正在用的地址与端口；Token 保存时自动生成。</span>';
     });
   }
 
@@ -1635,7 +1653,7 @@ function openServerProfileModal(mode = 'new') {
   }
 
   setTimeout(() => {
-    const first = $('#server-profile-form [name="name"]');
+    const first = $('#server-profile-form [name="host"]');
     if (first) first.focus();
   }, 30);
 }
@@ -1649,13 +1667,14 @@ async function saveServerProfileModal(btn) {
   };
   const host = value('host');
   if (!host) return toast('error', '请输入服务器 IP 或域名');
+  const password = form.querySelector('[name="password"]').value;
   const payload = {
     id: form.dataset.id || '',
     name: value('name'),
     host,
     port: Number(value('port')) || 22,
     username: value('username') || 'root',
-    password: form.querySelector('[name="password"]').value,
+    password,
     clientPort: Number(value('clientPort')) || 7000,
     clientToken: value('clientToken'),
     configPath: value('configPath'),
@@ -1674,10 +1693,23 @@ async function saveServerProfileModal(btn) {
     S.server.logs = '';
     applyServerState(res.data, seq);
     renderServer(true);
-    toast('success', '服务器档案已保存', `${payload.name || host}`);
+    const name = payload.name || host;
     if (res.data && res.data.hostChanged) {
       toast('warn', '档案地址已变更', '旧主机保存的密码已清除，下次连接需要重新输入');
+      return;
     }
+    /* 新建档案 = 现在要配置这台服务器。带上刚填的密码直接连，
+     * 页面会立刻变成这台服务器的状态/向导，而不是继续显示上一台。 */
+    if (res.data && res.data.created && res.data.savedCredential) {
+      toast('success', '档案已创建', `正在连接 ${name}…`);
+      await autoConnectActiveProfile();
+      return;
+    }
+    if (res.data && res.data.created) {
+      toast('success', '档案已创建，接着填 SSH 密码', `${name} · 连接后即可初始化 frps`);
+      return;
+    }
+    toast('success', '服务器档案已保存', name);
   });
 }
 
@@ -2009,14 +2041,14 @@ function connectedFormMarkup() {
       <div class="page-head">
         <div class="page-title">
           <h1>服务器</h1>
-          <p>通过 SSH 连接 frps 服务器，完成状态检查、配置向导、服务启停与全链路验证。</p>
+          <p>通过 SSH 登录自己的服务器，把 frps 装好、配置好、跑起来。</p>
         </div>
       </div>
-      ${profileBarMarkup()}
+      ${profileBarMarkup({ showDiff: false })}
       <section class="card">
         <div class="card-head">
           <div class="ch-icon">${icon('server')}</div>
-          <div class="grow"><h3>连接 frps 服务器</h3><p>需要服务器开放 SSH（默认 22）和登录密码。</p></div>
+          <div class="grow"><h3>连接 frps 服务器</h3><p>需要服务器开放 SSH（默认 22）和登录密码。全链路连通性在概览与代理映射页检查。</p></div>
         </div>
         <form id="server-form" class="server-form" autocomplete="off" onsubmit="return false">
           <div class="field span-2">
@@ -2050,7 +2082,7 @@ function connectedFormMarkup() {
                <span class="field-hint">${s.savedCredential ? '已保存密码：切换档案会自动连接并读取状态。' : '密码不会写入 frpc 配置或日志。'}</span>`}
         </div>
       </section>
-      <div class="note">${icon('shield')}<div>连接后可完成：状态检查 → 配置向导 → 保存并重启 → 全链路自检 → 查看映射与结构化日志。</div></div>
+      <div class="note">${icon('shield')}<div>连接后按顺序走：检查 frps 是否在跑 → 需要时一键从零初始化 → 保存配置并重启 → 做一次「服务器就绪检查」。都绿了再去代理映射添加隧道。</div></div>
     </div>`;
 }
 
@@ -2360,22 +2392,24 @@ function renderSelfTest() {
   if (panel) panel.innerHTML = selftestMarkup();
 }
 
+const SELFTEST_LAYERS = ['ssh', 'service', 'bindPort', 'token'];
+const SELFTEST_OK = '服务器就绪';
+
 async function runServerSelfTest() {
   const st = S.server.selftest || {};
   if (st.busy) return;
   S.server.selftest = {
     busy: true,
     conclusion: '',
-    steps: { local: { state: 'idle' }, tunnel: { state: 'idle' }, public: { state: 'idle' } },
+    steps: Object.fromEntries(SELFTEST_LAYERS.map((key) => [key, { state: 'idle' }])),
   };
   renderSelfTest();
-  const layers = ['local', 'tunnel', 'public'];
   let failure = '';
-  for (const layer of layers) {
+  for (const layer of SELFTEST_LAYERS) {
     S.server.selftest.steps[layer] = { state: 'running' };
     renderSelfTest();
     const res = await FRP.serverSelfTest(layer);
-    const data = res && res.ok ? res.data : { ok: false, reason: res ? res.error : '检测失败' };
+    const data = res && res.ok ? res.data : { ok: false, reason: res ? res.error : '检查失败' };
     S.server.selftest.steps[layer] = {
       state: data.ok ? 'ok' : 'fail',
       detail: data.detail || '',
@@ -2383,17 +2417,21 @@ async function runServerSelfTest() {
       ms: data.ms || 0,
     };
     if (!data.ok) {
-      failure = data.reason || data.detail || '检测失败';
-      const later = layers.slice(layers.indexOf(layer) + 1);
+      failure = data.reason || data.detail || '检查失败';
+      const later = SELFTEST_LAYERS.slice(SELFTEST_LAYERS.indexOf(layer) + 1);
       for (const key of later) S.server.selftest.steps[key] = { state: 'skipped' };
       break;
     }
     renderSelfTest();
   }
   S.server.selftest.busy = false;
-  S.server.selftest.conclusion = failure ? failure : '全链路通';
+  S.server.selftest.conclusion = failure || SELFTEST_OK;
   renderSelfTest();
-  toast(failure ? 'error' : 'success', failure ? '全链路检测未通过' : '全链路检测通过', failure);
+  if (failure) {
+    toast('error', '服务器还没准备好', failure);
+    return;
+  }
+  toast('success', '服务器已就绪', '接下来去「代理映射」添加隧道，三层全绿即可访问');
 }
 
 async function disconnectServer() {
@@ -2464,7 +2502,6 @@ function renderSettings(force = false) {
   const paths = state.paths || {};
   const app = state.app || {};
   const service = state.service || {};
-  const auth = config.auth || {};
   const log = config.log || {};
   const admin = config.webServer || null;
 
@@ -2473,54 +2510,11 @@ function renderSettings(force = false) {
       <div class="page-head">
         <div class="page-title">
           <h1>设置</h1>
-          <p>连接参数、可执行文件路径、运行模式与系统服务。</p>
+          <p>本机程序行为、可执行文件路径、系统集成与版本更新。服务器地址、端口与 Token 全部在「服务器」页管理。</p>
         </div>
       </div>
 
       <div class="settings-grid">
-        <section class="card section">
-          <div class="section-head">
-            <div class="section-title"><strong>服务器连接</strong><span>本机只有一条隧道。这里保存后会自动生成/更新对应的“服务器档案”，并把它设为本机隧道目标。</span></div>
-            <div class="section-actions">
-              <button class="btn" type="button" data-act="settings.test.conn">${icon('activity')}<span>测试连通性</span></button>
-              <button class="btn" type="button" data-act="settings.restart.conn">${icon('restart')}<span>保存并重启</span></button>
-              <button class="btn primary" type="button" data-act="settings.save.conn">${icon('check')}<span>保存连接配置</span></button>
-            </div>
-          </div>
-          <form id="form-connection" class="form-grid" autocomplete="off">
-            <div class="field">
-              <label>服务器地址 <span class="req">*</span></label>
-              <input class="input" name="serverAddr" value="${esc(config.serverAddr)}" placeholder="frps 域名或 IP" />
-            </div>
-            <div class="field">
-              <label>服务器端口 <span class="req">*</span></label>
-              <input class="input" name="serverPort" type="number" min="1" max="65535" value="${esc(config.serverPort || 7000)}" />
-            </div>
-            <div class="field span-2">
-              <label>认证 Token ${auth.token ? '<span class="badge green" style="font-size:9px">已设置</span>' : ''}</label>
-              <div class="input-group">
-                <input class="input" id="token-input" name="token" type="password" value="${esc(auth.token || '')}" placeholder="与 frps 的 auth.token 保持一致" />
-                <button class="btn icon" type="button" data-act="token.eye" title="显示 / 隐藏">${icon('eye')}</button>
-              </div>
-              <div class="field-hint">Token 会写入 frpc.toml；修改前会自动备份原配置。</div>
-            </div>
-            <div class="field">
-              <label>日志级别</label>
-              <select class="select" name="logLevel">
-                ${['trace', 'debug', 'info', 'warn', 'error'].map((lv) => `<option value="${lv}" ${log.level === lv ? 'selected' : ''}>${lv}</option>`).join('')}
-              </select>
-            </div>
-            <div class="field">
-              <label>连接失败时退出</label>
-              <div class="switch-row" style="justify-content:space-between">
-                <div class="sr-text"><strong>loginFailExit</strong><span>登录失败后不继续尝试</span></div>
-                <button class="switch ${config.loginFailExit !== false ? 'on' : ''}" type="button" data-act="toggle" data-field="loginFailExit" aria-pressed="${config.loginFailExit !== false}"></button>
-              </div>
-            </div>
-          </form>
-          <div class="note">${icon('server')}<div>保存会同步到「服务器」页的档案列表：同一 IP 复用原档案，新 IP 自动新建档案并设为当前查看。要让隧道真正连到新地址，请到服务器页点「切换隧道并重启」。</div></div>
-        </section>
-
         <section class="card section">
           <div class="section-head">
             <div class="section-title"><strong>可执行文件与路径</strong><span>frpc.exe 与 frpc.toml 的位置。</span></div>
@@ -2532,7 +2526,7 @@ function renderSettings(force = false) {
             <div class="path-row">
               <div class="path-display grow">
                 <span class="p-label">frps 面板地址（可选）</span>
-                <span class="p-value mono">${esc(settings.frpsDashboardUrl || `${config.serverAddr || ''}:7500`)}</span>
+                <span class="p-value mono">${esc(settings.frpsDashboardUrl || (config.serverAddr ? `${config.serverAddr}:7500` : '配置服务器后可用'))}</span>
               </div>
             </div>
             <div class="path-row">
@@ -2586,7 +2580,7 @@ function renderSettings(force = false) {
             <div class="section-title"><strong>运行模式与行为</strong><span>决定控制台如何启动 frpc 以及界面行为。</span></div>
             <button class="btn primary" type="button" data-act="settings.save.behavior">${icon('check')}<span>保存行为设置</span></button>
           </div>
-          <form id="form-behavior" class="form-grid" autocomplete="off">
+          <form id="form-behavior" class="form-grid" autocomplete="off" onsubmit="return false">
             <div class="field">
               <label>运行模式</label>
               <select class="select" name="runMode">
@@ -2601,6 +2595,20 @@ function renderSettings(force = false) {
             <div class="field">
               <label>状态刷新间隔（毫秒）</label>
               <input class="input" name="pollIntervalMs" type="number" min="1000" max="30000" step="500" value="${esc(settings.pollIntervalMs || 3000)}" />
+            </div>
+            <div class="field">
+              <label>frpc 日志级别</label>
+              <select class="select" name="logLevel">
+                ${['trace', 'debug', 'info', 'warn', 'error'].map((lv) => `<option value="${lv}" ${log.level === lv ? 'selected' : ''}>${lv}</option>`).join('')}
+              </select>
+              <div class="field-hint">写入 frpc.toml，保存时会自动备份原配置</div>
+            </div>
+            <div class="field">
+              <div class="switch-row" style="justify-content:space-between">
+                <div class="sr-text"><strong>loginFailExit</strong><span>登录失败后直接退出，不再反复重试</span></div>
+                <button class="switch ${config.loginFailExit !== false ? 'on' : ''}" type="button" data-act="toggle" data-field="loginFailExit" aria-pressed="${config.loginFailExit !== false}"></button>
+              </div>
+              <div class="field-hint">写进 frpc.toml；两者都在「保存行为设置」时一起生效</div>
             </div>
             <div class="field span-2">
               <div class="stack" style="gap:0">
@@ -2669,9 +2677,7 @@ function renderSettings(force = false) {
       </div>
     </div>`;
 
-  bindSettingsForms();
-  renderUpdateBox();
-  if (!S.update) refreshUpdateState();
+  renderUpdateBox();  if (!S.update) refreshUpdateState();
 }
 
 function pathRow(label, value, exists, kind) {
@@ -2692,12 +2698,6 @@ function switchRow(label, desc, field, on) {
   </div>`;
 }
 
-function bindSettingsForms() {
-  const form = $('#form-connection');
-  if (form) {
-    form.addEventListener('submit', (e) => e.preventDefault());
-  }
-}
 function isOn(field) {
   const btn = document.querySelector(`.switch[data-field="${field}"]`);
   return !!(btn && btn.classList.contains('on'));
@@ -3075,30 +3075,6 @@ async function handleAction(act, dataset, btn) {
         if (okQuit) await FRP.quit();
         break;
       }
-      case 'settings.save.conn':
-        await saveConnectionConfig(btn);
-        break;
-      case 'settings.restart.conn':
-        await saveConnectionConfig(btn, { restart: true });
-        break;
-      case 'settings.test.conn': {
-        const form = $('#form-connection');
-        if (!form) break;
-        const host = form.querySelector('[name="serverAddr"]').value.trim();
-        const port = Number(form.querySelector('[name="serverPort"]').value);
-        if (!host || !Number.isInteger(port) || port < 1 || port > 65535) {
-          toast('error', '请先填写有效的服务器地址和端口');
-          break;
-        }
-        await withBusy(btn, async () => {
-          const res = await FRP.probeTcp(host, port);
-          if (res && res.ok) {
-            if (res.data.ok) toast('success', '服务器可达', `${host}:${port} · ${res.data.ms} ms`);
-            else toast('error', '服务器不可达', res.data.error || '连接失败');
-          } else toastResult(res);
-        });
-        break;
-      }
       case 'settings.save.behavior':
         await saveBehavior(btn);
         break;
@@ -3129,14 +3105,6 @@ async function handleAction(act, dataset, btn) {
       case 'toggle': {
         const target = btn.classList.toggle('on');
         btn.setAttribute('aria-pressed', String(target));
-        break;
-      }
-      case 'token.eye': {
-        const input = $('#token-input');
-        if (!input) break;
-        const show = input.type === 'password';
-        input.type = show ? 'text' : 'password';
-        btn.innerHTML = icon(show ? 'eyeoff' : 'eye');
         break;
       }
       case 'proxyform.suggest': {
@@ -3508,55 +3476,26 @@ function closeModal() {
 
 /* ----------------------------- 设置保存 --------------------------- */
 
-async function saveConnectionConfig(btn, { restart = false } = {}) {
-  const form = $('#form-connection');
-  if (!form) return;
-  const state = S.state || {};
-  const config = state.config || {};
-  const serverAddr = form.querySelector('[name="serverAddr"]').value.trim();
-  const serverPort = Number(form.querySelector('[name="serverPort"]').value);
-  const token = form.querySelector('[name="token"]').value;
-  const level = form.querySelector('[name="logLevel"]').value;
-  if (!serverAddr) return toast('error', '服务器地址不能为空');
-  if (!Number.isInteger(serverPort) || serverPort < 1 || serverPort > 65535) return toast('error', '服务器端口无效');
-  await withBusy(btn, async () => {
-    const res = await FRP.saveConfig({
-      serverAddr,
-      serverPort,
-      loginFailExit: isOn('loginFailExit'),
-      auth: { ...(config.auth || {}), method: 'token', token },
-      log: { ...(config.log || {}), level },
-      transport: config.transport || null,
-    });
-    if (!res || !res.ok) return toastResult(res);
-    if (res.data && res.data.state) S.state = res.data.state;
-    const bound = await FRP.serverBindClient({ host: serverAddr, serverPort, token });
-    if (bound && bound.ok && bound.data && bound.data.state) {
-      S.server.profiles = bound.data.state.profiles || S.server.profiles;
-      S.server.activeServerId = bound.data.state.activeServerId || S.server.activeServerId;
-      S.server.clientServerId = bound.data.state.clientServerId || S.server.clientServerId;
-      S.server.client = bound.data.state.client || S.server.client;
-      S.server.saved = bound.data.state.saved || S.server.saved;
-    }
-    toast('success', '连接配置已保存', res.data && res.data.reloaded ? '已热重载' : '');
-    S.lastKeys.settings = '';
-    if (restart) {
-      toast('info', '正在重启隧道', `使用新的服务器 ${serverAddr}:${serverPort}`);
-      const rr = await FRP.restartTunnel();
-      if (rr && rr.ok) {
-        if (rr.data && rr.data.state) S.state = rr.data.state;
-        toast('success', '隧道已重启', '已按新的连接参数重新建立连接');
-        S.lastKeys.overview = '';
-        renderCurrent({ force: true });
-      } else {
-        toastResult(rr);
-      }
-      return;
-    }
-    if (res.data && res.data.restartRecommended) {
-      toast('warn', '需要重启隧道生效', '服务器地址、端口或 Token 变更后，点击“保存并重启”或到概览页重启隧道');
-    }
+/* 日志级别与 loginFailExit 属于 frpc.toml，但服务器地址 / 端口 / Token 一律
+ * 不在这里改 —— 那是「服务器」页的职责。所以这里把现有连接参数原样带回去，
+ * 只覆盖 log 与 loginFailExit，避免设置页变成第二个能改隧道的地方。
+ *
+ * 全新安装时 frpc.toml 里还没有 serverAddr，config:save 会以「服务器地址不能为空」
+ * 拒绝。这种情况直接跳过：等用户在服务器页连上服务器、隧道指向确定之后，
+ * 这两个值会在下一次保存时一起写进去。 */
+async function saveClientLogOptions(level, loginFailExit) {
+  const config = (S.state || {}).config || {};
+  if (!config.serverAddr) return { ok: true, skipped: true };
+  const res = await FRP.saveConfig({
+    serverAddr: config.serverAddr,
+    serverPort: config.serverPort,
+    loginFailExit,
+    auth: config.auth || { method: 'token', token: '' },
+    log: { ...(config.log || {}), level },
+    transport: config.transport || null,
   });
+  if (res && res.ok && res.data && res.data.state) S.state = res.data.state;
+  return res;
 }
 
 async function saveBehavior(btn) {
@@ -3574,16 +3513,30 @@ async function saveBehavior(btn) {
     stripProxyEnv: isOn('stripProxyEnv'),
   };
   await withBusy(btn, async () => {
+    const level = form.querySelector('[name="logLevel"]').value;
+    const loginFailExit = isOn('loginFailExit');
     const res = await FRP.saveSettings(patch);
-    if (res && res.ok) {
-      if (res.data && res.data.state) S.state = res.data.state;
-      S.lastKeys.settings = '';
-      toast('success', '行为设置已保存');
-    } else {
+    if (!res || !res.ok) {
       toastResult(res);
       // 保存失败时把开关拨回系统里的真实状态（例如启动项被组策略拦下）
       renderSettings(true);
+      return;
     }
+    if (res.data && res.data.state) S.state = res.data.state;
+    /* 日志级别 / loginFailExit 落在 frpc.toml 里，同一个按钮一起写掉，
+     * 免得用户改完日志级别还要再找一次“保存配置在哪”。 */
+    const cfg = await saveClientLogOptions(level, loginFailExit);
+    if (!cfg || !cfg.ok) {
+      toastResult(cfg);
+      renderSettings(true);
+      return;
+    }
+    S.lastKeys.settings = '';
+    if (cfg.skipped) {
+      toast('success', '行为设置已保存', '还没有配置服务器，日志级别与 loginFailExit 会在隧道建立后一起写入');
+      return;
+    }
+    toast('success', '设置已保存', cfg.data && cfg.data.reloaded ? 'frpc 配置已热重载' : '');
   });
 }
 
