@@ -314,6 +314,15 @@ node tools/cdp-shot.cjs .proxy-row out.png # 按选择器截单个元素
 
 ## 更新日志
 
+### 1.2.5
+
+这一轮补上「服务器页」的整条链路（用一个本地假 sshd 模拟了一台 Debian 12 + systemd 的服务器，把登录、四步就绪检查、读写 frps.toml、看日志全跑了一遍）：
+
+- **同一台机器上同时装了 `frpc.service` 和 `frps.service` 时，可能把 frpc 的服务当成 frps**：旧逻辑 `grep -i frp | head -n 2` 取第一行，而 systemd 按名字排序 `frpc` 在 `frps` 前面。现在会列出所有 frp 相关 unit、排除 `frpc`，对 `frp` 这种含糊名字再用 `systemctl cat` 看 `ExecStart` 是不是 frps 确认；认不出来宁可不认（当成“进程在跑但不受服务管理”），也绝不改写猜来的 unit。
+- 服务器页读 `journalctl -u <服务名>` 时服务名没有转义，含空格或特殊字符的 unit 名会被 shell 拆开；现在统一走 `shellQuote`。
+- 管理端口被别的 frpc 占用（端口冲突）期间，健康检查会继续把每条代理刷成“隧道未建立”，把真正的原因淹掉；现在冲突期间暂停探测、保留上一次结果。
+- 服务器页 Token 一致的提示文案补了空格（以前是“本机 frpc.toml的”）。
+
 ### 1.2.4
 
 本轮按“真环境跑一遍”的方式做了一次体检（本地 frps + 真 frpc + 真本地服务，24 条代理、含 http/stcp/tcpmux），修掉的全是**会让人判断错**的问题：

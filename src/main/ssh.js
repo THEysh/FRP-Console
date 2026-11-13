@@ -41,6 +41,53 @@ function sleep(ms) {
 
 const STATUS_TEXT = { running: '运行中', stopped: '已停止', abnormal: '异常' };
 
+/* systemctl list-units --no-legend 的每一行：
+ *   frps.service   loaded active running frp server
+ *   ● frpc.service loaded failed failed  frp client
+ * 取第一行当“就是它”是不安全的：同一台机器同时装了 frpc 与 frps 时，
+ * 按名字排序 frpc 在 frps 前面，于是会把客户端的 unit 当成服务端，
+ * 后面 systemctl cat / 重写 unit 就会动错对象。这里按名字排序取“最像 frps”的。
+ */
+function parseServiceUnits(text) {
+  const items = [];
+  for (const raw of String(text || '').split(/\r?\n/)) {
+    const line = raw.replace(/^[●*·\s]+/, '').trim();
+    if (!line) continue;
+    const parts = line.split(/\s+/);
+    const unit = (parts[0] || '').replace(/\.service$/i, '');
+    if (!unit) continue;
+    items.push({
+      unit,
+      load: parts[1] || '',
+      active: parts[2] || '',
+      sub: parts[3] || '',
+      description: parts.slice(4).join(' '),
+    });
+  }
+  return items;
+}
+
+/* 给候选 unit 打分：名字直接叫 frps / frps-2 / frps@inst 的最可信；
+ * 沾 frpc 的一律排除（那是客户端，重写它会打断用户自己的隧道）；
+ * 只写 frp 的属于“名字看不出客户端还是服务端”，要再用 ExecStart 确认。 */
+function rankServiceUnits(items) {
+  const scored = [];
+  for (const item of items) {
+    const name = String(item.unit || '').toLowerCase();
+    if (/frpc/.test(name)) continue;
+    let score = -1;
+    if (/^frps/.test(name)) score = 100;
+    else if (/frps/.test(name)) score = 80;
+    else if (/^frp$|^frp-(server|service)$|^frp-?server$/.test(name)) score = 40;
+    else if (/frp/.test(name)) score = 20;
+    if (score < 0) continue;
+    scored.push({ ...item, score, sure: score >= 80 });
+  }
+  scored.sort((a, b) => b.score - a.score || a.unit.localeCompare(b.unit));
+  return scored;
+}
+
+
 class ServerSession {
   constructor() {
     this.client = null;
@@ -159,7 +206,9 @@ class ServerSession {
       "echo @@KERNEL; uname -r 2>/dev/null",
       "echo @@ARCH; uname -m 2>/dev/null",
       "echo @@UPTIME; uptime -p 2>/dev/null || uptime 2>/dev/null",
-      "echo @@SERVICE; systemctl list-units --type=service --all --no-legend 2>/dev/null | grep -i frp | head -n 2",
+      // head 从 2 放宽到 20：一台机器上 frpc.service / frps.service / frps@a.service 可能同时存在，
+      // 只取两行会漏掉真正要的那一个。
+      "echo @@SERVICE; systemctl list-units --type=service --all --no-legend 2>/dev/null | grep -i frp | head -n 20",
       "echo @@PROCESS; for d in /proc/[0-9]*; do [ \"$(cat $d/comm 2>/dev/null)\" = frps ] && echo \"${d##*/} $(tr '\\0' ' ' < $d/cmdline 2>/dev/null)\"; done | head -n 4",
       "echo @@BIN; command -v frps 2>/dev/null || true",
       "echo @@LISTEN; ss -lntp 2>/dev/null | head -n 80",
@@ -205,20 +254,37 @@ class ServerSession {
     const processAlive = pids.length > 0;
     let configExists = false;
 
-    const serviceLine = lines('SERVICE')[0] || '';
-    const serviceName = serviceLine ? serviceLine.split(/\s+/)[0].replace(/\.service$/, '') : '';
-    const hasUnit = !!serviceName;
+    /* 以前直接取第一行，机器上同时有 frpc.service 时会把它当成 frps。
+     * 现在按“名字最像 frps”排序，名字看不出客户端/服务端的（比如 frp.service）
+     * 再用 ExecStart 确认一眼；实在认不出来就当作“没有 systemd unit”，
+     * 让界面走“进程在跑但不受服务管理”的分支，而不是去重写一个猜来的 unit。 */
+    const candidates = rankServiceUnits(parseServiceUnits(lines('SERVICE').join('\n')));
+    let serviceName = '';
+    let serviceSub = '';
     let unitActive = '';
-    if (hasUnit) {
-      const activeResult = await this.exec(`systemctl is-active -- ${serviceName} 2>/dev/null || true`, 8000);
-      unitActive = firstLine(activeResult.stdout);
+    for (const candidate of candidates) {
+      let execLine = '';
+      if (!candidate.sure) {
+        const cat = await this.exec(`systemctl cat ${shellQuote(candidate.unit)} 2>/dev/null | grep -m1 '^ExecStart=' || true`, 8000);
+        execLine = firstLine(cat.stdout);
+        if (/frpc/i.test(execLine) && !/frps/i.test(execLine)) continue;
+        if (execLine && !/frps/i.test(execLine)) continue;
+      }
+      serviceName = candidate.unit;
+      serviceSub = candidate.sub || '';
+      const activeResult = await this.exec(`systemctl is-active -- ${shellQuote(candidate.unit)} 2>/dev/null || true`, 8000);
+      unitActive = firstLine(activeResult.stdout) || candidate.active || '';
       if (!configPath) {
-        const cat = await this.exec(`systemctl cat ${shellQuote(serviceName)} 2>/dev/null | grep -m1 '^ExecStart=' || true`, 8000);
-        const execLine = firstLine(cat.stdout);
+        if (!execLine) {
+          const cat = await this.exec(`systemctl cat ${shellQuote(candidate.unit)} 2>/dev/null | grep -m1 '^ExecStart=' || true`, 8000);
+          execLine = firstLine(cat.stdout);
+        }
         const argMatch = /(?:-c|--config)(?:=|\s+)("[^"]+"|'[^']+'|\S+)/.exec(execLine);
         if (argMatch) configPath = validConfigPath(argMatch[1]);
       }
+      break;
     }
+    const hasUnit = !!serviceName;
     if (configPath) {
       const exists = await this.exec(`[ -f ${shellQuote(configPath)} ] && echo yes || true`, 6000);
       configExists = firstLine(exists.stdout) === 'yes';
@@ -264,7 +330,7 @@ class ServerSession {
     }
     if (!version) version = 'unknown';
 
-    const unitFailed = /failed|error/.test(unitActive) || serviceLine.includes(' failed ');
+    const unitFailed = /failed|error/.test(unitActive) || /failed|error/.test(serviceSub);
     const running = processAlive || dockerRunning || unitActive === 'active';
     const abnormal = unitFailed || (docker && /restarting|unhealthy|dead/i.test(docker.status));
     const status = abnormal ? 'abnormal' : running ? 'running' : 'stopped';
@@ -677,7 +743,7 @@ class ServerSession {
     const count = Math.min(1000, Math.max(10, Number(lines) || 200));
     const info = this.info || {};
     const journal = info.hasUnit && info.serviceName
-      ? await this.exec(`journalctl -u ${info.serviceName} -n ${count} --no-pager 2>/dev/null`, 15000)
+      ? await this.exec(`journalctl -u ${shellQuote(info.serviceName)} -n ${count} --no-pager 2>/dev/null`, 15000)
       : { ok: false, stdout: '' };
     if (journal.ok && journal.stdout.trim()) return { ok: true, source: `journalctl -u ${info.serviceName}`, content: journal.stdout };
     if (info.docker && info.docker.name) {
@@ -690,4 +756,4 @@ class ServerSession {
   }
 }
 
-module.exports = { ServerSession };
+module.exports = { ServerSession, parseServiceUnits, rankServiceUnits };

@@ -1105,7 +1105,11 @@ async function tick({ force = false } = {}) {
       lastServiceCheck = Date.now();
       await tickStep('refreshService', () => refreshService({ detect: false }));
     }
-    if (!healthBusy && Date.now() - (tick.lastHealth || 0) > 14000 && model && model.proxies.length) {
+    /* 管理端口上跑的是别人的 frpc 时，本配置的隧道根本没在工作：
+     * 继续做三层检查只会把每条代理都刷成“隧道未建立”，把真正的原因
+     * （端口冲突）淹掉。这时保留上一次结果并停止探测，等端口冲突解决了再查。 */
+    const foreignNow = !!manager.snapshot().foreign;
+    if (!healthBusy && !foreignNow && Date.now() - (tick.lastHealth || 0) > 14000 && model && model.proxies.length) {
       tick.lastHealth = Date.now();
       healthBusy = true;
       checkHealth()
@@ -2328,7 +2332,7 @@ function registerIpc() {
         return ok({ layer, ok: false, ms: Date.now() - startedAt, reason: '服务端未启用鉴权', detail: `${tokenSource} 里配了 Token，但 frps.toml 里没有 auth.token，frpc 登录会被拒` });
       }
       if (!clientToken) {
-        return ok({ layer, ok: false, ms: Date.now() - startedAt, reason: '本机没有 Token', detail: `服务端已启用 Token，但${tokenSource}里没有，隧道登录会失败` });
+        return ok({ layer, ok: false, ms: Date.now() - startedAt, reason: '本机没有 Token', detail: `服务端已启用 Token，但 ${tokenSource} 里没有，隧道登录会失败` });
       }
       if (serverToken !== clientToken) {
         const gap = liveTarget
@@ -2339,10 +2343,10 @@ function registerIpc() {
           ok: false,
           ms: Date.now() - startedAt,
           reason: 'Token 不一致',
-          detail: `服务端 ${serverToken.slice(0, 4)}… 与${tokenSource}的 ${clientToken.slice(0, 4)}… 不同。${gap}`,
+          detail: `服务端 ${serverToken.slice(0, 4)}… 与 ${tokenSource} 的 ${clientToken.slice(0, 4)}… 不同。${gap}`,
         });
       }
-      return ok({ layer, ok: true, ms: Date.now() - startedAt, detail: `服务端与${tokenSource}的 Token 一致（${serverToken.slice(0, 4)}…，${serverToken.length} 位）` });
+      return ok({ layer, ok: true, ms: Date.now() - startedAt, detail: `服务端与 ${tokenSource} 的 Token 一致（${serverToken.slice(0, 4)}…，${serverToken.length} 位）` });
     }
 
     return fail('未知的检测层');
