@@ -2,6 +2,7 @@
 
 const fs = require('node:fs');
 const { Client } = require('ssh2');
+const { parseConfig: frpsParseConfig, summary: frpsSummary } = require('./frpsconfig');
 
 function friendlyError(err) {
   const message = String((err && err.message) || err || '');
@@ -330,7 +331,10 @@ class ServerSession {
     }
     if (!version) version = 'unknown';
 
-    const unitFailed = /failed|error/.test(unitActive) || /failed|error/.test(serviceSub);
+    // systemd 的 `activating (auto-restart)` 表示服务反复崩溃重启（例如端口被占用），
+    // unitActive="activating"、serviceSub="auto-restart" 都不匹配 failed/error，
+    // 不单独识别会把「起不来的服务」误报成 stopped。
+    const unitFailed = /failed|error/.test(unitActive) || /failed|error/.test(serviceSub) || /auto-restart/.test(serviceSub);
     const running = processAlive || dockerRunning || unitActive === 'active';
     const abnormal = unitFailed || (docker && /restarting|unhealthy|dead/i.test(docker.status));
     const status = abnormal ? 'abnormal' : running ? 'running' : 'stopped';
@@ -611,6 +615,8 @@ class ServerSession {
       return { ok: false, error: `frps 未按新配置启动（当前进程 ${after.info.binaryPath || 'unknown'}）`, steps, configPath };
     }
     report('done', '初始化完成，frps 已运行', 100);
+    // 自动放开 frps 监听端口（ufw / firewalld / iptables），防止被防火墙拦截。
+    const firewall = await this.openFirewallPorts(this.configPorts(content));
     return {
       ok: true,
       arch,
@@ -624,6 +630,7 @@ class ServerSession {
       bootWarning,
       steps,
       info: after.info,
+      firewall,
     };
   }
 
@@ -646,9 +653,126 @@ class ServerSession {
     return `${shellQuote(bin)} verify -c ${shellQuote(remoteFile)}`;
   }
 
+  // 从配置内容里提取需要监听的端口（用于端口冲突预检 + 自动开防火墙）。
+  configPorts(content) {
+    const parsed = frpsParseConfig(String(content || ''));
+    if (!parsed.ok) return [];
+    const s = frpsSummary(parsed.data);
+    const ports = [];
+    if (s.bindPort) { ports.push({ port: s.bindPort, proto: 'tcp', label: 'bindPort' }); ports.push({ port: s.bindPort, proto: 'udp', label: 'bindPort' }); }
+    if (s.webPort && s.webPort !== s.bindPort) ports.push({ port: s.webPort, proto: 'tcp', label: 'Dashboard' });
+    if (s.vhostHTTPPort) ports.push({ port: s.vhostHTTPPort, proto: 'tcp', label: 'vhostHTTPPort' });
+    if (s.vhostHTTPSPort) ports.push({ port: s.vhostHTTPSPort, proto: 'tcp', label: 'vhostHTTPSPort' });
+    return ports;
+  }
+
+  // 解析 `ss -lntp` / `netstat -ltnp`，取每条监听端口的进程名。
+  parseListeners(text) {
+    const listeners = [];
+    for (const line of String(text || '').split(/\r?\n/)) {
+      const match = /:(\d{1,5})\s+\S+\s+users:\(\(\"?([^"\),\s]+)/.exec(line);
+      if (match) listeners.push({ port: Number(match[1]), process: match[2] });
+    }
+    return listeners;
+  }
+
+  // 检查新配置要监听的 TCP 端口是否已被非 frps 进程占用。
+  async portConflicts(ports) {
+    const tcpPorts = (ports || []).filter((p) => p.proto === 'tcp');
+    if (!tcpPorts.length) return [];
+    const result = await this.exec('ss -lntp 2>/dev/null || netstat -ltnp 2>/dev/null', 12000);
+    const listeners = this.parseListeners(result.stdout || '');
+    const conflicts = [];
+    for (const { port, label } of tcpPorts) {
+      if (!port) continue;
+      const hit = listeners.find((l) => l.port === port && l.process && !/^frps/i.test(l.process));
+      if (hit) conflicts.push(`${label}（${port}）已被 ${hit.process} 占用`);
+    }
+    return conflicts;
+  }
+
+  // 自动放开 frps 需要监听的端口（ufw / firewalld / 裸 iptables），防止被防火墙拦截。
+  async openFirewallPorts(ports) {
+    if (!this.connected) return { ok: false, error: '尚未连接服务器' };
+    if (!ports || !ports.length) return { ok: true, manager: 'none', opened: [], notes: ['没有可开的端口'] };
+    const sudo = await this.detectSudo();
+    if (!sudo.ok) return { ok: false, error: sudo.error };
+    const prefix = sudo.prefix;
+    const opened = [];
+    const notes = [];
+
+    const ufwCheck = await this.exec('command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | head -n 1 || true', 8000);
+    const ufwActive = /status: active/i.test(ufwCheck.stdout || '');
+    if (ufwActive) {
+      for (const { port, proto, label } of ports) {
+        const r = await this.exec(`${prefix}ufw allow ${port}/${proto} 2>&1`, 15000);
+        const msg = `${r.stdout || ''}${r.stderr || ''}`;
+        if (r.ok || /Rule added|Skipping adding existing rule/i.test(msg)) opened.push(`${label}(${port}/${proto})`);
+        else notes.push(`${label}(${port}/${proto}) 开端口失败：${firstLine(r.stderr || r.stdout)}`);
+      }
+      return { ok: opened.length > 0, manager: 'ufw', opened, notes };
+    }
+
+    const fwCheck = await this.exec('command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state 2>/dev/null || true', 8000);
+    const fwRunning = /running/.test(fwCheck.stdout || '');
+    if (fwRunning) {
+      for (const { port, proto, label } of ports) {
+        const r = await this.exec(`${prefix}firewall-cmd --permanent --add-port=${port}/${proto} 2>&1`, 15000);
+        const msg = `${r.stdout || ''}${r.stderr || ''}`;
+        if (r.ok || /ALREADY_ENABLED/i.test(msg)) opened.push(`${label}(${port}/${proto})`);
+        else notes.push(`${label}(${port}/${proto}) 开端口失败：${firstLine(r.stderr || r.stdout)}`);
+      }
+      await this.exec(`${prefix}firewall-cmd --reload 2>/dev/null || true`, 15000);
+      return { ok: opened.length > 0, manager: 'firewalld', opened, notes };
+    }
+
+    // 裸 iptables（规则不持久化，重启后丢失；仅兜底）
+    for (const { port, proto, label } of ports) {
+      const cmd = `iptables -C INPUT -p ${proto} --dport ${port} -j ACCEPT 2>/dev/null || iptables -I INPUT -p ${proto} --dport ${port} -j ACCEPT`;
+      const r = await this.exec(`${prefix}${cmd}`, 15000);
+      if (r.ok) opened.push(`${label}(${port}/${proto})`);
+      else notes.push(`${label}(${port}/${proto}) 开端口失败：${firstLine(r.stderr || r.stdout)}`);
+    }
+    return { ok: opened.length > 0, manager: 'iptables', opened, notes };
+  }
+
+  // 读当前配置并放开它要监听的端口（best-effort，出错返回 null，不阻断主流程）。
+  async openFirewallForConfig() {
+    try {
+      const cfg = await this.readConfig();
+      if (!cfg.ok) return null;
+      const ports = this.configPorts(cfg.content);
+      if (!ports.length) return null;
+      return await this.openFirewallPorts(ports);
+    } catch {
+      return null;
+    }
+  }
+
+  // 从 journalctl / 日志里挑出第一行报错原因，用于「重启后没起来」时告诉用户到底为什么。
+  failureReason(logRes) {
+    const lines = String((logRes && logRes.content) || '').split(/\r?\n/).filter(Boolean);
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i];
+      if (!/error|fatal|panic|address already in use|bind:|failed/i.test(line)) continue;
+      const msg = line.replace(/^.*?frps(?:\[\d+\])?:\s*/, '').trim();
+      if (msg) return msg;
+    }
+    return '';
+  }
+
   async writeConfig(content, { restart = false } = {}) {
     if (!this.connected) return { ok: false, error: '尚未连接服务器' };
     if (!this.configPath) return { ok: false, error: '未找到 frps 配置文件' };
+
+    // 端口冲突预检：配置里要监听的 TCP 端口若已被其它进程（如 nginx 占 80/443）占用，
+    // frps 会 bind 失败并陷入 systemd auto-restart 死循环。这里提前拦截，不写坏配置。
+    const ports = this.configPorts(content);
+    const conflicts = await this.portConflicts(ports);
+    if (conflicts.length) {
+      return { ok: false, error: `配置端口与现有服务冲突，frps 会启动失败：${conflicts.join('；')}。请改用空闲端口，或先停掉占用进程。`, conflicts };
+    }
+
     const ext = /\.ini$/i.test(this.configPath) ? 'ini' : 'toml';
     const remoteTmp = `/tmp/frps-console-new.${ext}`;
     const base64 = Buffer.from(content, 'utf8').toString('base64');
@@ -678,8 +802,29 @@ class ServerSession {
     if (!moveResult.ok) return { ok: false, error: `写入失败：${moveResult.stderr || '未知错误'}` };
 
     let restarted = null;
-    if (restart) restarted = await this.control('restart');
-    return { ok: true, backup, restarted };
+    let firewall = null;
+    if (restart) {
+      restarted = await this.control('restart');
+      // systemctl restart 命令成功 ≠ frps 真的起来了（端口冲突会让 systemd 陷入 auto-restart）。
+      // 起来后校验状态；没起来就取日志、回滚配置，把服务恢复成原样再报错。
+      const runningAfter = !!(restarted && restarted.after && restarted.after.status === 'running');
+      if (!runningAfter) {
+        const logRes = await this.logs(40);
+        const reason = this.failureReason(logRes) || (restarted && restarted.error) || ((restarted && restarted.after && restarted.after.statusText) || '');
+        const rollback = await this.exec(`cp -p ${shellQuote(backup)} ${shellQuote(this.configPath)}`, 10000);
+        if (rollback.ok) await this.control('restart');
+        return {
+          ok: false,
+          error: `重启后 frps 未运行${reason ? `：${reason}` : ''}。已回滚到修改前的配置。`,
+          backup,
+          rolledBack: !!rollback.ok,
+          restarted,
+        };
+      }
+      // frps 起来了，顺手放开防火墙端口，避免下次被防火墙拦截。
+      firewall = await this.openFirewallPorts(ports);
+    }
+    return { ok: true, backup, restarted, firewall };
   }
 
   async control(action) {
@@ -693,7 +838,11 @@ class ServerSession {
       const result = await this.dockerCommand(action, info.docker.name);
       if (!result.ok) return { ok: false, error: `Docker ${actionText}失败：${(result.stderr || result.stdout || '未知错误').trim()}` };
       const after = await this.inspect();
-      return { ok: true, via: 'docker', container: info.docker.name, before, after: after.info || null };
+      const afterInfo = after.info || null;
+      if ((action === 'start' || action === 'restart') && afterInfo && afterInfo.status && afterInfo.status !== 'running') {
+        return { ok: false, error: `Docker ${actionText}后 frps 未运行（${afterInfo.statusText}）`, via: 'docker', container: info.docker.name, before, after: afterInfo };
+      }
+      return { ok: true, via: 'docker', container: info.docker.name, before, after: afterInfo };
     }
 
     if (info.hasUnit && info.serviceName) {
@@ -702,7 +851,12 @@ class ServerSession {
         return { ok: false, error: `${actionText}失败：${(result.stderr || result.stdout || '请确认当前账户有 systemctl 权限').trim()}` };
       }
       const after = await this.inspect();
-      return { ok: true, via: 'systemd', service: info.serviceName, before, after: after.info || null };
+      const afterInfo = after.info || null;
+      if ((action === 'start' || action === 'restart') && afterInfo && afterInfo.status && afterInfo.status !== 'running') {
+        return { ok: false, error: `${actionText}后 frps 未运行（${afterInfo.statusText}）`, via: 'systemd', service: info.serviceName, before, after: afterInfo };
+      }
+      if (action === 'start' || action === 'restart') await this.openFirewallForConfig();
+      return { ok: true, via: 'systemd', service: info.serviceName, before, after: afterInfo };
     }
 
     if (action === 'stop' || action === 'restart') {
@@ -732,7 +886,12 @@ class ServerSession {
       if (!result.ok) return { ok: false, error: `启动失败：${(result.stderr || result.stdout || '请确认 frps 路径与配置').trim()}` };
       await new Promise((r) => setTimeout(r, 1200));
       const after = await this.inspect();
-      return { ok: true, via: 'process', pid: (after.info && after.info.pids) || [], after: after.info || null };
+      const afterInfo = after.info || null;
+      if (afterInfo && afterInfo.status && afterInfo.status !== 'running') {
+        return { ok: false, error: `${actionText}后 frps 未运行（${afterInfo.statusText}）`, via: 'process', pid: afterInfo.pids || [], after: afterInfo };
+      }
+      await this.openFirewallForConfig();
+      return { ok: true, via: 'process', pid: afterInfo.pids || [], after: afterInfo };
     }
 
     return { ok: false, error: '没有可用的启动方式' };
