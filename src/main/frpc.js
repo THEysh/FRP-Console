@@ -288,10 +288,12 @@ class FrpcManager extends EventEmitter {
   }
 
   async restart(options = {}) {
+    /* “重启”的语义是“让隧道用当前配置跑起来”。以前在隧道没跑时直接 return ok，
+     * 导致「切换隧道并重启」/「重启隧道」在停止状态下点了却什么都不做，还提示“已重启”。
+     * 这里改成：停（如果还在跑）→ 等 400ms → 再启动。没跑就直接启动。 */
     const wasRunning = this.apiOk || this.isChildAlive;
     const stop = wasRunning ? await this.stop(options) : { ok: true };
     if (!stop.ok) return stop;
-    if (!wasRunning) return { ok: true };
     await sleep(400);
     return this.start(options);
   }
