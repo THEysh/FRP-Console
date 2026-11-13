@@ -6,6 +6,8 @@ const toml = require('smol-toml');
 
 const PROXY_TYPES = ['tcp', 'udp', 'http', 'https', 'stcp', 'sudp', 'xtcp', 'tcpmux'];
 const HOST_TYPES = ['tcp', 'udp'];
+// 备份目录里保留多少份（够回退最近几十次改动，又不至于把磁盘占满）
+const BACKUP_KEEP = 30;
 
 const KNOWN_TOP_LEVEL = new Set([
   'serverAddr', 'serverPort', 'loginFailExit', 'auth', 'log', 'webServer', 'transport', 'proxies', 'visitors',
@@ -19,6 +21,25 @@ function toInt(value, fallback = null) {
   if (value === '' || value === null || value === undefined) return fallback;
   const n = Number(value);
   return Number.isFinite(n) ? Math.trunc(n) : fallback;
+}
+
+/* 主机名 / IPv4 的合理性检查。
+ * 不联网、不查 DNS，只挡掉明显写错的东西（999.1.1.1、带协议前缀、带空格）。 */
+function isHostLike(value) {
+  const text = String(value || '').trim();
+  if (!text) return false;
+  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(text)) {
+    return text.split('.').every((part) => Number(part) <= 255);
+  }
+  return /^(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$/.test(text);
+}
+
+/* 绑定域名：允许 *.example.com 这种通配，但不允许协议、路径、端口、空格。 */
+function isDomainLike(value) {
+  const text = String(value || '').trim();
+  if (!text) return false;
+  if (/[\/\\\s:]/.test(text)) return false;
+  return /^\*?(?:\.[A-Za-z0-9-]+)*\.[A-Za-z0-9][A-Za-z0-9-]*$|^[A-Za-z0-9][A-Za-z0-9-]*(?:\.[A-Za-z0-9][A-Za-z0-9-]*)+$/.test(text);
 }
 
 function normalizeAuth(raw) {
@@ -57,7 +78,13 @@ function normalizeProxy(raw) {
   proxy.type = typeof proxy.type === 'string' && proxy.type ? proxy.type.trim().toLowerCase() : 'tcp';
   proxy.localIP = typeof proxy.localIP === 'string' && proxy.localIP ? proxy.localIP : '127.0.0.1';
   proxy.localPort = toInt(proxy.localPort, null);
-  if (proxy.remotePort !== undefined) proxy.remotePort = toInt(proxy.remotePort, null);
+  // 只保留该类型真正认的字段：手改过的配置里常见 stcp 带 remotePort、
+  // tcpmux 带 remotePort，写回去 frpc 会整份配置拒绝启动。
+  if (HOST_TYPES.includes(proxy.type)) {
+    if (proxy.remotePort !== undefined) proxy.remotePort = toInt(proxy.remotePort, null);
+  } else if (PROXY_TYPES.includes(proxy.type)) {
+    delete proxy.remotePort;
+  }
   if (Array.isArray(proxy.customDomains)) proxy.customDomains = proxy.customDomains.map(String).filter(Boolean);
   if (Array.isArray(proxy.locations)) proxy.locations = proxy.locations.map(String).filter(Boolean);
   if (isPlainObject(proxy.transport)) {
@@ -107,9 +134,9 @@ function validate(model) {
   const push = (level, field, message) => (level === 'error' ? errors : warnings).push({ field, message });
 
   if (!model.serverAddr) push('error', 'serverAddr', '服务器地址不能为空');
-  else if (!/^[A-Za-z0-9.-]+$/.test(model.serverAddr) && !/^\d{1,3}(\.[\d]{1,3}){3}$/.test(model.serverAddr)) {
-    push('warn', 'serverAddr', '服务器地址看起来不是常见的主机名或 IP');
-  }
+  else if (/\s/.test(model.serverAddr)) push('error', 'serverAddr', '服务器地址不能包含空格');
+  else if (/^[a-z]+:\/\//i.test(model.serverAddr)) push('error', 'serverAddr', '服务器地址只填主机名或 IP，不要带 http:// 前缀');
+  else if (!/^[A-Za-z0-9.-]+$/.test(model.serverAddr)) push('warn', 'serverAddr', '服务器地址看起来不是常见的主机名或 IP');
   if (!Number.isInteger(model.serverPort) || model.serverPort < 1 || model.serverPort > 65535) {
     push('error', 'serverPort', '服务器端口必须在 1 - 65535 之间');
   }
@@ -136,6 +163,10 @@ function validate(model) {
         push('error', `proxies[${index}].localPort`, `${label} 的本地端口无效`);
       }
       if (!proxy.localIP) push('warn', `proxies[${index}].localIP`, `${label} 未设置 localIP，默认使用 127.0.0.1`);
+      /* localIP 不校验的话，"999.1.1.1" 这种地址会被原样写进配置：
+       * frpc 连不上本地服务，界面只会说“本地服务不通”，
+       * 用户去查那个服务查半天，其实是 IP 打错了。 */
+      else if (!isHostLike(proxy.localIP)) push('error', `proxies[${index}].localIP`, `${label} 的本地地址「${proxy.localIP}」不是合法的主机名或 IP`);
     }
 
     if (HOST_TYPES.includes(proxy.type)) {
@@ -150,10 +181,14 @@ function validate(model) {
       }
     }
 
-    if (['http', 'https'].includes(proxy.type)) {
-      const hasDomains = Array.isArray(proxy.customDomains) && proxy.customDomains.length > 0;
-      if (!hasDomains && !proxy.subdomain) {
+    if (['http', 'https', 'tcpmux'].includes(proxy.type)) {
+      const domains = Array.isArray(proxy.customDomains) ? proxy.customDomains : [];
+      if (!domains.length && !proxy.subdomain) {
         push('error', `proxies[${index}].customDomains`, `${label} 需要至少一个自定义域名或 subdomain`);
+      }
+      for (const domain of domains) {
+        // 带 http:// 或者带端口的域名会让 frpc 启动失败，但报错信息完全看不出是这个原因
+        if (!isDomainLike(domain)) push('error', `proxies[${index}].customDomains`, `${label} 的域名「${domain}」不合法：只填域名本身，不要带 http://、端口或路径`);
       }
     }
 
@@ -201,7 +236,7 @@ function emitDotted(obj, prefix, lines, skip = new Set()) {
   }
 }
 
-const PROXY_ORDER = ['name', 'type', 'localIP', 'localPort', 'remotePort', 'customDomains', 'subdomain', 'locations', 'secretKey', 'serverName', 'allowUsers', 'plugin'];
+const PROXY_ORDER = ['name', 'type', 'localIP', 'localPort', 'remotePort', 'customDomains', 'subdomain', 'multiplexer', 'locations', 'secretKey', 'serverName', 'allowUsers', 'plugin'];
 const TRANSPORT_ORDER = ['useCompression', 'useEncryption', 'bandwidthLimit', 'bandwidthLimitMode', 'proxyProtocolVersion', 'dialServerTimeout', 'dialServerKeepalive'];
 
 function proxyLines(proxy) {
@@ -330,12 +365,14 @@ function backupConfig(configPath) {
     const dir = path.join(path.dirname(configPath), 'frp-console-backups');
     fs.mkdirSync(dir, { recursive: true });
     const now = new Date();
-    const stamp = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}-${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}${String(now.getSeconds()).padStart(2, '0')}`;
+    /* 名字精确到毫秒：以前只到秒，同一秒内连续保存两次会写同一个文件名，
+     * 后一次把前一次的备份覆盖掉，正好丢掉最该留的那份。 */
+    const stamp = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}-${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}${String(now.getSeconds()).padStart(2, '0')}-${String(now.getMilliseconds()).padStart(3, '0')}`;
     const base = path.basename(configPath, path.extname(configPath));
     const target = path.join(dir, `${base}-${stamp}.toml`);
     fs.copyFileSync(configPath, target);
     const files = fs.readdirSync(dir).filter((f) => f.endsWith('.toml')).map((f) => ({ f, t: fs.statSync(path.join(dir, f)).mtimeMs })).sort((a, b) => b.t - a.t);
-    for (const item of files.slice(30)) {
+    for (const item of files.slice(BACKUP_KEEP)) {
       try { fs.unlinkSync(path.join(dir, item.f)); } catch { /* ignore */ }
     }
     return target;
@@ -344,28 +381,48 @@ function backupConfig(configPath) {
   }
 }
 
+/* 保存时写在文件头的“最近保存”时间戳不属于配置内容，
+ * 比较时必须先抹掉，否则每分钟第一次保存都会判定“内容变了”，
+ * 于是备份目录被相同的副本迅速灌满，真正的改动反而被挤出去。 */
+const STAMP_LINE = /^# 最近保存：.*$/m;
+
+function configContentKey(text) {
+  return String(text || '').replace(STAMP_LINE, '').replace(/\r\n/g, '\n').trim();
+}
+
 function writeConfig(configPath, model) {
   const text = serialize(model);
   const previous = fs.existsSync(configPath) ? fs.readFileSync(configPath, 'utf8') : null;
-  if (previous === text) return { changed: false, backup: null, text };
-  const backup = previous ? backupConfig(configPath) : null;
+  if (previous !== null && configContentKey(previous) === configContentKey(text)) {
+    return { changed: false, backup: null, text: previous };
+  }
+  const backup = previous !== null ? backupConfig(configPath) : null;
   const tmp = `${configPath}.tmp-${process.pid}`;
   fs.writeFileSync(tmp, text, 'utf8');
   fs.renameSync(tmp, configPath);
   return { changed: true, backup, text };
 }
 
-function ensureAdmin(model, { port = 7400, user = 'admin', password = 'admin' } = {}) {
+/* 把管理 API 的监听信息写进 frpc.toml。
+ * 调用方传进来的是整份 settings（字段叫 adminPort/adminUser/adminPassword），
+ * 以前这里按 port/user/password 解构，于是永远落在默认值 7400/admin/admin上 ——
+ * 用户在设置里改端口、改口令，写进配置的还是老样子，
+ * 控制台去问新端口，frpc 还在老端口听着，界面就永远卡在“等待管理 API 就绪”。 */
+function ensureAdmin(model, options = {}) {
+  const port = Number(options.adminPort !== undefined ? options.adminPort : options.port !== undefined ? options.port : 7400) || 7400;
+  const user = String(options.adminUser || options.user || 'admin');
+  const password = String(options.adminPassword || options.password || 'admin');
   const current = model.webServer;
-  if (current && current.addr === '127.0.0.1' && Number(current.port) === Number(port) && current.user === user && current.password === password) {
+  if (current && current.addr === '127.0.0.1' && Number(current.port) === port && current.user === user && current.password === password) {
     return false;
   }
-  model.webServer = { ...(current || {}), addr: '127.0.0.1', port: Number(port), user, password };
+  model.webServer = { ...(current || {}), addr: '127.0.0.1', port, user, password };
   return true;
 }
 
 function suggestRemotePort(model, type = 'tcp') {
-  if (!HOST_TYPES.includes(type) && type !== 'tcpmux') return null;
+  // 只有 tcp/udp 有公网端口；tcpmux 靠域名复用，不占端口。
+  if (!HOST_TYPES.includes(type)) return null;
   const used = new Set();
   for (const proxy of model.proxies) {
     if (proxy.remotePort) used.add(Number(proxy.remotePort));
@@ -376,17 +433,67 @@ function suggestRemotePort(model, type = 'tcp') {
   return port;
 }
 
-function publicAddressFor(model, proxy) {
+function firstDomainOf(proxy) {
+  if (Array.isArray(proxy.customDomains) && proxy.customDomains.length) return String(proxy.customDomains[0]);
+  return proxy.subdomain ? String(proxy.subdomain) : '';
+}
+
+function publicAddressFor(model, proxy, options = {}) {
   if (!model.serverAddr) return '';
   if (HOST_TYPES.includes(proxy.type)) {
     return proxy.remotePort ? `${model.serverAddr}:${proxy.remotePort}` : '';
   }
   if (proxy.type === 'http' || proxy.type === 'https') {
-    const domain = Array.isArray(proxy.customDomains) && proxy.customDomains.length ? proxy.customDomains[0] : proxy.subdomain || '';
+    const domain = firstDomainOf(proxy);
     if (!domain) return '';
-    return `${proxy.type}://${domain}`;
+    /* 端口不能省：frps 的 vhostHTTPPort 很少真的开在 80（容器、非 root、多实例都换过端口），
+     * 以前一律拼成 http://域名，导致健康检查永远访问不到自己的服务，
+     * 界面报“公网不可达”，而实际隧道是通的。 */
+    const standard = proxy.type === 'https' ? 443 : 80;
+    const port = vhostPortOf(proxy.type, options);
+    return `${proxy.type}://${domain}${port === standard ? '' : `:${port}`}`;
+  }
+  /* tcpmux 不是真端口：客户端要用 HTTP CONNECT 去 frps 的 tcpmux 端口上认领这个域名。
+   * 直接标成 http://域名 会让人以为浏览器能打开，所以带上协议说明。 */
+  if (proxy.type === 'tcpmux') {
+    const domain = firstDomainOf(proxy);
+    return domain ? `http-connect://${domain}` : '';
   }
   return '';
+}
+
+/* vhost 端口是 frps 侧的配置，客户端只能听用户说。缺省按 80/443。 */
+function vhostPortOf(type, options = {}) {
+  const raw = type === 'https' ? options.vhostHttpsPort : options.vhostHttpPort;
+  const port = Number(raw);
+  if (Number.isInteger(port) && port > 0 && port < 65536) return port;
+  return type === 'https' ? 443 : 80;
+}
+
+/* 连通性检查到底往哪儿打。
+ * http：连 serverAddr:vhostHTTPPort，用 Host 头带上绑定域名。
+ *   直接按域名访问往往在“客户端这台机器”上根本解析不到（内网 DNS、测试域名、
+ *   CDN 只对公网生效），结果是隧道明明通着，界面却永久报“公网不可达”。
+ * https：反过来只能按域名打 —— 按 IP 连会因 SNI / 证书不匹配握手失败。
+ * tcp/udp：连 serverAddr:remotePort。 */
+function probeTargetFor(model, proxy, options = {}) {
+  if (!model.serverAddr) return null;
+  const type = proxy.type || 'tcp';
+  if (type === 'http') {
+    const domain = firstDomainOf(proxy);
+    if (!domain) return null;
+    const port = vhostPortOf('http', options);
+    return { kind: 'http', url: `http://${model.serverAddr}:${port}/`, host: domain, port, display: publicAddressFor(model, proxy, options) };
+  }
+  if (type === 'https') {
+    const url = publicAddressFor(model, proxy, options);
+    if (!url) return null;
+    return { kind: 'http', url, host: '', port: vhostPortOf('https', options), display: url };
+  }
+  if (HOST_TYPES.includes(type) && proxy.remotePort) {
+    return { kind: 'tcp', host: model.serverAddr, port: Number(proxy.remotePort), display: publicAddressFor(model, proxy, options) };
+  }
+  return null;
 }
 
 function makeProxy(input) {
@@ -397,8 +504,10 @@ function makeProxy(input) {
     localIP: String(input.localIP || '127.0.0.1').trim() || '127.0.0.1',
     localPort: toInt(input.localPort, null),
   };
-  if (HOST_TYPES.includes(type) || type === 'tcpmux') base.remotePort = toInt(input.remotePort, null);
-  if (type === 'http' || type === 'https') {
+  // remotePort 只有 tcp/udp 认。tcpmux 写进去 frpc 会直接拒绝整份配置
+  // （unmarshal ProxyConfig error: json: unknown field "remotePort"）。
+  if (HOST_TYPES.includes(type)) base.remotePort = toInt(input.remotePort, null);
+  if (type === 'http' || type === 'https' || type === 'tcpmux') {
     const domains = Array.isArray(input.customDomains)
       ? input.customDomains
       : String(input.customDomains || '').split(/[,，\s]+/);
@@ -406,6 +515,7 @@ function makeProxy(input) {
     if (cleaned.length) base.customDomains = cleaned;
     if (input.subdomain) base.subdomain = String(input.subdomain).trim();
   }
+  if (type === 'tcpmux') base.multiplexer = String(input.multiplexer || 'httpconnect').trim() || 'httpconnect';
   if (input.secretKey) base.secretKey = String(input.secretKey);
   const transport = {};
   if (input.useCompression) transport.useCompression = true;
@@ -426,6 +536,9 @@ module.exports = {
   serialize,
   writeConfig,
   backupConfig,
+  probeTargetFor,
+  firstDomainOf,
+  vhostPortOf,
   ensureAdmin,
   suggestRemotePort,
   publicAddressFor,

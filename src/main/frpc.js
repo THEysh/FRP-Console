@@ -3,6 +3,7 @@
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 const { EventEmitter } = require('node:events');
+const toml = require('smol-toml');
 const { tcpCheck } = require('./util');
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -21,6 +22,18 @@ function childEnv(settings) {
   const env = { ...process.env };
   for (const key of PROXY_ENV_KEYS) delete env[key];
   return env;
+}
+
+/* Windows 上 spawn 一个“不是可执行文件”的东西只会给一句 `spawn UNKNOWN`，
+ * 用户完全不知道发生了什么（常见于：把 frpc.exe 换成了文本、被杀软隔离、
+ * 路径指向了一个目录、或者下载中断留下半截文件）。 */
+function spawnErrorText(error, frpcPath) {
+  const raw = String((error && (error.code || error.message)) || 'unknown');
+  const name = frpcPath || 'frpc.exe';
+  if (/UNKNOWN|EINVAL/i.test(raw)) return `${name} 无法执行：文件可能已损坏、被杀毒软件隔离，或根本不是 exe`;
+  if (/EACCES|EPERM/i.test(raw)) return `没有权限执行 ${name}（被安全软件拦住，或文件属性为只读/受保护）`;
+  if (/ENOENT/i.test(raw)) return `找不到 ${name}`;
+  return `${raw}（${name}）`;
 }
 
 class FrpcManager extends EventEmitter {
@@ -42,6 +55,10 @@ class FrpcManager extends EventEmitter {
     this.connectedAt = null;
     this.lastRefreshAt = 0;
     this.refreshing = null;
+    // 7400 上的管理 API 到底是不是“这台机器这份配置”的 frpc：
+    // 'own' 是自家的，'foreign' 是别的 frpc 占着端口，'unknown' 还没验过。
+    this.ownership = 'unknown';
+    this.ownershipAt = 0;
   }
 
   get settings() {
@@ -120,6 +137,18 @@ class FrpcManager extends EventEmitter {
           }
         }
       }
+      /* 管理 API 能应答 ≠ 它是我们这份配置的 frpc。
+       * 端口是固定的（默认 7400），同一台机器上另一份配置、另一个控制台实例、
+       * 或者用户手工开的 frpc 都可能占着它：那时 /api/status 会把别人的隧道
+       * 当成自己的报上来，点“停止隧道”还会把别人的进程停掉。
+       * 用 /api/config 把身份核对一遍（只在状态刚变成可用、或每分钟做一次）。 */
+      if (this.apiOk && (!previousOk || !this.ownershipAt || Date.now() - this.ownershipAt > 60000)) {
+        this.ownership = await this.detectOwnership();
+        this.ownershipAt = Date.now();
+      } else if (!this.apiOk) {
+        this.ownership = 'unknown';
+        this.ownershipAt = 0;
+      }
       this.lastRefreshAt = Date.now();
       return this.snapshot();
     })();
@@ -128,6 +157,32 @@ class FrpcManager extends EventEmitter {
     } finally {
       this.refreshing = null;
     }
+  }
+
+  /* 核对 7400 上的 frpc 是不是“这份配置”起的。
+   * 只比三样东西：服务器地址、服务器端口、代理名单（外加 token 有就比）。
+   * 一致就当自家的；不一致 / 读不到 / 解析失败一律 foreign，宁可不接管，
+   * 也不要把别人的隧道当成自己的去停。 */
+  async detectOwnership() {
+    const model = this.config;
+    if (!model) return 'unknown';
+    let remote;
+    try {
+      const r = await this.api('/api/config', { timeout: 2500 });
+      remote = toml.parse(r.text || '');
+    } catch (e) {
+      // 认证失败说明密码对不上，那也不是我们的进程
+      return /401|403/.test(String(e && e.message)) ? 'foreign' : 'unknown';
+    }
+    if (!remote || typeof remote !== 'object') return 'unknown';
+    const norm = (value) => String(value === undefined || value === null ? '' : value).trim();
+    if (norm(remote.serverAddr) !== norm(model.serverAddr)) return 'foreign';
+    if (Number(remote.serverPort || 7000) !== Number(model.serverPort || 7000)) return 'foreign';
+    const remoteToken = remote.auth && remote.auth.token !== undefined ? norm(remote.auth.token) : null;
+    if (remoteToken !== null && remoteToken !== norm(model.auth && model.auth.token)) return 'foreign';
+    const names = (list) => (Array.isArray(list) ? list.map((item) => norm(item && item.name)).sort().join('|') : '');
+    if (names(remote.proxies) !== names(model.proxies)) return 'foreign';
+    return 'own';
   }
 
   describeApiError(error) {
@@ -148,25 +203,30 @@ class FrpcManager extends EventEmitter {
     if (this.serviceState && this.serviceState.installed && this.serviceState.state === 'running') {
       return this.apiOk ? 'service' : 'starting';
     }
-    if (this.apiOk) return 'external';
+    if (this.apiOk) return this.ownership === 'foreign' ? 'foreign' : 'external';
     return 'stopped';
   }
 
   snapshot() {
     const serviceRunning = !!(this.serviceState && this.serviceState.installed && this.serviceState.state === 'running');
+    const foreign = this.ownership === 'foreign';
     return {
       mode: this.runtimeMode(),
       // running 指“frpc 进程或服务在跑”，connected 指“本机管理 API 有响应”。
       // 两者不再混为一谈：frpc 连不上 frps 时 api 仍然能有响应，但隧道其实没通。
       running: this.isChildAlive || serviceRunning || this.apiOk,
-      connected: this.apiOk,
+      // 别人的 frpc 占着管理端口时，不能算“我们的隧道连上了”
+      connected: this.apiOk && !foreign,
+      foreign,
+      ownership: this.ownership,
       adminPort: this.admin.port,
       apiError: this.apiError,
       pid: this.isChildAlive ? this.child.pid : serviceRunning ? this.serviceState.pid : null,
       since: this.connectedAt,
       childStartedAt: this.childStartedAt,
       service: this.serviceState,
-      proxies: [...this.proxyStatus.values()],
+      // 别人的 frpc 报上来的代理不是这份配置的，别混进状态里冒充“我的隧道”
+      proxies: foreign ? [] : [...this.proxyStatus.values()],
       lastRefreshAt: this.lastRefreshAt,
       lastExit: this.lastExit,
     };
@@ -177,7 +237,13 @@ class FrpcManager extends EventEmitter {
   }
 
   async start({ runMode = 'auto' } = {}) {
-    if (this.apiOk) return { ok: true, already: true };
+    if (this.apiOk) {
+      // 端口被别人的 frpc 占着：既不能接管，也不能假装已经启动成功
+      if (this.ownership === 'foreign') {
+        return { ok: false, error: `管理端口 ${this.admin.port} 被另一个 frpc 占用（不是这份配置的），请先关掉它或改用别的 adminPort` };
+      }
+      return { ok: true, already: true };
+    }
     const service = this.serviceState || {};
     const useService = runMode === 'service' || (runMode === 'auto' && service.installed);
     if (useService) {
@@ -205,6 +271,12 @@ class FrpcManager extends EventEmitter {
       return down.ok ? { ok: true, mode: 'service' } : { ok: false, error: down.error || '服务已停止，但管理 API 仍有响应' };
     }
     if (this.apiOk) {
+      /* 只有当这个管理 API 确实属于“这份配置”时才停止它。
+       * 以前不看归属，端口上的任意 frpc 都会被 POST /api/stop 关掉 ——
+       * 另一份配置、另一个控制台实例正在用的隧道就这么被杀了。 */
+      if (this.ownership === 'foreign') {
+        return { ok: false, error: `管理端口 ${this.admin.port} 上的 frpc 不是本配置启动的，已拒绝停止它` };
+      }
       try {
         await this.api('/api/stop', { method: 'POST', timeout: 4000 });
         return { ok: true };
@@ -248,7 +320,8 @@ class FrpcManager extends EventEmitter {
       });
     } catch (e) {
       this.childStartedAt = null;
-      return { ok: false, error: `启动 frpc 失败：${e.message}` };
+      // spawn 失败的原因是给用户看的：spawn UNKNOWN / EACCES 这类英文码得翻译成人话
+      return { ok: false, error: `启动 frpc 失败：${spawnErrorText(e, frpcPath)}` };
     }
     this.child = child;
     this.childPid = child.pid;
@@ -264,7 +337,7 @@ class FrpcManager extends EventEmitter {
 
     child.once('error', (error) => {
       this.emit('error', error);
-      this.lastExit = { code: null, error: error.message, at: Date.now() };
+      this.lastExit = { code: null, error: spawnErrorText(error, this.paths.frpcPath), at: Date.now() };
       this.refresh().catch(() => {});
     });
     child.once('exit', (code, signal) => {

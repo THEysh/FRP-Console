@@ -7,26 +7,33 @@ const fs = require('node:fs');
 const crypto = require('node:crypto');
 
 function execFileP(file, args = [], options = {}) {
+  const opts = {
+    windowsHide: true,
+    timeout: 20000,
+    maxBuffer: 8 * 1024 * 1024,
+    encoding: 'utf8',
+    ...options,
+  };
   return new Promise((resolve) => {
-    const opts = {
-      windowsHide: true,
-      timeout: 20000,
-      maxBuffer: 8 * 1024 * 1024,
-      encoding: 'utf8',
-      ...options,
-    };
-    execFile(file, args, opts, (error, stdout, stderr) => {
-      resolve({
-        ok: !error,
-        code: error ? (typeof error.code === 'number' ? error.code : 1) : 0,
-        signal: error && error.signal ? error.signal : null,
-        stdout: String(stdout || ''),
-        stderr: String(stderr || ''),
-        message: error ? String(error.message || '').split('\n')[0] : '',
-        file,
-        args,
+    try {
+      execFile(file, args, opts, (error, stdout, stderr) => {
+        resolve({
+          ok: !error,
+          code: error ? (typeof error.code === 'number' ? error.code : 1) : 0,
+          signal: error && error.signal ? error.signal : null,
+          stdout: String(stdout || ''),
+          stderr: String(stderr || ''),
+          message: error ? String(error.message || '').split('\n')[0] : '',
+          file,
+          args,
+        });
       });
-    });
+    } catch (e) {
+      /* spawn 一个不可执行的文件（frpc.exe 被换成文本、被杀软隔离、路径其实是个目录）时，
+       * Windows 会在 uv_spawn 里同步抛 `spawn UNKNOWN`，Promise 执行器里的同步异常
+       * 会变成 reject —— 以前一路冒到 IPC，界面点“保存”毫无反应。这里一律收敛成结果对象。 */
+      resolve({ ok: false, code: 1, signal: null, stdout: '', stderr: '', message: String((e && e.message) || e).split('\n')[0], file, args });
+    }
   });
 }
 
@@ -44,11 +51,28 @@ function powershell(script, options = {}) {
   );
 }
 
+/* 端口/主机先自己校验一遍，永不抛。
+ * net.connect({ port: NaN }) 会同步抛 ERR_SOCKET_BAD_PORT，抛出点在 Promise
+ * 执行器内 → 变成 reject。stcp/xtcp 这类代理没有 remotePort，
+ * Number(undefined) 就是 NaN，于是整轮 Promise.all 直接 reject，
+ * 健康检查从此不再更新，界面会一直停在“全部在线”。 */
 function tcpCheck(host, port, timeout = 2500) {
+  const target = String(host || '').trim();
+  const num = Number(port);
+  if (!target) return Promise.resolve({ ok: false, ms: 0, error: '主机为空' });
+  if (!Number.isInteger(num) || num < 1 || num > 65535) {
+    return Promise.resolve({ ok: false, ms: 0, error: `端口无效（${port === undefined || port === null ? '空' : String(port)}）` });
+  }
   return new Promise((resolve) => {
     const started = Date.now();
     let settled = false;
-    const socket = net.connect({ host, port: Number(port) });
+    let socket;
+    try {
+      socket = net.connect({ host: target, port: num });
+    } catch (err) {
+      resolve({ ok: false, ms: 0, error: err.code || err.message || 'unknown' });
+      return;
+    }
     const finish = (ok, error) => {
       if (settled) return;
       settled = true;
@@ -62,43 +86,80 @@ function tcpCheck(host, port, timeout = 2500) {
   });
 }
 
-async function httpProbe(url, timeout = 6000) {
+/* 探测一个 HTTP 地址。
+ * 用 node:http(s) 而不是 fetch：fetch（undici）会无视调用方传的 Host 头，
+ * 一律按 URL 里的主机名发请求 —— 而探测 frps 的 vhost 恰恰需要
+ * “连 127.0.0.1:vhostPort、Host 写绑定域名”，否则永远匹配不到代理，
+ * 返回的是 frps 自己的 404 页面。 */
+function httpProbe(url, timeout = 6000, extraHeaders = null) {
   const started = Date.now();
   let parsed;
   try {
     parsed = new URL(url);
   } catch {
-    return { ok: false, status: 0, ms: 0, error: 'URL 无效' };
+    return Promise.resolve({ ok: false, status: 0, ms: 0, error: 'URL 无效' });
   }
   if (!['http:', 'https:'].includes(parsed.protocol)) {
-    return { ok: false, status: 0, ms: 0, error: '仅支持 HTTP/HTTPS' };
+    return Promise.resolve({ ok: false, status: 0, ms: 0, error: '仅支持 HTTP/HTTPS' });
   }
-  try {
-    const res = await fetch(url, {
-      redirect: 'follow',
-      signal: AbortSignal.timeout(timeout),
-      headers: { 'User-Agent': 'frp-console/1.0' },
+  const transport = parsed.protocol === 'https:' ? require('node:https') : require('node:http');
+  const headers = { 'User-Agent': 'frp-console/1.0', ...(extraHeaders || {}) };
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    let req;
+    try {
+      req = transport.request(
+        {
+          protocol: parsed.protocol,
+          host: parsed.hostname,
+          port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+          path: `${parsed.pathname || '/'}${parsed.search || ''}`,
+          method: 'GET',
+          headers,
+          timeout,
+        },
+        (res) => {
+          let body = '';
+          res.setEncoding('utf8');
+          res.on('data', (chunk) => {
+            if (body.length < 64 * 1024) body += chunk;
+          });
+          res.on('end', () => {
+            const status = res.statusCode || 0;
+            const titleMatch = body.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+            /* frps 在没有匹配到任何代理时会返回自己的 404 页面。
+             * 那种页面看着“HTTP 通了”，其实隧道根本没转发，必须算失败。 */
+            const frpsMiss = status === 404 && /<?!?DOCTYPE html/i.test(body) && /<title>Not Found<\/title>/i.test(body);
+            done({
+              ok: status > 0 && status < 500 && !frpsMiss,
+              status,
+              ms: Date.now() - started,
+              title: titleMatch ? titleMatch[1].replace(/\s+/g, ' ').trim().slice(0, 120) : '',
+              finalUrl: url,
+              contentType: String(res.headers['content-type'] || ''),
+              error: frpsMiss ? 'frps 上没有匹配到该域名（代理未注册或域名不一致）' : null,
+            });
+          });
+        },
+      );
+    } catch (err) {
+      done({ ok: false, status: 0, ms: Date.now() - started, error: err.code || err.message });
+      return;
+    }
+    req.on('timeout', () => {
+      req.destroy();
+      done({ ok: false, status: 0, ms: Date.now() - started, error: '请求超时' });
     });
-    const buffer = await res.arrayBuffer();
-    const text = Buffer.from(buffer).toString('utf8');
-    const titleMatch = text.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
-    return {
-      ok: res.status < 500,
-      status: res.status,
-      ms: Date.now() - started,
-      title: titleMatch ? titleMatch[1].replace(/\s+/g, ' ').trim().slice(0, 120) : '',
-      finalUrl: res.url,
-      contentType: res.headers.get('content-type') || '',
-    };
-  } catch (err) {
-    const code = err && err.cause && (err.cause.code || err.cause.message);
-    return {
-      ok: false,
-      status: 0,
-      ms: Date.now() - started,
-      error: err.name === 'TimeoutError' || err.name === 'AbortError' ? '请求超时' : code || err.message,
-    };
-  }
+    req.on('error', (err) => {
+      done({ ok: false, status: 0, ms: Date.now() - started, error: err.code || err.message });
+    });
+    req.end();
+  });
 }
 
 function readJson(file, fallback) {

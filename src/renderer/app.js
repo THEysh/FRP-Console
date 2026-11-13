@@ -200,6 +200,9 @@ function runtimeInfo() {
   const running = !!r.connected;
   const starting = r.mode === 'starting' || !!r.pending;
   const external = r.mode === 'external';
+  /* 管理 API 有响应，但 /api/config 显示它不是这份配置的 frpc：
+   * 那个端口上跑的是别人的隧道，既不能接管，也不能让“停止隧道”去杀它。 */
+  const foreign = !!r.foreign || r.mode === 'foreign';
   // 只有在“本来该由系统服务提供隧道”的模式下，服务停了才值得单独提示。
   // 托管模式下服务停着是常态，再报“系统服务未运行”只会把人引偏。
   const wantsService = runMode === 'auto' || runMode === 'service';
@@ -224,6 +227,12 @@ function runtimeInfo() {
       title = '隧道已连接';
       desc = modeLabel(r.mode);
     }
+  } else if (foreign) {
+    // 管理端口上是别人的 frpc：既没连上，也不能报“外部进程（可能是正常隧道）”
+    tone = 'error';
+    label = '端口冲突';
+    title = `管理端口 ${r.adminPort || 7400} 被别的 frpc 占用`;
+    desc = '那不是这份配置的隧道';
   } else if (starting) {
     tone = 'warn';
     label = '连接中…';
@@ -256,7 +265,7 @@ function runtimeInfo() {
     // 这里没有任何进程在跑，apiError（“管理 API 未启动”）对用户毫无信息量，只留操作提示。
     desc = '点击“启动隧道”建立连接';
   }
-  return { tone, label, title, desc, online, running, starting, external, r, service };
+  return { tone, label, title, desc, online, running, starting, external, foreign, r, service };
 }
 
 /* ---------------------------- 页面骨架 ---------------------------- */
@@ -428,7 +437,7 @@ function renderOverview(force = false) {
   S.lastKeys.overview = key;
   const state = S.state || {};
   const info = runtimeInfo();
-  const counts = state.counts || { total: 0, online: 0, unhealthy: 0, unhealthyLocal: 0 };
+  const counts = state.counts || { total: 0, online: 0, unhealthy: 0, unchecked: 0, unhealthyLocal: 0 };
   const proxies = state.proxies || [];
   const app = state.app || {};
   const settings = state.settings || {};
@@ -472,6 +481,10 @@ function renderOverview(force = false) {
   const issues = [];
   if (state.binding && state.binding.unarchived) issues.push(orphanTunnelNote());
   if (state.configError) issues.push(`<div class="note error">${icon('alert')}<div>${esc(state.configError)}</div></div>`);
+  if (info.foreign) {
+    const port = (info.r && info.r.adminPort) || 7400;
+    issues.push(`<div class="note error">${icon('alert')}<div><strong>管理端口 ${esc(port)} 上跑着另一个 frpc</strong><br>它连的服务器或代理名单跟这份配置对不上（多半是另一份配置、另一个控制台实例，或手工开的 frpc）。本配置的隧道没有在跑，这里也不能停它。<br><span style="opacity:.75">到「设置 → 运行模式与行为」换一个管理 API 端口，或先把那个 frpc 关掉。</span></div></div>`);
+  }
   if (onlyMissingServer) {
     issues.push(`<div class="note">${icon('alert')}<div><strong>还没有连上服务器</strong><br>到「服务器」页新建一个档案，填 IP 和 SSH 密码，连上后一键初始化 frps——地址与 Token 会自动写进本机配置，不用手填。<br><span style="opacity:.75">服务器就绪后，去「代理映射」加一条穿透规则，回来这里看三层是否全绿。</span></div></div>`);
   } else if (validationErrors.length) {
@@ -544,12 +557,12 @@ function renderOverview(force = false) {
         <div class="card metric">
           <div class="metric-top"><span class="metric-label">在线代理</span><span class="metric-icon">${icon('activity')}</span></div>
           <div class="metric-value">${esc(counts.online)}<small> / ${esc(counts.total)}</small></div>
-          <div class="metric-foot"><span class="${!config.serverAddr ? '' : (counts.online === counts.total && counts.total ? 'up' : 'down')}">${!config.serverAddr ? '配置服务器后自动检测' : counts.total ? (counts.online === counts.total ? '全部在线' : `${counts.total - counts.online} 条未通过连通性检查`) : '暂无代理'}</span></div>
+          <div class="metric-foot"><span class="${!config.serverAddr ? '' : (counts.online === counts.total && counts.total ? 'up' : counts.unchecked > 0 ? '' : 'down')}">${!config.serverAddr ? '配置服务器后自动检测' : !counts.total ? '暂无代理' : counts.online === counts.total ? '全部在线' : counts.unchecked > 0 && counts.unhealthy === 0 ? `${counts.unchecked} 条待检测` : `${counts.total - counts.online} 条未通过连通性检查`}</span></div>
         </div>
         <div class="card metric">
           <div class="metric-top"><span class="metric-label">连通性异常</span><span class="metric-icon">${icon('cpu')}</span></div>
           <div class="metric-value">${config.serverAddr ? esc(counts.unhealthy || 0) : '—'}</div>
-          <div class="metric-foot"><span class="${!config.serverAddr ? '' : counts.unhealthy ? 'down' : 'up'}">${!config.serverAddr ? '尚未开始检测' : counts.unhealthy ? layerFailText(counts) : '全部代理三层全通（本地 → 隧道 → 公网）'}</span></div>
+          <div class="metric-foot"><span class="${!config.serverAddr ? '' : counts.unhealthy ? 'down' : counts.unchecked > 0 ? '' : 'up'}">${!config.serverAddr ? '尚未开始检测' : counts.unhealthy ? layerFailText(counts) : counts.unchecked > 0 ? `${counts.unchecked} 条还没测完` : '全部代理三层全通（本地 → 隧道 → 公网）'}</span></div>
         </div>
         <div class="card metric">
           <div class="metric-top"><span class="metric-label">运行时长</span><span class="metric-icon">${icon('clock')}</span></div>
@@ -2693,6 +2706,32 @@ function renderSettings(force = false) {
             ? `<div class="note">${icon('shield')}<div>已启用：<span class="mono">${esc(admin.addr || '127.0.0.1')}:${esc(admin.port)}</span> · 用户 <span class="mono">${esc(admin.user || '-')}</span><br>该管理接口会写回 frpc.toml，启用/修改后需要一次服务重启。</div></div>`
             : `<div class="note warn">${icon('alert')}<div>未检测到 <span class="mono">webServer</span> 配置。启用后控制台可以读取代理在线状态并热重载配置。</div></div>`}
           <div class="field-hint" style="margin-top:10px">当前连接：${state.runtime && state.runtime.connected ? '管理 API 可用' : `不可用${state.runtime && state.runtime.apiError ? `（${esc(state.runtime.apiError)}）` : ''}`}</div>
+          <form class="form-grid" id="form-admin" style="margin-top:12px" autocomplete="off" onsubmit="return false">
+            <div class="field">
+              <label>端口</label>
+              <input class="input" name="adminPort" type="number" min="1" max="65535" value="${esc(settings.adminPort || 7400)}" />
+              <div class="field-hint">仅监听 127.0.0.1。改成别的端口时，控制台会同步改写 frpc.toml 并重启隧道。</div>
+            </div>
+            <div class="field">
+              <label>用户名 / 密码</label>
+              <div style="display:flex;gap:6px">
+                <input class="input" name="adminUser" type="text" value="${esc(settings.adminUser || 'admin')}" style="flex:1" />
+                <input class="input" name="adminPassword" type="text" value="${esc(settings.adminPassword || '')}" style="flex:2" />
+              </div>
+              <div class="field-hint">口令会一起写进 frpc.toml 的 <span class="mono">webServer</span>。默认口令等于没有保护：任何本机进程都能用它读到自己配置里的 auth.token。</div>
+            </div>
+            <div class="field">
+              <label>frps 的 HTTP / HTTPS 端口</label>
+              <div style="display:flex;gap:6px">
+                <input class="input" name="vhostHttpPort" type="number" min="1" max="65535" value="${esc(settings.vhostHttpPort || 80)}" style="flex:1" />
+                <input class="input" name="vhostHttpsPort" type="number" min="1" max="65535" value="${esc(settings.vhostHttpsPort || 443)}" style="flex:1" />
+              </div>
+              <div class="field-hint">frps 的 vhostHTTPPort / vhostHTTPSPort。用来拼 http 代理的公网地址和做连通性检查；不是 80/443 时必须填对，否则会误报“公网不可达”。</div>
+            </div>
+            <div class="field" style="align-self:end">
+              <button class="btn primary" type="button" data-act="admin.save">${icon('check')}<span>保存并写入配置</span></button>
+            </div>
+          </form>
         </section>
 
         <section class="card section">
@@ -3136,6 +3175,49 @@ async function handleAction(act, dataset, btn) {
       case 'settings.save.behavior':
         await saveBehavior(btn);
         break;
+      case 'admin.save': {
+        const form = $('#form-admin');
+        if (!form) break;
+        const val = (name) => {
+          const el = form.querySelector(`[name="${name}"]`);
+          return el ? el.value : '';
+        };
+        const patch = {
+          adminPort: Number(val('adminPort')) || 7400,
+          adminUser: String(val('adminUser') || '').trim() || 'admin',
+          adminPassword: String(val('adminPassword') || ''),
+          vhostHttpPort: Number(val('vhostHttpPort')) || 80,
+          vhostHttpsPort: Number(val('vhostHttpsPort')) || 443,
+        };
+        await withBusy(btn, async () => {
+          let res;
+          try {
+            res = await FRP.saveSettings(patch);
+          } catch (e) {
+            toast('error', '保存失败', (e && e.message) || String(e));
+            return;
+          }
+          if (!res || !res.ok) {
+            toastResult(res);
+            return;
+          }
+          if (res.data && res.data.state) S.state = res.data.state;
+          // 端口/口令落到 frpc.toml 的 webServer 里，否则控制台与 frpc 对不上
+          let ensured;
+          try {
+            ensured = await FRP.enableAdmin();
+          } catch (e) {
+            toast('error', '写入配置失败', (e && e.message) || String(e));
+            return;
+          }
+          if (ensured && ensured.ok && ensured.data && ensured.data.state) S.state = ensured.data.state;
+          S.lastKeys.settings = '';
+          if (ensured && ensured.ok) toast('success', '管理 API 配置已更新', 'frpc.toml 里的 webServer 已同步；隧道正在跑时会自动重启一次');
+          else toastResult(ensured);
+          renderSettings(true);
+        });
+        break;
+      }
       case 'admin.enable': {
         await withBusy(btn, async () => {
           const res = await FRP.enableAdmin();

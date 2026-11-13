@@ -870,6 +870,9 @@ function runtimeView(runtime) {
     connectFailed: detected || unconfirmed,
     connectError: detected ? problem.text : unconfirmed ? '管理 API 可达，但服务器上没有任何代理注册成功' : '',
     connectKind: detected ? problem.kind : unconfirmed ? 'unconfirmed' : '',
+    // 管理端口被别的 frpc 占着：状态、代理列表、停止操作都不能当真
+    foreign: !!runtime.foreign,
+    adminConflict: runtime.foreign ? `管理端口 ${runtime.adminPort || 7400} 上的 frpc 不是本配置启动的` : '',
   };
 }
 
@@ -893,11 +896,12 @@ function buildState() {
   const runtime = runtimeView(manager.snapshot());
   const validation = model ? configModule.validate(model) : { errors: [], warnings: [] };
   const proxies = (model ? model.proxies : []).map((proxy) => {
-    const st = manager.proxyStatus.get(proxy.name) || null;
+    // 管理端口上是别人的 frpc 时，它报的代理状态与本配置无关，一律当作没同步
+    const st = runtime.foreign ? null : manager.proxyStatus.get(proxy.name) || null;
     const health = healthCache.get(proxy.name) || null;
     return {
       ...proxy,
-      publicAddress: configModule.publicAddressFor(model, proxy),
+      publicAddress: configModule.publicAddressFor(model, proxy, settings),
       status: st && st.status ? st.status : runtime.loggedIn ? 'pending' : 'unknown',
       statusError: st && st.err ? st.err : '',
       runtimeLocal: st ? st.local_addr : '',
@@ -932,15 +936,21 @@ function buildState() {
     service: serviceCache,
     proxies,
     counts: (() => {
-      const failed = proxies.filter((p) => p.health && !p.health.ok);
+      /* 只有“隧道状态 running 且三层检查真的通过”才算在线。
+       * 以前 `!p.health || p.health.ok` 把“还没检查”也当成在线，
+       * 结果是刚启动、或健康检查被卡住时，坏代理照样报绿。 */
+      const fresh = (p) => !!p.health && Date.now() - (p.health.at || 0) < 90000;
+      const verified = proxies.filter(fresh);
+      const failed = verified.filter((p) => !p.health.ok);
       // 按失败的层级拆开计数：概览页据此说“是本地服务、隧道还是公网不通”，
       // 而不是笼统一句“未通过三层检查”，把人骗去查本地端口。
       const layerFailed = (name) => failed.filter((p) => p.health.layers && p.health.layers[name] && !p.health.layers[name].ok).length;
       return {
         total: proxies.length,
-        // 只有隧道在线、且三层连通性检查全部通过，才算真正“在线”。
-        online: proxies.filter((p) => p.status === 'running' && (!p.health || p.health.ok)).length,
+        online: verified.filter((p) => p.health.ok && p.status === 'running').length,
         unhealthy: failed.length,
+        // 这一轮还没测完（或代理刚加进来）的条数：界面上既不能说在线也不能说异常
+        unchecked: proxies.length - verified.length,
         unhealthyLocal: layerFailed('local'),
         unhealthyTunnel: layerFailed('tunnel'),
         unhealthyPublic: layerFailed('public'),
@@ -1130,6 +1140,87 @@ function scheduleHealth(delay = 1200) {
   }, delay);
 }
 
+/* 一轮健康检查最多同时探测几条、总共花多久。
+ * 以前写死“只查前 16 条”，第 17 条之后的代理永远拿不到结果，
+ * 坏掉的代理会一直显示在线（概览还会说“全部三层全通”）；
+ * 但也不能把几百条代理一次性全丢进去，同一瞬间开上百个 socket。 */
+const HEALTH_CONCURRENCY = 6;
+const HEALTH_BUDGET_MS = 7000;
+
+/* 限制并发的 map：结果按输入顺序返回，超出时间预算的条目留 null 给下一轮 */
+async function mapLimit(items, limit, worker) {
+  const out = new Array(items.length).fill(null);
+  let cursor = 0;
+  const runners = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
+    for (;;) {
+      const index = cursor;
+      cursor += 1;
+      if (index >= items.length) return;
+      out[index] = await worker(items[index], index);
+    }
+  });
+  await Promise.all(runners);
+  return out;
+}
+
+/* 单条代理的三层检查。任何异常都收敛成一条失败结果：
+ * 一条代理出问题不能让整轮检查作废（以前 Promise.all 一 reject，整轮全丢）。 */
+async function checkProxyHealth(p, ctx) {
+  const at = Date.now();
+  const layers = {};
+  const local = await manager.testLocal(p);
+  layers.local = { ok: !!local.ok, ms: local.ms || 0, error: local.error || null };
+  if (!local.ok) {
+    return [p.name, { ok: false, reason: '本地服务不通', ms: local.ms || 0, error: local.error || null, layers, at }];
+  }
+
+  // 第 2 层：本地 frpc 已连上远程服务器，且该代理已在服务端注册（frpc 状态 running）。
+  const status = manager.proxyStatus.get(p.name);
+  const running = !!status && status.status === 'running';
+  if (!running) {
+    layers.tunnel = { ok: false, ms: 0, error: status && status.err ? status.err : '代理尚未在服务端注册' };
+    return [p.name, { ok: false, reason: '隧道未建立', ms: local.ms || 0, error: layers.tunnel.error, layers, at }];
+  }
+  const server = await ctx.serverCheck();
+  layers.tunnel = { ok: !!server.ok, ms: server.ms || 0, error: server.error || null };
+  if (!server.ok) {
+    return [p.name, { ok: false, reason: '本地到服务器不可达', ms: (local.ms || 0) + (server.ms || 0), error: server.error || null, layers, at }];
+  }
+
+  // 第 3 层：从本地经公网地址访问远程端口，确认服务端已对公网监听。
+  // udp/sudp/xtcp/stcp 没有可探测的公网 TCP 端口或不走公网，
+  // tcpmux 要先在 frps 的 tcpmux 端口上发 HTTP CONNECT 才能认领域名，
+  // 这几种都只能确认到“隧道已注册”，第 3 层标记为 skipped。
+  const type = p.type || 'tcp';
+  if (type === 'udp' || type === 'sudp' || type === 'xtcp' || type === 'stcp' || type === 'tcpmux') {
+    layers.public = { ok: true, ms: 0, skipped: true, error: null };
+    return [p.name, { ok: true, reason: null, ms: (local.ms || 0) + (server.ms || 0), error: null, layers, at }];
+  }
+  let pub;
+  const target = configModule.probeTargetFor(model, p, settings);
+  if (!target) {
+    pub = { ok: false, ms: 0, error: type === 'http' || type === 'https' ? '缺少公网域名' : '缺少公网端口' };
+    layers.public = { ok: false, ms: 0, error: pub.error, skipped: true };
+  } else if (target.kind === 'http') {
+    pub = await httpProbe(target.url, 5000, target.host ? { Host: target.host } : null);
+    layers.public = { ok: !!pub.ok, ms: pub.ms || 0, error: pub.error || null, status: pub.status || 0, url: target.display || target.url };
+  } else {
+    pub = await tcpCheck(target.host, target.port, 2500);
+    layers.public = { ok: !!pub.ok, ms: pub.ms || 0, error: pub.error || null };
+  }
+  if (!pub.ok) {
+    return [p.name, { ok: false, reason: '公网不可达', ms: (local.ms || 0) + (server.ms || 0) + (layers.public.ms || 0), error: pub.error || null, layers, at }];
+  }
+  return [p.name, {
+    ok: true,
+    reason: null,
+    ms: (local.ms || 0) + (server.ms || 0) + (layers.public.ms || 0),
+    error: null,
+    layers,
+    at,
+  }];
+}
+
 async function checkHealth() {
   if (!model) return;
   // 还没填服务器地址时，隧道和公网两层必然不通，检查出来全是红色异常，
@@ -1138,67 +1229,36 @@ async function checkHealth() {
     healthCache.clear();
     return;
   }
-  const targets = model.proxies.filter((p) => p.localPort && !p.plugin).slice(0, 16);
-  const serverAddr = model.serverAddr;
-  const serverPort = Number(model.serverPort);
+  // plugin 代理（socks5/http_proxy 等）没有本地端口，没得可测，直接跳过。
+  const targets = model.proxies.filter((p) => !p.plugin);
+  const ctx = { serverAddr: model.serverAddr };
   let serverCheck = null;
-  const getServerCheck = () => {
-    if (!serverCheck) serverCheck = tcpCheck(serverAddr, serverPort, 2500);
+  ctx.serverCheck = () => {
+    if (!serverCheck) serverCheck = tcpCheck(ctx.serverAddr, Number(model.serverPort), 2500);
     return serverCheck;
   };
 
-  const results = await Promise.all(
-    targets.map(async (p) => {
-      const at = Date.now();
-      const layers = {};
-      // 第 1 层：本地服务已启动且端口可达。失败即短路，不再探测后面两层。
-      const local = await manager.testLocal(p);
-      layers.local = { ok: local.ok, ms: local.ms, error: local.error || null };
-      if (!local.ok) {
-        return [p.name, { ok: false, reason: '本地服务不通', ms: local.ms, error: local.error || null, layers, at }];
-      }
-
-      // 第 2 层：本地 frpc 已连上远程服务器，且该代理已在服务端注册（frpc 状态 running）。
-      const status = manager.proxyStatus.get(p.name);
-      const running = !!status && status.status === 'running';
-      if (!running) {
-        layers.tunnel = { ok: false, ms: 0, error: status && status.err ? status.err : '代理尚未在服务端注册' };
-        return [p.name, { ok: false, reason: '隧道未建立', ms: local.ms, error: layers.tunnel.error, layers, at }];
-      }
-      const server = await getServerCheck();
-      layers.tunnel = { ok: !!server.ok, ms: server.ms, error: server.error || null };
-      if (!server.ok) {
-        return [p.name, { ok: false, reason: '本地到服务器不可达', ms: local.ms + server.ms, error: server.error || null, layers, at }];
-      }
-
-      // 第 3 层：从本地经公网地址访问远程端口，确认服务端已对公网监听。
-      let pub;
-      if (p.type === 'udp' || p.type === 'sudp') {
-        layers.public = { ok: true, ms: 0, skipped: true, error: null };
-        pub = { ok: true, ms: 0 };
-      } else if (p.type === 'http' || p.type === 'https') {
-        const url = configModule.publicAddressFor(model, p);
-        pub = url ? await httpProbe(url, 5000) : { ok: false, ms: 0, error: '缺少公网域名' };
-        layers.public = { ok: !!pub.ok, ms: pub.ms || 0, error: pub.error || null, status: pub.status || 0 };
-      } else {
-        pub = await tcpCheck(serverAddr, Number(p.remotePort), 2500);
-        layers.public = { ok: !!pub.ok, ms: pub.ms || 0, error: pub.error || null };
-      }
-      if (!pub.ok) {
-        return [p.name, { ok: false, reason: '公网不可达', ms: local.ms + (layers.tunnel.ms || 0) + (layers.public.ms || 0), error: pub.error || null, layers, at }];
-      }
-
+  const started = Date.now();
+  const results = await mapLimit(targets, HEALTH_CONCURRENCY, async (p) => {
+    // 时间预算用完就把剩下的留到下一轮，避免几十条代理把一轮拖成半分钟
+    if (Date.now() - started > HEALTH_BUDGET_MS) return null;
+    try {
+      return await checkProxyHealth(p, ctx);
+    } catch (err) {
       return [p.name, {
-        ok: true,
-        reason: null,
-        ms: local.ms + (layers.tunnel.ms || 0) + (layers.public.ms || 0),
-        error: null,
-        layers,
-        at,
+        ok: false,
+        reason: '检查出错',
+        ms: 0,
+        error: (err && (err.code || err.message)) || 'unknown',
+        layers: {},
+        at: Date.now(),
       }];
-    }),
-  );
-  for (const [name, value] of results) healthCache.set(name, value);
+    }
+  });
+  for (const item of results) if (item) healthCache.set(item[0], item[1]);
+  // 配置里已经删掉的代理要顺手清掉，否则以后加回同名代理会读到上一次的旧结果
+  const alive = new Set(model.proxies.map((p) => p.name));
+  for (const name of Array.from(healthCache.keys())) if (!alive.has(name)) healthCache.delete(name);
 }
 
 async function checkExternalConfig() {
@@ -1316,11 +1376,20 @@ function registerIpc() {
   });
 
   ipcMain.handle('settings:save', async (event, patch) => {
+    try {
+      return await saveSettingsPatch(patch);
+    } catch (e) {
+      // 渲染层对 IPC 抛错是“静默”的（只 await 不 catch），所以这里必须自己兜住
+      return fail(`保存设置失败：${(e && e.message) || e}`);
+    }
+  });
+
+  async function saveSettingsPatch(patch) {
     const allowed = [
       'frpcPath', 'configPath', 'frpsDashboardUrl', 'serviceName', 'runMode',
       'adminPort', 'adminUser', 'adminPassword', 'autoReload', 'pollIntervalMs', 'closeToTray',
       'startMinimized', 'launchTunnelOnStart', 'serviceAutoDetect', 'logBuffer', 'confirmStopService',
-      'stripProxyEnv', 'launchAtLogin',
+      'stripProxyEnv', 'launchAtLogin', 'vhostHttpPort', 'vhostHttpsPort',
     ];
     const clean = {};
     for (const key of allowed) if (patch && Object.prototype.hasOwnProperty.call(patch, key)) clean[key] = patch[key];
@@ -1330,9 +1399,14 @@ function registerIpc() {
       if (!result.ok) return fail(result.error);
       clean.launchAtLogin = !!result.actual;
     }
-    if (clean.pollIntervalMs) clean.pollIntervalMs = Math.min(30000, Math.max(1000, Number(clean.pollIntervalMs) || 3000));
-    if (clean.adminPort) clean.adminPort = Math.min(65535, Math.max(1, Number(clean.adminPort) || 7400));
-    if (clean.logBuffer) clean.logBuffer = Math.min(2000, Math.max(100, Number(clean.logBuffer) || 600));
+    if (clean.pollIntervalMs !== undefined) clean.pollIntervalMs = Math.min(30000, Math.max(1000, Number(clean.pollIntervalMs) || 3000));
+    if (clean.adminPort !== undefined) clean.adminPort = Math.min(65535, Math.max(1, Number(clean.adminPort) || 7400));
+    if (clean.vhostHttpPort !== undefined) clean.vhostHttpPort = Math.min(65535, Math.max(1, Number(clean.vhostHttpPort) || 80));
+    if (clean.vhostHttpsPort !== undefined) clean.vhostHttpsPort = Math.min(65535, Math.max(1, Number(clean.vhostHttpsPort) || 443));
+    if (clean.adminPort !== undefined && Number(clean.adminPort) === Number(model && model.serverPort)) {
+      return fail(`管理 API 端口不能和服务器端口 ${model.serverPort} 相同`);
+    }
+    if (clean.logBuffer !== undefined) clean.logBuffer = Math.min(2000, Math.max(100, Number(clean.logBuffer) || 600));
     // 日志缓冲上限要立刻作用到正在跑的 LogFollower，否则要等下次启动才生效。
     if (clean.logBuffer) {
       follower.maxLines = clean.logBuffer;
@@ -1341,23 +1415,52 @@ function registerIpc() {
     if (clean.runMode && !['auto', 'service', 'managed'].includes(clean.runMode)) delete clean.runMode;
     if (clean.configPath !== undefined) {
       const wanted = String(clean.configPath || '').trim();
-      // 填了但文件不存在就直接报错。否则 refreshPaths 会悄悄换回旧路径，
-      // 用户以为“保存成功了”，实际用的还是另一个配置文件。
-      if (wanted && !fs.existsSync(wanted)) return fail(`配置文件不存在：${wanted}`);
+      /* 填了但文件不存在就直接报错。否则 refreshPaths 会悄悄换回旧路径，
+       * 用户以为“保存成功了”，实际用的还是另一个配置文件。
+       * 还要挡住“选成文件夹”：以前只判断存在性，选错目录会存进去，
+       * 之后每次读配置都报 EISDIR，界面上所有代理凭空消失。 */
+      if (wanted) {
+        let st = null;
+        try { st = fs.statSync(wanted); } catch { st = null; }
+        if (!st) return fail(`配置文件不存在：${wanted}`);
+        if (st.isDirectory()) return fail(`这是一个文件夹，不是配置文件：${wanted}`);
+      }
     }
+    const adminBefore = { port: settings.adminPort, user: settings.adminUser, password: settings.adminPassword };
     settings = settingsModule.save(clean);
     const previousConfig = paths.configPath;
     const previousFrpc = paths.frpcPath;
     const refreshed = await settingsModule.refreshPaths();
     paths = { ...paths, ...refreshed };
     if (paths.configPath !== previousConfig) loadConfigFromDisk();
-    if (paths.frpcPath !== previousFrpc) frpcVersion = await readFrpcVersion();
+    if (paths.frpcPath !== previousFrpc) {
+      // 版本号读不出来不该让“保存设置”整个失败（以前直接 reject，界面毫无反应）
+      frpcVersion = (await tickStep('readFrpcVersion', readFrpcVersion)) || frpcVersion;
+    }
     follower.setFile(paths.logPath);
     if (settings.pollIntervalMs !== pollInterval) startPolling();
+    /* 管理 API 的端口/口令改了，frpc.toml 里的 webServer 必须跟着改，
+     * 否则控制台问 7401、frpc 还在 7400 上听着，界面会永远停在“等待管理 API 就绪”。 */
+    const adminChanged = adminBefore.port !== settings.adminPort
+      || adminBefore.user !== settings.adminUser
+      || adminBefore.password !== settings.adminPassword;
+    if (adminChanged && model) {
+      const changed = configModule.ensureAdmin(model, settings);
+      if (changed) {
+        const saved = persistModel(model, { reload: false });
+        if (!saved.ok) return fail(`管理 API 配置写入失败：${saved.error || '未知原因'}`);
+      }
+      const snap = manager.snapshot();
+      if (snap.running) {
+        // 正在跑的 frpc 还按旧端口/旧口令监听，重启一次才对得上
+        await manager.restart().catch(() => {});
+        suppressExitUntil = Date.now() + 8000;
+      }
+    }
     await manager.refresh().catch(() => {});
     pushState();
     return ok({ state: buildState(), paths: pathsForState() });
-  });
+  }
 
   ipcMain.handle('paths:pick', async (event, kind) => {
     const target = kind === 'config' ? 'configPath' : 'frpcPath';
@@ -1526,6 +1629,11 @@ function registerIpc() {
   });
 
   ipcMain.handle('tunnel:reload', async () => {
+    /* 隧道没在跑时“热重载”本来就没对象：以前统一报“管理 API 未启动”，
+     * 用户会以为是管理 API 坏了。直接把真正的状态说清楚。 */
+    if (!manager.snapshot().running) {
+      return fail('隧道没有在运行，不需要热重载（配置已保存，下次启动即生效）', { state: buildState() });
+    }
     const result = await manager.reload();
     await manager.refresh().catch(() => {});
     healthCache.clear();
@@ -2435,6 +2543,8 @@ const STARTER_CONFIG = [
   'auth.token = ""',
   '',
   'log.to = "./frpc.log"',
+  // info 级别里最吵的是控制台自己每 3 秒一次的 /api/status 查询（约占 86%），
+  // 那些行由 LogFollower 过滤掉，这里保持 info，用户还能看到登录成功/代理注册这些关键行。
   'log.level = "info"',
   '',
 ].join('\n');
@@ -2479,6 +2589,16 @@ function ensureStarterConfig() {
 
 async function bootstrap() {
   settings = settingsModule.load();
+  /* 管理 API 的口令。
+   * 老版本写死 admin/admin，本机任何进程只要知道这个口令（写在文档里）就能
+   * GET /api/config 读到自己 frpc 配置的明文 —— 里面带着 frps 的 auth.token。
+   * 这里只给“从来没设置过口令”的安装（全新用户）随机生成一个：
+   * 老用户的值在 settings.json 里已经是 admin，不会被悄悄改掉，
+   * 也就不会出现“隧道在跑、控制台却认证失败”的升级事故。
+   * 想换口令的用户可以在「设置 → 客户端管理 API」里改。 */
+  if (!settings.adminPassword) {
+    settings = settingsModule.save({ adminPassword: randomToken(20) });
+  }
   // 先载入本机配置并按 frpc.toml 归档，再迁移 v1 单密码：
   // 这样“由 frpc.toml 派生出来的档案”也能拿到旧密码。
   paths = { ...paths, ...(await settingsModule.refreshPaths()) };

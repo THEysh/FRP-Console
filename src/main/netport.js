@@ -30,6 +30,17 @@ async function listListeners() {
 
   const { names: pidToName, error: processError } = await processNames();
 
+  /* 覆盖率要报出来。
+   * tasklist 在权限不足时会“成功”返回一个只有部分进程的列表：
+   * 实测 105 个监听端口里只有 12 个能对上进程名，界面上却一句提示都没有，
+   * 用户只会以为那些端口不属于任何程序。 */
+  const pids = [...new Set([...entries.values()].map((item) => item.pid))].filter(Boolean);
+  const missing = pids.filter((pid) => !pidToName.get(pid));
+  const coverage = pids.length ? (pids.length - missing.length) / pids.length : 1;
+  const coverageError = missing.length && coverage < 0.8
+    ? `${missing.length} / ${pids.length} 个端口的进程名读不出来（权限不足时常见；以管理员身份运行可看到全部）`
+    : '';
+
   const listeners = [...entries.values()].map((item) => {
     const hosts = [...item.hosts].sort();
     return {
@@ -42,7 +53,7 @@ async function listListeners() {
     };
   });
   listeners.sort((a, b) => a.port - b.port);
-  return { ok: true, listeners, processError };
+  return { ok: true, listeners, processError: coverageError || processError };
 }
 
 /**

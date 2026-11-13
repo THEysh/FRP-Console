@@ -16,7 +16,14 @@ const DEFAULT_SETTINGS = {
   runMode: 'auto',
   adminPort: 7400,
   adminUser: 'admin',
-  adminPassword: 'admin',
+  // 留空表示“还没生成”，首次启动会换成一串随机密码（见 index.js）。
+  // 以前这里写死 admin/admin：本机任何进程都能用这组口令读 /api/config，
+  // 而那份响应里带着 frps 的 auth.token 明文。
+  adminPassword: '',
+  // frps 侧的 vhost 端口。客户端没有别的办法知道它，只能由用户填；
+  // 拼公网地址和做连通性检查都要用（不填就是 80/443）。
+  vhostHttpPort: 80,
+  vhostHttpsPort: 443,
   autoReload: true,
   pollIntervalMs: 3000,
   // 默认不把系统 HTTP_PROXY 传给 frpc：frp 会拿它去代理 TCP 握手，多半被网关 502 拒掉。
