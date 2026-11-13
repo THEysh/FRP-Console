@@ -2624,8 +2624,8 @@ function certRow(c) {
         </div>
       </div>
       <div class="cert-actions">
-        <button class="btn small" type="button" data-act="certs.renew" data-domain="${esc(c.domain)}">${icon('reload')}<span>续期</span></button>
-        <button class="btn small danger-text" type="button" data-act="certs.remove" data-domain="${esc(c.domain)}">${icon('trash')}<span>删除</span></button>
+        <button class="btn small" type="button" data-act="certs.renew" data-domain="${esc(c.domain)}" data-staging="${c.staging ? '1' : '0'}">${icon('reload')}<span>续期</span></button>
+        <button class="btn small danger-text" type="button" data-act="certs.remove" data-domain="${esc(c.domain)}" data-staging="${c.staging ? '1' : '0'}">${icon('trash')}<span>删除</span></button>
       </div>
     </div>`;
 }
@@ -3478,7 +3478,8 @@ async function handleAction(act, dataset, btn) {
       }
       case 'certs.renew': {
         await withBusy(btn, async () => {
-          const res = await FRP.certRenew(dataset.domain);
+          const staging = dataset.staging === '1';
+          const res = await FRP.certRenew(dataset.domain, staging);
           if (res && res.ok) {
             toast('success', '证书已续期', `${res.data.domain} · 剩余 ${res.data.daysLeft} 天`);
             await loadCerts({ silent: true });
@@ -3488,6 +3489,7 @@ async function handleAction(act, dataset, btn) {
       }
       case 'certs.remove': {
         const domain = dataset.domain;
+        const staging = dataset.staging === '1';
         openModal(`
           <div class="modal" style="width:440px">
             <div class="modal-head">
@@ -3496,7 +3498,7 @@ async function handleAction(act, dataset, btn) {
               <button class="icon-btn modal-close" type="button" data-act="modal.close">${icon('x')}</button>
             </div>
             <div class="modal-body">
-              <div class="note warn">${icon('alert')}<div>删除后，引用 <strong>${esc(domain)}</strong> 证书的 https2http / https2https 代理会失去证书，公网访问会失败，直到重新签发并填回路径。</div></div>
+              <div class="note warn">${icon('alert')}<div>删除后，引用 <strong>${esc(domain)}</strong>${staging ? '<span class="badge amber">STAGING</span>' : ''} 证书的 https2http / https2https 代理会失去证书，公网访问会失败，直到重新签发并填回路径。</div></div>
             </div>
             <div class="modal-foot">
               <span class="mf-left"></span>
@@ -3507,7 +3509,7 @@ async function handleAction(act, dataset, btn) {
         const delBtn = $('#cert-del-confirm');
         if (delBtn) delBtn.addEventListener('click', async () => {
           delBtn.disabled = true;
-          const res = await FRP.certRemove(domain);
+          const res = await FRP.certRemove(domain, staging);
           if (res && res.ok) {
             closeModal();
             toast('success', '已删除证书', domain);

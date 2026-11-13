@@ -90,6 +90,17 @@ let lastServiceDetect = 0;
 const follower = new LogFollower('', { maxLines: 600 });
 let manager = null;
 const acmeManager = new AcmeManager({ userDataDir: settingsModule.dataDir() });
+
+/* 当前 DNS 验证渠道（现阶段只有 Cloudflare）。证书签发 / 自动续期共用。 */
+function currentDnsProvider() {
+  const provider = String(settings.dnsProvider || '').trim().toLowerCase();
+  if (provider === 'cloudflare') {
+    const token = settingsModule.readCloudflareToken();
+    if (!token) return { ok: false, error: '尚未配置 Cloudflare API token' };
+    return { ok: true, dns: new CloudflareDns({ token }) };
+  }
+  return { ok: false, error: '尚未配置 DNS 验证渠道（当前仅支持 Cloudflare）' };
+}
 const serverSession = new ServerSession();
 let serverConfig = { path: '', content: '', summary: null, error: '' };
 let sessionServerId = '';
@@ -2410,16 +2421,6 @@ function registerIpc() {
 
   /* ---- HTTPS 证书（Let's Encrypt / DNS-01）---- */
 
-  function currentDnsProvider() {
-    const provider = String(settings.dnsProvider || '').trim().toLowerCase();
-    if (provider === 'cloudflare') {
-      const token = settingsModule.readCloudflareToken();
-      if (!token) return { ok: false, error: '尚未配置 Cloudflare API token' };
-      return { ok: true, dns: new CloudflareDns({ token }) };
-    }
-    return { ok: false, error: '尚未配置 DNS 验证渠道（当前仅支持 Cloudflare）' };
-  }
-
   ipcMain.handle('cert:list', async () => ok({ certs: acmeManager.list() }));
 
   ipcMain.handle('cert:issue', async (event, payload = {}) => {
@@ -2442,11 +2443,11 @@ function registerIpc() {
     try {
       const domain = String((payload && payload.domain) || '').trim();
       if (!domain) return fail('缺少域名');
-      const existing = acmeManager.get(domain);
+      const staging = payload.staging !== undefined ? !!payload.staging : !!settings.acmeStaging;
+      const existing = acmeManager.get(domain, { staging });
       const provider = currentDnsProvider();
       if (!provider.ok) return fail(provider.error);
       const email = existing && existing.email ? existing.email : String(settings.acmeEmail || '');
-      const staging = existing ? !!existing.staging : !!settings.acmeStaging;
       const result = await acmeManager.renew(domain, { email, staging, dns: provider.dns });
       if (!result.ok) return fail(result.error);
       pushState();
@@ -2459,7 +2460,8 @@ function registerIpc() {
   ipcMain.handle('cert:remove', async (event, payload = {}) => {
     const domain = String((payload && payload.domain) || '').trim();
     if (!domain) return fail('缺少域名');
-    const result = acmeManager.removeLocal(domain);
+    const staging = payload.staging !== undefined ? !!payload.staging : undefined;
+    const result = acmeManager.removeLocal(domain, staging === undefined ? {} : { staging });
     if (!result.ok) return fail(result.error);
     pushState();
     return ok({ removed: true });
@@ -2633,6 +2635,44 @@ function startPolling() {
   if (pollTimer.unref) pollTimer.unref();
 }
 
+/* ---- HTTPS 证书自动续期 ----
+ * 证书到期前（默认剩 30 天内）自动用同一套 DNS-01 重签，避免用户忘记手动续期。
+ * 每 12 小时检查一次；后台失败只记日志、不打断主流程、不弹窗吓人。 */
+const AUTO_RENEW_BEFORE_DAYS = 30;
+const AUTO_RENEW_INTERVAL_MS = 12 * 3600 * 1000;
+let autoRenewTimer = null;
+let autoRenewRunning = false;
+
+async function autoRenewExpiringCerts() {
+  if (autoRenewRunning) return;
+  autoRenewRunning = true;
+  try {
+    const provider = currentDnsProvider();
+    if (!provider.ok) return; // 没配 DNS 渠道就跳过，静默。
+    const result = await acmeManager.renewIfExpiring({ days: AUTO_RENEW_BEFORE_DAYS, dns: provider.dns });
+    if (result.renewed.length) {
+      const names = result.renewed.map((c) => `${c.domain}（${c.daysLeft} 天）`).join('、');
+      notify('info', '证书已自动续期', names);
+      pushState(); // 刷新证书列表，让到期天数即时更新
+    }
+    if (result.errors.length) {
+      const first = result.errors[0];
+      notify('error', '证书自动续期失败', `${first.domain}：${first.error}`);
+    }
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.log(`[auto-renew] ${(e && e.message) || e}`);
+  } finally {
+    autoRenewRunning = false;
+  }
+}
+
+function scheduleAutoRenew() {
+  if (autoRenewTimer) clearInterval(autoRenewTimer);
+  autoRenewTimer = setInterval(() => autoRenewExpiringCerts().catch(() => {}), AUTO_RENEW_INTERVAL_MS);
+  if (autoRenewTimer.unref) autoRenewTimer.unref();
+}
+
 follower.on('lines', (lines) => send('logs:append', lines));
 follower.on('reset', () => send('logs:reset', { lines: follower.recent(300) }));
 
@@ -2768,6 +2808,10 @@ async function bootstrap() {
   await manager.refresh().catch(() => {});
   checkHealth().catch(() => {});
   startPolling();
+  scheduleAutoRenew();
+  // 启动后先等 30 秒再跑一次自动续期检查，避开启动期的资源占用与状态竞态。
+  const initialRenew = setTimeout(() => autoRenewExpiringCerts().catch(() => {}), 30000);
+  if (initialRenew.unref) initialRenew.unref();
   refreshTray();
   pushState();
 }

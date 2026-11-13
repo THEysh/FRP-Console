@@ -43,6 +43,14 @@ function certFolder(domain) {
   return String(domain || '').replace(/^\*\./, 'wildcard.').replace(/[\\/:*?"<>|]/g, '_');
 }
 
+/* STAGING 与生产证书分目录存放：生产沿用原来的 `wildcard.域名/`（不破坏已存在的
+ * 生产证书路径），STAGING 放到 `wildcard.域名.staging/`。这样「误开 STAGING 再签」
+ * 只会写进 .staging 目录，绝不会覆盖生产证书。 */
+function certFolderFor(domain, staging) {
+  const base = certFolder(domain);
+  return staging ? `${base}.staging` : base;
+}
+
 function daysLeft(notAfter) {
   const t = new Date(notAfter).getTime();
   if (!t) return 0;
@@ -178,7 +186,7 @@ class AcmeManager {
 
   storeCertificate({ fullchain, key, domains, email, staging }) {
     const primary = domains[0];
-    const folder = certFolder(primary);
+    const folder = certFolderFor(primary, !!staging);
     const dir = path.join(this.certsDir, folder);
     ensureDir(dir);
 
@@ -204,6 +212,8 @@ class AcmeManager {
       ok: true,
       domain: primary,
       domains,
+      staging: !!staging,
+      folder,
       notBefore: info.notBefore ? info.notBefore.toISOString() : null,
       notAfter: info.notAfter ? info.notAfter.toISOString() : null,
       daysLeft: daysLeft(info.notAfter),
@@ -228,6 +238,7 @@ class AcmeManager {
         const keyPath = path.join(dir, 'key.pem');
         const certPath = path.join(dir, 'cert.pem');
         result.push({
+          folder: entry.name,
           domain: meta.domains[0],
           domains: meta.domains,
           email: meta.email || '',
@@ -247,21 +258,51 @@ class AcmeManager {
     return result;
   }
 
-  get(domain) {
+  get(domain, { staging } = {}) {
     const primary = certFolder(domain);
-    return this.list().find((c) => c.domain === domain || certFolder(c.domain) === primary) || null;
+    const matches = this.list().filter((c) => c.domain === domain || certFolder(c.domain) === primary);
+    if (staging !== undefined) return matches.find((c) => !!c.staging === !!staging) || null;
+    return matches[0] || null;
   }
 
   /* 续期：对同一批域名重新走一次签发。 */
   async renew(domain, { email = '', staging = true, dns } = {}) {
-    const existing = this.get(domain);
-    if (!existing) return { ok: false, error: `本地没有 ${domain} 的证书记录，请直接签发` };
-    return this.issue({ domains: existing.domains, email: email || existing.email, staging, dns });
+    const existing = this.get(domain, { staging });
+    if (!existing) return { ok: false, error: `本地没有 ${domain} 的${staging ? ' STAGING ' : '生产 '}证书，请直接签发` };
+    return this.issue({ domains: existing.domains, email: email || existing.email, staging: !!existing.staging, dns });
   }
 
-  removeLocal(domain) {
-    const folder = certFolder(domain);
-    const dir = path.join(this.certsDir, folder);
+  /* 自动续期：把「剩余天数 ≤ days」的证书逐张重签，返回结果汇总。
+   * 只处理有 DNS 渠道能签的；每张失败不影响其它张。 */
+  async renewIfExpiring({ days = 30, dns } = {}) {
+    if (!dns || typeof dns.create !== 'function') {
+      return { renewed: [], errors: [{ domain: '', error: '缺少 DNS 验证提供者' }] };
+    }
+    const certs = this.list().filter((c) => c.exists && c.daysLeft <= days);
+    const renewed = [];
+    const errors = [];
+    for (const cert of certs) {
+      try {
+        const result = await this.issue({
+          domains: cert.domains,
+          email: cert.email,
+          staging: !!cert.staging,
+          dns,
+        });
+        if (result.ok) renewed.push({ domain: cert.domain, daysLeft: result.daysLeft, notAfter: result.notAfter });
+        else errors.push({ domain: cert.domain, error: result.error });
+      } catch (e) {
+        errors.push({ domain: cert.domain, error: String((e && e.message) || e) });
+      }
+    }
+    return { renewed, errors };
+  }
+
+  removeLocal(domain, { staging } = {}) {
+    const entry = staging === undefined ? this.get(domain) : this.get(domain, { staging });
+    const dir = entry && entry.folder
+      ? path.join(this.certsDir, entry.folder)
+      : path.join(this.certsDir, certFolderFor(domain, !!staging));
     try {
       if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
       return { ok: true };
@@ -271,4 +312,4 @@ class AcmeManager {
   }
 }
 
-module.exports = { AcmeManager, daysLeft, certFolder, dns01Name };
+module.exports = { AcmeManager, daysLeft, certFolder, certFolderFor, dns01Name };
