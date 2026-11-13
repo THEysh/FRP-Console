@@ -15,10 +15,16 @@
 ; （settings.closeToTray = true），收到 WM_CLOSE 只是隐藏窗口、进程不退，
 ; 于是安装器一直等到超时，报“FRP控制台无法关闭，请手动关闭”。
 ;
-; 这里直接按进程名结束，并带 /T 一并结束它派生的 frpc 子进程，
-; 避免留下孤儿隧道进程。
+; 这里直接按进程名结束。
+;
+; ⚠ 绝对不能用 /T（结束子进程树）：应用内更新时，安装器本身是
+;   electron-updater 用 spawn(detached) 从正在运行的应用里拉起来的**子进程**，
+;   /T 会把安装器自己一起杀掉 —— 表现为「点重启并安装，窗口没了，版本没变，
+;   没有任何提示」（退出码 1，安装目录一个字节都没动）。
+;   隧道进程由应用自己在 prepareUpdateInstall / quitApp 里先停掉，
+;   不需要安装器代劳；这里只负责结束控制台本体。
 !macro customCheckAppRunning
-  nsExec::Exec '"$SYSDIR\taskkill.exe" /F /T /IM "${APP_EXECUTABLE_FILENAME}"'
+  nsExec::Exec '"$SYSDIR\taskkill.exe" /F /IM "${APP_EXECUTABLE_FILENAME}"'
   Pop $0
   Sleep 700
 !macroend
@@ -51,8 +57,9 @@ Var /GLOBAL FrpRescueOk
   ; 没装过旧版就没什么可抢救的
   IfFileExists "$INSTDIR\${APP_EXECUTABLE_FILENAME}" 0 frp_rescue_end
 
-  ; 先把控制台结束掉，否则它拉着 frpc.exe，改名/复制都会失败
-  nsExec::Exec '"$SYSDIR\taskkill.exe" /F /T /IM "${APP_EXECUTABLE_FILENAME}"'
+  ; 先把控制台结束掉，否则它拉着 frpc.exe，改名/复制都会失败。
+  ; 同样不能带 /T —— 应用内更新时这个安装器就是控制台的子进程，/T 会连自己一起杀。
+  nsExec::Exec '"$SYSDIR\taskkill.exe" /F /IM "${APP_EXECUTABLE_FILENAME}"'
   Pop $0
   Sleep 500
 
