@@ -23,6 +23,7 @@ const S = {
   follow: true,
   modalOpen: false,
   proxyEdit: null,
+  update: null,
   lastKeys: {},
   viewScroll: {},
   busy: new Set(),
@@ -2663,11 +2664,14 @@ function renderSettings(force = false) {
             ${detailRow('管理员权限', app.elevated ? '已提升' : '普通权限', app.elevated ? 'ok' : '')}
             ${detailRow('数据目录', app.dataDir || '')}
           </div>
+          <div class="update-box" id="update-box"></div>
         </section>
       </div>
     </div>`;
 
   bindSettingsForms();
+  renderUpdateBox();
+  if (!S.update) refreshUpdateState();
 }
 
 function pathRow(label, value, exists, kind) {
@@ -2697,6 +2701,76 @@ function bindSettingsForms() {
 function isOn(field) {
   const btn = document.querySelector(`.switch[data-field="${field}"]`);
   return !!(btn && btn.classList.contains('on'));
+}
+
+/* ---------------------------- 自动更新 ---------------------------- */
+
+/* 状态都由主进程给（src/main/update.js）：idle / checking / available /
+ * downloading / ready / uptodate / error / unsupported。这里只做文案与按钮映射。 */
+function updateBoxView() {
+  const u = S.update || {};
+  const cur = u.currentVersion || (S.app && S.app.version) || '';
+  const version = u.version ? `v${String(u.version).replace(/^v/, '')}` : '';
+  const checkBtn = '<button class="btn small" type="button" data-act="update.check">检查更新</button>';
+  const currentLine = cur ? `当前 v${cur}` : '';
+
+  switch (u.state) {
+    case 'unsupported':
+      return {
+        title: u.reason === 'portable' ? '便携版不支持自动更新' : '当前运行方式不支持自动更新',
+        desc: u.message || currentLine,
+        buttons: u.releaseUrl
+          ? `<button class="btn small" type="button" data-act="open" data-url="${esc(u.releaseUrl)}">打开发布页</button>`
+          : '',
+        percent: -1,
+      };
+    case 'checking':
+      return { title: '正在检查更新…', desc: currentLine, buttons: '<button class="btn small" type="button" disabled>检查中…</button>', percent: -1 };
+    case 'available':
+      return {
+        title: `发现新版本 ${version || '（版本未知）'}`,
+        desc: `${currentLine ? currentLine + '，' : ''}下载后重启即可完成升级`,
+        buttons: `<button class="btn small primary" type="button" data-act="update.download">下载更新</button>${checkBtn}`,
+        percent: -1,
+      };
+    case 'downloading':
+      return { title: `正在下载 ${version || '更新包'}`, desc: u.message || '', buttons: '', percent: u.percent || 0 };
+    case 'ready':
+      return {
+        title: `${version || '新版本'} 已就绪`,
+        desc: '重启后自动安装。安装前会先停掉控制台托管的隧道，更新完成后接回；系统服务模式不受影响',
+        buttons: '<button class="btn small primary" type="button" data-act="update.install">重启并安装</button>',
+        percent: -1,
+      };
+    case 'uptodate':
+      return { title: '已是最新版本', desc: currentLine, buttons: checkBtn, percent: -1 };
+    case 'error':
+      return { title: '检查更新失败', desc: u.message || '', buttons: checkBtn, percent: -1 };
+    default:
+      return { title: '检查更新', desc: currentLine, buttons: checkBtn, percent: -1 };
+  }
+}
+
+function renderUpdateBox() {
+  const box = $('#update-box');
+  if (!box) return;
+  const v = updateBoxView();
+  box.innerHTML = `
+    <div class="ub-row">
+      <div class="ub-text"><strong>${esc(v.title)}</strong>${v.desc ? `<span>${esc(v.desc)}</span>` : ''}</div>
+      ${v.buttons ? `<div class="ub-actions">${v.buttons}</div>` : ''}
+    </div>
+    ${v.percent >= 0 && v.percent < 100 ? `<div class="ub-bar"><i style="width:${v.percent}%"></i></div>` : ''}`;
+}
+
+async function refreshUpdateState() {
+  try {
+    const res = await FRP.updateState();
+    if (res && res.ok) S.update = res.data;
+  } catch {
+    /* 拿不到就按“未检查”展示 */
+  }
+  renderUpdateBox();
 }
 
 /* ---------------------------- 操作处理 ---------------------------- */
@@ -3075,6 +3149,57 @@ async function handleAction(act, dataset, btn) {
       }
       case 'proxyform.type': {
         setProxyFormType(dataset.type);
+        break;
+      }
+      case 'update.check': {
+        S.update = { ...(S.update || {}), state: 'checking', message: '正在检查更新…' };
+        renderUpdateBox();
+        /* 这里自己兜异常：外层 catch 只弹提示，不会重置状态，
+         * 一旦 IPC 抛错界面就会永远停在“检查中…”。 */
+        let result;
+        try {
+          const res = await FRP.checkUpdate();
+          result = (res && res.ok && res.data) || { state: 'error', message: (res && res.error) || '未知错误' };
+        } catch (e) {
+          result = { state: 'error', message: e && e.message ? e.message : String(e) };
+        }
+        S.update = result;
+        renderUpdateBox();
+        if (result.state === 'available') toast('success', `发现新版本 v${result.version}`, '点「下载更新」获取安装包');
+        else if (result.state === 'uptodate') toast('info', '已是最新版本');
+        else if (result.state === 'error') toast('error', '检查更新失败', result.message || '');
+        else if (result.state === 'unsupported') toast('info', '无法自动更新', result.message || '');
+        break;
+      }
+      case 'update.download': {
+        await withBusy(btn, async () => {
+          let res = null;
+          try {
+            res = await FRP.downloadUpdate();
+          } catch (e) {
+            toast('error', '下载更新失败', e && e.message ? e.message : String(e));
+            return;
+          }
+          if (res && res.ok) {
+            S.update = res.data;
+            renderUpdateBox();
+            if (res.data && res.data.state === 'error') toast('error', '下载更新失败', res.data.message || '');
+          } else toastResult(res);
+        });
+        break;
+      }
+      case 'update.install': {
+        /* 安装会结束当前进程，必须让用户明确知道隧道会短暂中断 */
+        const confirmed = await confirmDialog({
+          title: '重启并安装更新',
+          body: '控制台会关闭，随后安装新版本并自动重新打开。安装前会先停掉控制台托管的隧道，新版本启动后接回；使用系统服务模式时隧道不会中断。',
+          confirmText: '重启并安装',
+        });
+        if (!confirmed) break;
+        await withBusy(btn, async () => {
+          const res = await FRP.installUpdate();
+          if (!res || !res.ok) toast('error', '安装失败', (res && res.error) || '未知错误');
+        });
         break;
       }
       default:
@@ -3623,6 +3748,15 @@ async function boot() {
     });
     FRP.on('logs:append', (lines) => appendLogs(lines));
     FRP.on('logs:reset', ({ lines } = {}) => { S.logs = lines || []; if (S.view === 'logs') renderLogs(true); });
+    FRP.on('update:status', (payload) => {
+      if (!payload) return;
+      S.update = payload;
+      renderUpdateBox();
+      // 下载是主进程异步推进的，完成时给一次明确反馈（进度条本身不弹提示）
+      if (payload.state === 'ready') {
+        toast('success', '更新已就绪', `${payload.version ? `v${payload.version}` : '新版本'} 下载完成，点「重启并安装」生效`);
+      }
+    });
     FRP.on('notify', (payload) => {
       if (!payload) return;
       toast(payload.kind === 'error' ? 'error' : payload.kind === 'warn' ? 'warn' : 'info', payload.title || '提示', payload.message || '');

@@ -22,3 +22,139 @@
   Pop $0
   Sleep 700
 !macroend
+
+; ---------------------------------------------------------------------------
+; 升级前抢救用户放在安装目录里的文件
+;
+; electron-builder 的卸载旧版本流程是「把 $INSTDIR 整体改名搬走 → RMDir /r
+; $INSTDIR → 解压新文件」（uninstaller.nsh 的 isUpdated 分支），所以安装目录里
+; 的任何东西在升级时都会消失。而 README 长期建议「frpc.exe 放在控制台同目录」，
+; 不少用户就这么干，一升级连 frpc.toml 和 frp-console-backups/ 一起没了。
+;
+; 做法：在 .onInit（早于卸载旧版）把这几样搬到 %LOCALAPPDATA%\frp-console\
+; upgrade-rescue，装完再搬回去，路径不变、配置继续有效。优先用 Rename（同卷
+; 秒完成），跨卷或被占用时退回 CopyFiles。
+; ---------------------------------------------------------------------------
+; 这两个变量只在安装器（非卸载器）里用到。卸载器那一趟是同一份脚本用
+; BUILD_UNINSTALLER 编译的，不加这层判断会报 warning 6001（声明了没用），
+; 而 electron-builder 把 NSIS 的 warning 当 error。
+!ifndef BUILD_UNINSTALLER
+Var /GLOBAL FrpRescueDir
+Var /GLOBAL FrpRescueDone
+Var /GLOBAL FrpRescueOk
+!endif
+
+!macro customInit
+  StrCpy $FrpRescueDone "0"
+  StrCpy $FrpRescueDir "$LOCALAPPDATA\frp-console\upgrade-rescue"
+
+  ; 没装过旧版就没什么可抢救的
+  IfFileExists "$INSTDIR\${APP_EXECUTABLE_FILENAME}" 0 frp_rescue_end
+
+  ; 先把控制台结束掉，否则它拉着 frpc.exe，改名/复制都会失败
+  nsExec::Exec '"$SYSDIR\taskkill.exe" /F /T /IM "${APP_EXECUTABLE_FILENAME}"'
+  Pop $0
+  Sleep 500
+
+  ; 上一次升级如果半路失败（解压中断、被杀、断电），用户文件还留在 upgrade-rescue
+  ; 里、而安装目录是空的。这种时候先放回去，否则下面那句 RMDir 会把它删干净。
+  IfFileExists "$FrpRescueDir\frpc.exe" 0 frp_rescue_prev_toml
+    IfFileExists "$INSTDIR\frpc.exe" frp_rescue_prev_toml
+      CopyFiles /SILENT "$FrpRescueDir\frpc.exe" "$INSTDIR"
+  frp_rescue_prev_toml:
+  IfFileExists "$FrpRescueDir\frpc.toml" 0 frp_rescue_wipe
+    IfFileExists "$INSTDIR\frpc.toml" frp_rescue_wipe
+      CopyFiles /SILENT "$FrpRescueDir\frpc.toml" "$INSTDIR"
+
+  frp_rescue_wipe:
+  RMDir /r "$FrpRescueDir"
+  CreateDirectory "$FrpRescueDir"
+
+  IfFileExists "$INSTDIR\frpc.exe" 0 frp_rescue_toml
+    StrCpy $FrpRescueDone "1"
+    ClearErrors
+    Rename "$INSTDIR\frpc.exe" "$FrpRescueDir\frpc.exe"
+    IfErrors 0 frp_rescue_toml
+      CopyFiles /SILENT "$INSTDIR\frpc.exe" "$FrpRescueDir"
+
+  frp_rescue_toml:
+  IfFileExists "$INSTDIR\frpc.toml" 0 frp_rescue_bak
+    StrCpy $FrpRescueDone "1"
+    ClearErrors
+    Rename "$INSTDIR\frpc.toml" "$FrpRescueDir\frpc.toml"
+    IfErrors 0 frp_rescue_bak
+      CopyFiles /SILENT "$INSTDIR\frpc.toml" "$FrpRescueDir"
+
+  frp_rescue_bak:
+  IfFileExists "$INSTDIR\frp-console-backups\*.*" 0 frp_rescue_data
+    StrCpy $FrpRescueDone "1"
+    ClearErrors
+    Rename "$INSTDIR\frp-console-backups" "$FrpRescueDir\frp-console-backups"
+    IfErrors 0 frp_rescue_data
+      CreateDirectory "$FrpRescueDir\frp-console-backups"
+      CopyFiles /SILENT "$INSTDIR\frp-console-backups\*.*" "$FrpRescueDir\frp-console-backups"
+
+  frp_rescue_data:
+  IfFileExists "$INSTDIR\frp-console-data\*.*" 0 frp_rescue_end
+    StrCpy $FrpRescueDone "1"
+    ClearErrors
+    Rename "$INSTDIR\frp-console-data" "$FrpRescueDir\frp-console-data"
+
+  frp_rescue_end:
+!macroend
+
+!macro customInstall
+  StrCmp $FrpRescueDone "1" 0 frp_restore_end
+
+  IfFileExists "$FrpRescueDir\frpc.exe" 0 frp_restore_toml
+    CopyFiles /SILENT "$FrpRescueDir\frpc.exe" "$INSTDIR"
+
+  frp_restore_toml:
+  IfFileExists "$FrpRescueDir\frpc.toml" 0 frp_restore_bak
+    CopyFiles /SILENT "$FrpRescueDir\frpc.toml" "$INSTDIR"
+
+  frp_restore_bak:
+  IfFileExists "$FrpRescueDir\frp-console-backups" 0 frp_restore_data
+    ClearErrors
+    Rename "$FrpRescueDir\frp-console-backups" "$INSTDIR\frp-console-backups"
+    IfErrors 0 frp_restore_data
+      CreateDirectory "$INSTDIR\frp-console-backups"
+      CopyFiles /SILENT "$FrpRescueDir\frp-console-backups\*.*" "$INSTDIR\frp-console-backups"
+
+  frp_restore_data:
+  IfFileExists "$FrpRescueDir\frp-console-data" 0 frp_restore_clean
+    ClearErrors
+    Rename "$FrpRescueDir\frp-console-data" "$INSTDIR\frp-console-data"
+
+  frp_restore_clean:
+  ; 放回去了才清抢救目录。复制失败（被占用、磁盘满）时留着，
+  ; 那是用户 frpc.exe / frpc.toml 唯一的一份，宁可留个目录也不能删。
+  StrCpy $FrpRescueOk "1"
+
+  IfFileExists "$FrpRescueDir\frpc.exe" 0 frp_rescue_ok_toml
+    IfFileExists "$INSTDIR\frpc.exe" frp_rescue_ok_toml
+      StrCpy $FrpRescueOk "0"
+  frp_rescue_ok_toml:
+
+  IfFileExists "$FrpRescueDir\frpc.toml" 0 frp_rescue_ok_data
+    IfFileExists "$INSTDIR\frpc.toml" frp_rescue_ok_data
+      StrCpy $FrpRescueOk "0"
+  frp_rescue_ok_data:
+
+  IfFileExists "$FrpRescueDir\frp-console-backups\*.*" 0 frp_rescue_ok_bak
+    IfFileExists "$INSTDIR\frp-console-backups\*.*" frp_rescue_ok_bak
+      StrCpy $FrpRescueOk "0"
+  frp_rescue_ok_bak:
+
+  IfFileExists "$FrpRescueDir\frp-console-data\*.*" 0 frp_rescue_ok_decide
+    IfFileExists "$INSTDIR\frp-console-data\*.*" frp_rescue_ok_decide
+      StrCpy $FrpRescueOk "0"
+  frp_rescue_ok_decide:
+
+  StrCmp $FrpRescueOk "1" 0 frp_restore_keep
+    RMDir /r "$FrpRescueDir"
+  frp_restore_keep:
+  StrCpy $FrpRescueDone "0"
+
+  frp_restore_end:
+!macroend

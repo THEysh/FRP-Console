@@ -86,5 +86,10 @@ contextBridge.exposeInMainWorld('FRP', {
   trayState: () => invoke('app:tray-state'),
   notify: (kind, title, message) => invoke('app:notification', { kind, title, message }),
   createShortcut: () => invoke('app:create-shortcut'),
+  // 自动更新：状态在主进程，渲染层只做展示与触发
+  updateState: () => invoke('update:state'),
+  checkUpdate: () => invoke('update:check'),
+  downloadUpdate: () => invoke('update:download'),
+  installUpdate: () => invoke('update:install'),
   on,
 });

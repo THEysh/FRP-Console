@@ -75,18 +75,23 @@ jobs:
           Get-ChildItem dist -Filter *.exe |
             Where-Object { $_.Name -notmatch '__uninstaller|unpacked' } |
             Copy-Item -Destination out
+          # 自动更新的三件套少一个都不行：latest.yml 给 electron-updater 判断版本，
+          # .blockmap 让差分下载只取变化的片段。早先只传了 exe，客户端检查更新会 404。
+          Get-ChildItem dist -Filter latest.yml | Copy-Item -Destination out
+          Get-ChildItem dist -Filter *.blockmap | Copy-Item -Destination out
+          if (-not (Test-Path out/latest.yml)) { throw "缺少 latest.yml，自动更新会失效" }
           Get-ChildItem out | Select-Object Name, Length
 
       - uses: actions/upload-artifact@v4
         with:
           name: windows-build
-          path: out/*.exe
+          path: out/*
           if-no-files-found: error
 
       - name: 发布到 Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: out/*.exe
+          files: out/*
           generate_release_notes: true
           draft: false

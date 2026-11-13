@@ -43,6 +43,7 @@ const { ServerSession } = require('./ssh');
 const frpsConfig = require('./frpsconfig');
 const { TrayPanel } = require('./tray-panel');
 const frpsBinary = require('./frpsBinary');
+const updateModule = require('./update');
 const { execFileP, tcpCheck, httpProbe, hashText, formatDuration } = require('./util');
 
 const assetsDir = path.join(__dirname, '..', '..', 'assets');
@@ -1270,6 +1271,18 @@ function registerIpc() {
     return ok(buildState());
   });
 
+  /* ---------------- 自动更新 ----------------
+   * 状态由主进程持有（见 src/main/update.js），渲染层只负责展示与触发，
+   * 这样窗口重载、切页之后状态不会丢。 */
+  ipcMain.handle('update:state', async () => ok(updateModule.snapshot()));
+  ipcMain.handle('update:check', async () => ok(await updateModule.check()));
+  ipcMain.handle('update:download', async () => ok(await updateModule.download()));
+  ipcMain.handle('update:install', async () => {
+    const result = await updateModule.install();
+    if (!result.ok) return fail(result.error);
+    return ok(updateModule.snapshot());
+  });
+
   ipcMain.handle('settings:save', async (event, patch) => {
     const allowed = [
       'frpcPath', 'configPath', 'frpsDashboardUrl', 'serviceName', 'runMode',
@@ -2384,6 +2397,50 @@ function notifyExistingInstance() {
   });
 }
 
+/* ------------------------- 更新前后的隧道交接 -------------------------
+ * 安装器（build/installer.nsh 的 customCheckAppRunning）是 taskkill /F /T，
+ * 托管模式下 frpc 是控制台的子进程，会被一起带走。所以在装之前先把隧道
+ * 优雅停掉，并留一张便条；新版本起来后凭它把隧道接回来，用户不用手动点。
+ * 服务模式不写便条：frpc 由 nssm 托管，安装器杀不到，本来就不会断。
+ */
+const UPDATE_RESTART_FLAG = 'update-restart.json';
+
+function updateFlagPath() {
+  try {
+    return path.join(settingsModule.dataDir(), UPDATE_RESTART_FLAG);
+  } catch {
+    return '';
+  }
+}
+
+async function prepareUpdateInstall() {
+  if (!manager || !manager.isChildAlive) return;
+  try {
+    await manager.stop({ runMode: settings.runMode });
+  } catch {
+    /* 停不掉也继续：安装器自己会 taskkill 兜底 */
+  }
+  try {
+    const file = updateFlagPath();
+    if (file) fs.writeFileSync(file, JSON.stringify({ at: Date.now() }), 'utf8');
+  } catch {
+    /* 便条写不下去只影响“更新后自动拉起隧道”，不影响更新本身 */
+  }
+}
+
+function takeUpdateRestartFlag() {
+  const file = updateFlagPath();
+  if (!file) return false;
+  try {
+    const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+    fs.unlinkSync(file);
+    // 超过 10 分钟就作废：可能是上次更新失败留下的，不该莫名把隧道拉起来
+    return !!(data && data.at && Date.now() - data.at < 10 * 60 * 1000);
+  } catch {
+    return false;
+  }
+}
+
 function startApp() {
   app.whenReady().then(async () => {
     bootstrapReady = bootstrap().catch((e) => {
@@ -2395,8 +2452,15 @@ function startApp() {
     createWindow();
     // 系统里的启动项和设置对不上时补一次（重装、移动目录、被任务管理器禁用过）
     syncLaunchAtLogin();
+    // 更新模块只做“状态持有 + 响应按钮”，不主动联网：检查更新由用户点按钮触发。
+    updateModule.init({
+      onStatus: (payload) => send('update:status', payload),
+      beforeInstall: prepareUpdateInstall,
+    });
+    // 刚被更新过：上次更新前隧道在跑，这次启动把它接回来（服务模式下不会有这张便条）
+    const restoreTunnel = takeUpdateRestartFlag();
     // bootstrap() 第一句就同步载入 settings，这里可以安全读取启动偏好。
-    if (settings.launchTunnelOnStart) {
+    if (settings.launchTunnelOnStart || restoreTunnel) {
       bootstrapReady
         .then(() => manager.start({ runMode: settings.runMode }))
         .then(() => manager.refresh())

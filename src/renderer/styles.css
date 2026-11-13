@@ -936,6 +936,28 @@ label .icon-btn svg { width: 13px; height: 13px; }
 .path-display .p-label { font-family: var(--sans); font-size: 10.5px; color: var(--text-3); flex: 0 0 auto; margin-right: 9px; }
 .path-display .p-value { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 
+/* 「关于」卡片里的更新条：一行说明 + 按钮，下载时补一根细进度条 */
+.update-box { margin-top: 14px; }
+.update-box .ub-row {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: rgba(8, 12, 18, .32);
+}
+.update-box .ub-text { display: flex; flex-direction: column; gap: 3px; flex: 1; min-width: 0; }
+.update-box .ub-text strong { font-size: 12px; font-weight: 600; color: var(--text); }
+.update-box .ub-text span { font-size: 10.5px; color: var(--text-3); line-height: 1.5; }
+.update-box .ub-actions { display: flex; gap: 8px; flex: 0 0 auto; }
+.update-box .ub-bar {
+  margin-top: 8px; height: 5px; border-radius: 99px; overflow: hidden;
+  background: rgba(148, 163, 184, .12);
+}
+.update-box .ub-bar i {
+  display: block; height: 100%; border-radius: 99px;
+  background: var(--accent); transition: width .25s ease;
+}
+
 /* 代理表单里用 hidden 控制字段显示 */
 #pf-remote-field.hidden, #pf-domain-field.hidden { display: none; }
 

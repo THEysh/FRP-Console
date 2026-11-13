@@ -30,6 +30,7 @@
 | **服务器（frps）** | SSH 连接后识别 systemd / 裸进程 / Docker / 端口四种运行方式，展示版本与 Token 状态，支持启停、配置向导、全链路检测、结构化日志 |
 | **实时日志** | 跟随 `frpc.log`，按级别过滤、暂停、导出 |
 | **设置** | 服务器地址 / 端口 / Token、frpc 路径、运行模式、开机自启、管理 API、托盘行为 |
+| **自动更新** | 「设置 → 关于」里检查新版本、下载、重启安装；安装版走 NSIS 差分更新，便携版只给下载入口 |
 
 <table>
 <tr>
@@ -51,10 +52,19 @@
 | `FRP-Console-Setup-<版本>-x64.exe` | NSIS 一键安装，装到 `%LOCALAPPDATA%\Programs\frp-console`，自动建桌面与开始菜单快捷方式 |
 | `FRP-Console-<版本>.exe` | 单文件便携版，数据写在 exe 同级的 `frp-console-data\` |
 
-安装包只装控制台，**不含 frpc，也不含 frps**——`frpc.exe` 请自行从 [frp Releases](https://github.com/fatedier/frp/releases) 下载，放在控制台能找到的位置（建议与控制台同目录），或在「设置 → 可执行文件与路径」里手动选择。服务端的 `frps` 会在首次「一键初始化」时按服务器架构自动下载（约 18 MB，只下一次），详见 [frps 服务端控制台](#frps-服务端控制台)。
+安装包只装控制台，**不含 frpc，也不含 frps**——`frpc.exe` 请自行从 [frp Releases](https://github.com/fatedier/frp/releases) 下载，放在控制台能找到的位置（控制台目录、数据目录，或在「设置 → 可执行文件与路径」里手动指定）。**更推荐放在数据目录**：安装目录在升级时会被整个替换，虽然安装器会把 `frpc.exe` / `frpc.toml` 先搬走再放回（见[版本更新](#版本更新)），但放在数据目录从根上避免这个问题。服务端的 `frps` 会在首次「一键初始化」时按服务器架构自动下载（约 18 MB，只下一次），详见 [frps 服务端控制台](#frps-服务端控制台)。
+
+### 版本更新
+
+安装版支持应用内更新：**设置 → 关于 → 检查更新**，发现新版本后点「下载更新」（走 NSIS 差分，只下变化的片段），下完点「重启并安装」，控制台关闭、安装、自动重开。
+
+- **不会偷偷联网**：不检查则不请求，只在点按钮时才去 GitHub 取 Release 信息，见 [安全说明](#安全说明)。
+- **升级是一次「卸载旧版 + 装新版」**（electron-builder 的 NSIS 流程），不是覆盖文件。`settings.json`、服务器档案、DPAPI 密码都在数据目录，不受影响。
+- 放在安装目录里的 `frpc.exe` / `frpc.toml` / `frp-console-backups/` 会在升级前被搬到 `%LOCALAPPDATA%\frp-console\upgrade-rescue`，装完再搬回去——即便如此，**仍建议把 frpc 放在数据目录而不是安装目录**。
+- 托管进程模式下升级会短暂断开隧道（安装器结束控制台时会带走 frpc 子进程）。控制台会在安装前留一张便条，新版本启动后自动把隧道接回来；系统服务模式完全不受影响。
+- **便携版不支持自替换**：关于里只提供「打开发布页」，手动下载新版本替换 exe 即可（数据在 exe 同级的 `frp-console-data\`）。
 
 ### 系统要求
-
 - Windows 10 / 11（x64）
 - 会被管理的隧道需要本机有 `frpc.exe`；服务端管理需要目标机器开启 SSH
 - 不做跨平台：服务控制走 `sc` / UAC，端口扫描走 `netstat` + PowerShell，都是 Windows 专有实现
@@ -190,6 +200,9 @@ npm install --cache .\.npm-cache
 - **开了「开机自动启动」但重启后没自动运行**：这条设置写在当前用户的启动项里（`HKCU\...\Run`，不需要管理员权限）。被安全软件或组策略拦下时保存会直接报错、开关不会假装打开；这种情况可以在 `shell:startup`（Win+R 输入后回车打开的那个文件夹）里放一个控制台的快捷方式代替。另外建议同时打开「以最小化状态启动」，免得每次开机都弹窗。
 - **看到两个控制台窗口**：不会。单实例锁 + 固定端口 47823 双保险，后启动的副本会叫出已有窗口后退出。
 - **启动即退出 / 白屏**：程序会依次尝试 exe 同级 `frp-console-data`、`%LOCALAPPDATA%\frp-console`、程序目录下的数据目录；都不可写时会失败，请换到有写权限的位置。
+- **检查更新报「更新源缺少 latest.yml」**：说明那个 Release 只挂了 exe。发版时 `latest.yml` 和 `*.blockmap` 必须一起上传（[release.yml](.github/workflows/release.yml) 会自动收集并校验，手工发版容易漏）。
+- **升级后安装目录里的 frpc.exe / frpc.toml 不见了**：旧版本会被卸载旧版的流程连带删掉。现在安装器会先把它们搬到 `%LOCALAPPDATA%\frp-console\upgrade-rescue`，装完再搬回原处；即便如此，把 frpc 放在安装目录仍不是好习惯，建议放到数据目录后在设置里指过去。
+- **检查更新连不上**：它走 `github.com` 的 Release，网络受限时会失败（报错会写明是网络问题）。可以手动到 Releases 下载安装包覆盖安装，效果一样。
 
 ## 开发
 
@@ -204,6 +217,7 @@ src/main/          主进程
   frpsconfig.js    frps 配置解析、向导字段与 TOML 生成
   netport.js       本机 TCP 监听端口扫描
   log.js           日志跟随
+  update.js        自动更新（electron-updater，仅安装版）
   preload.js       contextBridge 暴露 window.FRP
 src/renderer/      无框架单页界面（index.html / styles.css / app.js）
 assets/            应用与托盘图标（托盘图标由脚本生成）
@@ -230,6 +244,8 @@ Remove-Item "$env:TEMP\eb-dl-*.lock.lock" -Recurse -Force
 npm run dist
 ```
 
+**发版必须一起上传的三件套**：`FRP-Console-Setup-<版本>-x64.exe`、`latest.yml`、`*.blockmap`。前两个决定客户端能不能发现新版本（electron-updater 读 `latest.yml` 比对版本、校验 sha512），第三个让差分下载只取变化的片段。`package.json` 的 `build.publish` 指向 `THEysh/FRP-Console`，打出来的包自带 `resources/app-update.yml`；`latest.yml` 里的版本来自 `package.json.version`，所以**版本号与 tag 必须同步改**，否则客户端认为没有更新。
+
 ### 自检脚本
 
 `tools/` 下是基于 CDP 的自动化脚本。用独立的 userData 和实例端口跑，不会碰到你正在用的实例：
@@ -250,7 +266,8 @@ node tools/cdp-shot.cjs .proxy-row out.png # 按选择器截单个元素
 
 - SSH 密码与本机 Token 使用 Windows DPAPI 加密后存在用户数据目录，**不会明文落盘**；解密绑定当前 Windows 账户，拷到别的机器上无效。
 - 安装包里**不含任何服务器地址、Token 或作者的个人配置**：装完全新的环境里服务器档案是空的，一切都由你自己填。
-- 控制台不向外发包：所有连接都是你显式发起的（本机 frpc、frpc Admin API、你填的 SSH 主机）。**唯一的例外**是「从零初始化」时从 `github.com/fatedier/frp` 下载 frps 二进制（只在服务器已装 frps 时不发生，且可用本地文件代替，见 [resources/frps](resources/frps/README.md)）。
+- 控制台平时不向外发包：所有连接都是你显式发起的（本机 frpc、frpc Admin API、你填的 SSH 主机）。主动联网只有两处，都由你触发：① 点「检查更新」时向 GitHub 取 Release 信息与更新包（`latest.yml` + 安装包，sha512 校验后才安装）；② 「从零初始化」时从 `github.com/fatedier/frp` 下载 frps 二进制（只在服务器已装 frps 时不发生，且可用本地文件代替，见 [resources/frps](resources/frps/README.md)）。
+- 更新包来自本仓库的 GitHub Release，靠 `latest.yml` 里的 sha512 校验完整性；安装包**未做代码签名**，首次下载运行时可能被 SmartScreen 提示，介意的话请手动下载核对。
 - frps 初始化会写入 `/etc/frp/frps.toml`、注册系统服务并重启 frps；**若服务器上原有的 frps 正在服务其他隧道，这会短暂中断并替换其配置**，执行前请确认影响范围。
 
 ## 许可证
