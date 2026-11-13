@@ -204,15 +204,26 @@ function runtimeInfo() {
   // 托管模式下服务停着是常态，再报“系统服务未运行”只会把人引偏。
   const wantsService = runMode === 'auto' || runMode === 'service';
   const serviceDown = wantsService && service.installed && !online && (service.state === 'stopped' || service.state === 'paused' || service.state === 'stop-pending');
+  /* 隧道在跑，但它连的那台服务器在本机已经没有档案了（档案被删、或 frpc.toml 是手改的）。
+   * 连通性是真通，可控制台已经管不到它 —— 不能再亮绿灯说“一切正常”。
+   * 注意区分「档案还在、只是没绑到隧道上」（matchProfileName 有值），那种情况不严重。 */
+  const orphan = !!(state.binding && state.binding.unarchived && !state.binding.matchProfileName);
   let tone = 'warn';
   let label = '未连接';
   let title = '隧道未运行';
   let desc = '';
   if (online && !starting) {
-    tone = 'online';
-    label = '隧道在线';
-    title = '隧道已连接';
-    desc = modeLabel(r.mode);
+    if (orphan) {
+      tone = 'warn';
+      label = '隧道在线 · 无档案';
+      title = '隧道仍在运行，但没有对应的服务器档案';
+      desc = `frpc.toml 还在连 ${state.binding.addr}:${state.binding.port || '—'}`;
+    } else {
+      tone = 'online';
+      label = '隧道在线';
+      title = '隧道已连接';
+      desc = modeLabel(r.mode);
+    }
   } else if (starting) {
     tone = 'warn';
     label = '连接中…';
@@ -350,6 +361,8 @@ function overviewKey() {
     ce: r.connectKind || '', cx: r.connectError ? 1 : 0, lf: r.loginFailed ? 1 : 0, pd: r.pending ? 1 : 0,
     svc: svc.state, svcType: svc.startType,
     counts: s.counts, cfgErr: s.configError,
+    // 隧道在跑但已无档案：这个提示的出现/消失必须触发重绘
+    orph: s.binding && s.binding.unarchived ? `${s.binding.addr}:${s.binding.port}` : '',
     val: s.validation && s.validation.errors ? s.validation.errors.length : 0,
     proxies: (s.proxies || []).map((p) => [p.name, p.status, p.publicAddress, p.health && p.health.ok, p.health && p.health.reason, p.statusError]),
   });
@@ -375,6 +388,38 @@ function layerFailText(counts) {
   if (counts.unhealthyTunnel) return `${counts.unhealthyTunnel} 个隧道未建立`;
   if (counts.unhealthyPublic) return `${counts.unhealthyPublic} 个公网不可达`;
   return '存在隧道或公网检查失败';
+}
+
+/* 隧道还在跑、但它连的服务器在本机已经没有档案了。
+ *
+ * 这时候三层检查是真的全绿（frpc 确实还在正常登录 frps），所以不能简单把状态改红
+ * ——那是在说谎；但也不能继续报"一切正常"，因为控制台已经管不到这条隧道了。
+ * 用一个警示条把事实说清楚，并给两个出口：重建档案 / 停掉隧道。 */
+function orphanTunnelNote() {
+  const b = (S.state && S.state.binding) || {};
+  if (!b.unarchived) return '';
+  /* 只在隧道真的还在跑的时候提示。停掉之后 frpc.toml 仍然指向老地址（我们从不擅自
+   * 改用户配置），但那时候没有任何东西在对外提供服务，再挂一条警示只是噪音。 */
+  const r = (S.state && S.state.runtime) || {};
+  const running = !!r.connected || !!r.pending || r.mode === 'starting' || r.mode === 'external';
+  if (!running) return '';
+  const where = `${esc(b.addr || '—')}:${esc(b.port || '—')}`;
+  // 档案还在、只是没绑到隧道上：说清楚绑一下就行，别吓唬人说“档案没了”。
+  if (b.matchProfileName) {
+    return `<div class="note warn" style="margin-bottom:14px">${icon('alert')}<div>
+      <strong>本机隧道没有归属到档案</strong><br>
+      <code>frpc.toml</code> 指向 <code>${where}</code>，本机有档案「${esc(b.matchProfileName)}」与它对应，但隧道目标没有指向这份档案。
+      <div style="margin-top:10px"><button class="btn small" type="button" data-act="nav" data-view="server">${icon('server')}<span>去服务器页绑定</span></button></div>
+    </div></div>`;
+  }
+  return `<div class="note warn" style="margin-bottom:14px">${icon('alert')}<div>
+    <strong>隧道还在跑，但已经没有对应的服务器档案</strong><br>
+    本机 <code>frpc.toml</code> 仍指向 <code>${where}</code>，这台服务器的档案已经不在了。隧道确实还能通，所以下面的状态不是误报——只是它已经不在控制台的记录里，出问题也没人帮你核对服务器侧。
+    <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn small" type="button" data-act="nav" data-view="server">${icon('server')}<span>去服务器页重建档案</span></button>
+      <button class="btn small" type="button" data-act="tunnel.stop">${icon('stop')}<span>停止隧道</span></button>
+    </div>
+  </div></div>`;
 }
 
 function renderOverview(force = false) {
@@ -425,6 +470,7 @@ function renderOverview(force = false) {
   const logLines = miniLogHtml();
 
   const issues = [];
+  if (state.binding && state.binding.unarchived) issues.push(orphanTunnelNote());
   if (state.configError) issues.push(`<div class="note error">${icon('alert')}<div>${esc(state.configError)}</div></div>`);
   if (onlyMissingServer) {
     issues.push(`<div class="note">${icon('alert')}<div><strong>还没有连上服务器</strong><br>到「服务器」页新建一个档案，填 IP 和 SSH 密码，连上后一键初始化 frps——地址与 Token 会自动写进本机配置，不用手填。<br><span style="opacity:.75">服务器就绪后，去「代理映射」加一条穿透规则，回来这里看三层是否全绿。</span></div></div>`);
@@ -461,7 +507,7 @@ function renderOverview(force = false) {
       <section class="card hero">
         <div class="hero-main">
           <div class="hero-status">
-            <div class="hero-orb ${info.online ? 'online' : info.tone === 'error' ? 'error' : 'warn'}">${icon(info.online ? 'shield' : info.starting ? 'clock' : 'alert')}</div>
+            <div class="hero-orb ${info.tone === 'online' ? 'online' : info.tone === 'error' ? 'error' : 'warn'}">${icon(info.tone === 'online' ? 'shield' : info.starting ? 'clock' : 'alert')}</div>
             <div class="hero-titles">
               <h2>${esc(info.title)}</h2>
               <p>${esc(config.serverAddr ? `${config.serverAddr}:${config.serverPort}` : '尚未配置服务器')} · ${esc(info.desc)}</p>
@@ -567,6 +613,9 @@ function proxiesKey() {
   return JSON.stringify({
     q: S.proxyQuery,
     cfgErr: s.configError,
+    // 隧道起停会决定「无档案」提示要不要出现，必须进 key，否则页面不重绘
+    rc: (s.runtime && s.runtime.connected) ? 1 : 0,
+    orph: s.binding && s.binding.unarchived ? `${s.binding.addr}:${s.binding.port}` : '',
     list: (s.proxies || []).map((p) => [p.name, p.type, p.status, p.statusError, p.publicAddress, p.localPort, p.health && p.health.ok, p.health && p.health.ms, p.health && p.health.reason]),
   });
 }
@@ -602,6 +651,7 @@ function renderProxies(force = false) {
         </div>
       </div>
 
+      ${orphanTunnelNote()}
       ${state.configError ? `<div class="note error" style="margin-bottom:14px">${icon('alert')}<div>${esc(state.configError)}</div></div>` : ''}
 
       <section class="card table-card">
@@ -1992,7 +2042,7 @@ function confirmDeleteServerProfile() {
       </div>
       <div class="modal-body">
         <div class="note warn">${icon('alert')}<div>确定删除档案 <strong>${esc(active.name)}</strong>（${esc(active.host)}）吗？该档案保存的密码会一并清除。</div></div>
-        ${bound ? `<label class="check-line" style="margin-top:12px"><input type="checkbox" id="profile-del-force"> 这是本机隧道当前目标，同时解除绑定（不会修改 frpc.toml，隧道仍连原地址）</label>` : ''}
+        ${bound ? `<label class="check-line" style="margin-top:12px"><input type="checkbox" id="profile-del-force"> 这是本机隧道当前目标，同时解除绑定<strong>并停止隧道</strong>（不会修改 frpc.toml，以后重建档案还能接着用）</label>` : ''}
       </div>
       <div class="modal-foot">
         <span class="mf-left"></span>
@@ -2018,8 +2068,16 @@ function confirmDeleteServerProfile() {
         S.server.wizard = null;
         S.server.wizardDirty = false;
         applyServerState(res.data, seq);
-        renderServer(true);
-        toast('success', '档案已删除', active.name);
+        /* 删除可能顺手把隧道停了，全局状态（顶栏胶囊、概览、代理映射）得一起换掉，
+         * 否则页面还停在“全绿”，看起来像删除没生效。 */
+        if (res.data && res.data.appState) S.state = res.data.appState;
+        updateChrome();
+        renderCurrent({ force: true });
+        if (res.data && res.data.stoppedTunnel) toast('success', '档案已删除，隧道已停止', active.name);
+        else if (res.data && res.data.stopError) toast('warn', '档案已删除，但隧道没停下来', res.data.stopError);
+        else if (res.data && res.data.stopSkipped === 'service') toast('warn', '档案已删除，但隧道还在跑', '隧道由系统服务托管，需要到「设置 → 隧道」里停止服务');
+        else if (res.data && res.data.stopSkipped === 'external') toast('warn', '档案已删除，但隧道还在跑', '这个 frpc 不是控制台启动的，请到它的来源处停止');
+        else toast('success', '档案已删除', active.name);
       } else {
         confirm.disabled = false;
         toastResult(res);

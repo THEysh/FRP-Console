@@ -142,6 +142,13 @@ function tunnelBindingView() {
   const addr = String((model && model.serverAddr) || '');
   const port = Number((model && model.serverPort) || 0);
   const token = (model && model.auth && model.auth.token) || '';
+  /* 本机配置指向的这台服务器，本机到底还有没有档案记录？和「绑定」是两件事：
+   * 档案在、只是没绑到隧道上（matchProfileName 非空）和档案根本没了好
+   * （都被删了）要说不同的话，否则用户会以为自己的档案被误删。 */
+  const match = addr
+    ? (serverProfiles().find((item) => item.host.toLowerCase() === addr.toLowerCase() && Number(item.clientPort) === port)
+      || serverProfiles().find((item) => item.host.toLowerCase() === addr.toLowerCase()))
+    : null;
   return {
     addr,
     port,
@@ -154,6 +161,8 @@ function tunnelBindingView() {
     portMatch: !!(bound && port && Number(bound.clientPort) === port),
     tokenMatch: !!(bound && token && bound.clientToken === token),
     unarchived: !bound && !!addr,
+    matchProfileId: match ? match.id : '',
+    matchProfileName: match ? match.name : '',
   };
 }
 
@@ -938,6 +947,10 @@ function buildState() {
       };
     })(),
     dashboardUrl: dashboardUrl(),
+    /* 本机 frpc.toml 与「隧道目标档案」的绑定情况。渲染层据此识别一种很容易骗人的状态：
+     * 隧道确实在跑、三层也确实通（frpc 还在连那台服务器），但这台服务器在本机已经
+     * 没有档案了 —— 概览不能继续报"一切正常"。 */
+    binding: tunnelBindingView(),
     logs: { count: follower.lines.length, last: follower.lines.length ? follower.lines[follower.lines.length - 1].ts : 0 },
   };
 }
@@ -1057,16 +1070,31 @@ async function refreshService({ detect = false } = {}) {
   return serviceCache;
 }
 
+/* 轮询里的每一步都单独兜住，谁出错都不许拖累别人。
+ *
+ * 以前是顺序 await，只要 service 查询抛一次（sc.exe 被安全软件拦、权限不足、
+ * 服务名被改），后面的 manager.refresh() 就永远轮不到执行 —— 隧道状态定格在
+ * 上一次的"全绿"，用户看到的就是"我都删了服务器，它还显示联通"。 */
+async function tickStep(name, fn) {
+  try {
+    return await fn();
+  } catch (e) {
+    if (process.env.FRP_CONSOLE_DEBUG) console.warn(`[tick] ${name}`, e && e.stack ? e.stack.split('\n')[0] : e);
+    return undefined;
+  }
+}
+
 async function tick({ force = false } = {}) {
   if (tickBusy && !force) return;
   tickBusy = true;
   try {
-    await checkExternalConfig();
+    await tickStep('checkExternalConfig', checkExternalConfig);
+    // 先刷隧道真实状态：它决定了界面"通不通"，优先级高于服务托管信息
+    await tickStep('manager.refresh', () => manager.refresh());
     if (Date.now() - lastServiceCheck > 3800 || force) {
       lastServiceCheck = Date.now();
-      await refreshService({ detect: false });
+      await tickStep('refreshService', () => refreshService({ detect: false }));
     }
-    await manager.refresh();
     if (!healthBusy && Date.now() - (tick.lastHealth || 0) > 14000 && model && model.proxies.length) {
       tick.lastHealth = Date.now();
       healthBusy = true;
@@ -1786,7 +1814,8 @@ function registerIpc() {
   ipcMain.handle('server:profile-delete', async (event, payload = {}) => {
     const profile = findServerProfile(payload.id);
     if (!profile) return fail('服务器档案不存在', { state: serverState() });
-    if (profile.id === settings.clientServerId && !payload.force) {
+    const wasTunnelTarget = profile.id === settings.clientServerId;
+    if (wasTunnelTarget && !payload.force) {
       return fail('这台服务器正绑定本机隧道，请先切换到其他档案，或勾选“同时解除绑定”后删除。', {
         state: serverState(),
         needsForce: true,
@@ -1807,9 +1836,44 @@ function registerIpc() {
       servers: rest,
       activeServerId: nextActive ? nextActive.id : '',
     };
-    if (profile.id === settings.clientServerId) patch.clientServerId = '';
+    if (wasTunnelTarget) patch.clientServerId = '';
     settings = settingsModule.save(patch);
-    return ok({ ...serverState(), disconnected });
+
+    /* 删掉的正是「本机隧道目标」时，隧道要跟着下线。
+     *
+     * 档案就是这台服务器在本机的全部记录：记录没了还留一条连过去的隧道，frpc 会
+     * 继续正常登录、代理继续在线，概览一路全绿 —— 用户删完服务器看到"还是通的"，
+     * 只会以为删除没生效或者程序在骗他。
+     *
+     * 分寸：
+     *  · 本应用拉起的 frpc —— 直接收掉，天经地义。
+     *  · 系统服务托管且本进程已提权 —— 一并停服务。
+     *  · 系统服务托管但没提权 / 是别人的 frpc —— 不动，只把事实说回去。停它要
+     *    弹管理员授权，用户点的是"删档案"，突然冒出 UAC 会被当成出事，还可能
+     *    卡满 90 秒超时。渲染层据此提示"隧道还在跑，请去设置页停"。
+     *
+     * frpc.toml 一律保持原样：里面是用户自己的配置，重新建档案还能接着用。 */
+    let stoppedTunnel = false;
+    let stopError = '';
+    let stopSkipped = '';
+    if (wasTunnelTarget && manager) {
+      const rt = manager.snapshot();
+      const alive = rt.running || rt.connected;
+      const hasService = !!(rt.service && rt.service.installed && rt.service.state === 'running');
+      // mode 为 starting 且没有服务在跑，说明是自家子进程刚起、管理 API 还没就绪
+      const childOwned = rt.mode === 'managed' || (rt.mode === 'starting' && !hasService);
+      if (alive && (childOwned || (hasService && elevated))) {
+        const stopped = await manager.stop({ runMode: settings.runMode }).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+        stoppedTunnel = !!stopped.ok;
+        if (!stoppedTunnel) stopError = stopped.error || '停止隧道失败';
+        await manager.refresh().catch(() => {});
+      } else if (alive) {
+        stopSkipped = hasService ? 'service' : 'external';
+      }
+      healthCache.clear();
+      scheduleHealth(1200);
+    }
+    return ok({ ...serverState(), disconnected, stoppedTunnel, stopError, stopSkipped, appState: buildState() });
   });
 
   ipcMain.handle('server:profile-clear-password', async (event, payload = {}) => {
@@ -2466,9 +2530,12 @@ async function bootstrap() {
     }
   });
   follower.start();
-  await refreshService({ detect: true });
-  frpcVersion = await readFrpcVersion();
-  elevated = await service.isElevated();
+  /* 这几步拿的都是"锦上添花"的信息，读不到不该让整个启动失败。
+   * sc.exe 被安全软件拉黑 / 权限不足的机器上，原来会在 refreshService 直接抛出，
+   * 连轮询都起不来，界面从此定格在初始状态。 */
+  await tickStep('refreshService', () => refreshService({ detect: true }));
+  frpcVersion = (await tickStep('readFrpcVersion', readFrpcVersion)) || '';
+  elevated = !!(await tickStep('isElevated', () => service.isElevated()));
   await manager.refresh().catch(() => {});
   checkHealth().catch(() => {});
   startPolling();

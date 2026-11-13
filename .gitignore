@@ -32,6 +32,8 @@ desktop.ini
 .shots/
 # 截图演示用的隔离数据目录
 .demo/
+# 端到端回归用的隔离沙箱（临时 settings/frpc.toml，绝不入库）
+.e2e/
 
 # 打包时的工作目录残留
 __pycache__/
