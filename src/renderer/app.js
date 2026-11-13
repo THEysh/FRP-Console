@@ -140,6 +140,7 @@ function modeLabel(mode) {
 }
 
 const TYPE_LABEL = { tcp: 'TCP', udp: 'UDP', http: 'HTTP', https: 'HTTPS', stcp: 'STCP', sudp: 'SUDP', xtcp: 'XTCP', tcpmux: 'TCPMUX' };
+const SCOPE_LABEL = { loopback: '回环', all: '全网', docker: 'Docker', lan: '内网', public: '公网', other: '其它' };
 
 function healthTip(h) {
   if (!h || !h.layers) return '';
@@ -759,6 +760,13 @@ function renderDiscovery(force = false) {
   if (!force && S.lastKeys.discovery === 'rendered') return;
   S.lastKeys.discovery = 'rendered';
   const listeners = S.listeners || [];
+  const scopeFilter = S.discoveryScope || '';
+  const visible = scopeFilter ? listeners.filter((l) => (l.scopes || (l.loopbackOnly ? ['loopback'] : [])).includes(scopeFilter)) : listeners;
+  const scopeCounts = { loopback: 0, all: 0, docker: 0, lan: 0, public: 0, other: 0 };
+  listeners.forEach((l) => {
+    const scopes = l.scopes || (l.loopbackOnly ? ['loopback'] : []);
+    scopes.forEach((s) => { if (scopeCounts[s] !== undefined) scopeCounts[s] += 1; });
+  });
 
   $('#view').innerHTML = `
     <div class="view">
@@ -775,16 +783,21 @@ function renderDiscovery(force = false) {
       <section class="card table-card">
         <div class="toolbar">
           <div class="card-title">${icon('server', 'ct-icon')}<span>本机监听端口</span></div>
-          <span class="muted" style="font-size:11px">${listeners.length ? `${listeners.length} 个 TCP 监听` : '尚未扫描'}</span>
+          <span class="muted" style="font-size:11px">${listeners.length ? `${visible.length} / ${listeners.length} 个 TCP 监听` : '尚未扫描'}</span>
         </div>
+        ${listeners.length
+          ? `<div class="seg" id="discovery-scope" style="margin:0 16px 12px">
+              ${[['', '全部'], ['loopback', '回环'], ['all', '全网'], ['docker', 'Docker'], ['lan', '内网'], ['public', '公网']].map(([key, label]) => `<button type="button" data-act="listeners.scope" data-scope="${key}" class="${scopeFilter === key ? 'active' : ''}">${label}${key ? ` ${scopeCounts[key] || 0}` : ''}</button>`).join('')}
+            </div>`
+          : ''}
         ${S.listenersBusy && !listeners.length
           ? `<div class="empty" style="padding:34px 20px"><span class="spinner-sm"></span><p style="margin-top:10px">正在扫描本机端口…</p></div>`
-          : listeners.length
+          : visible.length
             ? `<table class="listener-table">
                 <thead><tr><th>端口</th><th>监听地址</th><th>进程</th><th>PID</th><th style="text-align:right">发布</th></tr></thead>
-                <tbody>${listeners.slice(0, 200).map(listenerRow).join('')}</tbody>
+                <tbody>${visible.slice(0, 200).map(listenerRow).join('')}</tbody>
               </table>`
-            : `<div class="empty" style="padding:30px 20px"><p>还没有扫描结果，点击右上角“扫描本机端口”。</p></div>`}
+            : `<div class="empty" style="padding:30px 20px"><p>${listeners.length ? '这个分类下没有监听端口。' : '还没有扫描结果，点击右上角“扫描本机端口”。'}</p></div>`}
       </section>
 
       <div class="note" style="margin-top:14px">
@@ -800,9 +813,13 @@ function renderDiscovery(force = false) {
 }
 
 function listenerRow(l) {
+  const scopes = l.scopes && l.scopes.length ? l.scopes : (l.loopbackOnly ? ['loopback'] : ['other']);
+  const scopeTitle = { loopback: '只监听 127.0.0.1 / ::1，只有本机能访问', all: '监听所有网卡（0.0.0.0 / ::），局域网内都能访问', docker: 'Docker 网桥段，通常是容器网络', lan: '内网地址（192.168 / 10.x 等），局域网内可访问', public: '公网地址，若防火墙放行则全网可访问', other: '无法归类' };
+  const badges = scopes.slice(0, 3).map((s) => `<span class="badge scope-${esc(s)}" title="${esc(scopeTitle[s] || '')}">${esc(SCOPE_LABEL[s] || s)}</span>`).join('');
+  const fullTitle = (l.hosts ? l.hosts.join(', ') : '') + (scopes.length ? ` · ${scopes.map((s) => SCOPE_LABEL[s] || s).join(' / ')}` : '');
   return `<tr>
     <td class="port-cell">${esc(l.port)}</td>
-    <td class="addr-cell" title="${esc(l.hosts ? l.hosts.join(', ') : '')}">${esc(l.hosts ? l.hosts[0] : '')}${l.hosts && l.hosts.length > 1 ? ` +${l.hosts.length - 1}` : ''}</td>
+    <td class="addr-cell" title="${esc(fullTitle)}">${badges} ${esc(l.hosts ? l.hosts[0] : '')}${l.hosts && l.hosts.length > 1 ? ` +${l.hosts.length - 1}` : ''}</td>
     <td class="proc-cell" title="${esc(l.process || '当前进程环境无法读取进程名')}">${esc(l.process || '未知')}</td>
     <td class="addr-cell">${esc(l.pid)}</td>
     <td style="text-align:right"><button class="btn small" type="button" data-act="listener.publish" data-port="${esc(l.port)}" data-process="${esc(l.process)}">添加代理</button></td>
@@ -2951,6 +2968,10 @@ async function handleAction(act, dataset, btn) {
       case 'listeners.scan':
         await scanListeners();
         break;
+      case 'listeners.scope':
+        S.discoveryScope = dataset.scope || '';
+        renderDiscovery(true);
+        break;
       case 'listener.publish': {
         const proc = String(dataset.process || '').replace(/\.exe$/i, '').replace(/[^A-Za-z0-9._-]/g, '');
         openProxyEditor({ mode: 'add', preset: { name: uniqueName(`port-${dataset.port}${proc ? `-${proc}` : ''}`), localPort: Number(dataset.port), type: 'tcp' } });
@@ -3259,6 +3280,10 @@ async function handleAction(act, dataset, btn) {
         setProxyFormType(dataset.type);
         break;
       }
+      case 'proxyform.plugin': {
+        setProxyPluginFields(dataset.plugin || '');
+        break;
+      }
       case 'update.check': {
         S.update = { ...(S.update || {}), state: 'checking', message: '正在检查更新…' };
         renderUpdateBox();
@@ -3357,6 +3382,10 @@ function openProxyEditor({ mode, proxy = null, preset = null }) {
     subdomain: current.subdomain || '',
     useCompression: current.transport ? !!current.transport.useCompression : true,
     useEncryption: current.transport ? !!current.transport.useEncryption : false,
+    pluginType: current.plugin ? current.plugin.type || '' : '',
+    pluginCrtPath: current.plugin ? current.plugin.crtPath || '' : '',
+    pluginKeyPath: current.plugin ? current.plugin.keyPath || '' : '',
+    pluginHostHeaderRewrite: current.plugin ? current.plugin.hostHeaderRewrite || '' : '',
   };
   S.proxyEdit = { mode, originalName: current.name || '' };
   const types = ['tcp', 'udp', 'http', 'https'];
@@ -3407,6 +3436,32 @@ function openProxyEditor({ mode, proxy = null, preset = null }) {
             <input class="input" id="pf-domains" name="customDomains" value="${esc(initial.customDomains)}" placeholder="example.com, sub.example.com" />
             <div class="field-hint">HTTP/HTTPS 类型必填；使用 frps 的 vhost 域名转发。</div>
           </div>
+          <div class="field span-2 hidden" id="pf-plugin-field">
+            <label>HTTPS 证书 / TLS 终止</label>
+            <div class="seg" id="pf-plugin-types">
+              <button type="button" data-act="proxyform.plugin" data-plugin="" class="${!initial.pluginType ? 'active' : ''}">透传（本地服务自己配证书）</button>
+              <button type="button" data-act="proxyform.plugin" data-plugin="https2http" class="${initial.pluginType === 'https2http' ? 'active' : ''}">https2http（frps 终止 TLS，后端是 HTTP）</button>
+              <button type="button" data-act="proxyform.plugin" data-plugin="https2https" class="${initial.pluginType === 'https2https' ? 'active' : ''}">https2https（frps 终止 TLS，后端仍是 HTTPS）</button>
+            </div>
+            <div class="field-hint">“透传”= frps 只按域名把加密流量原样转给本地服务，证书由本地服务自己持有；“https2http / https2https”= frps 替你解 TLS，需要把证书交给 frpc。</div>
+          </div>
+          <div class="field span-2 hidden" id="pf-plugin-fields">
+            <div class="stack" style="gap:10px">
+              <div class="field">
+                <label>证书文件（crtPath）<span class="req">*</span></label>
+                <input class="input" id="pf-plugin-crt" value="${esc(initial.pluginCrtPath)}" placeholder="C:\path\to\server.crt（绝对路径）" />
+              </div>
+              <div class="field">
+                <label>私钥文件（keyPath）<span class="req">*</span></label>
+                <input class="input" id="pf-plugin-key" value="${esc(initial.pluginKeyPath)}" placeholder="C:\path\to\server.key（绝对路径）" />
+              </div>
+              <div class="field">
+                <label>Host 重写（hostHeaderRewrite，可选）</label>
+                <input class="input" id="pf-plugin-host" value="${esc(initial.pluginHostHeaderRewrite)}" placeholder="例如 127.0.0.1（把 Host 头改写后发给后端）" />
+              </div>
+            </div>
+            <div class="field-hint">证书和私钥由 Let's Encrypt 或你自己的证书源签发，路径必须是 frpc 这台机器上的绝对路径。证书绑定的域名要和上面的自定义域名一致。</div>
+          </div>
           <div class="field span-2">
             <label>传输选项</label>
             <div class="stack" style="gap:0">
@@ -3447,6 +3502,21 @@ async function suggestRemotePort(type) {
   }
 }
 
+function currentProxyPlugin() {
+  const active = $('#pf-plugin-types [data-plugin].active');
+  return active ? active.dataset.plugin : '';
+}
+
+function setProxyPluginFields(type) {
+  const fields = $('#pf-plugin-fields');
+  if (fields) fields.classList.toggle('hidden', !type);
+  $$('#pf-plugin-types [data-plugin]').forEach((b) => b.classList.toggle('active', b.dataset.plugin === type));
+}
+
+function refreshProxyPluginFields() {
+  setProxyPluginFields(currentProxyPlugin());
+}
+
 function setProxyFormType(type) {
   const hidden = $('#pf-type');
   if (hidden) hidden.value = type;
@@ -3455,8 +3525,13 @@ function setProxyFormType(type) {
   const domainType = type === 'http' || type === 'https';
   const remoteField = $('#pf-remote-field');
   const domainField = $('#pf-domain-field');
+  const pluginField = $('#pf-plugin-field');
   if (remoteField) remoteField.classList.toggle('hidden', !needsRemote);
   if (domainField) domainField.classList.toggle('hidden', !domainType);
+  if (pluginField) pluginField.classList.toggle('hidden', !domainType);
+  // 切到 tcp/udp 时，插件字段一起收起；再切回 http/https 时按当前插件类型恢复显示
+  if (!domainType) setProxyPluginFields('');
+  else refreshProxyPluginFields();
   const remoteInput = $('#pf-remote');
   if (needsRemote && remoteInput && !remoteInput.value) suggestRemotePort(type);
 }
@@ -3478,6 +3553,10 @@ async function submitProxyForm(form, mode) {
   const domains = $('#pf-domains').value;
   const useCompression = isOn('pf-compression');
   const useEncryption = isOn('pf-encryption');
+  const pluginType = currentProxyPlugin();
+  const pluginCrtPath = ($('#pf-plugin-crt') ? $('#pf-plugin-crt').value : '').trim();
+  const pluginKeyPath = ($('#pf-plugin-key') ? $('#pf-plugin-key').value : '').trim();
+  const pluginHostHeaderRewrite = ($('#pf-plugin-host') ? $('#pf-plugin-host').value : '').trim();
 
   if (!name) return showError('请填写代理名称');
   if (!/^[A-Za-z0-9_.-]+$/.test(name)) return showError('名称建议只包含字母、数字、点、下划线或短横线');
@@ -3486,6 +3565,8 @@ async function submitProxyForm(form, mode) {
   const domainType = type === 'http' || type === 'https';
   if (needsRemote && (!Number.isInteger(remotePort) || remotePort < 1 || remotePort > 65535)) return showError('公网端口必须是 1 - 65535 的整数');
   if (domainType && !domains.trim()) return showError('HTTP/HTTPS 类型需要填写自定义域名');
+  if (pluginType && !pluginCrtPath) return showError('使用 https2http / https2https 需要填写证书文件（crtPath）');
+  if (pluginType && !pluginKeyPath) return showError('使用 https2http / https2https 需要填写私钥文件（keyPath）');
 
   const input = {
     name, type, localIP, localPort,
@@ -3494,6 +3575,15 @@ async function submitProxyForm(form, mode) {
     useCompression,
     useEncryption,
   };
+  if (pluginType) {
+    input.plugin = {
+      type: pluginType,
+      localAddr: `${localIP || '127.0.0.1'}:${localPort}`,
+      crtPath: pluginCrtPath,
+      keyPath: pluginKeyPath,
+    };
+    if (pluginHostHeaderRewrite) input.plugin.hostHeaderRewrite = pluginHostHeaderRewrite;
+  }
   if (errorEl) errorEl.classList.add('hidden');
   const submit = $('#pf-submit');
   if (submit) {

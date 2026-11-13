@@ -436,8 +436,19 @@ class FrpcManager extends EventEmitter {
   }
 
   async testLocal(proxy, timeout = 2200) {
-    const host = proxy.plugin ? null : proxy.localIP || '127.0.0.1';
-    const port = proxy.localPort;
+    // plugin 代理（https2http/https2https）的后端地址在 plugin.localAddr 里，
+    // 形如 "127.0.0.1:18080"；普通代理用 localIP/localPort。
+    let host = null;
+    let port = null;
+    if (proxy.plugin && typeof proxy.plugin.localAddr === 'string') {
+      const match = /^(.+):(\d+)$/.exec(proxy.plugin.localAddr.trim());
+      if (match) {
+        host = match[1];
+        port = Number(match[2]);
+      }
+    }
+    if (!host) host = proxy.localIP || '127.0.0.1';
+    if (!port) port = proxy.localPort;
     if (!host || !port) return { ok: false, error: '缺少本地端口' };
     return tcpCheck(host, port, timeout);
   }

@@ -91,7 +91,7 @@ function tcpCheck(host, port, timeout = 2500) {
  * 一律按 URL 里的主机名发请求 —— 而探测 frps 的 vhost 恰恰需要
  * “连 127.0.0.1:vhostPort、Host 写绑定域名”，否则永远匹配不到代理，
  * 返回的是 frps 自己的 404 页面。 */
-function httpProbe(url, timeout = 6000, extraHeaders = null) {
+function httpProbe(url, timeout = 6000, extraHeaders = null, tlsOptions = null) {
   const started = Date.now();
   let parsed;
   try {
@@ -113,16 +113,23 @@ function httpProbe(url, timeout = 6000, extraHeaders = null) {
     };
     let req;
     try {
+      const requestOptions = {
+        protocol: parsed.protocol,
+        host: parsed.hostname,
+        port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+        path: `${parsed.pathname || '/'}${parsed.search || ''}`,
+        method: 'GET',
+        headers,
+        timeout,
+      };
+      // 探测 https 时允许“连 IP、SNI 填域名、不校验证书”——健康检查只关心
+      // 流量有没有被 frps 按域名路由过去，证书是否可信不影响“隧道通不通”。
+      if (parsed.protocol === 'https:' && tlsOptions) {
+        if (tlsOptions.servername) requestOptions.servername = tlsOptions.servername;
+        if (typeof tlsOptions.rejectUnauthorized === 'boolean') requestOptions.rejectUnauthorized = tlsOptions.rejectUnauthorized;
+      }
       req = transport.request(
-        {
-          protocol: parsed.protocol,
-          host: parsed.hostname,
-          port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
-          path: `${parsed.pathname || '/'}${parsed.search || ''}`,
-          method: 'GET',
-          headers,
-          timeout,
-        },
+        requestOptions,
         (res) => {
           let body = '';
           res.setEncoding('utf8');

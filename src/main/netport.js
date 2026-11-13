@@ -43,6 +43,7 @@ async function listListeners() {
 
   const listeners = [...entries.values()].map((item) => {
     const hosts = [...item.hosts].sort();
+    const scopes = [...new Set(hosts.map(classifyHost))].sort((a, b) => scopeRank(b) - scopeRank(a));
     return {
       port: item.port,
       pid: item.pid,
@@ -50,10 +51,34 @@ async function listListeners() {
       hosts,
       address: hosts.join(', '),
       loopbackOnly: hosts.every((h) => /^(127\.0\.0\.1|::1)$/.test(h)),
+      scopes,
+      scope: scopes[0] || 'other',
     };
   });
   listeners.sort((a, b) => a.port - b.port);
   return { ok: true, listeners, processError: coverageError || processError };
+}
+
+/* 把监听地址归成几类，前端好标注“这个服务到底是只给自己、还是整个局域网/公网都能连”。
+ * 只按 IP 段做静态判断，不联网、不查 DNS。 */
+function classifyHost(host) {
+  const text = String(host || '').trim();
+  if (!text) return 'other';
+  // IPv4 映射的 IPv6 地址（::ffff:127.0.0.1）还原成 IPv4 再判。
+  if (/^::ffff:/i.test(text)) return classifyHost(text.replace(/^::ffff:/i, ''));
+  if (/^(127\.\d+\.\d+\.\d+|::1)$/.test(text)) return 'loopback';
+  if (/^(0\.0\.0\.0|\[::\]|::)$/.test(text)) return 'all';
+  // 172.17~172.31 是 Docker 默认网桥/自定义网络的惯用段，单独标出来，
+  // 避免用户误以为这是自己局域网里的另一台机器。
+  if (/^172\.(1[7-9]|2\d|3[01])\.\d+\.\d+$/.test(text)) return 'docker';
+  if (/^(10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|169\.254\.\d+\.\d+)$/.test(text)) return 'lan';
+  return 'public';
+}
+
+/* “开放程度”排序：越靠前越说明这个端口暴露给越多的来源。
+ * 有多个地址时取最开放的那个作为主标签。 */
+function scopeRank(scope) {
+  return { all: 5, public: 4, lan: 3, docker: 2, loopback: 1, other: 0 }[scope] || 0;
 }
 
 /**
@@ -98,4 +123,4 @@ async function processNames() {
   return { names, error: names.size ? '' : `读不到进程名：${psError.join('；')}` };
 }
 
-module.exports = { listListeners };
+module.exports = { listListeners, classifyHost };

@@ -1206,7 +1206,10 @@ async function checkProxyHealth(p, ctx) {
     pub = { ok: false, ms: 0, error: type === 'http' || type === 'https' ? '缺少公网域名' : '缺少公网端口' };
     layers.public = { ok: false, ms: 0, error: pub.error, skipped: true };
   } else if (target.kind === 'http') {
-    pub = await httpProbe(target.url, 5000, target.host ? { Host: target.host } : null);
+    const tlsOptions = target.servername || typeof target.rejectUnauthorized === 'boolean'
+      ? { servername: target.servername, rejectUnauthorized: target.rejectUnauthorized }
+      : null;
+    pub = await httpProbe(target.url, 5000, target.host ? { Host: target.host } : null, tlsOptions);
     layers.public = { ok: !!pub.ok, ms: pub.ms || 0, error: pub.error || null, status: pub.status || 0, url: target.display || target.url };
   } else {
     pub = await tcpCheck(target.host, target.port, 2500);
@@ -1233,8 +1236,13 @@ async function checkHealth() {
     healthCache.clear();
     return;
   }
-  // plugin 代理（socks5/http_proxy 等）没有本地端口，没得可测，直接跳过。
-  const targets = model.proxies.filter((p) => !p.plugin);
+  // plugin 代理里，socks5/http_proxy/static_file 等没有可探测的本地后端，跳过；
+  // 但 https2http/https2https 有 plugin.localAddr 后端 + https vhost 公网入口，正常测。
+  const targets = model.proxies.filter((p) => {
+    if (!p.plugin) return true;
+    const pt = p.plugin && p.plugin.type;
+    return pt === 'https2http' || pt === 'https2https';
+  });
   const ctx = { serverAddr: model.serverAddr };
   let serverCheck = null;
   ctx.serverCheck = () => {

@@ -467,6 +467,13 @@ a { color: var(--accent); text-decoration: none; }
 .badge.amber { color: #ffe3ad; border-color: rgba(255, 195, 92, 0.24); background: rgba(255, 195, 92, 0.1); }
 .badge.muted { color: var(--text-3); }
 .badge .bdot { width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
+/* 服务发现：监听地址的开放范围 */
+.badge.scope-loopback { color: #9ff0d0; border-color: rgba(46, 224, 160, 0.24); background: rgba(46, 224, 160, 0.1); }
+.badge.scope-all { color: #ffe3ad; border-color: rgba(255, 195, 92, 0.24); background: rgba(255, 195, 92, 0.1); }
+.badge.scope-docker { color: #c8c0ff; border-color: rgba(139, 125, 255, 0.24); background: rgba(139, 125, 255, 0.1); }
+.badge.scope-lan { color: #9ee8ff; border-color: rgba(90, 209, 255, 0.2); background: rgba(90, 209, 255, 0.09); }
+.badge.scope-public { color: #ffbdbd; border-color: rgba(255, 118, 118, 0.24); background: rgba(255, 118, 118, 0.1); }
+.badge.scope-other { color: var(--text-3); }
 
 
 .health-hint {

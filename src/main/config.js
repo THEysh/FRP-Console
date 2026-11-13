@@ -192,6 +192,15 @@ function validate(model) {
       }
     }
 
+    if (isPlainObject(proxy.plugin)) {
+      const plugin = proxy.plugin;
+      if (!['https2http', 'https2https'].includes(plugin.type)) {
+        push('error', `proxies[${index}].plugin.type`, `${label} 的插件类型「${plugin.type}」不支持`);
+      }
+      if (!plugin.crtPath) push('error', `proxies[${index}].plugin.crtPath`, `${label} 需要证书文件 crtPath`);
+      if (!plugin.keyPath) push('error', `proxies[${index}].plugin.keyPath`, `${label} 需要私钥文件 keyPath`);
+    }
+
     if (['stcp', 'sudp', 'xtcp'].includes(proxy.type) && !proxy.secretKey) {
       push('warn', `proxies[${index}].secretKey`, `${label} 建议设置 secretKey`);
     }
@@ -474,7 +483,9 @@ function vhostPortOf(type, options = {}) {
  * http：连 serverAddr:vhostHTTPPort，用 Host 头带上绑定域名。
  *   直接按域名访问往往在“客户端这台机器”上根本解析不到（内网 DNS、测试域名、
  *   CDN 只对公网生效），结果是隧道明明通着，界面却永久报“公网不可达”。
- * https：反过来只能按域名打 —— 按 IP 连会因 SNI / 证书不匹配握手失败。
+ * https：连 serverAddr:vhostHTTPSPort，SNI 填绑定域名、rejectUnauthorized 关掉证书校验。
+ *   健康检查只关心“流量能不能被 frps 按域名路由过去”，不关心证书是不是
+ *   浏览器信任的（自签、过期、域名不一致都不该影响“隧道通不通”的判定）。
  * tcp/udp：连 serverAddr:remotePort。 */
 function probeTargetFor(model, proxy, options = {}) {
   if (!model.serverAddr) return null;
@@ -486,9 +497,20 @@ function probeTargetFor(model, proxy, options = {}) {
     return { kind: 'http', url: `http://${model.serverAddr}:${port}/`, host: domain, port, display: publicAddressFor(model, proxy, options) };
   }
   if (type === 'https') {
-    const url = publicAddressFor(model, proxy, options);
-    if (!url) return null;
-    return { kind: 'http', url, host: '', port: vhostPortOf('https', options), display: url };
+    const domain = firstDomainOf(proxy);
+    if (!domain) return null;
+    const port = vhostPortOf('https', options);
+    return {
+      kind: 'http',
+      url: `https://${model.serverAddr}:${port}/`,
+      /* Host 头也要带上域名：frps 做 TLS 终止（https2http/https2https）时会按 Host
+       * 校验请求是不是发给这个代理的，只填 SNI、不填 Host 会得到 421。 */
+      host: domain,
+      servername: domain,
+      rejectUnauthorized: false,
+      port,
+      display: publicAddressFor(model, proxy, options),
+    };
   }
   if (HOST_TYPES.includes(type) && proxy.remotePort) {
     return { kind: 'tcp', host: model.serverAddr, port: Number(proxy.remotePort), display: publicAddressFor(model, proxy, options) };
@@ -516,6 +538,10 @@ function makeProxy(input) {
     if (input.subdomain) base.subdomain = String(input.subdomain).trim();
   }
   if (type === 'tcpmux') base.multiplexer = String(input.multiplexer || 'httpconnect').trim() || 'httpconnect';
+  if (type === 'http' || type === 'https') {
+    const plugin = normalizePlugin(input.plugin);
+    if (plugin) base.plugin = plugin;
+  }
   if (input.secretKey) base.secretKey = String(input.secretKey);
   const transport = {};
   if (input.useCompression) transport.useCompression = true;
@@ -524,6 +550,22 @@ function makeProxy(input) {
   if (input.bandwidthLimitMode) transport.bandwidthLimitMode = String(input.bandwidthLimitMode).trim();
   if (Object.keys(transport).length) base.transport = transport;
   return base;
+}
+
+/* http/https 代理的 TLS 终止插件（frp 的 https2http / https2https）。
+ * 只认这两个：别的 plugin 类型（如 http_proxy、static_file）不在这里暴露，
+ * 用户手改配置写进去的其它 plugin 会经 normalizeProxy 原样保留。 */
+function normalizePlugin(input) {
+  if (!isPlainObject(input)) return null;
+  const type = String(input.type || '').trim().toLowerCase();
+  if (!['https2http', 'https2https'].includes(type)) return null;
+  const plugin = { type };
+  const str = (v) => String(v || '').trim();
+  if (str(input.localAddr)) plugin.localAddr = str(input.localAddr);
+  if (str(input.crtPath)) plugin.crtPath = str(input.crtPath);
+  if (str(input.keyPath)) plugin.keyPath = str(input.keyPath);
+  if (str(input.hostHeaderRewrite)) plugin.hostHeaderRewrite = str(input.hostHeaderRewrite);
+  return plugin;
 }
 
 module.exports = {
