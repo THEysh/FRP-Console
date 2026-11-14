@@ -8,6 +8,7 @@ function friendlyError(err) {
   const message = String((err && err.message) || err || '');
   if (/authentication methods failed|authentication failure/i.test(message)) return '用户名或密码错误';
   if (/cannot connect|ECONNREFUSED/i.test(message)) return 'SSH 端口无法连接，请检查 IP 与端口';
+  if (/connection lost before handshake|handshake/i.test(message)) return '连接在握手前被断开，该端口可能不是 SSH 服务或被防火墙拦截';
   if (/ETIMEDOUT|timed out|timeout/i.test(message)) return '连接超时，请检查网络与防火墙';
   if (/ENOTFOUND|EAI_AGAIN/i.test(message)) return '找不到该主机，请检查 IP';
   if (/Permission denied/i.test(message)) return '权限不足，请使用有权限的账户';
