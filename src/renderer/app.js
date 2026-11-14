@@ -407,7 +407,7 @@ function overviewKey() {
 
 /* 概览页“最近日志”卡片的最小刷新：只换日志区，不重建整页 */
 function miniLogHtml() {
-  const recent = S.logs.slice(-9).reverse();
+  const recent = S.logs.slice(-22).reverse();
   return recent.length
     ? recent.map((l) => logLineHtml(l)).join('')
     : '<div class="log-empty"><span>暂无日志</span></div>';
