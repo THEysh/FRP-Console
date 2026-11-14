@@ -3,6 +3,7 @@
 const fs = require('node:fs');
 const { Client } = require('ssh2');
 const { parseConfig: frpsParseConfig, summary: frpsSummary } = require('./frpsconfig');
+const { stringify: tomlStringify } = require('smol-toml');
 
 function friendlyError(err) {
   const message = String((err && err.message) || err || '');
@@ -966,6 +967,33 @@ class ServerSession {
     }
     if (!pids.length) return { ok: true, killed: [], note: ['这些端口现在没有非 frps 进程占用'] };
     return this.killPids(pids);
+  }
+
+  /* 在服务器上找一个 >= start 的空闲 TCP 端口（从当前监听端口里排除）。 */
+  async findFreePort(start = 10000) {
+    const result = await this.exec('ss -lntp 2>/dev/null || netstat -ltnp 2>/dev/null', 10000);
+    const used = new Set(this.parseListeners(result.stdout || '').map((l) => l.port));
+    let p = Math.max(1024, Math.floor(Number(start) || 10000));
+    while (used.has(p)) p += 1;
+    return p;
+  }
+
+  /* 把配置内容里的端口按 remap {旧端口: 新端口} 替换（bindPort / vhostHTTPPort / vhostHTTPSPort / Dashboard），
+   * 返回新的 TOML 文本。用于「端口冲突」弹窗的「自动换端口」。 */
+  remapConfigPorts(content, remap) {
+    const parsed = frpsParseConfig(content);
+    if (!parsed.ok) return { ok: false, error: parsed.error };
+    const data = parsed.data;
+    for (const [oldPort, newPort] of Object.entries(remap || {})) {
+      const o = Number(oldPort);
+      const n = Number(newPort);
+      if (!o || !n || o === n) continue;
+      if (data.bindPort === o) data.bindPort = n;
+      if (data.vhostHTTPPort === o) data.vhostHTTPPort = n;
+      if (data.vhostHTTPSPort === o) data.vhostHTTPSPort = n;
+      if (data.webServer && typeof data.webServer === 'object' && data.webServer.port === o) data.webServer.port = n;
+    }
+    return { ok: true, content: tomlStringify(data), remap };
   }
 
   // 从 journalctl / 日志里挑出第一行报错原因，用于「重启后没起来」时告诉用户到底为什么。

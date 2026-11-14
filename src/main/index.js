@@ -2602,19 +2602,82 @@ function registerIpc() {
   });
 
   ipcMain.handle('server:save-config', async (event, payload = {}) => {
-    const content = String(payload.content || '');
+    let content = String(payload.content || '');
+    const resolve = payload.resolve || null; // { action: 'remap' } 自动换端口
     if (!content.trim()) return fail('配置内容为空');
     if (!serverSession.connected) return fail('尚未连接服务器', { state: serverState() });
     const check = frpsConfig.validateText(content);
     if (!check.ok) return fail(`配置语法错误：${check.error}`);
     const epoch = sessionEpoch;
+
+    // 「自动换端口」：为冲突端口找空闲替代，改配置后再写。旧端口会联动 nginx 反代与本机隧道。
+    let remapResult = null;
+    if (resolve && resolve.action === 'remap') {
+      const details = await serverSession.portConflictDetails(serverSession.configPorts(content));
+      if (epoch !== sessionEpoch) return staleFail();
+      if (details.length) {
+        const remap = {};
+        const remapLabels = {};
+        for (const d of details) {
+          const free = await serverSession.findFreePort(Number(d.port) + 1000);
+          remap[d.port] = free;
+          remapLabels[d.label] = free;
+        }
+        const remapped = serverSession.remapConfigPorts(content, remap);
+        if (!remapped.ok) return fail(`自动换端口失败：${remapped.error}`, { state: serverState() });
+        content = remapped.content;
+        remapResult = { remap, remapLabels, conflicts: details };
+      }
+    }
+
     const result = await serverSession.writeConfig(content, { restart: !!payload.restart });
     if (epoch !== sessionEpoch) return staleFail();
     if (!result.ok) return fail(result.error, { state: serverState(), conflicts: result.conflicts || [], conflictDetails: result.conflictDetails || [] });
-    // 重新读快照：adoptServerAuthFromConfig 会把刚写下的 bindPort / Token 对齐到档案，
-    // 所以这里不需要再单独回写一次。
+    // 重新读快照：dashboardUrl / vhost 设置 / adoptServerAuthFromConfig 都会在这里对齐。
     await loadServerSnapshot({ inspect: true, epoch });
-    return ok({ backup: result.backup, restarted: result.restarted, serverId: sessionServerId, state: serverState() });
+    if (epoch !== sessionEpoch) return staleFail();
+
+    // remap 后的联动（best-effort，失败不阻断保存结果）：
+    let nginxSync = null;
+    let clientSync = null;
+    if (remapResult) {
+      // 1) vhostHTTPPort 变了 → 用新端口重写 nginx 反代配置（有证书才做）。
+      if (remapResult.remapLabels.vhostHTTPPort) {
+        const certs = acmeManager.list();
+        const cert = certs.find((c) => !c.staging && c.exists) || certs.find((c) => c.exists) || null;
+        if (cert && cert.crtPath && cert.keyPath) {
+          nginxSync = await syncCertToServerNginx(cert).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+        }
+      }
+      // 2) bindPort 变了 → 本机 frpc 的 serverPort 跟着改并重启隧道（仅当本机正连这台服务器）。
+      if (remapResult.remapLabels.bindPort) {
+        const nextPort = Number(remapResult.remapLabels.bindPort);
+        const owner = sessionServerId ? findServerProfile(sessionServerId) : null;
+        if (model && model.serverAddr && owner
+          && String(model.serverAddr).toLowerCase() === String(owner.host).toLowerCase()
+          && Number(model.serverPort) !== nextPort) {
+          const next = structuredClone(model);
+          next.serverPort = nextPort;
+          const saved = persistModel(next, { reload: false });
+          if (saved.ok) {
+            if (manager) {
+              const rt = manager.snapshot();
+              if (rt.running || rt.connected) {
+                await manager.restart({ runMode: settings.runMode }).catch(() => ({}));
+                await manager.refresh().catch(() => {});
+                healthCache.clear();
+                scheduleHealth(1200);
+              }
+            }
+            clientSync = { ok: true, serverPort: nextPort };
+          } else {
+            clientSync = { ok: false, error: saved.error || '本机 frpc 配置写入失败' };
+          }
+        }
+      }
+    }
+
+    return ok({ backup: result.backup, restarted: result.restarted, serverId: sessionServerId, remap: remapResult && remapResult.remap, nginx: nginxSync, client: clientSync, state: serverState() });
   });
 
   /* 终止占用指定端口的非 frps 进程（「端口冲突」弹窗的「终止占用进程」用）。 */
@@ -2648,7 +2711,7 @@ function registerIpc() {
   /* 方案 Y：把一张已签发的证书同步到服务器 nginx（上传证书 + 写反代配置 + reload）。
    * best-effort：服务器没连/没 nginx 时返回 ok:false 但不抛错，证书仍留在本机。 */
   async function syncCertToServerNginx(cert) {
-    if (!cert || !cert.ok || !Array.isArray(cert.domains) || !cert.domains.length) {
+    if (!cert || !Array.isArray(cert.domains) || !cert.domains.length) {
       return { ok: false, error: '缺少证书信息' };
     }
     if (!serverSession.connected) {

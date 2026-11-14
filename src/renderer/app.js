@@ -2577,7 +2577,12 @@ async function saveServerConfig(restart, btn) {
       const details = res && res.conflictDetails && res.conflictDetails.length ? res.conflictDetails : null;
       if (details) {
         const choice = await confirmFrpsPortConflict(details);
-        if (choice === 'kill') {
+        if (choice === 'remap') {
+          const retry = await FRP.serverSaveConfig(content, restart, { action: 'remap' });
+          if (serverSeqStale(seq)) return;
+          if (!retry || !retry.ok) return toastResult(retry);
+          return applyServerConfigSave(retry, restart, seq);
+        } else if (choice === 'kill') {
           const kill = await FRP.serverKillPorts(details.map((d) => d.port));
           if (kill && kill.ok) {
             const retry = await FRP.serverSaveConfig(content, restart);
@@ -2586,9 +2591,6 @@ async function saveServerConfig(restart, btn) {
             return applyServerConfigSave(retry, restart, seq);
           }
           toastResult(kill);
-        } else if (choice === 'edit') {
-          focusServerConfig();
-          toast('info', '请修改端口', '把冲突端口改成空闲端口后再保存。');
         }
         return;
       }
@@ -2598,24 +2600,19 @@ async function saveServerConfig(restart, btn) {
   });
 }
 
-function focusServerConfig() {
-  if (S.server.mode !== 'advanced') setServerMode('advanced');
-  const area = $('#server-config');
-  if (area) {
-    area.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    area.focus();
-  }
-}
-
 async function applyServerConfigSave(res, restart, seq) {
   applyServerState(res.data && res.data.state, seq);
   S.server.wizardDirty = false;
   const backup = res.data && res.data.backup ? `备份：${res.data.backup}` : '';
+  const remap = res.data && res.data.remap;
+  const remapText = remap ? ` · 端口已自动调整：${Object.entries(remap).map(([o, n]) => `${o}→${n}`).join('、')}` : '';
+  const nginxNote = res.data && res.data.nginx ? (res.data.nginx.ok ? ' · nginx 反代已同步' : ' · nginx 反代未同步') : '';
+  const clientNote = res.data && res.data.client ? (res.data.client.ok ? ` · 本机隧道已指向 ${res.data.client.serverPort}` : ' · 本机隧道未同步') : '';
   if (restart) {
     const after = res.data && res.data.restarted && res.data.restarted.after;
-    toast('success', '配置已保存并重启 frps', `${backup}${after && after.statusText ? ` · ${after.statusText}` : ''}`);
+    toast('success', '配置已保存并重启 frps', `${backup}${remapText}${nginxNote}${clientNote}${after && after.statusText ? ` · ${after.statusText}` : ''}`);
   } else {
-    toast('success', '配置已保存', backup);
+    toast('success', '配置已保存', `${backup}${remapText}${nginxNote}${clientNote}`);
   }
   renderServer(true);
   await loadServerLogs();
@@ -4494,7 +4491,7 @@ function confirmFrpsPortConflict(details = []) {
     const finish = (value) => { if (settled) return; settled = true; closeModal(); resolve(value); };
     const rows = details.map((d) => `<div style="margin:6px 0"><code>${esc(d.label)}（${esc(String(d.port))}）</code> 被 <strong>${esc(d.process || '未知进程')}</strong> 占用</div>`).join('');
     openModal(`
-      <div class="modal" style="width:520px">
+      <div class="modal" style="width:540px">
         <div class="modal-head">
           <div class="mh-icon" style="color:var(--red)">${icon('alert')}</div>
           <div class="grow"><h3>配置端口与现有服务冲突</h3><p>这些端口已被占用，frps 启动会失败。</p></div>
@@ -4503,19 +4500,19 @@ function confirmFrpsPortConflict(details = []) {
         <div class="modal-body">
           <div class="note warn">${icon('alert')}<div>
             ${rows || '<div>检测到端口冲突。</div>'}
-            <div style="margin-top:8px">可以终止占用这些端口的进程（可能影响它们提供的服务），或去修改配置里的端口。</div>
+            <div style="margin-top:8px">「自动换端口」会挑空闲端口继续，并同步改 nginx 反代与本机隧道；「终止占用进程」会停掉占用这些端口的服务（可能影响它们）。</div>
           </div></div>
         </div>
         <div class="modal-foot">
           <span class="mf-left"></span>
           <button class="btn" type="button" id="fc-cancel">取消</button>
-          <button class="btn" type="button" id="fc-edit">去修改端口</button>
-          <button class="btn danger" type="button" id="fc-kill">${icon('alert')}<span>终止占用进程并继续</span></button>
+          <button class="btn danger" type="button" id="fc-kill">${icon('alert')}<span>终止占用进程</span></button>
+          <button class="btn primary" type="button" id="fc-remap">${icon('reload')}<span>自动换端口并保存</span></button>
         </div>
       </div>`);
     const on = (id, value) => { const el = $(`#${id}`); if (el) el.addEventListener('click', () => finish(value)); };
+    on('fc-remap', 'remap');
     on('fc-kill', 'kill');
-    on('fc-edit', 'edit');
     on('fc-cancel', 'cancel');
     on('fc-x', 'cancel');
   });
