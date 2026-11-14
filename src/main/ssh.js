@@ -750,6 +750,177 @@ class ServerSession {
     }
   }
 
+  // ---- nginx 反代（方案 Y：nginx 在 80/443 终止 TLS，frps 只做 HTTP vhost）----
+
+  /* 域名 → nginx ssl 目录名。通配符 `*.x` 换成 `wildcard.x`，避免路径歧义。 */
+  nginxSslDir(domain) {
+    return String(domain || '').replace(/^\*\./, 'wildcard.').replace(/[\\/:*?"<>|]/g, '_');
+  }
+
+  /* 探测服务器上的 nginx 状态 + 80/443 被谁占用 + 配置该写进哪个目录。 */
+  async detectNginxConfDir() {
+    const bt = await this.exec('[ -d /www/server/panel/vhost/nginx ] && echo /www/server/panel/vhost/nginx || true', 6000);
+    const btDir = firstLine(bt.stdout);
+    if (btDir) return { dir: btDir, managedBy: '宝塔面板' };
+    const confd = await this.exec('[ -d /etc/nginx/conf.d ] && echo /etc/nginx/conf.d || true', 6000);
+    const confdDir = firstLine(confd.stdout);
+    if (confdDir) return { dir: confdDir, managedBy: '' };
+    const sites = await this.exec('[ -d /etc/nginx/sites-enabled ] && echo /etc/nginx/sites-enabled || true', 6000);
+    const sitesDir = firstLine(sites.stdout);
+    if (sitesDir) return { dir: sitesDir, managedBy: '' };
+    return { dir: '/etc/nginx/conf.d', managedBy: '' };
+  }
+
+  async detectNginx() {
+    if (!this.connected) return { installed: false, error: '尚未连接服务器' };
+    const which = await this.exec('command -v nginx 2>/dev/null || true', 6000);
+    const installed = !!firstLine(which.stdout);
+    let version = '';
+    if (installed) {
+      const v = await this.exec('nginx -v 2>&1 | head -n 1 || true', 6000);
+      version = firstLine(`${v.stdout || ''}${v.stderr || ''}`).replace(/^nginx version:\s*/i, '');
+    }
+    const ss = await this.exec("ss -lntp 2>/dev/null | grep -E ':(80|443)\\s' || true", 10000);
+    const listeners = this.parseListeners(ss.stdout || '');
+    const p80 = listeners.filter((l) => l.port === 80);
+    const p443 = listeners.filter((l) => l.port === 443);
+    const confInfo = await this.detectNginxConfDir();
+    const proxyConf = await this.exec(`[ -f ${shellQuote(`${confInfo.dir}/frp-console.conf`)} ] && echo yes || true`, 6000);
+    return {
+      installed,
+      version,
+      running: p80.length > 0 || p443.length > 0,
+      port80By: p80.map((l) => l.process).filter(Boolean).join(', '),
+      port443By: p443.map((l) => l.process).filter(Boolean).join(', '),
+      port80Free: p80.length === 0,
+      port443Free: p443.length === 0,
+      confDir: confInfo.dir,
+      managedBy: confInfo.managedBy,
+      proxyConfigured: firstLine(proxyConf.stdout) === 'yes',
+    };
+  }
+
+  /* 按发行版自动装 nginx（apt-get / dnf / yum）。 */
+  async installNginx() {
+    if (!this.connected) return { ok: false, error: '尚未连接服务器' };
+    const sudo = await this.detectSudo();
+    if (!sudo.ok) return sudo;
+    const prefix = sudo.prefix;
+    const apt = firstLine((await this.exec('command -v apt-get 2>/dev/null || true', 6000)).stdout);
+    if (apt) {
+      const r = await this.exec(`${prefix}DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx 2>&1`, 180000);
+      if (!r.ok) return { ok: false, error: `安装 nginx 失败：${(r.stderr || r.stdout || '未知错误').trim()}` };
+    } else {
+      const dnf = firstLine((await this.exec('command -v dnf 2>/dev/null || true', 6000)).stdout);
+      const yum = firstLine((await this.exec('command -v yum 2>/dev/null || true', 6000)).stdout);
+      if (dnf) {
+        const r = await this.exec(`${prefix}dnf install -y -q nginx 2>&1`, 180000);
+        if (!r.ok) return { ok: false, error: `安装 nginx 失败：${(r.stderr || r.stdout || '未知错误').trim()}` };
+      } else if (yum) {
+        const r = await this.exec(`${prefix}yum install -y -q nginx 2>&1`, 180000);
+        if (!r.ok) return { ok: false, error: `安装 nginx 失败：${(r.stderr || r.stdout || '未知错误').trim()}` };
+      } else {
+        return { ok: false, error: '未找到 apt-get / dnf / yum，无法自动安装 nginx。请手动安装后再试。' };
+      }
+    }
+    return { ok: true };
+  }
+
+  /* 把本机签好的证书（fullchain + 私钥）上传到服务器 /etc/nginx/ssl/<域名>/。 */
+  async uploadCertToNginx(domain, { certPath, keyPath }) {
+    if (!this.connected) return { ok: false, error: '尚未连接服务器' };
+    if (!fs.existsSync(certPath) || !fs.existsSync(keyPath)) return { ok: false, error: '本机证书文件缺失' };
+    const sudo = await this.detectSudo();
+    if (!sudo.ok) return sudo;
+    const prefix = sudo.prefix;
+    const dir = `/etc/nginx/ssl/${this.nginxSslDir(domain)}`;
+    const mkdir = await this.exec(`${prefix}mkdir -p ${shellQuote(dir)}`, 10000);
+    if (!mkdir.ok) return { ok: false, error: `创建证书目录失败：${mkdir.stderr || '权限不足'}` };
+    const certB64 = Buffer.from(fs.readFileSync(certPath, 'utf8'), 'utf8').toString('base64');
+    const keyB64 = Buffer.from(fs.readFileSync(keyPath, 'utf8'), 'utf8').toString('base64');
+    const tmpCert = '/tmp/frp-console-cert.pem';
+    const tmpKey = '/tmp/frp-console-key.pem';
+    await this.exec(`printf %s ${certB64} | base64 -d > ${tmpCert}`, 15000);
+    await this.exec(`printf %s ${keyB64} | base64 -d > ${tmpKey}`, 15000);
+    const c = await this.exec(`${prefix}install -m 644 ${tmpCert} ${shellQuote(dir)}/fullchain.pem`, 10000);
+    const k = await this.exec(`${prefix}install -m 600 ${tmpKey} ${shellQuote(dir)}/key.pem`, 10000);
+    await this.exec(`rm -f ${tmpCert} ${tmpKey} 2>/dev/null || true`, 6000);
+    if (!c.ok) return { ok: false, error: `上传证书失败：${c.stderr || '未知错误'}` };
+    if (!k.ok) return { ok: false, error: `上传私钥失败：${k.stderr || '未知错误'}` };
+    return { ok: true, dir };
+  }
+
+  /* nginx server_name：多个域名空格分隔，通配符 `*.x` 原样传给 nginx。 */
+  nginxServerName(domains) {
+    const names = (Array.isArray(domains) ? domains : [domains]).map((d) => String(d || '').trim()).filter(Boolean);
+    return names.length ? names.join(' ') : 'localhost';
+  }
+
+  /* 写 frp-console.conf：80/443 终止 TLS，反代给 frps 的 HTTP vhost。confDir 缺省自动探测（宝塔/标准）。 */
+  async writeNginxProxyConfig({ serverNames, certDir, frpsHttpPort = 8080, confDir }) {
+    if (!this.connected) return { ok: false, error: '尚未连接服务器' };
+    const sudo = await this.detectSudo();
+    if (!sudo.ok) return sudo;
+    const prefix = sudo.prefix;
+    if (!confDir) {
+      const info = await this.detectNginxConfDir();
+      confDir = info.dir;
+    }
+    const confPath = `${confDir}/frp-console.conf`;
+    const conf = [
+      '# 由 FRP-Console 生成：nginx 在 80/443 终止 TLS，把 frp 域名的流量反代给 frps 的 HTTP vhost。',
+      '# 修改后请执行 nginx -t && systemctl reload nginx。',
+      'server {',
+      '    listen 80;',
+      `    server_name ${serverNames};`,
+      '    location / {',
+      `        proxy_pass http://127.0.0.1:${frpsHttpPort};`,
+      '        proxy_set_header Host $host;',
+      '        proxy_set_header X-Real-IP $remote_addr;',
+      '        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;',
+      '        proxy_set_header X-Forwarded-Proto $scheme;',
+      '    }',
+      '}',
+      '',
+      'server {',
+      '    listen 443 ssl;',
+      `    server_name ${serverNames};`,
+      `    ssl_certificate ${certDir}/fullchain.pem;`,
+      `    ssl_certificate_key ${certDir}/key.pem;`,
+      '    location / {',
+      `        proxy_pass http://127.0.0.1:${frpsHttpPort};`,
+      '        proxy_set_header Host $host;',
+      '        proxy_set_header X-Real-IP $remote_addr;',
+      '        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;',
+      '        proxy_set_header X-Forwarded-Proto $scheme;',
+      '    }',
+      '}',
+      '',
+    ].join('\n');
+    const b64 = Buffer.from(conf, 'utf8').toString('base64');
+    const tmp = '/tmp/frp-console-nginx.conf';
+    await this.exec(`printf %s ${b64} | base64 -d > ${tmp}`, 15000);
+    const install = await this.exec(`${prefix}install -m 644 ${tmp} ${shellQuote(confPath)}`, 10000);
+    await this.exec(`rm -f ${tmp} 2>/dev/null || true`, 6000);
+    if (!install.ok) return { ok: false, error: `写入 nginx 配置失败：${(install.stderr || install.stdout || '权限不足').trim()}` };
+    return { ok: true, confPath, content: conf };
+  }
+
+  /* nginx -t 校验 + reload。 */
+  async reloadNginx() {
+    const sudo = await this.detectSudo();
+    if (!sudo.ok) return sudo;
+    const prefix = sudo.prefix;
+    const test = await this.exec(`${prefix}nginx -t 2>&1`, 15000);
+    const testText = `${test.stdout || ''}\n${test.stderr || ''}`;
+    if (!test.ok && !/syntax is ok|test is successful/i.test(testText)) {
+      return { ok: false, error: `nginx 配置校验失败：${(test.stderr || test.stdout || '未知错误').trim()}` };
+    }
+    const reload = await this.exec(`${prefix}systemctl reload nginx 2>&1 || ${prefix}service nginx reload 2>&1 || ${prefix}nginx -s reload 2>&1`, 15000);
+    if (!reload.ok) return { ok: false, error: `nginx reload 失败：${(reload.stderr || reload.stdout || '未知错误').trim()}` };
+    return { ok: true };
+  }
+
   // 从 journalctl / 日志里挑出第一行报错原因，用于「重启后没起来」时告诉用户到底为什么。
   failureReason(logRes) {
     const lines = String((logRes && logRes.content) || '').split(/\r?\n/).filter(Boolean);

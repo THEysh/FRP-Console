@@ -402,6 +402,16 @@ node tools/cdp-shot.cjs .proxy-row out.png # 按选择器截单个元素
 
 ## 更新日志
 
+### 1.2.24
+
+新增「nginx 前置反代 + 统一入口」能力：让 `https://你的域名`（不带端口）也能访问服务，并自动把证书部署到服务器 nginx。
+
+- **服务器页新增「nginx 反代」卡片**：连接服务器后能自动探测 nginx 是否安装、版本、80/443 被谁占用、配置目录在哪（自动识别宝塔面板的站点目录），并显示「反代是否已配置」。
+- **一键初始化 nginx**：服务器没装 nginx 时，点一下自动用 apt/dnf/yum 装好。
+- **签发证书后自动部署到 nginx**：给域名签发正式证书后，程序自动把证书上传到服务器 `/etc/nginx/ssl/<域名>/`，并写入一份 `frp-console.conf` 反代配置（80 和 443 两个 server 块，把 `*.域名` 的流量反代给 frps 的 HTTP vhost 端口），最后 `nginx -t` 校验并 reload。之后访问 `https://你的域名`（不带端口）就能直达服务，TLS 由 nginx 统一终止。
+- **证书列表加「部署到 nginx」按钮**：可以手动把某张已签发的证书重新部署到服务器 nginx。
+- 说明：走这条路后，HTTP/HTTPS 代理在 frp 侧应保持 `type=http`（纯 HTTP），TLS 交给 nginx；之前用 `https2http/https2https` 插件在 frpc 侧终止 TLS 的旧代理，可改成纯 `http` 类型，证书流程由 nginx 统一接管。
+
 ### 1.2.23
 
 修一个「HTTP 代理挂上 HTTPS 证书后反而访问不了」的问题：

@@ -2389,6 +2389,44 @@ function registerIpc() {
     return ok({ ...result, localSync, state: serverState(), appState: buildState() });
   });
 
+  /* ---- nginx 反代（方案 Y）---- */
+
+  ipcMain.handle('server:nginx-state', async () => {
+    if (!serverSession.connected) return fail('尚未连接服务器');
+    try {
+      return ok(await serverSession.detectNginx());
+    } catch (e) {
+      return fail(String((e && e.message) || e));
+    }
+  });
+
+  /* 一键配置 nginx 反代：检测 →（缺则）安装 → 找一张生产证书 → 上传 + 写配置 + reload。 */
+  ipcMain.handle('server:nginx-setup', async (event, payload = {}) => {
+    if (!serverSession.connected) return fail('尚未连接服务器');
+    try {
+      let detect = await serverSession.detectNginx();
+      if (!detect.installed) {
+        const install = await serverSession.installNginx();
+        if (!install.ok) return fail(install.error);
+        detect = await serverSession.detectNginx();
+      }
+      const certs = acmeManager.list();
+      const cert = certs.find((c) => !c.staging && c.exists) || certs.find((c) => c.exists) || null;
+      if (!cert) {
+        return ok({
+          installed: detect.installed,
+          running: detect.running,
+          certMissing: true,
+          message: 'nginx 已就绪，但还没有可用的证书。请先到「HTTPS 证书」页签发一张（关掉 STAGING 签真实证书），再回来配置反代。',
+        });
+      }
+      const sync = await syncCertToServerNginx(cert);
+      return ok({ installed: detect.installed, running: detect.running, ...sync });
+    } catch (e) {
+      return fail(String((e && e.message) || e));
+    }
+  });
+
   /*
    * 服务器页的检查是「服务器侧就绪」判定，不是全链路检测。
    *
@@ -2567,6 +2605,27 @@ function registerIpc() {
     return ok(await tcpCheck(host, port, payload.timeout || 3000));
   });
 
+  /* 方案 Y：把一张已签发的证书同步到服务器 nginx（上传证书 + 写反代配置 + reload）。
+   * best-effort：服务器没连/没 nginx 时返回 ok:false 但不抛错，证书仍留在本机。 */
+  async function syncCertToServerNginx(cert) {
+    if (!cert || !cert.ok || !Array.isArray(cert.domains) || !cert.domains.length) {
+      return { ok: false, error: '缺少证书信息' };
+    }
+    if (!serverSession.connected) {
+      return { ok: false, error: '尚未连接服务器，证书已保存到本机但未上传到 nginx' };
+    }
+    const frpsHttpPort = (serverConfig.summary && Number(serverConfig.summary.vhostHTTPPort))
+      || Number(settings.vhostHttpPort) || 8080;
+    const upload = await serverSession.uploadCertToNginx(cert.domain, { certPath: cert.crtPath, keyPath: cert.keyPath });
+    if (!upload.ok) return upload;
+    const serverNames = serverSession.nginxServerName(cert.domains);
+    const write = await serverSession.writeNginxProxyConfig({ serverNames, certDir: upload.dir, frpsHttpPort });
+    if (!write.ok) return write;
+    const reload = await serverSession.reloadNginx();
+    if (!reload.ok) return reload;
+    return { ok: true, serverNames, certDir: upload.dir, frpsHttpPort };
+  }
+
   /* ---- HTTPS 证书（Let's Encrypt / DNS-01）---- */
 
   ipcMain.handle('cert:list', async () => ok({ certs: acmeManager.list() }));
@@ -2580,8 +2639,10 @@ function registerIpc() {
       if (!provider.ok) return fail(provider.error);
       const result = await acmeManager.issue({ domains, email, staging, dns: provider.dns });
       if (!result.ok) return fail(result.error);
+      // 生产证书签发后，自动上传到服务器 nginx 终止 TLS（方案 Y）。STAGING 假证书不部署。
+      const nginx = result.staging ? null : await syncCertToServerNginx(result);
       pushState();
-      return ok(result);
+      return ok({ ...result, nginx });
     } catch (e) {
       return fail(String((e && e.message) || e));
     }
@@ -2598,8 +2659,25 @@ function registerIpc() {
       const email = existing && existing.email ? existing.email : String(settings.acmeEmail || '');
       const result = await acmeManager.renew(domain, { email, staging, dns: provider.dns });
       if (!result.ok) return fail(result.error);
+      // 生产证书续期后，同样自动同步到 nginx。
+      const nginx = result.staging ? null : await syncCertToServerNginx(result);
       pushState();
-      return ok(result);
+      return ok({ ...result, nginx });
+    } catch (e) {
+      return fail(String((e && e.message) || e));
+    }
+  });
+
+  /* 手动把某张已签发证书同步到服务器 nginx（用于「先签证书、后连服务器」的场景）。 */
+  ipcMain.handle('cert:nginx-sync', async (event, payload = {}) => {
+    try {
+      const domain = String((payload && payload.domain) || '').trim();
+      const cert = domain ? acmeManager.get(domain) : (acmeManager.list()[0] || null);
+      if (!cert) return fail(domain ? `本地没有 ${domain} 的证书` : '本地还没有证书');
+      const sync = await syncCertToServerNginx(cert);
+      if (!sync.ok) return fail(sync.error);
+      pushState();
+      return ok(sync);
     } catch (e) {
       return fail(String((e && e.message) || e));
     }

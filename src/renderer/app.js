@@ -1120,9 +1120,23 @@ async function loadServerState({ autoConnect = false } = {}) {
   if (res && res.ok) {
     applyServerState(res.data, seq);
     renderServer(true);
+    if (S.server.connected) loadServerNginx(true).catch(() => {});
     // 只在“第一次打开服务器页”时自动连；绑定变化之类的刷新不打扰已断开的会话。
     if (autoConnect) autoConnectActiveProfile().catch(() => {});
   } else if (res && !res.ok) toastResult(res);
+}
+
+async function loadServerNginx(silent = false) {
+  if (!S.server.connected) return;
+  if (!silent) S.server.nginx = { ...(S.server.nginx || {}), loading: true };
+  if (S.view === 'server') renderServer(true);
+  const res = await FRP.serverNginxState();
+  if (res && res.ok) {
+    S.server.nginx = { ...(S.server.nginx || {}), ...res.data, loading: false };
+  } else {
+    S.server.nginx = { ...(S.server.nginx || {}), loading: false, error: (res && res.error) || '检测 nginx 失败' };
+  }
+  if (S.view === 'server') renderServer(true);
 }
 
 async function loadServerConfig(quiet = false) {
@@ -1423,6 +1437,45 @@ function renderServerLogs() {
     </div>`;
 }
 
+function nginxCardMarkup() {
+  const n = S.server.nginx || {};
+  if (!n || n.loading) {
+    return `<section class="card"><div class="card-head"><div class="ch-icon">${icon('globe')}</div><div class="grow"><h3>域名反代（nginx）</h3><p>检测服务器 nginx，让域名走 80/443、不用带端口。</p></div></div><div class="field-hint" style="padding:0 16px 12px">检测中…</div></section>`;
+  }
+  if (n.error) {
+    return `<section class="card"><div class="card-head"><div class="ch-icon">${icon('globe')}</div><div class="grow"><h3>域名反代（nginx）</h3><p>检测服务器 nginx，让域名走 80/443、不用带端口。</p></div></div><div class="note warn" style="margin:0 16px 12px">${icon('alert')}<div>${esc(n.error)}</div></div></section>`;
+  }
+  const installed = !!n.installed;
+  const free = n.port80Free && n.port443Free;
+  const statusBadge = installed
+    ? `<span class="badge ${free ? '' : 'amber'}"><span class="bdot"></span>${n.version ? esc(n.version) : '已安装'} · ${free ? '80/443 空闲' : '80/443 被占'}</span>`
+    : `<span class="badge amber"><span class="bdot"></span>未安装</span>`;
+  const detail = installed
+    ? (free
+      ? 'nginx 已装且 80/443 空闲：配置后域名可直接 https:// 访问，不用带端口。'
+      : `80/443 正在被${[n.port80By, n.port443By].filter(Boolean).join('、') || '其它进程'}占用。反代配置会自动接管 frp 域名，不影响已有站点。`)
+    : '服务器还没装 nginx。一键配置会自动安装并写好反代规则。';
+  const certMissing = n.certMissing;
+  return `
+    <section class="card">
+      <div class="card-head">
+        <div class="ch-icon">${icon('globe')}</div>
+        <div class="grow"><h3>域名反代（nginx）</h3><p>${esc(detail)}</p></div>
+        <div class="page-actions">
+          ${statusBadge}
+          <button class="btn" type="button" data-act="server.nginx.refresh">${icon('reload')}<span>重新检测</span></button>
+          <button class="btn primary" type="button" data-act="server.nginx.setup" ${S.server.nginxBusy ? 'disabled' : ''}>${S.server.nginxBusy ? '<span class="spinner-sm"></span>' : icon('globe')}<span>${S.server.nginxBusy ? '配置中…' : '一键配置反代'}</span></button>
+        </div>
+      </div>
+      ${certMissing
+        ? `<div class="note warn" style="margin:0 16px 12px">${icon('alert')}<div><strong>还没有可用证书</strong><br>反代需要一张证书来终止 HTTPS。请先到「HTTPS 证书」页签发一张真实证书（关掉 STAGING），再回来点「一键配置反代」。</div></div>`
+        : ''}
+      ${n.ok
+        ? `<div class="note" style="margin:0 16px 12px">${icon('check')}<div><strong>反代已就绪</strong><br>${esc(n.serverNames || '')} → nginx 80/443 → frps HTTP vhost（${esc(String(n.frpsHttpPort || ''))}）。现在用 <code>https://你的域名</code> 就能访问，不带端口。</div></div>`
+        : ''}
+    </section>`;
+}
+
 function renderServer(force = false) {
   if (!S.server.loaded) {
     $('#view').innerHTML = `<div class="view"><section class="card"><div class="empty"><span class="spinner"></span><h3>正在读取服务器连接状态</h3><p>请稍候…</p></div></section></div>`;
@@ -1502,6 +1555,8 @@ function renderServer(force = false) {
       </section>
 
       <section class="card selftest-card" id="selftest-panel">${selftestMarkup()}</section>
+
+      ${nginxCardMarkup()}
 
       <section class="card config-card">
         <div class="card-head">
@@ -2721,6 +2776,7 @@ function certRow(c) {
         </div>
       </div>
       <div class="cert-actions">
+        ${!c.staging ? `<button class="btn small" type="button" data-act="certs.nginx" data-domain="${esc(c.domain)}" title="上传到服务器 nginx 并配置反代">${icon('globe')}<span>部署到 nginx</span></button>` : ''}
         <button class="btn small" type="button" data-act="certs.renew" data-domain="${esc(c.domain)}" data-staging="${c.staging ? '1' : '0'}">${icon('reload')}<span>续期</span></button>
         <button class="btn small danger-text" type="button" data-act="certs.remove" data-domain="${esc(c.domain)}" data-staging="${c.staging ? '1' : '0'}">${icon('trash')}<span>删除</span></button>
       </div>
@@ -2869,7 +2925,7 @@ function renderCerts(force = false) {
       <div class="page-head">
         <div class="page-title">
           <h1>HTTPS 证书</h1>
-          <p>可选功能：用 Let's Encrypt 给自定义域名签发证书，供 https2http / https2https 代理交给 frps 终止 TLS。不配置也能正常使用隧道。</p>
+          <p>可选功能：用 Let's Encrypt 给自定义域名签发证书，部署到服务器 nginx 终止 TLS，让域名直接 <code>https://</code> 访问、不带端口。不配置也能正常使用隧道。</p>
         </div>
       </div>
 
@@ -2883,12 +2939,12 @@ function renderCerts(force = false) {
 
       <section class="card section">
         <div class="section-head">
-          <div class="section-title"><strong>已签发证书</strong><span>${coveredDomains.length ? `已覆盖域名：${esc(coveredText)} · ` : ''}保存在本机 userData\\certs\\ 下，私钥只留在 frpc 这台机器上。</span></div>
+          <div class="section-title"><strong>已签发证书</strong><span>${coveredDomains.length ? `已覆盖域名：${esc(coveredText)} · ` : ''}保存在本机 userData\\certs\\ 下；连上服务器后可「部署到 nginx」终止 TLS（私钥会同步到服务器 nginx）。</span></div>
           <button class="btn small" type="button" data-act="certs.refresh">${icon('reload')}<span>刷新</span></button>
         </div>
         ${certs.length
           ? `<div class="cert-list">${certs.map(certRow).join('')}</div>`
-          : `<div class="empty"><span class="spinner"></span><h3>还没有证书</h3><p>照上面向导「签发证书」一步签发第一张。签发后可在代理表单里一键填进 https2http / https2https 的 crtPath / keyPath。</p></div>`}
+          : `<div class="empty"><span class="spinner"></span><h3>还没有证书</h3><p>照上面向导「签发证书」一步签发第一张。签发后连上服务器即可「部署到 nginx」，让域名走 80/443。</p></div>`}
       </section>
     </div>`;
 }
@@ -3409,7 +3465,33 @@ async function handleAction(act, dataset, btn) {
           toast('success', '服务器状态已刷新');
           renderServer(true);
           await loadServerLogs();
+          await loadServerNginx(true);
         });
+        break;
+      }
+      case 'server.nginx.refresh':
+        await withBusy(btn, () => loadServerNginx(false));
+        break;
+      case 'server.nginx.setup': {
+        if (S.server.nginxBusy) break;
+        S.server.nginxBusy = true;
+        renderServer(true);
+        try {
+          const res = await FRP.serverNginxSetup();
+          if (res && res.ok) {
+            if (res.data && res.data.certMissing) {
+              toast('warn', '还差一张证书', res.data.message || '请先到「HTTPS 证书」页签发证书');
+            } else {
+              toast('success', '反代已配置', res.data && res.data.serverNames ? `${res.data.serverNames} → nginx 80/443 → frps ${res.data.frpsHttpPort}` : 'nginx 反代已就绪');
+            }
+            S.server.nginx = { ...(S.server.nginx || {}), ...(res.data || {}), ok: !!(res.data && res.data.ok) };
+          } else {
+            toastResult(res);
+          }
+        } finally {
+          S.server.nginxBusy = false;
+          renderServer(true);
+        }
         break;
       }
       case 'server.control':
@@ -3744,7 +3826,12 @@ async function handleAction(act, dataset, btn) {
         try {
           const res = await FRP.certIssue({ domains, email, staging });
           if (res && res.ok) {
-            toast('success', '证书已签发', `${res.data.domain} · 剩余 ${res.data.daysLeft} 天`);
+            const nginx = res.data && res.data.nginx;
+            if (nginx && nginx.ok) {
+              toast('success', '证书已签发并部署到 nginx', `${res.data.domain} · 剩余 ${res.data.daysLeft} 天 · ${nginx.serverNames} → 80/443`);
+            } else {
+              toast('success', '证书已签发', `${res.data.domain} · 剩余 ${res.data.daysLeft} 天${nginx ? `（未上传 nginx：${nginx.error}）` : ''}`);
+            }
             S.certs.wizard.expanded = true; // 签发后保持展开，让用户接着看「填进代理」
             await loadCerts({ silent: true });
           } else toastResult(res);
@@ -3761,8 +3848,18 @@ async function handleAction(act, dataset, btn) {
           const staging = dataset.staging === '1';
           const res = await FRP.certRenew(dataset.domain, staging);
           if (res && res.ok) {
-            toast('success', '证书已续期', `${res.data.domain} · 剩余 ${res.data.daysLeft} 天`);
+            const nginx = res.data && res.data.nginx;
+            toast('success', '证书已续期', `${res.data.domain} · 剩余 ${res.data.daysLeft} 天${nginx && nginx.ok ? ' · 已同步到 nginx' : ''}`);
             await loadCerts({ silent: true });
+          } else toastResult(res);
+        });
+        break;
+      }
+      case 'certs.nginx': {
+        await withBusy(btn, async () => {
+          const res = await FRP.certNginxSync({ domain: dataset.domain });
+          if (res && res.ok) {
+            toast('success', '已部署到 nginx', `${res.data.serverNames} → 80/443 → frps ${res.data.frpsHttpPort}`);
           } else toastResult(res);
         });
         break;
