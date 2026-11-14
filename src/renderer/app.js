@@ -3670,11 +3670,15 @@ async function handleAction(act, dataset, btn) {
       }
       case 'proxyform.type': {
         setProxyFormType(dataset.type);
+        // 切到 http 时，https2http/https2https 插件不适用（只在 https 下有效），清掉。
+        if (dataset.type === 'http') setProxyPluginFields('');
         refreshDomainReadiness();
         break;
       }
       case 'proxyform.plugin': {
         setProxyPluginFields(dataset.plugin || '');
+        // https2http/https2https 需要 type=https，选插件时把类型一并切到 https。
+        if (dataset.plugin) setProxyFormType('https');
         refreshDomainReadiness();
         break;
       }

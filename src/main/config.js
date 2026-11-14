@@ -78,6 +78,12 @@ function normalizeProxy(raw) {
   proxy.type = typeof proxy.type === 'string' && proxy.type ? proxy.type.trim().toLowerCase() : 'tcp';
   proxy.localIP = typeof proxy.localIP === 'string' && proxy.localIP ? proxy.localIP : '127.0.0.1';
   proxy.localPort = toInt(proxy.localPort, null);
+  // https2http / https2https 只在 https 类型下有效；type=http + 插件是非法组合，
+  // 会让 frps 把代理注册到 vhostHTTPPort、收到明文 HTTP 时报
+  // 「Client sent an HTTP request to an HTTPS server」。加载时自动纠正成 https。
+  if (isPlainObject(proxy.plugin) && ['https2http', 'https2https'].includes(proxy.plugin.type) && proxy.type !== 'https') {
+    proxy.type = 'https';
+  }
   // 只保留该类型真正认的字段：手改过的配置里常见 stcp 带 remotePort、
   // tcpmux 带 remotePort，写回去 frpc 会整份配置拒绝启动。
   if (HOST_TYPES.includes(proxy.type)) {
@@ -583,7 +589,13 @@ function makeProxy(input) {
   if (type === 'tcpmux') base.multiplexer = String(input.multiplexer || 'httpconnect').trim() || 'httpconnect';
   if (type === 'http' || type === 'https') {
     const plugin = normalizePlugin(input.plugin);
-    if (plugin) base.plugin = plugin;
+    if (plugin) {
+      base.plugin = plugin;
+      // https2http / https2https 只在 https 类型下有效：它们让 frps 终止 TLS，
+      // 而 type=http 会注册到 vhostHTTPPort，frps 收到明文 HTTP 会报
+      // 「Client sent an HTTP request to an HTTPS server」。这里把类型纠正成 https。
+      base.type = 'https';
+    }
   }
   if (input.secretKey) base.secretKey = String(input.secretKey);
   const transport = {};

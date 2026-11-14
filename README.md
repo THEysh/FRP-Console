@@ -402,6 +402,12 @@ node tools/cdp-shot.cjs .proxy-row out.png # 按选择器截单个元素
 
 ## 更新日志
 
+### 1.2.23
+
+修一个「HTTP 代理挂上 HTTPS 证书后反而访问不了」的问题：
+
+- **https2http / https2https 插件会自动把代理类型纠正成 https**：之前如果你给一个 `http` 类型的代理选了「https2http / https2https」TLS 终止，程序会把它写成 `type=http` + `plugin.type=https2http` 的组合——frps 会把这个代理注册到 HTTP 端口（8080），但又因为插件期待 TLS，于是收到明文 HTTP 请求就回一句「Client sent an HTTP request to an HTTPS server」，域名怎么都访问不了。现在只要选了这两个插件之一，程序会自动把类型切到 `https`（加载旧配置时也会自动纠正），访问 `https://域名:8443` 就正常了。
+
 ### 1.2.22
 
 修一个「一键建解析」误报没配 token 的问题，并给 token 加了「验证」：
