@@ -1904,6 +1904,15 @@ function registerIpc() {
     if (serverConfig.summary && serverConfig.summary.webPort && serverSession.host && !settings.frpsDashboardUrl) {
       settings = settingsModule.save({ frpsDashboardUrl: `http://${serverSession.host}:${serverConfig.summary.webPort}` });
     }
+    /* 服务器页已经拿到真实 vhost 端口，同步到本机探测设置：否则应用重启后还没重连服务器页，
+     * 概览健康检查会拿设置里的 vhost 端口（可能跟服务器实际不符）去探 http/https 代理，
+     * 把它们误报成「公网不可达」。服务器实际配置才是权威来源。 */
+    if (serverConfig.summary) {
+      const vh = Number(serverConfig.summary.vhostHTTPPort) || 0;
+      const vs = Number(serverConfig.summary.vhostHTTPSPort) || 0;
+      if (vh > 0 && Number(settings.vhostHttpPort) !== vh) settings = settingsModule.save({ vhostHttpPort: vh });
+      if (vs > 0 && Number(settings.vhostHttpsPort) !== vs) settings = settingsModule.save({ vhostHttpsPort: vs });
+    }
     if (serverConfig.summary) {
       applyPortStatus(serverSession.info, serverConfig.summary);
       const sync = adoptServerAuthFromConfig();
