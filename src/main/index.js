@@ -2740,10 +2740,19 @@ function registerIpc() {
       const staging = payload.staging !== undefined ? !!payload.staging : !!settings.acmeStaging;
       const provider = currentDnsProvider();
       if (!provider.ok) return fail(provider.error);
-      const result = await acmeManager.issue({ domains, email, staging, dns: provider.dns });
+      const sendProgress = (data) => {
+        try { event.sender.send('cert:progress', data); } catch { /* 窗口销毁时忽略 */ }
+      };
+      sendProgress({ label: '开始签发证书…', percent: 0 });
+      const result = await acmeManager.issue({ domains, email, staging, dns: provider.dns, onProgress: sendProgress });
       if (!result.ok) return fail(result.error);
       // 生产证书签发后，自动上传到服务器 nginx 终止 TLS（方案 Y）。STAGING 假证书不部署。
-      const nginx = result.staging ? null : await syncCertToServerNginx(result);
+      let nginx = null;
+      if (!result.staging) {
+        sendProgress({ label: '部署到服务器 nginx（上传证书 + 重载）…', percent: 95 });
+        nginx = await syncCertToServerNginx(result);
+      }
+      sendProgress({ label: '完成', percent: 100 });
       pushState();
       return ok({ ...result, nginx });
     } catch (e) {
@@ -2760,10 +2769,19 @@ function registerIpc() {
       const provider = currentDnsProvider();
       if (!provider.ok) return fail(provider.error);
       const email = existing && existing.email ? existing.email : String(settings.acmeEmail || '');
-      const result = await acmeManager.renew(domain, { email, staging, dns: provider.dns });
+      const sendProgress = (data) => {
+        try { event.sender.send('cert:progress', data); } catch { /* 窗口销毁时忽略 */ }
+      };
+      sendProgress({ label: '开始续期…', percent: 0 });
+      const result = await acmeManager.renew(domain, { email, staging, dns: provider.dns, onProgress: sendProgress });
       if (!result.ok) return fail(result.error);
       // 生产证书续期后，同样自动同步到 nginx。
-      const nginx = result.staging ? null : await syncCertToServerNginx(result);
+      let nginx = null;
+      if (!result.staging) {
+        sendProgress({ label: '部署到服务器 nginx（上传证书 + 重载）…', percent: 95 });
+        nginx = await syncCertToServerNginx(result);
+      }
+      sendProgress({ label: '完成', percent: 100 });
       pushState();
       return ok({ ...result, nginx });
     } catch (e) {

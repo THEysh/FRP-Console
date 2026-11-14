@@ -24,15 +24,21 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /* 等 TXT 记录真正发布到权威 DNS。用系统解析器轮询（尽力而为）：
  * Cloudflare 建完记录后到权威 NS 可见通常只要几秒，但 Let's Encrypt 有时查得太快会撞上 NXDOMAIN。 */
-async function waitForTxt(name, expected, { timeoutMs = 30000, intervalMs = 4000 } = {}) {
+async function waitForTxt(name, expected, { timeoutMs = 30000, intervalMs = 4000, onTick = null } = {}) {
   const dnsPromises = require('node:dns').promises;
-  const deadline = Date.now() + timeoutMs;
+  const start = Date.now();
+  const deadline = start + timeoutMs;
+  let attempts = 0;
   while (Date.now() < deadline) {
+    attempts += 1;
     try {
       const records = await dnsPromises.resolveTxt(name);
       const flat = (records || []).flat();
       if (flat.includes(expected)) return true;
     } catch { /* NXDOMAIN 或解析器暂时不可用，继续等 */ }
+    if (typeof onTick === 'function') {
+      try { onTick({ attempts, elapsed: Date.now() - start }); } catch { /* 进度回调异常不影响签发 */ }
+    }
     await sleep(intervalMs);
   }
   return false;
@@ -150,7 +156,12 @@ class AcmeManager {
    * domains 至少一项，第一项作为 CSR 的 commonName，其余进 altNames。
    * 返回 { ok, domain, notAfter, crtPath, keyPath, fullchainPath }。
    */
-  async issue({ domains, email = '', staging = true, dns }) {
+  async issue({ domains, email = '', staging = true, dns, onProgress = null }) {
+    const prog = (label, percent) => {
+      if (typeof onProgress === 'function') {
+        try { onProgress({ label, percent }); } catch { /* 进度回调异常不影响签发 */ }
+      }
+    };
     if (!dns || typeof dns.create !== 'function' || typeof dns.remove !== 'function') {
       return { ok: false, error: '缺少 DNS 验证提供者（Cloudflare token 未配置）' };
     }
@@ -162,11 +173,13 @@ class AcmeManager {
     const unique = Array.from(new Set(list));
     const commonName = unique[0];
 
+    prog('初始化 ACME 客户端…', 5);
     const { client, account } = await this.clientFor({ staging, email });
     const urlKey = staging ? 'staging' : 'production';
     const beforeUrl = account.accountUrls[urlKey] || '';
 
     try {
+      prog('生成密钥与证书请求…', 10);
       // auto() 内部会在没有 accountUrl 时自动注册账户；这里拿它保存下来复用。
       const [key, csr] = await acme.crypto.createCsr({
         keySize: 2048,
@@ -176,7 +189,9 @@ class AcmeManager {
 
       // 每个授权标识符的 TXT 记录 id，供 challengeRemoveFn 删除。
       const challengeRecords = new Map();
+      let challengeIndex = 0;
 
+      prog('创建订单并提交域名…', 15);
       const fullchain = await client.auto({
         csr,
         email: email || undefined,
@@ -191,11 +206,20 @@ class AcmeManager {
         challengeCreateFn: async (authz, challenge, keyAuthorization) => {
           // keyAuthorization 对 dns-01 已经是被 sha256 后 base64url 的最终 TXT 值。
           const identifier = authz.identifier && authz.identifier.value ? authz.identifier.value : commonName;
+          const idx = challengeIndex++;
+          const base = 25 + idx * 18;
+          prog(`验证域名 ${identifier}：创建 TXT 记录…`, Math.min(80, base));
           const rec = await dns.create(identifier, keyAuthorization);
           challengeRecords.set(identifier, rec);
           // 等 TXT 真正发布到权威 DNS 再让 Let's Encrypt 验证（Cloudflare 通常几秒内，
           // 但 LE 可能查太快撞上 NXDOMAIN）。用系统解析器尽力轮询。
-          await waitForTxt(dns01Name(identifier), keyAuthorization);
+          await waitForTxt(dns01Name(identifier), keyAuthorization, {
+            timeoutMs: 30000,
+            intervalMs: 4000,
+            onTick: ({ attempts, elapsed }) => {
+              prog(`验证域名 ${identifier}：等待 DNS 传播（第 ${attempts} 次检查，已 ${Math.round(elapsed / 1000)}s）…`, Math.min(82, base + attempts * 6));
+            },
+          });
         },
         challengeRemoveFn: async (authz) => {
           const identifier = authz.identifier && authz.identifier.value ? authz.identifier.value : commonName;
@@ -209,6 +233,7 @@ class AcmeManager {
         await this.saveAccountUrl(client.getAccountUrl(), staging);
       }
 
+      prog('保存证书到本机…', 90);
       return this.storeCertificate({ fullchain, key, domains: unique, email, staging });
     } catch (error) {
       return { ok: false, error: String((error && error.message) || error) };
@@ -297,10 +322,10 @@ class AcmeManager {
   }
 
   /* 续期：对同一批域名重新走一次签发。 */
-  async renew(domain, { email = '', staging = true, dns } = {}) {
+  async renew(domain, { email = '', staging = true, dns, onProgress = null } = {}) {
     const existing = this.get(domain, { staging });
     if (!existing) return { ok: false, error: `本地没有 ${domain} 的${staging ? ' STAGING ' : '生产 '}证书，请直接签发` };
-    return this.issue({ domains: existing.domains, email: email || existing.email, staging: !!existing.staging, dns });
+    return this.issue({ domains: existing.domains, email: email || existing.email, staging: !!existing.staging, dns, onProgress });
   }
 
   /* 自动续期：把「剩余天数 ≤ days」的证书逐张重签，返回结果汇总。

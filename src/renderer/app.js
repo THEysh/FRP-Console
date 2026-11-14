@@ -3868,6 +3868,8 @@ async function handleAction(act, dataset, btn) {
         try { await FRP.saveSettings({ acmeEmail: email, acmeStaging: staging }); } catch (_) { /* 不影响签发 */ }
         S.certs.issuing = true;
         renderCerts(true);
+        showCertProgress(staging ? '正在签发 STAGING 测试证书' : '正在签发正式证书');
+        const offProgress = FRP.on('cert:progress', updateCertProgress);
         try {
           const res = await FRP.certIssue({ domains, email, staging });
           if (res && res.ok) {
@@ -3883,21 +3885,28 @@ async function handleAction(act, dataset, btn) {
         } catch (e) {
           toast('error', '签发失败', e && e.message ? e.message : String(e));
         } finally {
+          offProgress();
+          closeModal();
           S.certs.issuing = false;
           renderCerts(true);
         }
         break;
       }
       case 'certs.renew': {
-        await withBusy(btn, async () => {
-          const staging = dataset.staging === '1';
+        const staging = dataset.staging === '1';
+        showCertProgress('正在续期证书');
+        const offProgress = FRP.on('cert:progress', updateCertProgress);
+        try {
           const res = await FRP.certRenew(dataset.domain, staging);
           if (res && res.ok) {
             const nginx = res.data && res.data.nginx;
             toast('success', '证书已续期', `${res.data.domain} · 剩余 ${res.data.daysLeft} 天${nginx && nginx.ok ? ' · 已同步到 nginx' : ''}`);
             await loadCerts({ silent: true });
           } else toastResult(res);
-        });
+        } finally {
+          offProgress();
+          closeModal();
+        }
         break;
       }
       case 'certs.nginx': {
@@ -4574,6 +4583,36 @@ function closeModal() {
   root.innerHTML = '';
   S.modalOpen = false;
   S.proxyEdit = null;
+}
+
+/* 证书签发 / 续期的进度条弹窗：签发 DNS-01 要等权威 DNS 传播 + LE 验证，
+ * 通常几十秒，给用户一个实时进度，而不是干等按钮转圈。 */
+function showCertProgress(title) {
+  const root = $('#modal-root');
+  root.innerHTML = `
+    <div class="modal-backdrop"></div>
+    <div class="modal" style="width:420px">
+      <div class="modal-head">
+        <div class="mh-icon" style="color:var(--blue)">${icon('shield')}</div>
+        <div class="grow"><h3>${esc(title)}</h3><p class="cert-progress-label" id="cert-progress-label">准备中…</p></div>
+      </div>
+      <div class="modal-body">
+        <div class="cert-progress-track"><div class="cert-progress-fill" id="cert-progress-fill" style="width:0%"></div></div>
+        <div class="cert-progress-pct" id="cert-progress-pct">0%</div>
+      </div>
+    </div>`;
+  root.classList.add('open');
+  S.modalOpen = true;
+}
+
+function updateCertProgress(data) {
+  const percent = Math.max(0, Math.min(100, Number((data && data.percent) || 0)));
+  const label = $('#cert-progress-label');
+  const fill = $('#cert-progress-fill');
+  const pct = $('#cert-progress-pct');
+  if (label) label.textContent = (data && data.label) || '';
+  if (fill) fill.style.width = `${percent}%`;
+  if (pct) pct.textContent = `${Math.round(percent)}%`;
 }
 
 /* ----------------------------- 设置保存 --------------------------- */
