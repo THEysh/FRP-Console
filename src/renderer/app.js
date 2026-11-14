@@ -399,6 +399,8 @@ function overviewKey() {
     // 隧道在跑但已无档案：这个提示的出现/消失必须触发重绘
     orph: s.binding && s.binding.unarchived ? `${s.binding.addr}:${s.binding.port}` : '',
     val: s.validation && s.validation.errors ? s.validation.errors.length : 0,
+    // 服务器面板地址可能在连上服务器后被自动探测出来，变化时要重绘 hero 按钮
+    durl: s.dashboardUrl || '',
     proxies: (s.proxies || []).map((p) => [p.name, p.status, p.publicAddress, p.health && p.health.ok, p.health && p.health.reason, p.statusError]),
   });
 }
@@ -529,9 +531,9 @@ function renderOverview(force = false) {
     && validationErrors.length === 1
     && validationErrors[0].field === 'serverAddr';
 
-  const addresses = proxies
-    .filter((p) => p.publicAddress)
-    .slice(0, 7)
+  const addrList = proxies.filter((p) => p.publicAddress);
+  const onlineCount = addrList.filter((p) => p.status === 'running' && p.health && p.health.ok).length;
+  const addresses = addrList
     .map((p) => {
       const failed = p.health && !p.health.ok;
       const online = p.status === 'running' && p.health && p.health.ok;
@@ -621,23 +623,21 @@ function renderOverview(force = false) {
                  <button class="btn danger" type="button" data-act="tunnel.stop">${icon('stop')}<span>停止隧道</span></button>`
               : `<button class="btn primary" type="button" data-act="tunnel.start">${icon('play')}<span>启动隧道</span></button>`}
             <button class="btn" type="button" data-act="tunnel.reload" title="从磁盘重新载入代理配置，不断开连接">${icon('reload')}<span>热重载</span></button>
-            ${dashboard ? `<button class="btn ghost" type="button" data-act="open" data-url="${esc(dashboard)}" title="打开 frps 面板">${icon('globe')}<span>服务器面板</span></button>` : ''}
+            ${dashboard ? `<button class="btn" type="button" data-act="open" data-url="${esc(dashboard)}" title="打开 frps 面板">${icon('globe')}<span>服务器面板</span></button>` : ''}
           </div>
-          <div class="hero-details">
-            <div class="hero-cell"><span>运行模式</span><strong>${esc(modeLabel(info.r.mode))}</strong></div>
-            <div class="hero-cell"><span>服务器端口</span><strong>${esc(config.serverPort || '—')}</strong></div>
-            <div class="hero-cell"><span>进程 PID</span><strong>${esc(info.r.pid || '—')}</strong></div>
-          </div>
-        </div>
-        <div class="hero-side">
-          <div class="hero-side-title">公网地址</div>
-          <div class="addr-list">
-            ${addresses || '<div class="muted" style="font-size:11.5px;padding:10px 2px">还没有可用的公网映射</div>'}
-          </div>
+          ${tunnelProgressHtml(state)}
         </div>
       </section>
 
-      ${tunnelProgressHtml(state)}
+      <section class="card section" style="margin-top:16px">
+        <div class="section-head">
+          <div class="section-title"><strong>公网地址</strong><span>${addrList.length ? `在线 ${onlineCount} / 共 ${addrList.length} 条 · 别人通过这些地址访问你的服务` : '还没有公网映射'}</span></div>
+          ${addrList.length ? `<button class="btn ghost small" type="button" data-act="nav" data-view="proxies">管理代理 ${icon('up')}</button>` : ''}
+        </div>
+        <div class="addr-list" style="padding:0 16px 16px">
+          ${addresses || '<div class="muted" style="font-size:11.5px;padding:10px 2px">还没有可用的公网映射</div>'}
+        </div>
+      </section>
 
       <section class="metrics" style="margin-top:16px">
         <div class="card metric">
@@ -654,11 +654,6 @@ function renderOverview(force = false) {
           <div class="metric-top"><span class="metric-label">${term('连通性异常', '三层（本地服务 → 隧道 → 公网）中至少一层没通的映射数；点击可看是哪条、哪一层。')}</span><span class="metric-icon">${icon('cpu')}</span></div>
           <div class="metric-value">${config.serverAddr ? esc(counts.unhealthy || 0) : '—'}</div>
           <div class="metric-foot"><span class="${!config.serverAddr ? '' : counts.unhealthy ? 'down' : counts.unchecked > 0 ? '' : 'up'}">${!config.serverAddr ? '尚未开始检测' : counts.unhealthy ? layerFailText(counts) : counts.unchecked > 0 ? `${counts.unchecked} 条还没测完` : '全部代理三层全通（本地 → 隧道 → 公网）'}</span></div>
-        </div>
-        <div class="card metric">
-          <div class="metric-top"><span class="metric-label">运行时长</span><span class="metric-icon">${icon('clock')}</span></div>
-          <div class="metric-value">${esc(app.uptimeLabel || '—')}</div>
-          <div class="metric-foot"><span>${esc(app.frpcVersion ? `frpc ${app.frpcVersion}` : 'frpc 0.61')}</span></div>
         </div>
       </section>
 
@@ -680,9 +675,13 @@ function renderOverview(force = false) {
             <div class="card-pad" style="padding-top:0">
               <div class="detail-list">
                 ${detailRow('服务器', config.serverAddr ? `${config.serverAddr}:${config.serverPort}` : '未配置')}
+                ${detailRow('运行模式', modeLabel(info.r.mode))}
                 ${detailRow('认证方式', `${config.auth && config.auth.method || 'token'}${config.auth && config.auth.token ? ' · 已设置' : ' · 未设置'}`, config.auth && config.auth.token ? 'ok' : 'bad')}
                 ${detailRow('管理 API', info.r.adminPort ? `127.0.0.1:${info.r.adminPort}` : '未启用', info.r.connected ? 'ok' : 'bad')}
                 ${detailRow('系统服务', info.service.installed ? `${info.service.name} · ${serviceStateText(info.service.state)}` : '未安装')}
+                ${detailRow('进程 PID', info.r.pid || '—')}
+                ${detailRow('运行时长', app.uptimeLabel || '—')}
+                ${detailRow('frpc 版本', app.frpcVersion || '—')}
                 ${detailRow('管理员权限', app.elevated ? '已提升' : '普通权限', app.elevated ? 'ok' : '')}
                 ${detailRow('配置文件', state.paths && state.paths.configPath ? state.paths.configPath : '未设置', state.paths && state.paths.configExists ? 'ok' : 'bad', true)}
               </div>

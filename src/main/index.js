@@ -1002,8 +1002,10 @@ function pathsForState() {
 
 function dashboardUrl() {
   if (settings.frpsDashboardUrl) return settings.frpsDashboardUrl;
-  if (model && model.serverAddr) return `http://${model.serverAddr}:7500`;
-  return '';
+  if (!model || !model.serverAddr) return '';
+  // 服务器页读到的 frps Dashboard 端口优先（真机常改端口，7500 只是兜底默认）。
+  const webPort = (serverConfig.summary && serverConfig.summary.webPort) || 0;
+  return `http://${model.serverAddr}:${webPort || 7500}`;
 }
 
 function loadConfigFromDisk({ initial = false } = {}) {
@@ -1888,6 +1890,11 @@ function registerIpc() {
       };
     } else {
       serverConfig = { path: serverSession.configPath || '', content: '', summary: null, error: configResult.error || '' };
+    }
+    /* 服务器页已经拿到真实 Dashboard 端口，就把「打开服务器面板」的地址记住，
+     * 概览/tray 才不至于重启后还跳回默认的 7500。只在用户没手动设过时自动填。 */
+    if (serverConfig.summary && serverConfig.summary.webPort && serverSession.host && !settings.frpsDashboardUrl) {
+      settings = settingsModule.save({ frpsDashboardUrl: `http://${serverSession.host}:${serverConfig.summary.webPort}` });
     }
     if (serverConfig.summary) {
       applyPortStatus(serverSession.info, serverConfig.summary);
