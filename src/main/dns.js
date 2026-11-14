@@ -76,17 +76,31 @@ class CloudflareDns {
   }
 
   /* 验证 token 是否有效：GET /user/tokens/verify。
-   * 返回 { status, active }；无效/过期时 status 非 200 或 success=false。 */
+   * 注意：Cloudflare 的 verify 端点只认「用户级」token（cfut_ 开头），
+   * 对「账户级」token（cfat_ 开头）会返回 401 Invalid API Token——
+   * 但那不代表 token 失效，账户级 token 完全能读写 DNS。
+   * 所以 verify 端点 401 时，回退到实际调一次 API（zones 列表）判断有效性。 */
   async verifyToken() {
     const res = await requestJson(`${this.base}/user/tokens/verify`, {
       method: 'GET',
       headers: this._headers(),
     });
-    if (res.status !== 200 || !res.data || !res.data.success) {
-      throw new Error(cfError(res, 'token 校验失败'));
+    if (res.status === 200 && res.data && res.data.success) {
+      const r = res.data.result || {};
+      return { status: r.status || '', active: r.status === 'active', method: 'verify' };
     }
-    const r = res.data.result || {};
-    return { status: r.status || '', active: r.status === 'active' };
+    // 401 / Invalid API Token：大概率是账户级 token，改用实际调用验证。
+    if (res.status === 401 || /Invalid API Token/i.test(cfError(res, ''))) {
+      const z = await requestJson(`${this.base}/zones?per_page=1`, {
+        method: 'GET',
+        headers: this._headers(),
+      });
+      if (z.status === 200 && z.data && z.data.success) {
+        return { status: 'active', active: true, method: 'zones', note: '账户级 token，已改用实际 API 调用验证' };
+      }
+      throw new Error(cfError(z, 'token 无效或权限不足（签发证书需 Zone.Zone:Read + Zone.DNS:Edit 权限）'));
+    }
+    throw new Error(cfError(res, 'token 校验失败'));
   }
 
   async _zoneId(domain) {

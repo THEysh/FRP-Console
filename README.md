@@ -402,6 +402,13 @@ node tools/cdp-shot.cjs .proxy-row out.png # 按选择器截单个元素
 
 ## 更新日志
 
+### 1.2.27
+
+修一个会误导人的 token 校验：Cloudflare 的「账户级」token（`cfat_` 开头）用 verify 端点查会被返回 401，程序误报「token 失效」，其实 token 完全能用。
+
+- **验证逻辑修正**：verify 端点不认账户级 token 时，自动改用「实际调一次 Cloudflare API」来判断 token 是否有效，不再误报失效。
+- 有效提示会注明「账户级 token，已改用实际 API 调用验证」，让用户知道这是正常的，不是错误。
+
 ### 1.2.26
 
 「端口冲突」弹窗里的「换端口」升级成**自动换**：不再只是引导你手动改，而是程序自动挑空闲端口继续，并同步改 nginx 反代和本机隧道。

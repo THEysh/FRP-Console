@@ -3961,7 +3961,8 @@ async function handleAction(act, dataset, btn) {
         await withBusy(btn, async () => {
           const res = await FRP.dnsVerify({ token });
           if (res && res.ok && res.data && res.data.active) {
-            toast('success', 'Token 有效', 'Cloudflare 校验通过，可以保存并继续下一步。');
+            const note = (res.data && res.data.note) ? `（${res.data.note}）` : '';
+            toast('success', 'Token 有效', `Cloudflare 校验通过${note}，可以保存并继续下一步。`);
           } else if (res && res.ok) {
             toast('warn', 'Token 校验未通过', `状态：${(res.data && res.data.status) || '未知'}`);
           } else {
