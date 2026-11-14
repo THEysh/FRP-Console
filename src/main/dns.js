@@ -75,6 +75,20 @@ class CloudflareDns {
     return { Authorization: `Bearer ${this.token}` };
   }
 
+  /* 验证 token 是否有效：GET /user/tokens/verify。
+   * 返回 { status, active }；无效/过期时 status 非 200 或 success=false。 */
+  async verifyToken() {
+    const res = await requestJson(`${this.base}/user/tokens/verify`, {
+      method: 'GET',
+      headers: this._headers(),
+    });
+    if (res.status !== 200 || !res.data || !res.data.success) {
+      throw new Error(cfError(res, 'token 校验失败'));
+    }
+    const r = res.data.result || {};
+    return { status: r.status || '', active: r.status === 'active' };
+  }
+
   async _zoneId(domain) {
     const apex = apexOf(domain);
     const res = await requestJson(`${this.base}/zones?name=${encodeURIComponent(apex)}`, {

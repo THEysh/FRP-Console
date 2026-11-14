@@ -2627,11 +2627,25 @@ function registerIpc() {
     return ok(await resolveDomainInfo(String(domain || '').trim()));
   });
 
+  /* 验证已保存的 Cloudflare token 是否有效（不暴露 token 明文）。 */
+  ipcMain.handle('dns:verify', async (event, payload = {}) => {
+    try {
+      const token = String((payload && payload.token) || '').trim();
+      // 允许直接验一个刚填还没保存的 token；没传就用已保存的。
+      const dns = token ? new CloudflareDns({ token }) : (currentDnsProvider().dns || null);
+      if (!dns || typeof dns.verifyToken !== 'function') return fail('尚未配置 DNS 验证渠道（需要 Cloudflare token）');
+      const r = await dns.verifyToken();
+      return ok(r);
+    } catch (e) {
+      return fail((e && e.message) || String(e));
+    }
+  });
+
   /* 域名向导「一键建解析」：给域名建/改 A 记录，指向 frps 服务器 IP。 */
   ipcMain.handle('dns:set-a', async (event, payload = {}) => {
     try {
       const provider = currentDnsProvider();
-      if (!provider || !provider.setARecord) return fail('尚未配置 DNS 验证渠道（需要 Cloudflare token）');
+      if (!provider.ok || !provider.dns || typeof provider.dns.setARecord !== 'function') return fail('尚未配置 DNS 验证渠道（需要 Cloudflare token）');
       const domain = String((payload && payload.domain) || '').trim();
       if (!domain) return fail('请先输入域名');
       // 目标 IP：显式传入优先；否则用活跃服务器档案的 host（SSH 公网 IP），再退回本机配置 serverAddr。
@@ -2639,7 +2653,7 @@ function registerIpc() {
       const profile = activeServerProfile();
       const ip = explicit || (profile && /^\d+\.\d+\.\d+\.\d+$/.test(profile.host || '') ? profile.host : '') || (model && /^\d+\.\d+\.\d+\.\d+$/.test(model.serverAddr || '') ? model.serverAddr : '');
       if (!ip) return fail('无法确定 frps 服务器 IP：请先连接服务器，或手动填一个 IP');
-      const record = await provider.setARecord(domain, ip);
+      const record = await provider.dns.setARecord(domain, ip);
       return ok(record);
     } catch (e) {
       return fail((e && e.message) || String(e));

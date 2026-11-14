@@ -2775,6 +2775,7 @@ function domainWizardHtml() {
               <input class="input" id="cert-dns-token" type="password" placeholder="${hasToken ? '已保存（留空不改动）' : 'Cloudflare API Token'}" autocomplete="new-password" />
               <button class="btn icon" type="button" data-act="certs.dns.eye" title="显示 / 隐藏">${icon('eye')}</button>
               <button class="btn primary" type="button" data-act="certs.dns.save">${icon('check')}<span>保存</span></button>
+              <button class="btn" type="button" data-act="certs.dns.verify">${icon('shield')}<span>验证</span></button>
               ${hasToken ? `<button class="btn danger-text" type="button" data-act="certs.dns.clear">${icon('trash')}<span>清除</span></button>` : ''}
             </div>
             <span style="font-size:11px">权限至少需要 <code>Zone.Zone:Read</code> + <code>Zone.DNS:Edit</code>，范围限定到你自己的域名；token 用 Windows DPAPI 加密存在本机，绝不出现在配置或日志里。</span>
@@ -3806,6 +3807,20 @@ async function handleAction(act, dataset, btn) {
             toast('success', 'DNS 设置已保存');
             await loadCerts({ silent: true });
           } else toastResult(res);
+        });
+        break;
+      }
+      case 'certs.dns.verify': {
+        const token = $('#cert-dns-token') ? $('#cert-dns-token').value.trim() : '';
+        await withBusy(btn, async () => {
+          const res = await FRP.dnsVerify({ token });
+          if (res && res.ok && res.data && res.data.active) {
+            toast('success', 'Token 有效', 'Cloudflare 校验通过，可以保存并继续下一步。');
+          } else if (res && res.ok) {
+            toast('warn', 'Token 校验未通过', `状态：${(res.data && res.data.status) || '未知'}`);
+          } else {
+            toastResult(res);
+          }
         });
         break;
       }
