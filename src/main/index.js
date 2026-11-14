@@ -2394,7 +2394,12 @@ function registerIpc() {
   ipcMain.handle('server:nginx-state', async () => {
     if (!serverSession.connected) return fail('尚未连接服务器');
     try {
-      return ok(await serverSession.detectNginx());
+      const det = await serverSession.detectNginx();
+      // 同步 nginx 反代状态：frp-console.conf 是否存在，决定 http/https 代理的公网地址要不要带端口。
+      if (!!det.proxyConfigured !== !!settings.nginxProxyEnabled) {
+        settings = settingsModule.save({ nginxProxyEnabled: !!det.proxyConfigured });
+      }
+      return ok(det);
     } catch (e) {
       return fail(String((e && e.message) || e));
     }
@@ -2726,6 +2731,10 @@ function registerIpc() {
     if (!write.ok) return write;
     const reload = await serverSession.reloadNginx();
     if (!reload.ok) return reload;
+    // 反代配置写成功并 reload 后，公网入口就是 nginx 443，代理地址不再带端口。
+    if (!settings.nginxProxyEnabled) {
+      settings = settingsModule.save({ nginxProxyEnabled: true });
+    }
     return { ok: true, serverNames, certDir: upload.dir, frpsHttpPort };
   }
 

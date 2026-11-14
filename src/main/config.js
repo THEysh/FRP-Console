@@ -504,6 +504,12 @@ function publicAddressFor(model, proxy, options = {}) {
   if (proxy.type === 'http' || proxy.type === 'https') {
     const domain = firstDomainOf(proxy);
     if (!domain) return '';
+    /* 方案 Y：服务器上已由 nginx 在 443 终止 TLS 并反代到 frps，公网入口
+     * 是统一的 https://域名（不带端口）。这里直接返回它，不再拼 frps 的
+     * vhost 端口（8080/8443 是内网端口，不该暴露给用户）。 */
+    if (options.nginxProxyEnabled) {
+      return `https://${domain}`;
+    }
     /* 端口不能省：frps 的 vhostHTTPPort 很少真的开在 80（容器、非 root、多实例都换过端口），
      * 以前一律拼成 http://域名，导致健康检查永远访问不到自己的服务，
      * 界面报“公网不可达”，而实际隧道是通的。 */
