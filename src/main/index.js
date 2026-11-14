@@ -1241,8 +1241,17 @@ async function mapLimit(items, limit, worker) {
 async function checkProxyHealth(p, ctx) {
   const at = Date.now();
   const layers = {};
-  const local = await manager.testLocal(p);
-  layers.local = { ok: !!local.ok, ms: local.ms || 0, error: local.error || null };
+  const type = p.type || 'tcp';
+  let local;
+  if (type === 'udp' || type === 'sudp') {
+    // UDP 是无连接的，没有 TCP 三次握手可用来判断「本地服务是否在听」；
+    // Windows 上往关闭端口发包连 ICMP port-unreachable 都不会回到 socket，
+    // 硬拿 tcpCheck 去连只会把好好的 UDP 服务误报成「本地服务不通」。本地层跳过。
+    local = { ok: true, ms: 0, error: null, skipped: true };
+  } else {
+    local = await manager.testLocal(p);
+  }
+  layers.local = { ok: !!local.ok, ms: local.ms || 0, error: local.error || null, skipped: !!local.skipped };
   if (!local.ok) {
     return [p.name, { ok: false, reason: '本地服务不通', ms: local.ms || 0, error: local.error || null, layers, at }];
   }
@@ -1264,7 +1273,6 @@ async function checkProxyHealth(p, ctx) {
   // udp/sudp/xtcp/stcp 没有可探测的公网 TCP 端口或不走公网，
   // tcpmux 要先在 frps 的 tcpmux 端口上发 HTTP CONNECT 才能认领域名，
   // 这几种都只能确认到“隧道已注册”，第 3 层标记为 skipped。
-  const type = p.type || 'tcp';
   if (type === 'udp' || type === 'sudp' || type === 'xtcp' || type === 'stcp' || type === 'tcpmux') {
     layers.public = { ok: true, ms: 0, skipped: true, error: null };
     return [p.name, { ok: true, reason: null, ms: (local.ms || 0) + (server.ms || 0), error: null, layers, at }];

@@ -128,8 +128,33 @@ function validateFields(fields) {
   return { ok: errors.length === 0, errors, warnings, allowPorts: allow.value };
 }
 
+function fieldsFromData(baseData) {
+  const d = baseData && typeof baseData === 'object' ? baseData : {};
+  const auth = d.auth && typeof d.auth === 'object' ? d.auth : {};
+  const web = (d.webServer && typeof d.webServer === 'object') ? d.webServer : {};
+  return {
+    bindAddr: d.bindAddr || DEFAULT_FIELDS.bindAddr,
+    bindPort: Number(d.bindPort) || DEFAULT_FIELDS.bindPort,
+    authEnabled: !!d.auth,
+    token: auth.token || '',
+    webEnabled: !!d.webServer,
+    webAddr: web.addr || DEFAULT_FIELDS.webAddr,
+    webPort: Number(web.port) || DEFAULT_FIELDS.webPort,
+    webUser: web.user || DEFAULT_FIELDS.webUser,
+    webPassword: web.password || '',
+    vhostHTTPEnabled: Number(d.vhostHTTPPort) > 0,
+    vhostHTTPPort: Number(d.vhostHTTPPort) || DEFAULT_FIELDS.vhostHTTPPort,
+    vhostHTTPSEnabled: Number(d.vhostHTTPSPort) > 0,
+    vhostHTTPSPort: Number(d.vhostHTTPSPort) || DEFAULT_FIELDS.vhostHTTPSPort,
+    allowPortsText: allowPortsToText(d.allowPorts),
+  };
+}
+
 function applyWizard(baseData, fields, { includeMeta = false } = {}) {
-  const f = { ...DEFAULT_FIELDS, ...(fields || {}) };
+  // 字段未显式给出时，从现有配置继承：否则「只改个 bindPort / 密码」也会按
+  // DEFAULT_FIELDS 的 token 为空、vhost 关闭来重写，把服务器上已配好的 token、
+  // vhostHTTPPort / vhostHTTPSPort 悄悄删掉。
+  const f = { ...fieldsFromData(baseData), ...(fields || {}) };
   const check = validateFields(f);
   if (!check.ok) return { ok: false, errors: check.errors, warnings: check.warnings };
 
