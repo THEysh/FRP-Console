@@ -2055,12 +2055,14 @@ function registerIpc() {
       });
     }
     let disconnected = '';
+    // 不管当前 SSH 连没连上，删除档案都让「连接中」的请求作废：否则一个正在进行的
+    // server:connect 会在 SSH 握手完成后偷偷把这个档案重建出来，出现「档案删了却还在读服务器信息」。
+    bumpSessionEpoch();
     if (serverSession.connected && sessionServerId === profile.id) {
       disconnected = profile.name;
       serverSession.disconnect();
       sessionServerId = '';
       serverConfig = { path: '', content: '', summary: null, error: '' };
-      bumpSessionEpoch();
     }
     settingsModule.clearServerSecret(profile.id);
     const rest = serverProfiles().filter((item) => item.id !== profile.id);
@@ -2212,7 +2214,16 @@ function registerIpc() {
 
     // 会话即将变更：让所有在途的读请求结果失效，防止旧档案的数据回写到新页面。
     bumpSessionEpoch();
+    const myEpoch = sessionEpoch;
     const result = await serverSession.connect({ host, port, username, password });
+    // SSH 连接期间用户可能删掉了这个档案 / 切到了别的档案：此时必须放弃这次连接，
+    // 不能继续 upsert（会偷偷重建一个档案），更不能去读配置回写页面。
+    if (sessionEpoch !== myEpoch) {
+      serverSession.disconnect();
+      sessionServerId = '';
+      serverConfig = { path: '', content: '', summary: null, error: '' };
+      return fail('连接期间服务器档案已变更，本次连接已取消', { stale: true, state: serverState() });
+    }
     if (!result.ok) return fail(result.error, { state: serverState() });
     profile = upsertServerProfile({ ...profile, host, port, username }, { activate: true });
     if (payload.remember) {
@@ -2222,10 +2233,22 @@ function registerIpc() {
       settingsModule.clearServerSecret(profile.id);
     }
     const inspected = await serverSession.inspect();
+    if (sessionEpoch !== myEpoch) {
+      serverSession.disconnect();
+      sessionServerId = '';
+      serverConfig = { path: '', content: '', summary: null, error: '' };
+      return fail('连接期间服务器档案已变更，本次连接已取消', { stale: true, state: serverState() });
+    }
     sessionServerId = profile.id;
     profile.lastConnectedAt = Date.now();
     settings = settingsModule.save({ servers: serverProfiles().map((item) => (item.id === profile.id ? profile : item)), activeServerId: profile.id });
-    await loadServerSnapshot();
+    const snap = await loadServerSnapshot({ epoch: myEpoch });
+    if (snap && snap.stale) {
+      serverSession.disconnect();
+      sessionServerId = '';
+      serverConfig = { path: '', content: '', summary: null, error: '' };
+      return fail('连接期间服务器档案已变更，本次连接已取消', { stale: true, state: serverState() });
+    }
     return ok({
       ...serverState(),
       adoptProfile: changed && payload.adoptProfile === true,
