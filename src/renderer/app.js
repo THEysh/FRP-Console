@@ -1139,6 +1139,31 @@ async function loadServerNginx(silent = false) {
   if (S.view === 'server') renderServer(true);
 }
 
+/* 一键配置反代的主流程：遇端口冲突弹窗让用户决定，kill 后递归重跑。 */
+async function runNginxSetup() {
+  const res = await FRP.serverNginxSetup();
+  if (!res || !res.ok) { toastResult(res); return; }
+  if (res.data && res.data.conflict) {
+    const choice = await confirmNginxPortConflict(res.data.conflicts || []);
+    if (choice !== 'kill') { await loadServerNginx(true); return; }
+    const freed = await FRP.serverNginxFree();
+    if (!freed || !freed.ok) { toastResult(freed); return; }
+    const after = freed.data && freed.data.after;
+    if (after && (after.port80Conflict || after.port443Conflict)) {
+      toast('error', '端口仍未释放', '终止后 80/443 仍被占用，请手动检查服务器上的服务再重试。');
+      await loadServerNginx(true);
+      return;
+    }
+    return runNginxSetup();
+  }
+  if (res.data && res.data.certMissing) {
+    toast('warn', '还差一张证书', res.data.message || '请先到「HTTPS 证书」页签发证书');
+  } else {
+    toast('success', '反代已配置', res.data && res.data.serverNames ? `${res.data.serverNames} → nginx 80/443 → frps ${res.data.frpsHttpPort}` : 'nginx 反代已就绪');
+  }
+  S.server.nginx = { ...(S.server.nginx || {}), ...(res.data || {}), ok: !!(res.data && res.data.ok) };
+}
+
 async function loadServerConfig(quiet = false) {
   if (!S.server.connected) return;
   const seq = serverSeq();
@@ -2548,19 +2573,52 @@ async function saveServerConfig(restart, btn) {
     const seq = serverSeq();
     const res = await FRP.serverSaveConfig(content, restart);
     if (serverSeqStale(seq)) return;
-    if (!res || !res.ok) return toastResult(res);
-    applyServerState(res.data && res.data.state, seq);
-    S.server.wizardDirty = false;
-    const backup = res.data && res.data.backup ? `备份：${res.data.backup}` : '';
-    if (restart) {
-      const after = res.data && res.data.restarted && res.data.restarted.after;
-      toast('success', '配置已保存并重启 frps', `${backup}${after && after.statusText ? ` · ${after.statusText}` : ''}`);
-    } else {
-      toast('success', '配置已保存', backup);
+    if (!res || !res.ok) {
+      const details = res && res.conflictDetails && res.conflictDetails.length ? res.conflictDetails : null;
+      if (details) {
+        const choice = await confirmFrpsPortConflict(details);
+        if (choice === 'kill') {
+          const kill = await FRP.serverKillPorts(details.map((d) => d.port));
+          if (kill && kill.ok) {
+            const retry = await FRP.serverSaveConfig(content, restart);
+            if (serverSeqStale(seq)) return;
+            if (!retry || !retry.ok) return toastResult(retry);
+            return applyServerConfigSave(retry, restart, seq);
+          }
+          toastResult(kill);
+        } else if (choice === 'edit') {
+          focusServerConfig();
+          toast('info', '请修改端口', '把冲突端口改成空闲端口后再保存。');
+        }
+        return;
+      }
+      return toastResult(res);
     }
-    renderServer(true);
-    await loadServerLogs();
+    return applyServerConfigSave(res, restart, seq);
   });
+}
+
+function focusServerConfig() {
+  if (S.server.mode !== 'advanced') setServerMode('advanced');
+  const area = $('#server-config');
+  if (area) {
+    area.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    area.focus();
+  }
+}
+
+async function applyServerConfigSave(res, restart, seq) {
+  applyServerState(res.data && res.data.state, seq);
+  S.server.wizardDirty = false;
+  const backup = res.data && res.data.backup ? `备份：${res.data.backup}` : '';
+  if (restart) {
+    const after = res.data && res.data.restarted && res.data.restarted.after;
+    toast('success', '配置已保存并重启 frps', `${backup}${after && after.statusText ? ` · ${after.statusText}` : ''}`);
+  } else {
+    toast('success', '配置已保存', backup);
+  }
+  renderServer(true);
+  await loadServerLogs();
 }
 
 async function runServerBootstrap(btn) {
@@ -3477,17 +3535,7 @@ async function handleAction(act, dataset, btn) {
         S.server.nginxBusy = true;
         renderServer(true);
         try {
-          const res = await FRP.serverNginxSetup();
-          if (res && res.ok) {
-            if (res.data && res.data.certMissing) {
-              toast('warn', '还差一张证书', res.data.message || '请先到「HTTPS 证书」页签发证书');
-            } else {
-              toast('success', '反代已配置', res.data && res.data.serverNames ? `${res.data.serverNames} → nginx 80/443 → frps ${res.data.frpsHttpPort}` : 'nginx 反代已就绪');
-            }
-            S.server.nginx = { ...(S.server.nginx || {}), ...(res.data || {}), ok: !!(res.data && res.data.ok) };
-          } else {
-            toastResult(res);
-          }
+          await runNginxSetup();
         } finally {
           S.server.nginxBusy = false;
           renderServer(true);
@@ -4406,6 +4454,70 @@ function confirmDialog({ title = '确认', body = '', confirmText = '确定', ca
     on('cd-ok', true);
     on('cd-cancel', false);
     on('cd-x', false);
+  });
+}
+
+function confirmNginxPortConflict(conflicts = []) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value) => { if (settled) return; settled = true; closeModal(); resolve(value); };
+    const rows = conflicts.map((c) => `<div style="margin:6px 0">端口 <code>${esc(String(c.port))}</code> 被 <strong>${esc(c.by || '未知进程')}</strong> 占用</div>`).join('');
+    openModal(`
+      <div class="modal" style="width:500px">
+        <div class="modal-head">
+          <div class="mh-icon" style="color:var(--red)">${icon('alert')}</div>
+          <div class="grow"><h3>80 / 443 端口被占用</h3><p>要用「域名不带端口访问」，nginx 必须占用 80 和 443。</p></div>
+          <button class="icon-btn modal-close" type="button" id="pc-x">${icon('x')}</button>
+        </div>
+        <div class="modal-body">
+          <div class="note warn">${icon('alert')}<div>
+            ${rows || '<div>以下端口被 nginx 之外的程序占用。</div>'}
+            <div style="margin-top:8px">终止这些进程会停掉它们提供的服务（可能是别的网站），请确认后再操作。也可以先手动停掉，再点「取消」后重新检测。</div>
+          </div></div>
+        </div>
+        <div class="modal-foot">
+          <span class="mf-left"></span>
+          <button class="btn" type="button" id="pc-cancel">取消</button>
+          <button class="btn danger" type="button" id="pc-kill">${icon('alert')}<span>终止占用进程并继续</span></button>
+        </div>
+      </div>`);
+    const on = (id, value) => { const el = $(`#${id}`); if (el) el.addEventListener('click', () => finish(value)); };
+    on('pc-kill', 'kill');
+    on('pc-cancel', 'cancel');
+    on('pc-x', 'cancel');
+  });
+}
+
+function confirmFrpsPortConflict(details = []) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value) => { if (settled) return; settled = true; closeModal(); resolve(value); };
+    const rows = details.map((d) => `<div style="margin:6px 0"><code>${esc(d.label)}（${esc(String(d.port))}）</code> 被 <strong>${esc(d.process || '未知进程')}</strong> 占用</div>`).join('');
+    openModal(`
+      <div class="modal" style="width:520px">
+        <div class="modal-head">
+          <div class="mh-icon" style="color:var(--red)">${icon('alert')}</div>
+          <div class="grow"><h3>配置端口与现有服务冲突</h3><p>这些端口已被占用，frps 启动会失败。</p></div>
+          <button class="icon-btn modal-close" type="button" id="fc-x">${icon('x')}</button>
+        </div>
+        <div class="modal-body">
+          <div class="note warn">${icon('alert')}<div>
+            ${rows || '<div>检测到端口冲突。</div>'}
+            <div style="margin-top:8px">可以终止占用这些端口的进程（可能影响它们提供的服务），或去修改配置里的端口。</div>
+          </div></div>
+        </div>
+        <div class="modal-foot">
+          <span class="mf-left"></span>
+          <button class="btn" type="button" id="fc-cancel">取消</button>
+          <button class="btn" type="button" id="fc-edit">去修改端口</button>
+          <button class="btn danger" type="button" id="fc-kill">${icon('alert')}<span>终止占用进程并继续</span></button>
+        </div>
+      </div>`);
+    const on = (id, value) => { const el = $(`#${id}`); if (el) el.addEventListener('click', () => finish(value)); };
+    on('fc-kill', 'kill');
+    on('fc-edit', 'edit');
+    on('fc-cancel', 'cancel');
+    on('fc-x', 'cancel');
   });
 }
 

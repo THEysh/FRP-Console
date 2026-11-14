@@ -2400,7 +2400,7 @@ function registerIpc() {
     }
   });
 
-  /* 一键配置 nginx 反代：检测 →（缺则）安装 → 找一张生产证书 → 上传 + 写配置 + reload。 */
+  /* 一键配置 nginx 反代：检测 →（缺则）安装 → 检查 80/443 冲突 → 找一张生产证书 → 上传 + 写配置 + reload。 */
   ipcMain.handle('server:nginx-setup', async (event, payload = {}) => {
     if (!serverSession.connected) return fail('尚未连接服务器');
     try {
@@ -2409,6 +2409,15 @@ function registerIpc() {
         const install = await serverSession.installNginx();
         if (!install.ok) return fail(install.error);
         detect = await serverSession.detectNginx();
+      }
+      // 80/443 被 nginx 之外的程序占用时，nginx 无法绑定标准端口，反代不起作用。
+      // 这里不硬来，返回冲突报告，交给前端弹窗让用户决定「终止占用进程」或「取消」。
+      if (detect.port80Conflict || detect.port443Conflict) {
+        const conflicts = [
+          detect.port80Conflict ? { port: 80, by: detect.port80By, pids: detect.port80Pids } : null,
+          detect.port443Conflict ? { port: 443, by: detect.port443By, pids: detect.port443Pids } : null,
+        ].filter(Boolean);
+        return ok({ conflict: true, conflicts, installed: detect.installed, running: detect.running });
       }
       const certs = acmeManager.list();
       const cert = certs.find((c) => !c.staging && c.exists) || certs.find((c) => c.exists) || null;
@@ -2422,6 +2431,24 @@ function registerIpc() {
       }
       const sync = await syncCertToServerNginx(cert);
       return ok({ installed: detect.installed, running: detect.running, ...sync });
+    } catch (e) {
+      return fail(String((e && e.message) || e));
+    }
+  });
+
+  /* 终止占用 80/443 的非 nginx 进程，然后重新探测（供前端「终止占用进程并继续」调用）。 */
+  ipcMain.handle('server:nginx-free', async () => {
+    if (!serverSession.connected) return fail('尚未连接服务器');
+    try {
+      const detect = await serverSession.detectNginx();
+      const pids = [
+        ...(detect.port80Conflict ? (detect.port80Pids || []) : []),
+        ...(detect.port443Conflict ? (detect.port443Pids || []) : []),
+      ];
+      const kill = await serverSession.killPids(pids);
+      await new Promise((r) => setTimeout(r, 800));
+      const after = await serverSession.detectNginx();
+      return ok({ killed: kill.killed, note: kill.note, after });
     } catch (e) {
       return fail(String((e && e.message) || e));
     }
@@ -2583,11 +2610,24 @@ function registerIpc() {
     const epoch = sessionEpoch;
     const result = await serverSession.writeConfig(content, { restart: !!payload.restart });
     if (epoch !== sessionEpoch) return staleFail();
-    if (!result.ok) return fail(result.error, { state: serverState() });
+    if (!result.ok) return fail(result.error, { state: serverState(), conflicts: result.conflicts || [], conflictDetails: result.conflictDetails || [] });
     // 重新读快照：adoptServerAuthFromConfig 会把刚写下的 bindPort / Token 对齐到档案，
     // 所以这里不需要再单独回写一次。
     await loadServerSnapshot({ inspect: true, epoch });
     return ok({ backup: result.backup, restarted: result.restarted, serverId: sessionServerId, state: serverState() });
+  });
+
+  /* 终止占用指定端口的非 frps 进程（「端口冲突」弹窗的「终止占用进程」用）。 */
+  ipcMain.handle('server:kill-ports', async (event, payload = {}) => {
+    if (!serverSession.connected) return fail('尚未连接服务器');
+    try {
+      const ports = (payload.ports || []).map(Number).filter((p) => p && p > 0);
+      const kill = await serverSession.killPortOccupants(ports);
+      await new Promise((r) => setTimeout(r, 800));
+      return ok(kill);
+    } catch (e) {
+      return fail(String((e && e.message) || e));
+    }
   });
 
   ipcMain.handle('server:logs', async (event, payload = {}) => {

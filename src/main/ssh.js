@@ -667,29 +667,38 @@ class ServerSession {
     return ports;
   }
 
-  // 解析 `ss -lntp` / `netstat -ltnp`，取每条监听端口的进程名。
+  // 解析 `ss -lntp` / `netstat -ltnp`，取每条监听端口的进程名与 PID（PID 用于 kill 占用者）。
   parseListeners(text) {
     const listeners = [];
     for (const line of String(text || '').split(/\r?\n/)) {
       const match = /:(\d{1,5})\s+\S+\s+users:\(\(\"?([^"\),\s]+)/.exec(line);
-      if (match) listeners.push({ port: Number(match[1]), process: match[2] });
+      if (!match) continue;
+      const pids = [];
+      for (const pm of line.matchAll(/pid=(\d+)/g)) pids.push(Number(pm[1]));
+      listeners.push({ port: Number(match[1]), process: match[2], pid: pids[0] || null, pids });
     }
     return listeners;
   }
 
-  // 检查新配置要监听的 TCP 端口是否已被非 frps 进程占用。
-  async portConflicts(ports) {
+  // 检查新配置要监听的 TCP 端口是否已被非 frps 进程占用（结构化结果，含 PID，供 kill / 换端口决策）。
+  async portConflictDetails(ports) {
     const tcpPorts = (ports || []).filter((p) => p.proto === 'tcp');
     if (!tcpPorts.length) return [];
     const result = await this.exec('ss -lntp 2>/dev/null || netstat -ltnp 2>/dev/null', 12000);
     const listeners = this.parseListeners(result.stdout || '');
-    const conflicts = [];
+    const out = [];
     for (const { port, label } of tcpPorts) {
       if (!port) continue;
       const hit = listeners.find((l) => l.port === port && l.process && !/^frps/i.test(l.process));
-      if (hit) conflicts.push(`${label}（${port}）已被 ${hit.process} 占用`);
+      if (hit) out.push({ port, label, process: hit.process, pids: hit.pids || [] });
     }
-    return conflicts;
+    return out;
+  }
+
+  // 结构化的文案版本，供「保存配置」时直接报给用户。
+  async portConflicts(ports) {
+    const details = await this.portConflictDetails(ports);
+    return details.map((d) => `${d.label}（${d.port}）已被 ${d.process} 占用`);
   }
 
   // 自动放开 frps 需要监听的端口（ufw / firewalld / 裸 iptables），防止被防火墙拦截。
@@ -792,8 +801,13 @@ class ServerSession {
       running: p80.length > 0 || p443.length > 0,
       port80By: p80.map((l) => l.process).filter(Boolean).join(', '),
       port443By: p443.map((l) => l.process).filter(Boolean).join(', '),
+      port80Pids: p80.flatMap((l) => l.pids || []),
+      port443Pids: p443.flatMap((l) => l.pids || []),
       port80Free: p80.length === 0,
       port443Free: p443.length === 0,
+      // 80/443 被「非 nginx」的程序占用时才算冲突（nginx 自己占着是正常共存，可继续写 server_name）。
+      port80Conflict: p80.some((l) => l.process && !/nginx/i.test(l.process)),
+      port443Conflict: p443.some((l) => l.process && !/nginx/i.test(l.process)),
       confDir: confInfo.dir,
       managedBy: confInfo.managedBy,
       proxyConfigured: firstLine(proxyConf.stdout) === 'yes',
@@ -921,6 +935,39 @@ class ServerSession {
     return { ok: true };
   }
 
+  /* 终止指定 PID（kill）。返回被 kill 的 PID 列表与每条结果说明；调用方随后重新探测确认端口是否释放。 */
+  async killPids(pids) {
+    if (!this.connected) return { ok: false, error: '尚未连接服务器' };
+    const sudo = await this.detectSudo();
+    if (!sudo.ok) return sudo;
+    const list = [...new Set((pids || []).map(Number).filter((n) => n && n > 1))];
+    if (!list.length) return { ok: false, error: '没有可终止的进程' };
+    const note = [];
+    for (const pid of list) {
+      const r = await this.exec(`${sudo.prefix}kill ${pid} 2>&1 || true`, 8000);
+      const msg = firstLine(`${r.stdout || ''}${r.stderr || ''}`);
+      note.push(msg ? `PID ${pid}：${msg}` : `PID ${pid}`);
+    }
+    return { ok: true, killed: list, note };
+  }
+
+  /* 终止监听指定端口的非 frps 进程（探测 PID → kill）。供「端口冲突」弹窗的「终止占用进程」用。 */
+  async killPortOccupants(ports) {
+    if (!this.connected) return { ok: false, error: '尚未连接服务器' };
+    const target = (ports || []).map(Number).filter((p) => p && p > 0);
+    if (!target.length) return { ok: false, error: '没有要处理的端口' };
+    const result = await this.exec('ss -lntp 2>/dev/null || netstat -ltnp 2>/dev/null', 10000);
+    const listeners = this.parseListeners(result.stdout || '');
+    const pids = [];
+    for (const l of listeners) {
+      if (target.includes(l.port) && l.process && !/^frps/i.test(l.process)) {
+        pids.push(...(l.pids || []));
+      }
+    }
+    if (!pids.length) return { ok: true, killed: [], note: ['这些端口现在没有非 frps 进程占用'] };
+    return this.killPids(pids);
+  }
+
   // 从 journalctl / 日志里挑出第一行报错原因，用于「重启后没起来」时告诉用户到底为什么。
   failureReason(logRes) {
     const lines = String((logRes && logRes.content) || '').split(/\r?\n/).filter(Boolean);
@@ -940,9 +987,10 @@ class ServerSession {
     // 端口冲突预检：配置里要监听的 TCP 端口若已被其它进程（如 nginx 占 80/443）占用，
     // frps 会 bind 失败并陷入 systemd auto-restart 死循环。这里提前拦截，不写坏配置。
     const ports = this.configPorts(content);
-    const conflicts = await this.portConflicts(ports);
+    const details = await this.portConflictDetails(ports);
+    const conflicts = details.map((d) => `${d.label}（${d.port}）已被 ${d.process} 占用`);
     if (conflicts.length) {
-      return { ok: false, error: `配置端口与现有服务冲突，frps 会启动失败：${conflicts.join('；')}。请改用空闲端口，或先停掉占用进程。`, conflicts };
+      return { ok: false, error: `配置端口与现有服务冲突，frps 会启动失败：${conflicts.join('；')}。请改用空闲端口，或先停掉占用进程。`, conflicts, conflictDetails: details };
     }
 
     const ext = /\.ini$/i.test(this.configPath) ? 'ini' : 'toml';

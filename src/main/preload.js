@@ -86,6 +86,8 @@ contextBridge.exposeInMainWorld('FRP', {
   serverSelfTest: (layer) => invoke('server:selftest', { layer }),
   serverNginxState: () => invoke('server:nginx-state'),
   serverNginxSetup: (payload) => invoke('server:nginx-setup', payload),
+  serverNginxFree: () => invoke('server:nginx-free'),
+  serverKillPorts: (ports) => invoke('server:kill-ports', { ports }),
   serverControl: (action) => invoke('server:control', { action }),
   serverSaveConfig: (content, restart) => invoke('server:save-config', { content, restart }),
   serverLogs: (lines) => invoke('server:logs', { lines }),
