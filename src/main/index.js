@@ -2216,7 +2216,8 @@ function registerIpc() {
         });
       }
     }
-    if (!profile) profile = upsertServerProfile({ host, port, username, name: host }, { activate: true });
+    const wasNew = !profile;
+    if (!profile) profile = upsertServerProfile({ host, port, username, name: host });
     if (!password) password = settingsModule.readServerSecret(profile.id);
     if (!password) return fail(changed ? '档案地址已变更，请重新输入 SSH 密码' : '请输入密码', { needsPassword: true, state: serverState() });
 
@@ -2232,7 +2233,18 @@ function registerIpc() {
       serverConfig = { path: '', content: '', summary: null, error: '' };
       return fail('连接期间服务器档案已变更，本次连接已取消', { stale: true, state: serverState() });
     }
-    if (!result.ok) return fail(result.error, { state: serverState() });
+    if (!result.ok) {
+      // 连接失败：这次临时新建的档案不能留着——否则用户只是手滑输错端口 / 网络不通，
+      // 列表里就多一条永远连不上的“垃圾档案”，还会把 activeServerId 顶到这条废档案上。
+      if (wasNew) {
+        const rest = serverProfiles().filter((item) => item.id !== profile.id);
+        settings = settingsModule.save({
+          servers: rest,
+          activeServerId: settings.activeServerId === profile.id ? (rest[0] ? rest[0].id : '') : settings.activeServerId,
+        });
+      }
+      return fail(result.error, { state: serverState() });
+    }
     profile = upsertServerProfile({ ...profile, host, port, username }, { activate: true });
     if (payload.remember) {
       const saved = settingsModule.saveServerSecret(profile.id, password);
