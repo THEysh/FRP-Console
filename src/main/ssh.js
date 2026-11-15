@@ -781,6 +781,18 @@ class ServerSession {
     return { dir: '/etc/nginx/conf.d', managedBy: '' };
   }
 
+  /* 轻量判断：nginx 反代配置 frp-console.conf 是否存在。只跑两次 SSH 命令
+   * （找配置目录 + test -f），不跑完整 detectNginx 的 ss/nginx -v。用于连服务器时
+   * 快速同步「公网地址要不要带端口」。 */
+  async nginxProxyConfigured() {
+    if (!this.connected) return false;
+    try {
+      const confInfo = await this.detectNginxConfDir();
+      const proxyConf = await this.exec(`[ -f ${shellQuote(`${confInfo.dir}/frp-console.conf`)} ] && echo yes || true`, 6000);
+      return firstLine(proxyConf.stdout) === 'yes';
+    } catch { return false; }
+  }
+
   async detectNginx() {
     if (!this.connected) return { installed: false, error: '尚未连接服务器' };
     const which = await this.exec('command -v nginx 2>/dev/null || true', 6000);

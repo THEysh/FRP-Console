@@ -1913,6 +1913,15 @@ function registerIpc() {
       if (vh > 0 && Number(settings.vhostHttpPort) !== vh) settings = settingsModule.save({ vhostHttpPort: vh });
       if (vs > 0 && Number(settings.vhostHttpsPort) !== vs) settings = settingsModule.save({ vhostHttpsPort: vs });
     }
+    /* nginx 反代状态同步：服务器上 frp-console.conf 是否存在，决定 http/https 代理的
+     * 公网地址要不要带内网端口（8080/8443）。每次连服务器 / 刷新都轻量检测一次，
+     * 用户不用再去服务器页手动点「nginx 检测」，新建代理时地址就是对的。 */
+    try {
+      const proxyConfigured = await serverSession.nginxProxyConfigured();
+      if (!!proxyConfigured !== !!settings.nginxProxyEnabled) {
+        settings = settingsModule.save({ nginxProxyEnabled: !!proxyConfigured });
+      }
+    } catch { /* nginx 检测失败不影响主流程 */ }
     if (serverConfig.summary) {
       applyPortStatus(serverSession.info, serverConfig.summary);
       const sync = adoptServerAuthFromConfig();
@@ -3037,6 +3046,37 @@ const AUTO_RENEW_INTERVAL_MS = 12 * 3600 * 1000;
 let autoRenewTimer = null;
 let autoRenewRunning = false;
 
+/* 启动后台同步：用户可能还没连服务器页，但服务器上已经配好了 nginx 反代
+ * （frp-console.conf 存在）。这里用保存的密码自动连一次、只查这个事实、
+ * 同步 nginxProxyEnabled 后立即断开，让新建代理时公网地址直接就是 https://域名。 */
+async function syncNginxProxyStateInBackground() {
+  try {
+    if (serverSession.connected) return; // 已连服务器页，loadServerSnapshot 会处理
+    const profile = activeServerProfile();
+    if (!profile || !profile.host || !profile.username) return;
+    const secret = settingsModule.readServerSecret(profile.id);
+    if (!secret) return; // 没存密码，无法自动连
+    const myEpoch = sessionEpoch;
+    const conn = await serverSession.connect({
+      host: profile.host,
+      port: profile.port || 22,
+      username: profile.username,
+      password: secret,
+    });
+    if (!conn.ok) return;
+    try {
+      if (sessionEpoch !== myEpoch) return; // 期间用户操作了服务器页，放弃
+      const proxyConfigured = await serverSession.nginxProxyConfigured();
+      if (!!proxyConfigured !== !!settings.nginxProxyEnabled) {
+        settings = settingsModule.save({ nginxProxyEnabled: !!proxyConfigured });
+        pushState();
+      }
+    } finally {
+      serverSession.disconnect();
+    }
+  } catch { /* best-effort：失败不影响主流程 */ }
+}
+
 async function autoRenewExpiringCerts() {
   if (autoRenewRunning) return;
   autoRenewRunning = true;
@@ -3206,6 +3246,10 @@ async function bootstrap() {
   // 启动后先等 30 秒再跑一次自动续期检查，避开启动期的资源占用与状态竞态。
   const initialRenew = setTimeout(() => autoRenewExpiringCerts().catch(() => {}), 30000);
   if (initialRenew.unref) initialRenew.unref();
+  // 启动 5 秒后后台同步一次 nginx 反代状态：用户可能没连服务器页就新建代理，
+  // 提前把「公网地址要不要带端口」这个事实同步过来。
+  const initialNginxSync = setTimeout(() => syncNginxProxyStateInBackground().catch(() => {}), 5000);
+  if (initialNginxSync.unref) initialNginxSync.unref();
   refreshTray();
   pushState();
 }
