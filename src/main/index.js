@@ -3395,17 +3395,33 @@ function updateFlagPath() {
 }
 
 async function prepareUpdateInstall() {
-  if (!manager || !manager.isChildAlive) return;
-  try {
-    await manager.stop({ runMode: settings.runMode });
-  } catch {
-    /* 停不掉也继续：安装器自己会 taskkill 兜底 */
+  // 记录更新前隧道是否由控制台托管（用于更新后自动接回）
+  const wasManaged = !!(manager && manager.isChildAlive);
+  // 1) 优雅停掉控制台托管的 frpc（如果还在跑）
+  if (wasManaged) {
+    try {
+      await manager.stop({ runMode: settings.runMode });
+    } catch {
+      /* 停不掉也继续：下面 taskkill 兜底 */
+    }
   }
+  // 2) 兜底：更新时绝不能留任何 frpc.exe 进程在跑。它会锁住安装目录里的
+  //    内置 frpc.exe（resources/frpc），导致 NSIS 卸载旧文件时 Rename 失败，
+  //    报 "Failed to uninstall old application files"。taskkill 找不到进程
+  //    会返回非 0，属正常，忽略即可。
   try {
-    const file = updateFlagPath();
-    if (file) fs.writeFileSync(file, JSON.stringify({ at: Date.now() }), 'utf8');
+    await execFileP('taskkill.exe', ['/F', '/IM', 'frpc.exe'], { timeout: 8000 });
   } catch {
-    /* 便条写不下去只影响“更新后自动拉起隧道”，不影响更新本身 */
+    /* execFileP 不 reject，此处仅保险 */
+  }
+  // 3) 写便条：更新后凭它把隧道接回来
+  if (wasManaged) {
+    try {
+      const file = updateFlagPath();
+      if (file) fs.writeFileSync(file, JSON.stringify({ at: Date.now() }), 'utf8');
+    } catch {
+      /* 便条写不下去只影响“更新后自动拉起隧道”，不影响更新本身 */
+    }
   }
 }
 

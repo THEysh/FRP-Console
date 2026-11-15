@@ -26,6 +26,12 @@
 !macro customCheckAppRunning
   nsExec::Exec '"$SYSDIR\taskkill.exe" /F /IM "${APP_EXECUTABLE_FILENAME}"'
   Pop $0
+  ; 双保险：隧道进程虽然应由应用在 prepareUpdateInstall / quitApp 里先停掉，
+  ; 但如果停晚了或没停干净，它会锁住安装目录里的内置 frpc.exe，导致卸载旧
+  ; 文件 Rename 失败、报 "Failed to uninstall old application files"。
+  ; 这里再补一刀（同样不带 /T，frpc.exe 也不是安装器，不会误杀自己）。
+  nsExec::Exec '"$SYSDIR\taskkill.exe" /F /IM "frpc.exe"'
+  Pop $0
   Sleep 700
 !macroend
 
