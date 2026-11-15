@@ -402,6 +402,23 @@ node tools/cdp-shot.cjs .proxy-row out.png # 按选择器截单个元素
 
 ## 更新日志
 
+### 1.2.32
+
+修两个升级到 1.2.31 仍然存在的问题：**「隧道显示成功、浏览器打开却是 frp 的 404 页」**，以及**「从老版本（1.2.28 及以前）升级仍报 `Failed to uninstall old application files.: 2`」**。
+
+**① nginx 反代（方案 Y）下 https 代理的 404 假绿**：服务器由 nginx 统一终止 TLS 后，若代理仍配置成 `https` 类型（或带 `https2http` / `https2https` 插件），frpc 会把它注册到 frps 的 `vhostHTTPSPort` 内网端口——nginx 永远不会转发它，表现为控制台三层检查全绿、浏览器打开却是 frp 的 404 页。现在：
+
+- 检测到服务器已配 nginx 反代时，`https` 类型及 TLS 插件代理在加载/保存时自动纠正为纯 `http`（TLS 交给 nginx），并在保存时弹提示说明原因；无需证书插件，浏览器直接访问 `https://域名` 即可。
+- 健康检查的公网层改走真实入口 `https://服务器IP/`（带域名 SNI + Host 头），不再探测内网 vhost 端口，杜绝「探测的端口恰好通、真实入口 404」的假绿。
+
+**② 老版本升级失败的根治**：老安装器（1.2.28 及以前编译）卸载自身文件时不杀 frpc；若 frpc 由 Windows 服务（nssm 等）托管，`taskkill` 后秒级被拉活、锁住安装目录，导致升级中 `Failed to uninstall old application files.: 2`。现在：
+
+- 安装器在卸载旧文件前循环确认 frpc 已结束（用 taskkill 退出码当探针），发现被服务托管时先请求停止 `nssmfrpc` / `frpc` 服务再杀，最多 3 轮。
+- 应用侧在更新安装前同样检测服务托管并尽力停止，杀不干净时记日志提醒。
+- **已知行为**：升级会结束正在运行的 frpc 进程（包括服务托管的）；若你用 nssm 托管 frpc，升级后它会自动重启，隧道会闪断几秒。
+
+**③ 顺带**：`npm start` / `npm run dev` 改为经 `tools/dev.cjs` 启动——自动剔除 `ELECTRON_RUN_AS_NODE` 环境变量（部分 CI/受限会话注入它会导致 electron 以纯 Node 模式启动、窗口不出现）、自动用项目内 `.frp-console-data` 数据目录与独立实例端口，可与安装版并存（`npm run dev:raw` 保持原行为）。单实例锁获取失败时也会在终端打印原因，不再静默退出。
+
 ### 1.2.31
 
 修「应用内更新时偶发 `Failed to uninstall old application files`」：升级过程中安装目录里的内置 `frpc.exe` 若还被隧道进程占用，NSIS 卸载旧文件那一步会失败。

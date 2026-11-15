@@ -33,6 +33,27 @@
   nsExec::Exec '"$SYSDIR\taskkill.exe" /F /IM "frpc.exe"'
   Pop $0
   Sleep 700
+
+  ; ---- frpc.exe 可能被 Windows 服务（nssm 等）托管：taskkill 后秒级被拉活，
+  ;      旧卸载器搬文件时它又锁着目录。taskkill 的退出码正好当探针用：
+  ;      0 = 刚杀掉了 frpc（说明刚才还活着，服务可能会拉活它，再等一轮确认），
+  ;      非 0 = 找不到 frpc 进程（已经死透了）。
+  ;      循环里先请求停止常见托管服务再杀，最多 3 轮 × 1s。----
+  StrCpy $R0 0
+  frp_frpc_check_loop:
+    IntOp $R0 $R0 + 1
+    StrCmp $R0 4 frp_frpc_done 0
+    nsExec::Exec '"$SYSDIR\taskkill.exe" /F /IM "frpc.exe"'
+    Pop $0
+    StrCmp $0 "0" 0 frp_frpc_done
+    ; 刚才还有活的 frpc：停掉托管它的服务（不存在/没权限都会失败，忽略），再杀一刀
+    nsExec::Exec '"$SYSDIR\sc.exe" stop nssmfrpc'
+    Pop $0
+    nsExec::Exec '"$SYSDIR\sc.exe" stop frpc'
+    Pop $0
+    Sleep 1000
+    Goto frp_frpc_check_loop
+  frp_frpc_done:
 !macroend
 
 ; ---------------------------------------------------------------------------

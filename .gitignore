@@ -10,6 +10,8 @@ dist-*/
 # 运行期数据（便携版会在 exe 同级生成）
 frp-console-data/
 frp-console-backups/
+# 源码模式在受限会话（如 DSH 沙箱）里的开发数据目录
+.frp-console-data/
 
 # 本机常驻的 frpc 运行时（frpc.exe + 含 token 的 frpc.toml，绝不入库）
 runtime/

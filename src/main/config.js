@@ -72,7 +72,7 @@ function normalizeWebServer(raw) {
   };
 }
 
-function normalizeProxy(raw) {
+function normalizeProxy(raw, options = {}) {
   const proxy = isPlainObject(raw) ? { ...raw } : {};
   proxy.name = typeof proxy.name === 'string' ? proxy.name.trim() : '';
   proxy.type = typeof proxy.type === 'string' && proxy.type ? proxy.type.trim().toLowerCase() : 'tcp';
@@ -83,6 +83,14 @@ function normalizeProxy(raw) {
   // 「Client sent an HTTP request to an HTTPS server」。加载时自动纠正成 https。
   if (isPlainObject(proxy.plugin) && ['https2http', 'https2https'].includes(proxy.plugin.type) && proxy.type !== 'https') {
     proxy.type = 'https';
+  }
+  /* 方案 Y（服务器 nginx 已统一终止 TLS）：公网入口只有 nginx 443 → frps vhostHTTPPort。
+   * https + https2http/https2https 插件会把代理注册到 frps 的 vhostHTTPSPort（内网端口），
+   * nginx 永远不会转发它 —— 表现为「控制台全绿、浏览器打开是 frp 的 404 页」。
+   * 插件意味着后端本来就是明文 HTTP，Y 模式下统一纠正成纯 http，TLS 交给 nginx。 */
+  if (options.nginxProxyEnabled && isPlainObject(proxy.plugin) && ['https2http', 'https2https'].includes(proxy.plugin.type)) {
+    proxy.type = 'http';
+    delete proxy.plugin;
   }
   // 只保留该类型真正认的字段：手改过的配置里常见 stcp 带 remotePort、
   // tcpmux 带 remotePort，写回去 frpc 会整份配置拒绝启动。
@@ -102,7 +110,7 @@ function normalizeProxy(raw) {
   return proxy;
 }
 
-function normalize(raw) {
+function normalize(raw, options = {}) {
   const src = isPlainObject(raw) ? raw : {};
   const extras = {};
   for (const [key, value] of Object.entries(src)) {
@@ -116,15 +124,15 @@ function normalize(raw) {
     log: normalizeLog(src.log),
     webServer: normalizeWebServer(src.webServer),
     transport: isPlainObject(src.transport) ? { ...src.transport } : null,
-    proxies: Array.isArray(src.proxies) ? src.proxies.map(normalizeProxy) : [],
+    proxies: Array.isArray(src.proxies) ? src.proxies.map((p) => normalizeProxy(p, options)) : [],
     visitors: Array.isArray(src.visitors) ? src.visitors.map((v) => (isPlainObject(v) ? { ...v } : v)) : [],
     _extra: extras,
   };
   return model;
 }
 
-function parseConfigText(text) {
-  return normalize(toml.parse(text));
+function parseConfigText(text, options = {}) {
+  return normalize(toml.parse(text), options);
 }
 
 function readConfig(configPath) {
@@ -545,6 +553,24 @@ function vhostPortOf(type, options = {}) {
 function probeTargetFor(model, proxy, options = {}) {
   if (!model.serverAddr) return null;
   const type = proxy.type || 'tcp';
+  if (type === 'http' || type === 'https') {
+    const domain = firstDomainOf(proxy);
+    if (!domain) return null;
+    /* 方案 Y：公网入口是 nginx 的 443（终止 TLS 后转 frps vhostHTTPPort），
+     * frps 自己的 vhost 端口（8080/8443）只是内网。健康检查必须走真实入口，
+     * 否则会出现「探测 8443 全绿、浏览器经 nginx 打开是 404」的假绿。 */
+    if (options.nginxProxyEnabled) {
+      return {
+        kind: 'http',
+        url: `https://${model.serverAddr}/`,
+        host: domain,
+        servername: domain,
+        rejectUnauthorized: false,
+        port: 443,
+        display: publicAddressFor(model, proxy, options),
+      };
+    }
+  }
   if (type === 'http') {
     const domain = firstDomainOf(proxy);
     if (!domain) return null;
@@ -573,7 +599,7 @@ function probeTargetFor(model, proxy, options = {}) {
   return null;
 }
 
-function makeProxy(input) {
+function makeProxy(input, options = {}) {
   const type = String(input.type || 'tcp').toLowerCase();
   const base = {
     name: String(input.name || '').trim(),
@@ -601,6 +627,13 @@ function makeProxy(input) {
       // 而 type=http 会注册到 vhostHTTPPort，frps 收到明文 HTTP 会报
       // 「Client sent an HTTP request to an HTTPS server」。这里把类型纠正成 https。
       base.type = 'https';
+    }
+    /* 方案 Y：同 normalizeProxy 里的理由 —— nginx 已统一终止 TLS，
+     * http/https 一律纯 http、不带插件，否则注册到内网 vhostHTTPSPort，
+     * 浏览器经 nginx 访问是 404。 */
+    if (options.nginxProxyEnabled) {
+      base.type = 'http';
+      delete base.plugin;
     }
   }
   if (input.secretKey) base.secretKey = String(input.secretKey);

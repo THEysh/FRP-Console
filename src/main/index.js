@@ -1,5 +1,30 @@
 'use strict';
 
+/* ELECTRON_RUN_AS_NODE=1 会让 electron 以纯 Node 模式执行本文件（不少 CI/受限
+ * 会话会注入这个变量），此时 require('electron') 拿不到 app，第 8 行 app.setName
+ * 直接 TypeError、退出码 1，看起来就是“electron . 启动不了、窗口不出现”。
+ * 这里检测到就清除它，并重新以 GUI 模式拉起同一个 electron，本进程干净退出。
+ * 子进程继承的是已删掉该变量后的环境，不会再次触发这段逻辑。 */
+if (process.env.ELECTRON_RUN_AS_NODE === '1') {
+  const nodePath = require('node:path');
+  const { spawn } = require('node:child_process');
+  delete process.env.ELECTRON_RUN_AS_NODE;
+  const appDir = nodePath.resolve(__dirname, '..', '..'); // <根>/src/main -> 项目根
+  /* 受限会话（如 DSH 沙箱）里，Electron 无法在工作区外（%LOCALAPPDATA%）创建
+   * SingletonLock，会报 "Lock file can not be created! Error code: 5" 后静默退出。
+   * 把 userData 指到项目内，绕过这个限制；正常终端不会有这个变量，不受影响。 */
+  if (!process.env.PORTABLE_EXECUTABLE_DIR) {
+    process.env.PORTABLE_EXECUTABLE_DIR = nodePath.join(appDir, '.frp-console-data');
+  }
+  const child = spawn(process.execPath, [appDir, ...process.argv.slice(2)], {
+    detached: true,
+    stdio: 'inherit', // 继承终端，GUI 启动失败的报错能透传出来，而不是静默消失
+    env: process.env,
+  });
+  child.unref();
+  process.exit(0);
+}
+
 const fs = require('node:fs');
 const path = require('node:path');
 const net = require('node:net');
@@ -21,6 +46,12 @@ if (process.platform === 'win32') app.setAppUserModelId('cn.ysh.frp-console');
   if (process.env.PORTABLE_EXECUTABLE_DIR) {
     candidates.push(path.join(process.env.PORTABLE_EXECUTABLE_DIR, 'frp-console-data'));
   }
+  /* 源码开发模式：数据放项目内 .frp-console-data，避免与安装版抢
+   * %LOCALAPPDATA%\frp-console 的单实例锁 —— 两边同时在跑时，源码版会
+   * 拿不到 requestSingleInstanceLock 而静默退出，看起来就是“启动不了”。 */
+  try {
+    if (!app.isPackaged) candidates.push(path.join(app.getAppPath(), '.frp-console-data'));
+  } catch { /* getAppPath 不可用时走后面的候选 */ }
   const base = process.env.LOCALAPPDATA || process.env.APPDATA || '';
   if (base) candidates.push(path.join(base, 'frp-console'));
   candidates.push(path.join(path.dirname(process.execPath), 'frp-console-data'));
@@ -1019,7 +1050,7 @@ function loadConfigFromDisk({ initial = false } = {}) {
   }
   try {
     const text = fs.readFileSync(paths.configPath, 'utf8');
-    model = configModule.parseConfigText(text);
+    model = configModule.parseConfigText(text, { nginxProxyEnabled: !!settings.nginxProxyEnabled });
     configHash = hashText(text);
     const st = fs.statSync(paths.configPath);
     configStamp = { mtimeMs: st.mtimeMs, size: st.size };
@@ -1387,7 +1418,7 @@ async function checkExternalConfig() {
   }
   const beforeClient = settings.clientServerId;
   try {
-    model = configModule.parseConfigText(text);
+    model = configModule.parseConfigText(text, { nginxProxyEnabled: !!settings.nginxProxyEnabled });
     configHash = hash;
     configStamp = { mtimeMs: st.mtimeMs, size: st.size };
     configError = null;
@@ -1630,7 +1661,7 @@ function registerIpc() {
       webServer: model.webServer,
       proxies: model.proxies,
       visitors: model.visitors,
-    });
+    }, { nginxProxyEnabled: !!settings.nginxProxyEnabled });
     clean._sourceText = model._sourceText;
     const validation = configModule.validate(clean);
     if (validation.errors.length) return { ok: false, error: validation.errors[0].message, errors: validation.errors, validation };
@@ -1663,7 +1694,8 @@ function registerIpc() {
         auth: { ...(model.auth || {}), method: 'token', token: seed.clientToken || '' },
       }
       : model;
-    const proxy = configModule.makeProxy(input);
+    const yMode = !!settings.nginxProxyEnabled;
+    const proxy = configModule.makeProxy(input, { nginxProxyEnabled: yMode });
     const next = configModule.normalize({
       ...base._extra,
       serverAddr: base.serverAddr,
@@ -1677,7 +1709,7 @@ function registerIpc() {
         ? model.proxies.map((p) => (p.name === originalName ? { ...proxy, ...(p.secretKey && !proxy.secretKey ? { secretKey: p.secretKey } : {}) } : p))
         : [...model.proxies, proxy],
       visitors: model.visitors,
-    });
+    }, { nginxProxyEnabled: yMode });
     if (mode === 'add' && model.proxies.some((p) => p.name === proxy.name)) {
       return { ok: false, error: `代理名称「${proxy.name}」已存在`, validation: configModule.validate(next) };
     }
@@ -1686,6 +1718,12 @@ function registerIpc() {
       return { ok: false, error: validation.errors[0].message, errors: validation.errors, validation };
     }
     const proxyWarnings = certCoverageWarnings(proxy);
+    /* 方案 Y：用户填了 https 类型或 TLS 插件，被自动纠正成纯 http 时明确告知，
+     * 免得「我明明选了 https 怎么变成 http」的困惑。 */
+    const wantedTls = String(input.type || '').toLowerCase() === 'https' || !!(input.plugin && input.plugin.type);
+    if (yMode && wantedTls && proxy.type === 'http') {
+      proxyWarnings.push('此服务器已由 nginx 统一终止 TLS：已自动改为 http 类型（无需证书插件），浏览器访问 https://域名 即可');
+    }
     const result = await applyAndMaybeReload(next);
     if (!result.ok) return result;
     // 地址是这次现填的：顺手把「本机隧道目标」记到这个档案上，概览和服务器页才不会
@@ -1708,7 +1746,7 @@ function registerIpc() {
       webServer: model.webServer,
       proxies: model.proxies.filter((p) => p.name !== name),
       visitors: model.visitors,
-    });
+    }, { nginxProxyEnabled: !!settings.nginxProxyEnabled });
     healthCache.delete(name);
     const result = await applyAndMaybeReload(next);
     if (!result.ok) return result;
@@ -3414,6 +3452,33 @@ async function prepareUpdateInstall() {
   } catch {
     /* execFileP 不 reject，此处仅保险 */
   }
+  // 2b) frpc 若由 Windows 服务托管（nssm 等），taskkill 后会立刻被拉活，
+  //     还是锁着安装目录。尽力停一下常见服务（per-user 应用通常没有
+  //     管理员权限，停不掉就交给安装器/用户处理），然后再确认一次。
+  for (const svc of ['nssmfrpc', 'frpc']) {
+    try {
+      const q = await execFileP('sc.exe', ['query', svc], { timeout: 5000 });
+      if (q && /RUNNING/.test(q.stdout || '')) {
+        try {
+          await execFileP('sc.exe', ['stop', svc], { timeout: 5000 });
+          console.log(`[update] 已请求停止服务 ${svc}（frpc 由服务托管）`);
+        } catch {
+          console.log(`[update] 服务 ${svc} 在运行但停不掉（可能需要管理员权限）`);
+        }
+      }
+    } catch {
+      /* 服务不存在（退出码 1060）——正常，跳过 */
+    }
+  }
+  // 2c) 最终确认：还有 frpc.exe 在跑就记日志提醒（不阻塞更新流程）
+  try {
+    const list = await execFileP('tasklist.exe', ['/FI', 'IMAGENAME eq frpc.exe'], { timeout: 5000 });
+    if (list && /frpc\.exe/i.test(list.stdout || '')) {
+      console.warn('[update] 警告：更新前 frpc.exe 仍在运行，可能锁住安装目录导致升级失败');
+    }
+  } catch {
+    /* 查询失败不影响更新 */
+  }
   // 3) 写便条：更新后凭它把隧道接回来
   if (wasManaged) {
     try {
@@ -3481,6 +3546,10 @@ function startApp() {
 }
 
 if (!gotLock) {
+  /* GUI 程序从终端启动时崩溃/退出不打字到控制台，这里显式写到 stderr，
+   * 让「为什么窗口没出来」至少有一条线索（npm start 的开发模式能看到）。 */
+  console.error('[frp-console] userData 被另一个实例占用（单实例锁获取失败），本进程退出。'
+    + '若你想同时跑源码版和安装版，请用 npm start（自动使用独立数据目录）。');
   app.quit();
 } else {
   app.on('second-instance', () => {
@@ -3508,6 +3577,8 @@ if (!gotLock) {
       return;
     }
     // 第二个实例必须干净退场：不建窗口、不建托盘、不碰隧道。
+    console.error('[frp-console] 检测到已有一个控制台实例在运行（端口 '
+      + (Number(process.env.FRP_INSTANCE_PORT) || 47823) + '），已把它叫到前台，本进程退出。');
     quitAllowed = true;
     setTimeout(() => app.exit(0), 250);
   });
