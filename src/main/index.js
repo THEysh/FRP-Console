@@ -157,6 +157,73 @@ function activeServerProfile() {
   return findServerProfile(settings.activeServerId) || serverProfiles()[0] || null;
 }
 
+/* 方案 Y（nginx 统一终止 TLS）是「某台服务器」的事实，跟着档案走。
+ * 读取按隧道绑定的档案（clientServerId，frpc.toml 实际指向的那台）解析；
+ * 没有绑定档案时退回当前查看的档案。以前存成全局开关，多服务器用户
+ * 切档案后会被上一台的状态污染（无 nginx 的服务器也按 https://域名 显示、探测）。 */
+function yModeEnabled() {
+  const bound = findServerProfile(settings.clientServerId) || activeServerProfile();
+  return !!(bound && bound.nginxProxyEnabled);
+}
+
+/* 把 nginx 反代状态写到「这台服务器」的档案上，不再写全局开关。
+ * 返回是否真的发生了变化（没变就不动 settings）。 */
+function setProfileNginxProxy(profileId, value) {
+  if (!profileId) return false;
+  const list = serverProfiles();
+  const target = list.find((item) => item.id === profileId);
+  if (!target || !!target.nginxProxyEnabled === !!value) return false;
+  settings = settingsModule.save({ servers: list.map((item) => (item.id === profileId ? { ...item, nginxProxyEnabled: !!value } : item)) });
+  return true;
+}
+
+/* frps 的 vhost 端口同样是「某台服务器」的事实，跟着档案走。
+ * 优先级：① SSH 正连着的就是隧道绑定的那台 → 用刚读到的 serverConfig.summary（实时权威）；
+ * ② 隧道绑定档案里记录的 vhostHttpPort/vhostHttpsPort（上次连它时读到并存下来的）；
+ * ③ 全局 settings 只在「隧道没绑定任何档案」时兜底。绑定档案存在但还没连过（端口 0）
+ *    时宁可落到默认 80/443（vhostPortOf 的缺省），也不能拿「最后连过的另一台」的端口——
+ *    那台端口上若有别的服务（比如本机 Docker 的 8080），探测会得到 200 造成假绿。
+ * 以前只看 ①+③：连了 A（8080）再切回 B（28080），B 的 http 代理会按 8080 显示和探测。 */
+function boundVhostPorts() {
+  const bound = findServerProfile(settings.clientServerId) || activeServerProfile();
+  const sessionIsBound = !!(serverSession && serverSession.connected && sessionServerId && bound && sessionServerId === bound.id);
+  const srvSummary = (sessionIsBound && serverConfig.summary) || null;
+  if (bound) {
+    return {
+      vhostHttpPort: (srvSummary && srvSummary.vhostHTTPPort) || Number(bound.vhostHttpPort) || 0,
+      vhostHttpsPort: (srvSummary && srvSummary.vhostHTTPSPort) || Number(bound.vhostHttpsPort) || 0,
+    };
+  }
+  return {
+    vhostHttpPort: Number(settings.vhostHttpPort) || 0,
+    vhostHttpsPort: Number(settings.vhostHttpsPort) || 0,
+  };
+}
+
+/* 把 SSH 会话读到的 vhost 端口写进「这台服务器」的档案，返回是否发生变化。 */
+function setProfileVhostPorts(profileId, vhostHttpPort, vhostHttpsPort) {
+  if (!profileId) return false;
+  const vh = Number(vhostHttpPort) || 0;
+  const vs = Number(vhostHttpsPort) || 0;
+  const list = serverProfiles();
+  const target = list.find((item) => item.id === profileId);
+  if (!target) return false;
+  if ((Number(target.vhostHttpPort) || 0) === vh && (Number(target.vhostHttpsPort) || 0) === vs) return false;
+  settings = settingsModule.save({ servers: list.map((item) => (item.id === profileId ? { ...item, vhostHttpPort: vh, vhostHttpsPort: vs } : item)) });
+  return true;
+}
+
+/* 当前 SSH 会话对应哪台服务器的档案：按主机名匹配，匹配不上退回当前查看的档案。 */
+function profileForSession(session) {
+  const host = String((session && session.host) || '').trim().toLowerCase();
+  const list = serverProfiles();
+  if (host) {
+    const byHost = list.find((item) => String(item.host || '').trim().toLowerCase() === host);
+    if (byHost) return byHost;
+  }
+  return activeServerProfile();
+}
+
 function serverProfileView(profile) {
   return {
     id: profile.id,
@@ -946,7 +1013,9 @@ function buildState() {
     const health = healthCache.get(proxy.name) || null;
     return {
       ...proxy,
-      publicAddress: configModule.publicAddressFor(model, proxy, settings),
+      // 公网地址跟「隧道绑定档案」的 nginx 状态走，不再读全局（多服务器时全局是
+      // 最后连过的那台的事实，拿来渲染别的服务器会显示成错的 https://域名）。
+      publicAddress: configModule.publicAddressFor(model, proxy, { ...settings, ...boundVhostPorts(), nginxProxyEnabled: yModeEnabled() }),
       status: st && st.status ? st.status : runtime.loggedIn ? 'pending' : 'unknown',
       statusError: st && st.err ? st.err : '',
       runtimeLocal: st ? st.local_addr : '',
@@ -1015,6 +1084,9 @@ function settingsForState() {
   // 档案里的 Token 只在主进程使用，渲染层只需要“有没有”。
   return {
     ...rest,
+    // 兼容旧字段名：nginx 反代状态已改为按档案存储，这里始终给
+    // 「隧道绑定档案」的当前值，界面/托盘读它不会读到别的服务器的状态。
+    nginxProxyEnabled: yModeEnabled(),
     servers: (servers || []).map(({ clientToken, ...item }) => ({ ...item, hasToken: !!clientToken })),
     // DNS 验证凭据同理：token 只留在主进程，界面只要“配没配”。
     dnsHasToken: settingsModule.hasCloudflareToken(),
@@ -1050,7 +1122,7 @@ function loadConfigFromDisk({ initial = false } = {}) {
   }
   try {
     const text = fs.readFileSync(paths.configPath, 'utf8');
-    model = configModule.parseConfigText(text, { nginxProxyEnabled: !!settings.nginxProxyEnabled });
+    model = configModule.parseConfigText(text, { nginxProxyEnabled: yModeEnabled() });
     configHash = hashText(text);
     const st = fs.statSync(paths.configPath);
     configStamp = { mtimeMs: st.mtimeMs, size: st.size };
@@ -1309,13 +1381,14 @@ async function checkProxyHealth(p, ctx) {
     return [p.name, { ok: true, reason: null, ms: (local.ms || 0) + (server.ms || 0), error: null, layers, at }];
   }
   let pub;
-  // vhost 端口是 frps 侧的配置。用户连过服务器、读到过 frps.toml 后，就该按服务器
-  // 实际的 vhost 端口探测；没连过（summary 为 null）或服务器没配（0）才退回客户端设定。
-  const srvSummary = serverConfig.summary || null;
+  // vhost 端口是 frps 侧的配置。按「隧道绑定的那台服务器」解析（boundVhostPorts）：
+  // 优先 SSH 正连着的实时 summary，其次绑定档案里存的，最后才是全局兜底。
   const vhostOpts = {
     ...settings,
-    vhostHttpPort: (srvSummary && srvSummary.vhostHTTPPort) || settings.vhostHttpPort,
-    vhostHttpsPort: (srvSummary && srvSummary.vhostHTTPSPort) || settings.vhostHttpsPort,
+    ...boundVhostPorts(),
+    // settings 里的全局 nginxProxyEnabled 是「最后一次连过的服务器」的事实（兼容字段），
+    // 探测必须按隧道绑定档案解析，否则切档案后 http 代理会按错的服务器探测 443。
+    nginxProxyEnabled: yModeEnabled(),
   };
   const target = configModule.probeTargetFor(model, p, vhostOpts);
   if (!target) {
@@ -1414,11 +1487,18 @@ async function checkExternalConfig() {
   const hash = hashText(text);
   if (hash === configHash) {
     configStamp = { mtimeMs: st.mtimeMs, size: st.size };
+    // 文件内容跟「最后一次成功解析」的一样（比如坏的写完又改回来了）。
+    // 如果还挂着上一轮坏文件的解析错误，要清掉，否则界面上会一直红着，
+    // 用户把文件改回去也看不到恢复。
+    if (configError) {
+      configError = null;
+      pushState();
+    }
     return;
   }
   const beforeClient = settings.clientServerId;
   try {
-    model = configModule.parseConfigText(text, { nginxProxyEnabled: !!settings.nginxProxyEnabled });
+    model = configModule.parseConfigText(text, { nginxProxyEnabled: yModeEnabled() });
     configHash = hash;
     configStamp = { mtimeMs: st.mtimeMs, size: st.size };
     configError = null;
@@ -1444,6 +1524,9 @@ async function checkExternalConfig() {
     pushState();
   } catch (e) {
     configError = `配置解析失败：${e.message}`;
+    // 坏文件也要记 stamp：否则「坏文件→改回原内容（mtime 恰好等于旧值或被还原）」时
+    // stat 与旧 stamp 相同、函数直接 return，界面会永远红着，用户把文件改回去也不恢复。
+    configStamp = { mtimeMs: st.mtimeMs, size: st.size };
     pushState();
   }
 }
@@ -1539,6 +1622,19 @@ function registerIpc() {
     if (clean.adminPort !== undefined) clean.adminPort = Math.min(65535, Math.max(1, Number(clean.adminPort) || 7400));
     if (clean.vhostHttpPort !== undefined) clean.vhostHttpPort = Math.min(65535, Math.max(1, Number(clean.vhostHttpPort) || 80));
     if (clean.vhostHttpsPort !== undefined) clean.vhostHttpsPort = Math.min(65535, Math.max(1, Number(clean.vhostHttpsPort) || 443));
+    /* 用户在设置页手填 vhost 端口时，隧道若绑定了档案，要同步写进该档案：
+     * 探测/显示按绑定档案解析（boundVhostPorts），只改全局的话界面上看不到任何变化，
+     * 用户会以为设置没生效。 */
+    if (clean.vhostHttpPort !== undefined || clean.vhostHttpsPort !== undefined) {
+      const bound = findServerProfile(settings.clientServerId) || activeServerProfile();
+      if (bound) {
+        setProfileVhostPorts(
+          bound.id,
+          clean.vhostHttpPort !== undefined ? clean.vhostHttpPort : bound.vhostHttpPort,
+          clean.vhostHttpsPort !== undefined ? clean.vhostHttpsPort : bound.vhostHttpsPort,
+        );
+      }
+    }
     if (clean.adminPort !== undefined && Number(clean.adminPort) === Number(model && model.serverPort)) {
       return fail(`管理 API 端口不能和服务器端口 ${model.serverPort} 相同`);
     }
@@ -1661,7 +1757,7 @@ function registerIpc() {
       webServer: model.webServer,
       proxies: model.proxies,
       visitors: model.visitors,
-    }, { nginxProxyEnabled: !!settings.nginxProxyEnabled });
+    }, { nginxProxyEnabled: yModeEnabled() });
     clean._sourceText = model._sourceText;
     const validation = configModule.validate(clean);
     if (validation.errors.length) return { ok: false, error: validation.errors[0].message, errors: validation.errors, validation };
@@ -1694,7 +1790,7 @@ function registerIpc() {
         auth: { ...(model.auth || {}), method: 'token', token: seed.clientToken || '' },
       }
       : model;
-    const yMode = !!settings.nginxProxyEnabled;
+    const yMode = yModeEnabled();
     const proxy = configModule.makeProxy(input, { nginxProxyEnabled: yMode });
     const next = configModule.normalize({
       ...base._extra,
@@ -1746,7 +1842,7 @@ function registerIpc() {
       webServer: model.webServer,
       proxies: model.proxies.filter((p) => p.name !== name),
       visitors: model.visitors,
-    }, { nginxProxyEnabled: !!settings.nginxProxyEnabled });
+    }, { nginxProxyEnabled: yModeEnabled() });
     healthCache.delete(name);
     const result = await applyAndMaybeReload(next);
     if (!result.ok) return result;
@@ -1942,12 +2038,16 @@ function registerIpc() {
     if (serverConfig.summary && serverConfig.summary.webPort && serverSession.host && !settings.frpsDashboardUrl) {
       settings = settingsModule.save({ frpsDashboardUrl: `http://${serverSession.host}:${serverConfig.summary.webPort}` });
     }
-    /* 服务器页已经拿到真实 vhost 端口，同步到本机探测设置：否则应用重启后还没重连服务器页，
-     * 概览健康检查会拿设置里的 vhost 端口（可能跟服务器实际不符）去探 http/https 代理，
-     * 把它们误报成「公网不可达」。服务器实际配置才是权威来源。 */
+    /* 服务器页已经拿到真实 vhost 端口，同步到「这台服务器」的档案：否则应用重启后
+     * 还没重连服务器页，概览健康检查会拿旧的 vhost 端口去探 http/https 代理，
+     * 把它们误报成「公网不可达」。服务器实际配置才是权威来源。
+     * 全局 settings.vhostHttpPort 继续跟着写（作为「隧道没绑定任何档案」时的兜底），
+     * 但探测/显示优先读绑定档案——否则连了 A 再切回 B 会被 A 的端口污染。 */
     if (serverConfig.summary) {
       const vh = Number(serverConfig.summary.vhostHTTPPort) || 0;
       const vs = Number(serverConfig.summary.vhostHTTPSPort) || 0;
+      const vhostProfile = profileForSession(serverSession);
+      if (vhostProfile && (vh > 0 || vs > 0)) setProfileVhostPorts(vhostProfile.id, vh, vs);
       if (vh > 0 && Number(settings.vhostHttpPort) !== vh) settings = settingsModule.save({ vhostHttpPort: vh });
       if (vs > 0 && Number(settings.vhostHttpsPort) !== vs) settings = settingsModule.save({ vhostHttpsPort: vs });
     }
@@ -1956,9 +2056,8 @@ function registerIpc() {
      * 用户不用再去服务器页手动点「nginx 检测」，新建代理时地址就是对的。 */
     try {
       const proxyConfigured = await serverSession.nginxProxyConfigured();
-      if (!!proxyConfigured !== !!settings.nginxProxyEnabled) {
-        settings = settingsModule.save({ nginxProxyEnabled: !!proxyConfigured });
-      }
+      // 状态是「这台服务器」的：写进对应档案，而不是全局开关。
+      setProfileNginxProxy(profileForSession(serverSession).id, proxyConfigured);
     } catch { /* nginx 检测失败不影响主流程 */ }
     if (serverConfig.summary) {
       applyPortStatus(serverSession.info, serverConfig.summary);
@@ -2443,9 +2542,8 @@ function registerIpc() {
     try {
       const det = await serverSession.detectNginx();
       // 同步 nginx 反代状态：frp-console.conf 是否存在，决定 http/https 代理的公网地址要不要带端口。
-      if (!!det.proxyConfigured !== !!settings.nginxProxyEnabled) {
-        settings = settingsModule.save({ nginxProxyEnabled: !!det.proxyConfigured });
-      }
+      // 状态属于「这台服务器」，写进对应档案。
+      setProfileNginxProxy(profileForSession(serverSession).id, det.proxyConfigured);
       return ok(det);
     } catch (e) {
       return fail(String((e && e.message) || e));
@@ -2779,9 +2877,7 @@ function registerIpc() {
     const reload = await serverSession.reloadNginx();
     if (!reload.ok) return reload;
     // 反代配置写成功并 reload 后，公网入口就是 nginx 443，代理地址不再带端口。
-    if (!settings.nginxProxyEnabled) {
-      settings = settingsModule.save({ nginxProxyEnabled: true });
-    }
+    setProfileNginxProxy(profileForSession(serverSession).id, true);
     return { ok: true, serverNames, certDir: upload.dir, frpsHttpPort };
   }
 
@@ -3105,10 +3201,8 @@ async function syncNginxProxyStateInBackground() {
     try {
       if (sessionEpoch !== myEpoch) return; // 期间用户操作了服务器页，放弃
       const proxyConfigured = await serverSession.nginxProxyConfigured();
-      if (!!proxyConfigured !== !!settings.nginxProxyEnabled) {
-        settings = settingsModule.save({ nginxProxyEnabled: !!proxyConfigured });
-        pushState();
-      }
+      // 状态属于「这台服务器」的档案；同步后立即断开。
+      if (setProfileNginxProxy(profile.id, proxyConfigured)) pushState();
     } finally {
       serverSession.disconnect();
     }

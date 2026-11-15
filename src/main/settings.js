@@ -59,6 +59,7 @@ function newServerId() {
 function normalizeServerProfile(input = {}) {
   const host = String(input.host || '').trim();
   const port = Number(input.port) || 22;
+  const clampPort = (n) => { const v = Number(n) || 0; return Number.isInteger(v) && v > 0 && v < 65536 ? v : 0; };
   return {
     id: String(input.id || '').trim() || newServerId(),
     name: String(input.name || '').trim() || host || '新服务器',
@@ -70,6 +71,15 @@ function normalizeServerProfile(input = {}) {
     configPath: String(input.configPath || ''),
     serviceName: String(input.serviceName || 'frps'),
     dashboardUrl: String(input.dashboardUrl || ''),
+    // 方案 Y 是「这台服务器」的事实（它上面配没配 nginx 反代），跟着档案走。
+    // 以前存成全局开关：多服务器用户切档案后会被上一台的状态污染
+    //（比如 lab 无 nginx，http 代理却按 https://域名 显示和探测）。
+    nginxProxyEnabled: !!input.nginxProxyEnabled,
+    // frps 的 vhost 端口同样是「这台服务器」的事实，跟着档案走（0 = 还没读到过）。
+    // 以前只存全局 settings.vhostHttpPort：连了 A（8080）再切回 B（28080），
+    // B 的 http 代理会按 A 的端口显示和探测，甚至探测到本机同端口的无关服务（假绿）。
+    vhostHttpPort: clampPort(input.vhostHttpPort),
+    vhostHttpsPort: clampPort(input.vhostHttpsPort),
     createdAt: Number(input.createdAt) || Date.now(),
     lastConnectedAt: Number(input.lastConnectedAt) || 0,
   };
@@ -119,6 +129,37 @@ function load() {
   if (!servers.some((item) => item.id === activeServerId)) activeServerId = '';
   let clientServerId = String(base.clientServerId || '');
   if (!servers.some((item) => item.id === clientServerId)) clientServerId = '';
+  // 迁移：老版本把 nginxProxyEnabled 存成全局开关。它其实是「某台服务器」的事实。
+  // 这个 true 只会在「连服务器页检测到 nginx 反代」时被置位（旧代码是全局覆盖写），
+  // 也就是说：全局为 true ⇒ 最后一次连接的那台服务器配了 nginx（连到没配的会把
+  // 它覆盖回 false）。所以归属按 lastConnectedAt 最新优先；activeServerId 会被
+  // serverApply 切换隧道目标改写、clientServerId 是绑定关系，都可能指向别的机器，
+  // 只作兜底。seed 错档案会让那台机器的 http 代理被错误按「已配 nginx」处理
+  // （公网地址/探测全走错）。
+  if (base.nginxProxyEnabled && servers.length && !servers.some((item) => item.nginxProxyEnabled)) {
+    const byRecent = [...servers].sort((a, b) => (b.lastConnectedAt || 0) - (a.lastConnectedAt || 0));
+    const target = byRecent.find((item) => item.lastConnectedAt)
+      || servers.find((item) => item.id === activeServerId)
+      || servers.find((item) => item.id === clientServerId)
+      || servers[0];
+    target.nginxProxyEnabled = true;
+  }
+  // 迁移：老版本只把 vhost 端口存成全局 settings.vhostHttpPort/vhostHttpsPort。它跟
+  // nginxProxyEnabled 一样是「最后一次连过的服务器」的事实，归属按同样的规则 seed 进
+  // 档案；全局值保留，作为「隧道没绑定任何档案」时的兜底。
+  if (servers.length && !servers.some((item) => item.vhostHttpPort || item.vhostHttpsPort)) {
+    const gHttp = Number(base.vhostHttpPort) || 0;
+    const gHttps = Number(base.vhostHttpsPort) || 0;
+    if (gHttp > 0 || gHttps > 0) {
+      const byRecent = [...servers].sort((a, b) => (b.lastConnectedAt || 0) - (a.lastConnectedAt || 0));
+      const target = byRecent.find((item) => item.lastConnectedAt)
+        || servers.find((item) => item.id === activeServerId)
+        || servers.find((item) => item.id === clientServerId)
+        || servers[0];
+      target.vhostHttpPort = gHttp;
+      target.vhostHttpsPort = gHttps;
+    }
+  }
   cached = {
     ...DEFAULT_SETTINGS,
     ...base,

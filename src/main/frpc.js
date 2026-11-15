@@ -141,13 +141,26 @@ class FrpcManager extends EventEmitter {
        * 端口是固定的（默认 7400），同一台机器上另一份配置、另一个控制台实例、
        * 或者用户手工开的 frpc 都可能占着它：那时 /api/status 会把别人的隧道
        * 当成自己的报上来，点“停止隧道”还会把别人的进程停掉。
-       * 用 /api/config 把身份核对一遍（只在状态刚变成可用、或每分钟做一次）。 */
+       * 用 /api/config 把身份核对一遍（只在状态刚变成可用、或每分钟做一次）。
+       * /api/status 直接 401 也一样：自家 frpc 用的就是这份配置里的密码，
+       * 端口上的 frpc 连密码都对不上，必然不是这份配置的进程。
+       * 试着用「常见默认密码」再探一次：能对上说明是别人的 frpc（不是我们的），
+       * 记成 foreign 并给出准确提示，而不是误导用户「请检查 webServer.user/password」
+       * （用户根本没改过密码）。 */
       if (this.apiOk && (!previousOk || !this.ownershipAt || Date.now() - this.ownershipAt > 60000)) {
         this.ownership = await this.detectOwnership();
         this.ownershipAt = Date.now();
       } else if (!this.apiOk) {
         this.ownership = 'unknown';
         this.ownershipAt = 0;
+        if (previousOk === false && this.apiError === '管理 API 认证失败，请检查 webServer.user / password' && !this.isChildAlive) {
+          // 自家 frpc 不在跑，端口上却有「别的密码」的 frpc 在应答 → foreign
+          const foreign = await this.probeForeignOwner();
+          if (foreign) {
+            this.ownership = 'foreign';
+            this.apiError = `管理端口 ${this.admin.port} 被另一个 frpc 占用（不是这份配置的），请先关掉它或换一个 adminPort`;
+          }
+        }
       }
       this.lastRefreshAt = Date.now();
       return this.snapshot();
@@ -230,6 +243,22 @@ class FrpcManager extends EventEmitter {
       lastRefreshAt: this.lastRefreshAt,
       lastExit: this.lastExit,
     };
+  }
+
+  /* 端口上有 frpc 在应答但 /api/status 用自家密码 401：再用默认密码 admin/admin
+   * 探一次。能对上 → 是别人手工开的 frpc（我们从未用 admin/admin），判 foreign；
+   * 仍 401 → 认不出来（可能是我们旧密码），保持 unknown。 */
+  async probeForeignOwner() {
+    try {
+      const res = await fetch(this.origin() + '/api/status', {
+        headers: { Authorization: 'Basic ' + Buffer.from('admin:admin').toString('base64') },
+        signal: AbortSignal.timeout(2000),
+      });
+      if (res.ok) return true;
+      return false;
+    } catch {
+      return false;
+    }
   }
 
   async ensureAdminConfig() {
