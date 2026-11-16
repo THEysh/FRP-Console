@@ -1565,7 +1565,7 @@ function firewallCardMarkup() {
       <div class="field-hint" style="padding:0 16px 6px">frps 端口：<span class="mono">${esc(frpsText)}</span></div>
       ${proxyText ? `<div class="field-hint" style="padding:0 16px 12px">代理映射端口：<span class="mono">${esc(proxyText)}</span></div>` : ''}
       ${opened
-        ? `<div class="note" style="margin:0 16px 12px">${icon('check')}<div><strong>已放行</strong><br>${esc(opened.join('、'))}</div></div>`
+        ? `<div style="padding:0 16px 12px"><div class="field-hint" style="padding:0 0 6px">已放行（${opened.length} 条，累计）：</div><div style="display:flex; flex-wrap:wrap; gap:6px;">${opened.map((p) => `<span class="tag ok">${esc(p)}</span>`).join('')}</div></div>`
         : ''}
       ${notes
         ? `<div class="note warn" style="margin:0 16px 12px">${icon('alert')}<div>${esc(notes.join('；'))}</div></div>`
@@ -1573,15 +1573,16 @@ function firewallCardMarkup() {
       ${f.manager !== 'none'
         ? `
       <div class="field-hint" style="padding:0 16px 6px">手动放行端口：</div>
-      <div style="padding:0 16px 12px; display:flex; gap:8px; align-items:center;">
-        <input id="fw-manual-port" type="text" placeholder="如 1-65500、8080、8000-9000,10000" style="flex:1; min-width:0;" ${busy ? 'disabled' : ''} />
-        <select id="fw-manual-proto" style="width:76px;" ${busy ? 'disabled' : ''}>
+      <div class="input-group" style="padding:0 16px 12px; align-items:center;">
+        <input id="fw-manual-port" class="input" type="text" placeholder="如 1-65500、8080、8000-9000,10000" ${busy ? 'disabled' : ''} />
+        <select id="fw-manual-proto" class="select" style="width:96px; flex:none;" ${busy ? 'disabled' : ''}>
+          <option value="both">tcp+udp</option>
           <option value="tcp">tcp</option>
           <option value="udp">udp</option>
         </select>
         <button class="btn" type="button" data-act="server.firewall.openports" ${busy}>${icon('plus')}<span>放行</span></button>
       </div>
-      <div class="field-hint" style="padding:0 16px 12px">支持单个端口、端口范围（如 1-65500 表示放行 1~65500）、逗号分隔多个。</div>
+      <div class="field-hint" style="padding:0 16px 12px">支持单个端口、端口范围（1-65500）、逗号分隔多个；可连续多次放行，结果在上方累计显示。</div>
       `
         : ''}
     </section>`;
@@ -3706,8 +3707,11 @@ async function handleAction(act, dataset, btn) {
           const res = await FRP.serverFirewallOpen();
           await loadServerFirewall(true);
           if (res && res.ok) {
-            S.server.firewall = { ...(S.server.firewall || {}), opened: (res.data && res.data.opened) || [], notes: (res.data && res.data.notes) || [] };
-            toast(`已放行端口${(res.data && res.data.opened && res.data.opened.length) ? `：${res.data.opened.join('、')}` : ''}`);
+            const now = (res.data && res.data.opened) || [];
+            const prev = (S.server.firewall && S.server.firewall.opened) || [];
+            const merged = [...new Set([...prev, ...now])];
+            S.server.firewall = { ...(S.server.firewall || {}), opened: merged, notes: (res.data && res.data.notes) || [] };
+            toast(`已放行端口${now.length ? `：${now.join('、')}` : ''}`);
           } else {
             toast((res && res.error) || '放行失败', 'error');
           }
@@ -3733,8 +3737,11 @@ async function handleAction(act, dataset, btn) {
           const res = await FRP.serverFirewallInstall();
           await loadServerFirewall(true);
           if (res && res.ok) {
-            S.server.firewall = { ...(S.server.firewall || {}), opened: (res.data && res.data.opened) || [], notes: (res.data && res.data.notes) || [] };
-            toast(`已安装并启用防火墙${(res.data && res.data.opened && res.data.opened.length) ? `，已放行：${res.data.opened.join('、')}` : ''}`);
+            const now = (res.data && res.data.opened) || [];
+            const prev = (S.server.firewall && S.server.firewall.opened) || [];
+            const merged = [...new Set([...prev, ...now])];
+            S.server.firewall = { ...(S.server.firewall || {}), opened: merged, notes: (res.data && res.data.notes) || [] };
+            toast(`已安装并启用防火墙${now.length ? `，已放行：${now.join('、')}` : ''}`);
           } else {
             toast((res && res.error) || '安装防火墙失败', 'error');
           }
@@ -3748,7 +3755,7 @@ async function handleAction(act, dataset, btn) {
         const input = $('#fw-manual-port');
         const protoSel = $('#fw-manual-proto');
         const text = (input && input.value || '').trim();
-        const proto = (protoSel && protoSel.value) || 'tcp';
+        const proto = (protoSel && protoSel.value) || 'both';
         if (!text) {
           toast('请输入要放行的端口', 'error');
           if (input) input.focus();
@@ -3760,14 +3767,19 @@ async function handleAction(act, dataset, btn) {
         try {
           const res = await FRP.serverFirewallOpenPorts({ text, proto });
           if (res && res.ok) {
-            S.server.firewall = { ...(S.server.firewall || {}), opened: (res.data && res.data.opened) || [], notes: (res.data && res.data.notes) || [] };
-            toast(`已放行：${((res.data && res.data.opened) || []).join('、')}`);
+            const now = (res.data && res.data.opened) || [];
+            const prev = (S.server.firewall && S.server.firewall.opened) || [];
+            const merged = [...new Set([...prev, ...now])];
+            S.server.firewall = { ...(S.server.firewall || {}), opened: merged, notes: (res.data && res.data.notes) || [] };
+            toast(`已放行：${now.join('、')}`);
           } else {
             toast((res && res.error) || '放行失败', 'error');
           }
         } finally {
           S.server.firewallBusy = false;
           renderServer(true);
+          const again = $('#fw-manual-port');
+          if (again) again.focus();
         }
         break;
       }

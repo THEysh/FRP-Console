@@ -934,7 +934,8 @@ class ServerSession {
     if (!this.connected) return { ok: false, error: '尚未连接服务器' };
     const parsed = parsePortInput(text);
     if (!parsed.ok) return parsed;
-    const protoSafe = proto === 'udp' ? 'udp' : 'tcp';
+    // proto 支持 tcp / udp / both（tcp+udp 同时放行）
+    const protos = proto === 'both' ? ['tcp', 'udp'] : [(proto === 'udp' ? 'udp' : 'tcp')];
     const ranges = parsed.ranges;
 
     // 先探测防火墙状态，给用户明确反馈，而不是默默走到 iptables 兜底。
@@ -953,35 +954,41 @@ class ServerSession {
     const notes = [];
 
     if (det.manager === 'ufw') {
-      for (const r of ranges) {
-        const spec = r.start === r.end ? `${r.start}/${protoSafe}` : `${r.start}:${r.end}/${protoSafe}`;
-        const rr = await this.exec(`${prefix}ufw allow ${spec} 2>&1`, 15000);
-        const msg = `${rr.stdout || ''}${rr.stderr || ''}`;
-        if (rr.ok || /Rule added|Skipping adding existing rule/i.test(msg)) opened.push(`${r.label}/${protoSafe}`);
-        else notes.push(`${r.label}/${protoSafe} 放行失败：${firstLine(rr.stderr || rr.stdout)}`);
+      for (const protoSafe of protos) {
+        for (const r of ranges) {
+          const spec = r.start === r.end ? `${r.start}/${protoSafe}` : `${r.start}:${r.end}/${protoSafe}`;
+          const rr = await this.exec(`${prefix}ufw allow ${spec} 2>&1`, 15000);
+          const msg = `${rr.stdout || ''}${rr.stderr || ''}`;
+          if (rr.ok || /Rule added|Skipping adding existing rule/i.test(msg)) opened.push(`${r.label}/${protoSafe}`);
+          else notes.push(`${r.label}/${protoSafe} 放行失败：${firstLine(rr.stderr || rr.stdout)}`);
+        }
       }
       return { ok: opened.length > 0, manager: 'ufw', opened, notes, ranges };
     }
 
     if (det.manager === 'firewalld') {
-      for (const r of ranges) {
-        const spec = r.start === r.end ? `${r.start}/${protoSafe}` : `${r.start}-${r.end}/${protoSafe}`;
-        const rr = await this.exec(`${prefix}firewall-cmd --permanent --add-port=${spec} 2>&1`, 15000);
-        const msg = `${rr.stdout || ''}${rr.stderr || ''}`;
-        if (rr.ok || /ALREADY_ENABLED/i.test(msg)) opened.push(`${r.label}/${protoSafe}`);
-        else notes.push(`${r.label}/${protoSafe} 放行失败：${firstLine(rr.stderr || rr.stdout)}`);
+      for (const protoSafe of protos) {
+        for (const r of ranges) {
+          const spec = r.start === r.end ? `${r.start}/${protoSafe}` : `${r.start}-${r.end}/${protoSafe}`;
+          const rr = await this.exec(`${prefix}firewall-cmd --permanent --add-port=${spec} 2>&1`, 15000);
+          const msg = `${rr.stdout || ''}${rr.stderr || ''}`;
+          if (rr.ok || /ALREADY_ENABLED/i.test(msg)) opened.push(`${r.label}/${protoSafe}`);
+          else notes.push(`${r.label}/${protoSafe} 放行失败：${firstLine(rr.stderr || rr.stdout)}`);
+        }
       }
       await this.exec(`${prefix}firewall-cmd --reload 2>/dev/null || true`, 15000);
       return { ok: opened.length > 0, manager: 'firewalld', opened, notes, ranges };
     }
 
     // 裸 iptables（规则不持久化，重启后丢失；仅兜底）
-    for (const r of ranges) {
-      const dport = r.start === r.end ? `${r.start}` : `${r.start}:${r.end}`;
-      const cmd = `iptables -C INPUT -p ${protoSafe} --dport ${dport} -j ACCEPT 2>/dev/null || iptables -I INPUT -p ${protoSafe} --dport ${dport} -j ACCEPT`;
-      const rr = await this.exec(`${prefix}${cmd}`, 15000);
-      if (rr.ok) opened.push(`${r.label}/${protoSafe}`);
-      else notes.push(`${r.label}/${protoSafe} 放行失败：${firstLine(rr.stderr || rr.stdout)}`);
+    for (const protoSafe of protos) {
+      for (const r of ranges) {
+        const dport = r.start === r.end ? `${r.start}` : `${r.start}:${r.end}`;
+        const cmd = `iptables -C INPUT -p ${protoSafe} --dport ${dport} -j ACCEPT 2>/dev/null || iptables -I INPUT -p ${protoSafe} --dport ${dport} -j ACCEPT`;
+        const rr = await this.exec(`${prefix}${cmd}`, 15000);
+        if (rr.ok) opened.push(`${r.label}/${protoSafe}`);
+        else notes.push(`${r.label}/${protoSafe} 放行失败：${firstLine(rr.stderr || rr.stdout)}`);
+      }
     }
     return { ok: opened.length > 0, manager: 'iptables', opened, notes, ranges };
   }
