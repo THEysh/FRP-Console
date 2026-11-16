@@ -135,6 +135,11 @@ function currentDnsProvider() {
 const serverSession = new ServerSession();
 let serverConfig = { path: '', content: '', summary: null, error: '' };
 let sessionServerId = '';
+
+// 服务器 allowPorts（frps 对 remotePort 的白名单），未连服务器时为 []。
+function serverAllowPorts() {
+  return (serverConfig.summary && serverConfig.summary.allowPorts) || [];
+}
 // SSH 会话代次：每次连接 / 断开 / 切档自增，异步返回时代次不符即丢弃，
 // 避免旧请求的返回值把新档案的页面状态覆盖掉。
 let sessionEpoch = 0;
@@ -1006,7 +1011,7 @@ function buildState() {
    * runtime.connected 只代表“管理 API 有响应”，frpc 连不上 frps 时它照样是 true，
    * 代理表会一直显示“同步中”。用登录状态判定才会落回“未同步”。 */
   const runtime = runtimeView(manager.snapshot());
-  const validation = model ? configModule.validate(model) : { errors: [], warnings: [] };
+  const validation = model ? configModule.validate(model, { allowPorts: serverAllowPorts() }) : { errors: [], warnings: [] };
   const proxies = (model ? model.proxies : []).map((proxy) => {
     // 管理端口上是别人的 frpc 时，它报的代理状态与本配置无关，一律当作没同步
     const st = runtime.foreign ? null : manager.proxyStatus.get(proxy.name) || null;
@@ -1148,7 +1153,7 @@ function updateLogFile() {
 }
 
 function persistModel(nextModel, { reload = true } = {}) {
-  const validation = configModule.validate(nextModel);
+  const validation = configModule.validate(nextModel, { allowPorts: serverAllowPorts() });
   if (validation.errors.length) {
     return { ok: false, errors: validation.errors, validation };
   }
@@ -1759,7 +1764,7 @@ function registerIpc() {
       visitors: model.visitors,
     }, { nginxProxyEnabled: yModeEnabled() });
     clean._sourceText = model._sourceText;
-    const validation = configModule.validate(clean);
+    const validation = configModule.validate(clean, { allowPorts: serverAllowPorts() });
     if (validation.errors.length) return { ok: false, error: validation.errors[0].message, errors: validation.errors, validation };
     const connChanged =
       clean.serverAddr !== model.serverAddr ||
@@ -1807,9 +1812,9 @@ function registerIpc() {
       visitors: model.visitors,
     }, { nginxProxyEnabled: yMode });
     if (mode === 'add' && model.proxies.some((p) => p.name === proxy.name)) {
-      return { ok: false, error: `代理名称「${proxy.name}」已存在`, validation: configModule.validate(next) };
+      return { ok: false, error: `代理名称「${proxy.name}」已存在`, validation: configModule.validate(next, { allowPorts: serverAllowPorts() }) };
     }
-    const validation = configModule.validate(next);
+    const validation = configModule.validate(next, { allowPorts: serverAllowPorts() });
     if (validation.errors.length) {
       return { ok: false, error: validation.errors[0].message, errors: validation.errors, validation };
     }
@@ -1852,7 +1857,32 @@ function registerIpc() {
 
   ipcMain.handle('proxy:suggest-port', async (event, type) => {
     if (!model) return ok({ port: 10000 });
-    return ok({ port: configModule.suggestRemotePort(model, type) });
+    const allowPorts = (serverConfig.summary && serverConfig.summary.allowPorts) || [];
+    return ok({ port: configModule.suggestRemotePort(model, type, { allowPorts }) });
+  });
+
+  ipcMain.handle('proxy:random-port', async (event, type) => {
+    if (!model) return ok({ port: 10000 });
+    const allowPorts = (serverConfig.summary && serverConfig.summary.allowPorts) || [];
+    return ok({ port: configModule.randomRemotePort(model, type, { allowPorts }) });
+  });
+
+  ipcMain.handle('proxy:check-port', async (event, port) => {
+    const n = Number(port);
+    if (!Number.isInteger(n) || n < 1 || n > 65535) return fail('端口必须是 1 - 65535 的整数');
+    if (!serverSession.connected) return fail('尚未连接服务器，无法检测端口占用');
+    const result = await serverSession.checkPortInUse(n);
+    if (!result.ok) return fail(result.error);
+    const allowPorts = (serverConfig.summary && serverConfig.summary.allowPorts) || [];
+    const allowOk = configModule.portInAllowList(n, allowPorts);
+    return ok({
+      port: n,
+      inUse: result.inUse,
+      process: result.process,
+      pid: result.pid,
+      allowOk,
+      allowPortsText: configModule.formatAllowPorts(allowPorts),
+    });
   });
 
   ipcMain.handle('tunnel:start', async () => {

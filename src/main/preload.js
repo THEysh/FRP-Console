@@ -53,6 +53,8 @@ contextBridge.exposeInMainWorld('FRP', {
   saveProxy: (mode, originalName, proxy) => invoke('proxy:save', { mode, originalName, proxy }),
   deleteProxy: (name) => invoke('proxy:delete', name),
   suggestPort: (type) => invoke('proxy:suggest-port', type),
+  randomPort: (type) => invoke('proxy:random-port', type),
+  checkPort: (port) => invoke('proxy:check-port', port),
   startTunnel: () => invoke('tunnel:start'),
   stopTunnel: () => invoke('tunnel:stop'),
   restartTunnel: () => invoke('tunnel:restart'),

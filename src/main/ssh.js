@@ -702,6 +702,25 @@ class ServerSession {
     return details.map((d) => `${d.label}（${d.port}）已被 ${d.process} 占用`);
   }
 
+  // 检查服务器上某个 TCP 端口是否已被监听（供「公网端口」检测按钮用）。
+  async checkPortInUse(port) {
+    if (!this.connected) return { ok: false, error: '尚未连接服务器' };
+    const n = Number(port);
+    if (!Number.isInteger(n) || n < 1 || n > 65535) return { ok: false, error: '端口无效' };
+    const result = await this.exec('ss -lntp 2>/dev/null || netstat -ltnp 2>/dev/null', 12000);
+    const listeners = this.parseListeners(result.stdout || '');
+    const hits = listeners.filter((l) => l.port === n);
+    const hit = hits.find((l) => l.process) || hits[0] || null;
+    return {
+      ok: true,
+      inUse: !!hit,
+      process: hit ? hit.process : null,
+      pid: hit ? hit.pid : null,
+      pids: hit ? (hit.pids || []) : [],
+      listeners: hits,
+    };
+  }
+
   // 自动放开 frps 需要监听的端口（ufw / firewalld / 裸 iptables），防止被防火墙拦截。
   async openFirewallPorts(ports) {
     if (!this.connected) return { ok: false, error: '尚未连接服务器' };

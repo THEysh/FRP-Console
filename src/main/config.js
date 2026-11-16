@@ -153,10 +153,11 @@ function readConfig(configPath) {
   return model;
 }
 
-function validate(model) {
+function validate(model, options = {}) {
   const errors = [];
   const warnings = [];
   const push = (level, field, message) => (level === 'error' ? errors : warnings).push({ field, message });
+  const allowPorts = options.allowPorts || [];
 
   if (!model.serverAddr) push('error', 'serverAddr', '服务器地址不能为空');
   else if (/\s/.test(model.serverAddr)) push('error', 'serverAddr', '服务器地址不能包含空格');
@@ -203,6 +204,10 @@ function validate(model) {
         }
         if (BROWSER_UNSAFE_PORTS.has(proxy.remotePort)) {
           push('warn', `proxies[${index}].remotePort`, `${label} 的公网端口 ${proxy.remotePort} 是浏览器（Chrome/Edge）的禁用端口，浏览器会拒绝访问（ERR_UNSAFE_PORT），建议换一个端口`);
+        }
+        if (!portInAllowList(proxy.remotePort, allowPorts)) {
+          const range = formatAllowPorts(allowPorts);
+          push('warn', `proxies[${index}].remotePort`, `${label} 的公网端口 ${proxy.remotePort} 不在服务器 allowPorts 允许范围${range ? `（${range}）` : ''}内，frps 会拒绝注册`);
         }
         const key = `${proxy.type}:${proxy.remotePort}`;
         if (remotePorts.has(key)) push('error', `proxies[${index}].remotePort`, `${label} 的公网端口 ${proxy.remotePort} 与「${remotePorts.get(key)}」重复`);
@@ -501,17 +506,65 @@ function ensureAdmin(model, options = {}) {
   return true;
 }
 
-function suggestRemotePort(model, type = 'tcp') {
-  // 只有 tcp/udp 有公网端口；tcpmux 靠域名复用，不占端口。
-  if (!HOST_TYPES.includes(type)) return null;
+/* 服务器 frps.toml 里的 allowPorts（[{start,end}|{single}]）是「客户端能申请的 remotePort 白名单」。
+ * 空数组 / 非数组 = 不限制。这里判断某个端口是否被允许。 */
+function portInAllowList(port, allowPorts) {
+  if (!Array.isArray(allowPorts) || allowPorts.length === 0) return true;
+  const n = Number(port);
+  return allowPorts.some((entry) => {
+    if (!entry || typeof entry !== 'object') return false;
+    if (entry.single != null) return n === Number(entry.single);
+    if (entry.start != null && entry.end != null) return n >= Number(entry.start) && n <= Number(entry.end);
+    return false;
+  });
+}
+
+function formatAllowPorts(allowPorts) {
+  if (!Array.isArray(allowPorts) || allowPorts.length === 0) return '';
+  return allowPorts
+    .map((entry) => {
+      if (!entry || typeof entry !== 'object') return '';
+      if (entry.single != null) return String(entry.single);
+      if (entry.start != null && entry.end != null) return `${entry.start}-${entry.end}`;
+      return '';
+    })
+    .filter(Boolean)
+    .join(',');
+}
+
+function collectUsedPorts(model) {
   const used = new Set();
   for (const proxy of model.proxies) {
     if (proxy.remotePort) used.add(Number(proxy.remotePort));
   }
   used.add(Number(model.serverPort));
+  return used;
+}
+
+function suggestRemotePort(model, type = 'tcp', options = {}) {
+  // 只有 tcp/udp 有公网端口；tcpmux 靠域名复用，不占端口。
+  if (!HOST_TYPES.includes(type)) return null;
+  const used = collectUsedPorts(model);
+  const allowPorts = options.allowPorts || [];
   let port = 10000;
-  while (port < 65000 && (used.has(port) || BROWSER_UNSAFE_PORTS.has(port))) port += 1;
-  return port;
+  while (port < 65000) {
+    if (!used.has(port) && !BROWSER_UNSAFE_PORTS.has(port) && portInAllowList(port, allowPorts)) return port;
+    port += 1;
+  }
+  return null;
+}
+
+/* 随机端口：优先在空闲 + 非浏览器黑名单 + 服务器 allowPorts 白名单里随机取一个，
+ * 随机 200 次都取不到（比如 allowPorts 范围很小）就退回顺序找。 */
+function randomRemotePort(model, type = 'tcp', options = {}) {
+  if (!HOST_TYPES.includes(type)) return null;
+  const used = collectUsedPorts(model);
+  const allowPorts = options.allowPorts || [];
+  for (let i = 0; i < 200; i++) {
+    const port = 10000 + Math.floor(Math.random() * 55000); // 10000..64999
+    if (!used.has(port) && !BROWSER_UNSAFE_PORTS.has(port) && portInAllowList(port, allowPorts)) return port;
+  }
+  return suggestRemotePort(model, type, options);
 }
 
 function firstDomainOf(proxy) {
@@ -694,6 +747,9 @@ module.exports = {
   vhostPortOf,
   ensureAdmin,
   suggestRemotePort,
+  randomRemotePort,
+  portInAllowList,
+  formatAllowPorts,
   publicAddressFor,
   makeProxy,
 };

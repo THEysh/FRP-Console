@@ -86,6 +86,7 @@ const ICON_PATHS = {
   stop: '<rect x="6" y="6" width="12" height="12" rx="2"/>',
   restart: '<path d="M20 12a8 8 0 1 1-2.4-5.7"/><path d="M20 4v4h-4"/>',
   reload: '<path d="M4 12a8 8 0 0 1 13.6-5.7"/><path d="M20 12a8 8 0 0 1-13.6 5.7"/><path d="M18 3v4h-4M6 21v-4h4"/>',
+  shuffle: '<path d="M16 3h5v5"/><path d="M4 20 21 3"/><path d="M21 16v5h-5"/><path d="m15 15 6 6M4 4l5 5"/>',
   plus: '<path d="M12 5v14M5 12h14"/>',
   search: '<circle cx="11" cy="11" r="6"/><path d="m20 20-4.2-4.2"/>',
   copy: '<rect x="8" y="8" width="11" height="11" rx="2"/><path d="M5 15a2 2 0 0 1-1-2V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 1"/>',
@@ -3804,6 +3805,39 @@ async function handleAction(act, dataset, btn) {
         }
         break;
       }
+      case 'proxyform.random': {
+        const res = await FRP.randomPort($('#pf-type') ? $('#pf-type').value : 'tcp');
+        if (res && res.ok && res.data.port) {
+          const input = $('#pf-remote');
+          if (input) input.value = res.data.port;
+        }
+        break;
+      }
+      case 'proxyform.checkport': {
+        const input = $('#pf-remote');
+        const port = input ? Number(input.value) : 0;
+        const status = $('#pf-remote-status');
+        if (!input || !Number.isInteger(port) || port < 1 || port > 65535) {
+          if (status) { status.textContent = '先填一个 1 - 65535 的端口再检测'; status.className = 'field-hint warn'; }
+          break;
+        }
+        if (status) { status.textContent = '正在连接服务器检测端口占用…'; status.className = 'field-hint'; }
+        const res = await FRP.checkPort(port);
+        if (res && res.ok) {
+          const d = res.data;
+          if (d.inUse) {
+            const who = d.process ? `（被 ${d.process} 占用` + (d.pid ? `，PID ${d.pid}` : '') + '）' : '';
+            if (status) { status.textContent = `端口 ${port} 已被占用${who}，建议换一个`; status.className = 'field-hint warn'; }
+          } else if (!d.allowOk) {
+            if (status) { status.textContent = `端口 ${port} 空闲，但不在服务器 allowPorts 允许范围` + (d.allowPortsText ? `（${d.allowPortsText}）` : '') + '，frps 会拒绝注册'; status.className = 'field-hint warn'; }
+          } else {
+            if (status) { status.textContent = `端口 ${port} 可用（服务器未占用，且在 allowPorts 允许范围内）`; status.className = 'field-hint ok'; }
+          }
+        } else {
+          if (status) { status.textContent = (res && res.error) || '检测失败'; status.className = 'field-hint warn'; }
+        }
+        break;
+      }
       case 'proxyform.type': {
         setProxyFormType(dataset.type);
         // 切到 http 时，https2http/https2https 插件不适用（只在 https 下有效），清掉。
@@ -4146,9 +4180,11 @@ function openProxyEditor({ mode, proxy = null, preset = null }) {
             <label>公网端口 <span class="req">*</span></label>
             <div class="input-group">
               <input class="input" id="pf-remote" name="remotePort" type="number" min="1" max="65535" value="${esc(initial.remotePort)}" placeholder="例如 23180" />
-              <button class="btn icon" type="button" data-act="proxyform.suggest" title="自动选择空闲端口">${icon('reload')}</button>
+              <button class="btn icon" type="button" data-act="proxyform.suggest" title="按顺序找一个空闲端口">${icon('reload')}</button>
+              <button class="btn icon" type="button" data-act="proxyform.random" title="随机一个端口">${icon('shuffle')}</button>
+              <button class="btn" type="button" data-act="proxyform.checkport" title="连服务器检查端口占用">${icon('activity')}<span>检测</span></button>
             </div>
-            <div class="field-hint">服务器上对外开放的端口，注意不要与已有服务冲突。</div>
+            <div class="field-hint" id="pf-remote-status">服务器上对外开放的端口，注意不要与已有服务冲突。</div>
           </div>
           <div class="field span-2 hidden" id="pf-domain-field">
             <label>自定义域名（逗号分隔）</label>
