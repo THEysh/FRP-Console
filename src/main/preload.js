@@ -113,6 +113,7 @@ contextBridge.exposeInMainWorld('FRP', {
   clearLogs: () => invoke('logs:clear'),
   exportLogs: () => invoke('logs:export'),
   copy: (text) => invoke('clipboard:write', text),
+  clipboardRead: () => invoke('clipboard:read'),
   openUrl: (url) => invoke('shell:open', url),
   windowControl: (action) => invoke('window:control', action),
   quit: () => invoke('app:quit'),

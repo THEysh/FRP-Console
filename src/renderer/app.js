@@ -1770,6 +1770,35 @@ async function openShellTerm() {
     });
     term.onData((data) => { FRP.shellInput(data); });
 
+    // Ctrl+C 复制 / Ctrl+V 粘贴：终端里默认 Ctrl+C 是「发送中断信号」、Ctrl+V 是字面量 ^V，
+    // 但桌面习惯是「选中后 Ctrl+C 复制、Ctrl+V 粘贴」。这里按选中状态区分：
+    // 选中了文字 → Ctrl+C 复制（不发中断）；没选中 → 交回 xterm 发 \x03 中断。
+    term.attachCustomKeyEventHandler((arg) => {
+      const ev = (arg && arg.domEvent) || {};
+      const ctrl = !!(ev.ctrlKey || ev.metaKey);
+      if (ctrl && !ev.shiftKey && !ev.altKey) {
+        const k = String(ev.key || '').toLowerCase();
+        if (k === 'c') {
+          const sel = term.getSelection();
+          if (sel) {
+            FRP.copy(sel).catch(() => {});
+            term.focus();
+            return false; // 已处理：复制选中文字，不再发 \x03
+          }
+          return true; // 没选中 → 正常发 \x03 中断当前命令
+        }
+        if (k === 'v') {
+          FRP.clipboardRead().then((res) => {
+            const text = res && res.ok && res.data && res.data.text;
+            if (text) term.paste(text);
+          }).catch(() => {});
+          term.focus();
+          return false; // 已处理：粘贴剪贴板内容
+        }
+      }
+      return true; // 其余按键交回 xterm
+    });
+
     const res = await FRP.shellOpen({ rows, cols });
     if (!res || !res.ok) throw new Error((res && res.error) || '打开终端失败');
 
@@ -1845,6 +1874,8 @@ function renderServer(force = false) {
 
       ${profileBarMarkup()}
 
+      ${terminalCardMarkup()}
+
       <section class="card server-status-card ${status.key}">
         <div class="ss-light ${status.key}"></div>
         <div class="ss-main">
@@ -1883,8 +1914,6 @@ function renderServer(force = false) {
       <section class="card selftest-card" id="selftest-panel">${selftestMarkup()}</section>
 
       ${nginxCardMarkup()}
-
-      ${terminalCardMarkup()}
 
       ${firewallCardMarkup()}
 

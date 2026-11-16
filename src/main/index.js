@@ -3333,6 +3333,14 @@ function registerIpc() {
     return ok({ written: true });
   });
 
+  ipcMain.handle('clipboard:read', async () => {
+    try {
+      return ok({ text: clipboard.readText() });
+    } catch (e) {
+      return ok({ text: '' });
+    }
+  });
+
   ipcMain.handle('shell:open', async (event, url) => {
     const target = String(url || '');
     if (!/^https?:\/\//i.test(target)) return fail('只允许打开 http/https 链接');
