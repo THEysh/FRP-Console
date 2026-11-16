@@ -2819,6 +2819,8 @@ function certRow(c) {
           <strong>${esc(c.domain)}</strong>
           ${c.staging ? '<span class="badge amber">STAGING</span>' : ''}
           ${c.domain.startsWith('*.') ? '<span class="badge">通配符</span>' : ''}
+          ${!c.staging && c.nginx && c.nginx.ok ? '<span class="badge green">已部署到 nginx</span>' : ''}
+          ${!c.staging && !(c.nginx && c.nginx.ok) ? '<span class="badge amber" title="证书还没上传到服务器 nginx，https://域名 暂时访问不了">未部署到 nginx</span>' : ''}
         </div>
         <div class="cert-meta mono">
           到期 ${c.notAfter ? new Date(c.notAfter).toLocaleString('zh-CN') : '—'}
@@ -2852,17 +2854,20 @@ function domainWizardHtml() {
   const certs = S.certs.list || [];
 
   // 当前输入域名是否已有证书覆盖（按域名本身 + SAN 逐一判断）
-  const certCovers = !!domain && certs.some((c) => {
+  const coveringCert = domain ? (certs.find((c) => {
     const names = [c.domain, ...(c.domains || [])].map((d) => String(d).trim().toLowerCase()).filter(Boolean);
     return names.some((n) => n === domain || coversDomain(n, domain));
-  });
+  }) || null) : null;
+  const certCovers = !!coveringCert;
+  // 生产证书已覆盖，但还没部署到服务器 nginx 时，https://域名 实际访问不了，向导要提示。
+  const certNginxPending = !!(coveringCert && !coveringCert.staging && !(coveringCert.nginx && coveringCert.nginx.ok));
 
   const dnsOk = !!(dns && (dns.resolved || []).length && dns.pointsToServer);
   const dnsResolvedOther = !!(dns && (dns.resolved || []).length && !dns.pointsToServer);
 
   const step1 = hasToken ? 'ok' : 'warn';
   const step2 = dns ? (dnsOk ? 'ok' : 'warn') : 'idle';
-  const step3 = domain ? (certCovers ? 'ok' : 'warn') : 'idle';
+  const step3 = domain ? (certCovers && !certNginxPending ? 'ok' : 'warn') : 'idle';
   const step4 = 'idle'; // 填进代理在代理页完成，这里只做跳转提示
 
   return `
@@ -2916,7 +2921,11 @@ function domainWizardHtml() {
           <div class="dw-body">
             <strong>签发证书</strong>
             <span>${domain
-              ? (certCovers ? `已有证书覆盖 ${esc(domain)}（见下方列表，可直接填进代理）。` : `还没有覆盖 ${esc(domain)} 的证书，在下面签发一张。`)
+              ? (certCovers
+                  ? (certNginxPending
+                      ? `已有证书覆盖 ${esc(domain)}，但还没部署到服务器 nginx —— 到下方证书列表点「部署到 nginx」，之后 https://${esc(domain)} 才能访问。`
+                      : `已有证书覆盖 ${esc(domain)}（见下方列表，可直接填进代理）。`)
+                  : `还没有覆盖 ${esc(domain)} 的证书，在下面签发一张。`)
               : 'DNS 就绪后，在这里签发。'}</span>
             <div class="dw-inline-form">
               <input class="input" id="cert-domains" placeholder="example.com, *.example.com（逗号分隔）" value="${esc(w.domain || '')}" />
@@ -2935,7 +2944,7 @@ function domainWizardHtml() {
           <span class="dw-dot">4</span>
           <div class="dw-body">
             <strong>填进代理</strong>
-            <span>新建 / 编辑 http、https 代理，插件选 https2http / https2https，在「从已签发证书选择」里选证书，自定义域名填${domain ? ` <code>${esc(domain)}</code>` : '你的域名'}。</span>
+            <span>新建 / 编辑 http、https 代理，插件选 https2http / https2https，填好自定义域名后「证书快捷填入」会自动列出匹配的证书并写入路径。</span>
             <div class="dw-inline-form">
               <button class="btn small" type="button" data-act="nav" data-view="proxies">${icon('link')}<span>去代理映射</span></button>
             </div>
@@ -3809,8 +3818,8 @@ async function handleAction(act, dataset, btn) {
         refreshDomainReadiness();
         break;
       }
-      case 'proxyform.cert.pick': {
-        const domain = $('#pf-plugin-cert-pick') ? $('#pf-plugin-cert-pick').value : '';
+      case 'proxyform.cert.fill': {
+        const domain = $('#pf-plugin-cert-fill') ? $('#pf-plugin-cert-fill').value : '';
         if (!domain) break;
         const cert = (S.certs.list || []).find((c) => c.domain === domain);
         if (cert) {
@@ -3818,11 +3827,6 @@ async function handleAction(act, dataset, btn) {
           const key = $('#pf-plugin-key');
           if (crt) crt.value = cert.crtPath;
           if (key) key.value = cert.keyPath;
-          const domains = $('#pf-domains');
-          if (domains && !domains.value.trim()) {
-            domains.value = (cert.domains || []).filter((d) => !d.startsWith('*.')).join(', ') || cert.domain;
-          }
-          refreshDomainReadiness();
           toast('success', '已填入证书路径', cert.domain);
         }
         break;
@@ -3851,9 +3855,12 @@ async function handleAction(act, dataset, btn) {
           const res = await FRP.dnsSetA({ domain });
           S.certs.wizard.setA = false;
           if (res && res.ok) {
-            toast('success', '解析记录已就绪', `${res.data.name} → ${res.data.content}${res.data.updated ? '' : '（已存在，无需改动）'}`);
+            // 乐观更新：A 记录刚建/改完，公共 DNS 传播需要几分钟，立刻 dnsResolve 会拿到旧值，
+            // 让向导显示「没指向服务器」。这里直接用刚写入的 IP 作为结果，不等传播。
+            S.certs.wizard.dns = { resolved: [res.data.content], pointsToServer: true, error: '' };
+            toast('success', '解析记录已就绪', `${res.data.name} → ${res.data.content}${res.data.updated ? '' : '（已存在，无需改动；公共 DNS 传播可能需要几分钟）'}`);
           } else toastResult(res);
-          await refreshDomainWizard();
+          renderCerts(true);
         });
         break;
       }
@@ -3915,6 +3922,8 @@ async function handleAction(act, dataset, btn) {
           if (res && res.ok) {
             toast('success', '已部署到 nginx', `${res.data.serverNames} → 80/443 → frps ${res.data.frpsHttpPort}`);
           } else toastResult(res);
+          // 刷新证书列表，让「已部署到 nginx / 未部署到 nginx」徽标反映最新结果。
+          await loadCerts({ silent: true });
         });
         break;
       }
@@ -4158,13 +4167,10 @@ function openProxyEditor({ mode, proxy = null, preset = null }) {
           </div>
           <div class="field span-2 hidden" id="pf-plugin-fields">
             <div class="stack" style="gap:10px">
-              <div class="field">
-                <label>从已签发证书选择</label>
-                <select class="select" id="pf-plugin-cert-pick">
-                  <option value="">手动填写路径…</option>
-                  ${(S.certs.list || []).map((c) => `<option value="${esc(c.domain)}">${esc(c.domain)}（剩余 ${c.daysLeft} 天）</option>`).join('')}
-                </select>
-                <div class="field-hint">选择「HTTPS 证书」页签发的证书后，自动填入下方 crtPath / keyPath。</div>
+              <div class="field hidden" id="pf-plugin-cert-match-field">
+                <label>证书快捷填入</label>
+                <div id="pf-plugin-cert-match"></div>
+                <div class="field-hint">已按上方「自定义域名」自动匹配，选一张即写入下方 crtPath / keyPath。</div>
               </div>
               <div class="field">
                 <label>证书文件（crtPath）<span class="req">*</span></label>
@@ -4243,6 +4249,7 @@ function setProxyPluginFields(type) {
 
 function refreshProxyPluginFields() {
   setProxyPluginFields(currentProxyPlugin());
+  renderPluginCertMatch();
 }
 
 function setProxyFormType(type) {
@@ -4310,6 +4317,30 @@ function renderDomainReadiness(badges) {
   if (box) box.innerHTML = badges.filter(Boolean).join('');
 }
 
+function renderPluginCertMatch() {
+  const field = $('#pf-plugin-cert-match-field');
+  const box = $('#pf-plugin-cert-match');
+  if (!field || !box) return;
+  const pluginType = currentProxyPlugin();
+  const domainsInput = $('#pf-domains');
+  const domainsText = domainsInput ? domainsInput.value.trim() : '';
+  const primary = (domainsText.split(/[,，\s]+/)[0] || '').trim();
+  const matching = (pluginType && primary)
+    ? (S.certs.list || []).filter((c) => (c.domains || []).some((p) => coversDomain(p, primary)))
+    : [];
+  if (!matching.length) {
+    field.classList.add('hidden');
+    box.innerHTML = '';
+    return;
+  }
+  field.classList.remove('hidden');
+  box.innerHTML = `
+    <select class="select" id="pf-plugin-cert-fill">
+      <option value="">选择已签发证书…</option>
+      ${matching.map((c) => `<option value="${esc(c.domain)}">${esc(c.domain)}（剩余 ${c.daysLeft} 天）</option>`).join('')}
+    </select>`;
+}
+
 function refreshDomainReadiness() {
   const box = $('#pf-domain-readiness');
   if (!box) return;
@@ -4321,6 +4352,7 @@ function refreshDomainReadiness() {
   const domains = domainsText.split(/[,，\s]+/).map((d) => d.trim()).filter(Boolean);
   const primary = domains[0] || '';
   const pluginType = currentProxyPlugin();
+  renderPluginCertMatch();
 
   const syncBadges = [primary ? vhostBadgeFor(type) : '', certBadgeFor(primary, pluginType)];
   if (!primary) { renderDomainReadiness(syncBadges); return; }
@@ -4738,9 +4770,9 @@ function bindStaticEvents() {
       selectServerProfile(profileSelect.value).catch((error) => toast('error', '切换档案失败', String(error && error.message || error)));
       return;
     }
-    const certPick = e.target.closest('#pf-plugin-cert-pick');
-    if (certPick) {
-      handleAction('proxyform.cert.pick', {}, certPick);
+    const certFill = e.target.closest('#pf-plugin-cert-fill');
+    if (certFill) {
+      handleAction('proxyform.cert.fill', {}, certFill);
       return;
     }
     if (!e.target.closest('#wizard-form')) return;

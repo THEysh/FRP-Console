@@ -2865,20 +2865,24 @@ function registerIpc() {
       return { ok: false, error: '缺少证书信息' };
     }
     if (!serverSession.connected) {
-      return { ok: false, error: '尚未连接服务器，证书已保存到本机但未上传到 nginx' };
+      const r = { ok: false, error: '尚未连接服务器，证书已保存到本机但未上传到 nginx' };
+      acmeManager.markNginx(cert.domain, r);
+      return r;
     }
     const frpsHttpPort = (serverConfig.summary && Number(serverConfig.summary.vhostHTTPPort))
       || Number(settings.vhostHttpPort) || 8080;
     const upload = await serverSession.uploadCertToNginx(cert.domain, { certPath: cert.crtPath, keyPath: cert.keyPath });
-    if (!upload.ok) return upload;
+    if (!upload.ok) { acmeManager.markNginx(cert.domain, upload); return upload; }
     const serverNames = serverSession.nginxServerName(cert.domains);
     const write = await serverSession.writeNginxProxyConfig({ serverNames, certDir: upload.dir, frpsHttpPort });
-    if (!write.ok) return write;
+    if (!write.ok) { acmeManager.markNginx(cert.domain, write); return write; }
     const reload = await serverSession.reloadNginx();
-    if (!reload.ok) return reload;
+    if (!reload.ok) { acmeManager.markNginx(cert.domain, reload); return reload; }
     // 反代配置写成功并 reload 后，公网入口就是 nginx 443，代理地址不再带端口。
     setProfileNginxProxy(profileForSession(serverSession).id, true);
-    return { ok: true, serverNames, certDir: upload.dir, frpsHttpPort };
+    const r = { ok: true, serverNames, certDir: upload.dir, frpsHttpPort };
+    acmeManager.markNginx(cert.domain, r);
+    return r;
   }
 
   /* ---- HTTPS 证书（Let's Encrypt / DNS-01）---- */

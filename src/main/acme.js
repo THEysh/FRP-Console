@@ -307,6 +307,7 @@ class AcmeManager {
           crtPath: fullchainPath,
           keyPath,
           certPath,
+          nginx: meta.nginx || null,
         });
       }
     } catch { /* ignore */ }
@@ -319,6 +320,19 @@ class AcmeManager {
     const matches = this.list().filter((c) => c.domain === domain || certFolder(c.domain) === primary);
     if (staging !== undefined) return matches.find((c) => !!c.staging === !!staging) || null;
     return matches[0] || null;
+  }
+
+  /* 记录一张证书最近一次「部署到服务器 nginx」的结果（成功或失败都记），
+   * 供证书列表/域名向导显示「已部署 / 未部署」，避免签了证书但没部署到 nginx
+   * 时界面还显示一切就绪、浏览器访问 https://域名 却被拒绝。 */
+  markNginx(domain, nginxResult) {
+    const cert = this.get(String(domain || '').trim());
+    if (!cert) return false;
+    const metaPath = path.join(this.certsDir, cert.folder, 'metadata.json');
+    const meta = readJson(metaPath, null) || {};
+    meta.nginx = nginxResult && typeof nginxResult === 'object' ? { ...nginxResult, at: Date.now() } : null;
+    writeJsonAtomic(metaPath, meta);
+    return true;
   }
 
   /* 续期：对同一批域名重新走一次签发。 */
