@@ -2658,12 +2658,31 @@ function registerIpc() {
   });
 
   /* 服务器防火墙：只读状态 + 一键放行 frps 需要监听的端口。 */
+  /* 本机 frpc 指向当前服务器时，代理映射的 remotePort 也在 frps 上监听、同样需要防火墙放行。 */
+  function proxyRemotePorts() {
+    if (!model || !model.serverAddr || !serverSession.host) return [];
+    const same = String(model.serverAddr).toLowerCase() === String(serverSession.host).toLowerCase();
+    if (!same) return [];
+    const out = [];
+    const seen = new Set();
+    for (const p of model.proxies || []) {
+      if (!p.remotePort || !['tcp', 'udp', 'tcpmux'].includes(p.type)) continue;
+      const proto = p.type === 'udp' ? 'udp' : 'tcp';
+      const key = `${proto}:${p.remotePort}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ port: p.remotePort, proto, label: p.name || '代理' });
+    }
+    return out;
+  }
+
   ipcMain.handle('server:firewall-state', async () => {
     if (!serverSession.connected) return fail('尚未连接服务器');
     try {
       const det = await serverSession.detectFirewall();
-      const ports = serverConfig.summary ? serverSession.configPorts(serverConfig.content) : [];
-      return ok({ ...det, ports });
+      const cfgPorts = serverConfig.summary ? serverSession.configPorts(serverConfig.content) : [];
+      const proxyPorts = proxyRemotePorts();
+      return ok({ ...det, ports: [...cfgPorts, ...proxyPorts], frpsPorts: cfgPorts, proxyPorts });
     } catch (e) {
       return fail(String((e && e.message) || e));
     }
@@ -2672,8 +2691,26 @@ function registerIpc() {
   ipcMain.handle('server:firewall-open', async () => {
     if (!serverSession.connected) return fail('尚未连接服务器');
     try {
-      const result = await serverSession.openFirewallForConfig();
-      if (!result) return fail('没有可放行的端口（先确认服务器上已读取到 frps 配置）');
+      const cfgPorts = serverConfig.summary ? serverSession.configPorts(serverConfig.content) : [];
+      const proxyPorts = proxyRemotePorts();
+      const ports = [...cfgPorts, ...proxyPorts];
+      if (!ports.length) return fail('没有可放行的端口（先确认服务器上已读取到 frps 配置或本机代理映射）');
+      const result = await serverSession.openFirewallPorts(ports);
+      return ok(result);
+    } catch (e) {
+      return fail(String((e && e.message) || e));
+    }
+  });
+
+  /* 服务器没有防火墙时，安装并启用（ufw/firewalld），先放行 SSH 再放行 frps/代理端口。 */
+  ipcMain.handle('server:firewall-install', async () => {
+    if (!serverSession.connected) return fail('尚未连接服务器');
+    try {
+      const cfgPorts = serverConfig.summary ? serverSession.configPorts(serverConfig.content) : [];
+      const proxyPorts = proxyRemotePorts();
+      const ports = [...cfgPorts, ...proxyPorts];
+      const result = await serverSession.installFirewall(ports);
+      if (!result.ok) return fail(result.error, { manager: result.manager, opened: result.opened || [], notes: result.notes || [] });
       return ok(result);
     } catch (e) {
       return fail(String((e && e.message) || e));

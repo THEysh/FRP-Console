@@ -1538,13 +1538,19 @@ function firewallCardMarkup() {
     return `<section class="card"><div class="card-head"><div class="ch-icon">${icon('shield')}</div><div class="grow"><h3>服务器防火墙</h3><p>检测服务器防火墙，确保 frps 端口放行、客户端能连上。</p></div></div><div class="note warn" style="margin:0 16px 12px">${icon('alert')}<div>${esc(f.error)}</div></div></section>`;
   }
   const managerLabel = { ufw: 'ufw', firewalld: 'firewalld', iptables: 'iptables', none: '无防火墙' }[f.manager] || esc(f.manager || '未知');
-  const ports = Array.isArray(f.ports) ? f.ports : [];
-  const portText = ports.length ? ports.map((p) => `${p.label} ${p.port}/${p.proto}`).join('、') : '（尚未读取到 frps 配置）';
+  const frpsPorts = Array.isArray(f.frpsPorts) && f.frpsPorts.length ? f.frpsPorts : (Array.isArray(f.ports) ? f.ports : []);
+  const proxyPorts = Array.isArray(f.proxyPorts) && f.proxyPorts.length ? f.proxyPorts : [];
+  const frpsText = frpsPorts.length ? frpsPorts.map((p) => `${p.label} ${p.port}/${p.proto}`).join('、') : '（尚未读取到 frps 配置）';
+  const proxyText = proxyPorts.length ? proxyPorts.map((p) => `${p.label} ${p.port}/${p.proto}`).join('、') : '';
   const statusBadge = f.active
     ? '<span class="badge amber"><span class="bdot"></span>已启用</span>'
     : '<span class="badge green"><span class="bdot"></span>未启用</span>';
   const opened = Array.isArray(f.opened) && f.opened.length ? f.opened : null;
   const notes = Array.isArray(f.notes) && f.notes.length ? f.notes : null;
+  const busy = S.server.firewallBusy ? 'disabled' : '';
+  const mainBtn = f.manager === 'none'
+    ? `<button class="btn primary" type="button" data-act="server.firewall.install" ${busy}>${S.server.firewallBusy ? '<span class="spinner-sm"></span>' : icon('shield')}<span>${S.server.firewallBusy ? '安装中…' : '安装并启用防火墙'}</span></button>`
+    : `<button class="btn primary" type="button" data-act="server.firewall.open" ${busy}>${S.server.firewallBusy ? '<span class="spinner-sm"></span>' : icon('shield')}<span>${S.server.firewallBusy ? '放行中…' : '放行端口'}</span></button>`;
   return `
     <section class="card">
       <div class="card-head">
@@ -1553,10 +1559,11 @@ function firewallCardMarkup() {
         <div class="page-actions">
           ${statusBadge}
           <button class="btn" type="button" data-act="server.firewall.refresh">${icon('reload')}<span>重新检测</span></button>
-          <button class="btn primary" type="button" data-act="server.firewall.open" ${S.server.firewallBusy ? 'disabled' : ''}>${S.server.firewallBusy ? '<span class="spinner-sm"></span>' : icon('shield')}<span>${S.server.firewallBusy ? '放行中…' : '放行 frps 端口'}</span></button>
+          ${mainBtn}
         </div>
       </div>
-      <div class="field-hint" style="padding:0 16px 12px">需要放行的端口：<span class="mono">${esc(portText)}</span></div>
+      <div class="field-hint" style="padding:0 16px 6px">frps 端口：<span class="mono">${esc(frpsText)}</span></div>
+      ${proxyText ? `<div class="field-hint" style="padding:0 16px 12px">代理映射端口：<span class="mono">${esc(proxyText)}</span></div>` : ''}
       ${opened
         ? `<div class="note" style="margin:0 16px 12px">${icon('check')}<div><strong>已放行</strong><br>${esc(opened.join('、'))}</div></div>`
         : ''}
@@ -3686,9 +3693,36 @@ async function handleAction(act, dataset, btn) {
           await loadServerFirewall(true);
           if (res && res.ok) {
             S.server.firewall = { ...(S.server.firewall || {}), opened: (res.data && res.data.opened) || [], notes: (res.data && res.data.notes) || [] };
-            toast(`已放行 frps 端口${(res.data && res.data.opened && res.data.opened.length) ? `：${res.data.opened.join('、')}` : ''}`);
+            toast(`已放行端口${(res.data && res.data.opened && res.data.opened.length) ? `：${res.data.opened.join('、')}` : ''}`);
           } else {
             toast((res && res.error) || '放行失败', 'error');
+          }
+        } finally {
+          S.server.firewallBusy = false;
+          renderServer(true);
+        }
+        break;
+      }
+      case 'server.firewall.install': {
+        if (S.server.firewallBusy) break;
+        const okConfirm = await confirmDialog({
+          title: '安装并启用防火墙',
+          body: '服务器当前没有防火墙。将按发行版安装 ufw（Debian/Ubuntu）或 firewalld（RHEL/CentOS），先放行 SSH 端口避免断开连接，再放行 frps 与代理映射端口，最后启用。启用防火墙有极小概率因规则问题导致 SSH 断开，确定继续吗？',
+          confirmText: '安装并启用',
+          cancelText: '取消',
+          danger: true,
+        });
+        if (!okConfirm) break;
+        S.server.firewallBusy = true;
+        renderServer(true);
+        try {
+          const res = await FRP.serverFirewallInstall();
+          await loadServerFirewall(true);
+          if (res && res.ok) {
+            S.server.firewall = { ...(S.server.firewall || {}), opened: (res.data && res.data.opened) || [], notes: (res.data && res.data.notes) || [] };
+            toast(`已安装并启用防火墙${(res.data && res.data.opened && res.data.opened.length) ? `，已放行：${res.data.opened.join('、')}` : ''}`);
+          } else {
+            toast((res && res.error) || '安装防火墙失败', 'error');
           }
         } finally {
           S.server.firewallBusy = false;

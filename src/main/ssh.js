@@ -731,6 +731,56 @@ class ServerSession {
     return { ok: true, removedBinary: bin || '', serviceName, configBackup, steps };
   }
 
+  // 安装并启用防火墙（服务器当前没有 ufw/firewalld/iptables 时调用）。
+  // 按发行版选 ufw（Debian/Ubuntu）或 firewalld（RHEL/CentOS/Fedora/Rocky/Alma）。
+  // 安装后先放行 SSH 端口避免把自己踢下线，再放行传入的 frps/代理端口，最后启用。
+  async installFirewall(ports) {
+    if (!this.connected) return { ok: false, error: '尚未连接服务器' };
+    const sudo = await this.detectSudo();
+    if (!sudo.ok) return { ok: false, error: sudo.error };
+    const prefix = sudo.prefix;
+    const sshPort = Number(this.port) || 22;
+    const all = [{ port: sshPort, proto: 'tcp', label: 'SSH' }, ...(ports || [])];
+
+    const osRelease = await this.exec('cat /etc/os-release 2>/dev/null | grep -E "^ID=" | head -n 1 || true', 6000);
+    const id = (osRelease.stdout || '').trim().toLowerCase();
+    const isRhel = /rhel|centos|fedora|rocky|almalinux|alma|openeuler/.test(id);
+
+    if (isRhel) {
+      const install = await this.exec(`${prefix}command -v firewall-cmd >/dev/null 2>&1 && echo installed || (yum install -y firewalld 2>/dev/null || dnf install -y firewalld 2>/dev/null)`, 120000);
+      if (!install.ok) return { ok: false, error: `安装 firewalld 失败：${firstLine(install.stderr || install.stdout)}` };
+      await this.exec(`${prefix}systemctl enable --now firewalld 2>/dev/null || service firewalld start 2>/dev/null || true`, 20000);
+      await sleep(1500);
+      const opened = [];
+      const notes = [];
+      for (const { port, proto, label } of all) {
+        const r = await this.exec(`${prefix}firewall-cmd --permanent --add-port=${port}/${proto} 2>&1`, 15000);
+        const msg = `${r.stdout || ''}${r.stderr || ''}`;
+        if (r.ok || /ALREADY_ENABLED/i.test(msg)) opened.push(`${label}(${port}/${proto})`);
+        else notes.push(`${label}(${port}/${proto}) 开端口失败：${firstLine(r.stderr || r.stdout)}`);
+      }
+      await this.exec(`${prefix}firewall-cmd --reload 2>/dev/null || true`, 15000);
+      return { ok: opened.length > 0, manager: 'firewalld', opened, notes };
+    }
+
+    // 默认 ufw（Debian/Ubuntu 系）
+    const install = await this.exec(`${prefix}command -v ufw >/dev/null 2>&1 && echo installed || apt-get install -y ufw 2>/dev/null`, 120000);
+    if (!install.ok) return { ok: false, error: `安装 ufw 失败：${firstLine(install.stderr || install.stdout)}` };
+    const opened = [];
+    const notes = [];
+    for (const { port, proto, label } of all) {
+      const r = await this.exec(`${prefix}ufw allow ${port}/${proto} 2>&1`, 15000);
+      const msg = `${r.stdout || ''}${r.stderr || ''}`;
+      if (r.ok || /Rule added|Skipping adding existing rule/i.test(msg)) opened.push(`${label}(${port}/${proto})`);
+      else notes.push(`${label}(${port}/${proto}) 开端口失败：${firstLine(r.stderr || r.stdout)}`);
+    }
+    const enable = await this.exec(`${prefix}ufw --force enable 2>&1`, 20000);
+    if (!enable.ok) {
+      return { ok: false, error: `启用 ufw 失败：${firstLine(enable.stderr || enable.stdout)}（端口已放行，但防火墙未启用）`, manager: 'ufw', opened, notes };
+    }
+    return { ok: opened.length > 0, manager: 'ufw', opened, notes };
+  }
+
   async readConfig() {
     if (!this.connected) return { ok: false, error: '尚未连接服务器' };
     if (!this.configPath) return { ok: false, error: '未找到 frps 配置文件（支持 /etc/frp/frps.toml 等常见路径）' };
