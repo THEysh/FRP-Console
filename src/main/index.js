@@ -894,7 +894,11 @@ function connectProblemKind(text) {
   if (/authorization failed|token in login|doesn't match|authentication failed|invalid token/i.test(text)) return 'auth';
   if (/actively refused|ECONNREFUSED|拒绝/i.test(text)) return 'refused';
   if (/proxy|StatusCode|50[234]/i.test(text)) return 'proxy';
-  if (/timeout|timed out|unreachable|ECONNRESET|network is unreachable|EOF|no such host|NXDOMAIN/i.test(text)) return 'unreachable';
+  // 云防火墙/安全组「代答」特征：TCP 三次握手能成，但数据被中间设备掐断。
+  // frpc 报 EOF / session shutdown / connection reset，而不是 timeout——这正是阿里云安全组、
+  // 轻量服务器防火墙等云平台防火墙没放行端口时的典型现象（见广州 8.148.198.61 案例）。
+  if (/EOF|session shutdown|reset by peer|connection reset|ECONNRESET/i.test(text)) return 'firewall';
+  if (/timeout|timed out|unreachable|network is unreachable|no such host|NXDOMAIN/i.test(text)) return 'unreachable';
   return 'unknown';
 }
 

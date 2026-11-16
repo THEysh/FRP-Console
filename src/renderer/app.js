@@ -272,7 +272,7 @@ function runtimeInfo() {
     // frpc 起来了但没登录上 frps，或连不上后直接退出——都不能显示成“已连接”。
     // 这个分支必须排在“服务已停止”前面：装了服务但没连上时，只报“服务未运行”会把人引去启服务，
     // 而真正的原因（端口没开 / Token 不对 / 被代理拦）就藏在下面的日志里。
-    const why = { refused: '端口未监听', unreachable: '网络不可达', auth: 'Token 校验失败', proxy: '被代理/网关拦截', unconfirmed: '服务器未确认代理' }[r.connectKind] || '连接失败';
+    const why = { refused: '端口未监听', unreachable: '网络不可达', firewall: '被防火墙/安全组拦截', auth: 'Token 校验失败', proxy: '被代理/网关拦截', unconfirmed: '服务器未确认代理' }[r.connectKind] || '连接失败';
     tone = 'error';
     label = '未连上服务器';
     title = 'frpc 连不上 frps';
@@ -581,6 +581,7 @@ function renderOverview(force = false) {
     const why = {
       refused: `服务器上的 frps 没在 ${config.serverPort || 7000} 端口监听：服务没启动、端口改过，或被防火墙拒绝。`,
       unreachable: '连不到服务器端口：网络 / 安全组把它丢了，也可能本机的代理、VPN 在拦截。',
+      firewall: '隧道连上了服务器端口，但数据被中间设备掐断——很可能是云厂商防火墙/安全组没放行这个端口（阿里云安全组、轻量服务器防火墙等），也可能服务器内的 ufw/firewalld 在拦。',
       auth: 'frps 在线，但 Token 校验没过：档案里的 Token 与服务端 auth.token 不一致。',
       proxy: '本机到服务器的链路走了 HTTP 代理，请求被网关挡回 502/503。到「设置 → 运行模式与行为」打开“不继承系统代理”，或让代理放行该端口。',
       unconfirmed: 'frpc 进程起来了，但配置里的代理一个都没在服务器上注册成功，说明还没登录上 frps（端口不对、Token 不符或被网络挡了）。',
@@ -590,6 +591,7 @@ function renderOverview(force = false) {
       auth: `<button class="btn small primary" type="button" data-act="nav" data-view="server">${icon('server')}<span>去服务器页同步 Token</span></button>`,
       refused: `<button class="btn small primary" type="button" data-act="nav" data-view="server">${icon('server')}<span>去服务器页检查 frps</span></button>`,
       unreachable: `<button class="btn small primary" type="button" data-act="nav" data-view="server">${icon('server')}<span>去服务器页检查端口</span></button>`,
+      firewall: `<button class="btn small primary" type="button" data-act="nav" data-view="server">${icon('server')}<span>去服务器页放行端口</span></button>`,
       unconfirmed: `<button class="btn small primary" type="button" data-act="nav" data-view="server">${icon('server')}<span>去服务器页核对配置</span></button>`,
       proxy: `<button class="btn small primary" type="button" data-act="nav" data-view="settings">${icon('gear')}<span>打开设置关系统代理</span></button>`,
     }[runtime.connectKind] || `<button class="btn small" type="button" data-act="nav" data-view="logs">${icon('terminal')}<span>查看 frpc 日志</span></button>`;
