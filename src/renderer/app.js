@@ -2019,12 +2019,17 @@ async function autoConnectActiveProfile() {
     S.server.logs = '';
     S.server.logsError = '';
     applyServerState(res.data, seq);
+    S.server.nginx = null;      // 旧服务器的 nginx 状态不残留，连接后重新检测
+    S.server.selftest = null;   // 旧服务器的就绪检查结果不残留
   } catch (e) {
     toast('error', '自动连接失败', String((e && e.message) || e));
   } finally {
     S.server.autoConnecting = false;
     renderServer(true);
-    if (S.server.connected) loadServerLogs().catch(() => {});
+    if (S.server.connected) {
+      loadServerLogs().catch(() => {});
+      loadServerNginx(true).catch(() => {});
+    }
   }
 }
 
@@ -2412,6 +2417,8 @@ async function connectServer(btn, options = undefined) {
     S.server.previewText = '';
     S.server.logs = '';
     applyServerState(res.data, seq);
+    S.server.nginx = null;      // 旧服务器的 nginx 状态不残留，连接后重新检测
+    S.server.selftest = null;   // 旧服务器的就绪检查结果不残留
     renderServer(true);
     if (res.data && res.data.adoptProfile) {
       toast('success', '已连接并更新档案地址', `${username}@${host}:${port}`);
@@ -2419,6 +2426,7 @@ async function connectServer(btn, options = undefined) {
       toast('success', '已连接服务器', `${username}@${host}:${port}`);
     }
     await loadServerLogs();
+    loadServerNginx(true).catch(() => {});
   });
 }
 
