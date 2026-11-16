@@ -353,6 +353,7 @@ function setView(view, { force = false } = {}) {
   if (changed) {
     S.viewScroll[S.view] = $('#view') ? $('#view').scrollTop : 0;
     S.view = view;
+    // 离开服务器页时终端 DOM 会被整页重写；后端会话保留，回来时 remount 恢复。
     $$('.nav-item').forEach((el) => el.classList.toggle('active', el.dataset.view === view));
     updateChrome();
   }
@@ -1613,6 +1614,157 @@ function firewallCardMarkup() {
     </section>`;
 }
 
+/* ---------------- SSH 交互式终端（xterm.js）----------------
+ * 终端实例 / 事件退订函数放在模块级：renderServer 会整页重写 #view，
+ * DOM 里的终端容器随时可能被换掉，靠这两个引用在重渲染后重新挂载或清理。
+ * term 存活期间 renderServer 重渲染只重画「打开终端」按钮状态，不销毁会话。 */
+const shellState = {
+  term: null,        // xterm Terminal 实例
+  fit: null,         // FitAddon
+  unSub: null,       // ssh:data 退订函数
+  resizeObs: null,   // 容器尺寸监听
+  open: false,       // 后端 shell 是否在跑
+  opening: false,    // 正在打开（防连点）
+};
+
+function terminalCardMarkup() {
+  const st = shellState;
+  const busy = st.opening ? 'disabled' : '';
+  if (st.open || st.opening) {
+    return `
+      <section class="card terminal-card" id="terminal-card">
+        <div class="card-head">
+          <div class="ch-icon">${icon('terminal')}</div>
+          <div class="grow"><h3>SSH 终端</h3><p>${st.open ? `${esc(S.server.username || 'root')}@${esc(S.server.host)} · 命令直接在服务器上执行，没有二次确认` : '正在请求服务器的交互式 shell…'}</p></div>
+          <div class="page-actions">
+            ${st.open ? `<button class="btn ghost" type="button" data-act="server.shell.close">${icon('x')}<span>关闭终端</span></button>` : ''}
+          </div>
+        </div>
+        <div class="term-shell" id="ssh-term-shell"><div id="ssh-term"></div></div>
+      </section>`;
+  }
+  return `
+    <section class="card terminal-card" id="terminal-card">
+      <div class="card-head">
+        <div class="ch-icon">${icon('terminal')}</div>
+        <div class="grow"><h3>SSH 终端</h3><p>在服务器上打开一个真实的交互式终端（bash / vim / htop 都能用）</p></div>
+        <div class="page-actions">
+          <button class="btn" type="button" data-act="server.shell.open" ${busy}>${icon('terminal')}<span>${st.opening ? '正在打开…' : '打开终端'}</span></button>
+        </div>
+      </div>
+      <div class="note warn" style="margin:0 16px 14px">${icon('alert')}<div>终端以登录账号直连服务器，<strong>命令直接执行、没有确认步骤</strong>（rm、ufw、systemctl 都是实打实的）。改防火墙时记得先放行 SSH 端口，避免把自己锁在外面。</div></div>
+    </section>`;
+}
+
+/* renderServer 整页 innerHTML 重写后调用：把还活着的终端重新挂回新 DOM。
+ * xterm 的 Term.open() 只能对一个容器调一次，所以这里「搬家」——
+ * 把旧 .xterm 元素 append 进新容器，canvas 渲染层会跟着走。 */
+function remountShellTerm() {
+  const st = shellState;
+  if (!st.open || !st.term) return;
+  const host = $('#ssh-term');
+  if (!host) return;
+  if (st.term.element && st.term.element.parentElement === host) return; // 已挂载
+  if (st.term.element) host.appendChild(st.term.element);
+  else st.term.open(host);
+  if (st.fit) { try { st.fit.fit(); } catch { /* ignore */ } }
+  st.term.focus();
+}
+
+function disposeShellTerm(notifyClosed) {
+  const st = shellState;
+  st.open = false;
+  st.opening = false;
+  if (st.unSub) { try { st.unSub(); } catch { /* ignore */ } st.unSub = null; }
+  if (st.resizeObs) { try { st.resizeObs.disconnect(); } catch { /* ignore */ } st.resizeObs = null; }
+  if (st.term) { try { st.term.dispose(); } catch { /* ignore */ } st.term = null; }
+  st.fit = null;
+  if (window.__shellTerm) window.__shellTerm = null;
+  if (notifyClosed) FRP.shellClose().catch(() => {});
+}
+
+async function openShellTerm() {
+  const st = shellState;
+  if (st.open || st.opening) return;
+  st.opening = true;
+  renderServer(true);
+  try {
+    // 先建 xterm（拿到真实行列数），再让服务器开 PTY，两边尺寸一开始就对齐。
+    const TermCtor = window.Terminal;
+    const FitCtor = window.FitAddon && window.FitAddon.FitAddon;
+    if (!TermCtor || !FitCtor) throw new Error('xterm 组件未加载（vendor/xterm）');
+    const term = new TermCtor({
+      cursorBlink: true,
+      fontSize: 13,
+      fontFamily: 'Consolas, "Courier New", monospace',
+      scrollback: 4000,
+      theme: { background: '#0d1117' },
+    });
+    const fit = new FitCtor();
+    term.loadAddon(fit);
+    if (window.WebLinksAddon && window.WebLinksAddon.WebLinksAddon) {
+      term.loadAddon(new window.WebLinksAddon.WebLinksAddon());
+    }
+    st.term = term;
+    st.fit = fit;
+    // 暴露给测试 / 调试读取 xterm 缓冲区（canvas 渲染，DOM textContent 读不到终端内容）。
+    window.__shellTerm = term;
+
+    // 挂到一个临时容器拿尺寸；renderServer(true) 之后 remountShellTerm 会搬进真正的卡。
+    renderServer(true);
+    const host = $('#ssh-term');
+    if (!host) throw new Error('终端容器未创建');
+    term.open(host);
+    try { fit.fit(); } catch { /* ignore */ }
+    const cols = Math.max(2, Math.min(500, term.cols || 100));
+    const rows = Math.max(2, Math.min(200, term.rows || 30));
+
+    // 先接好「后端输出 → 终端」「终端按键 → 后端」两条流，再开 shell。
+    // 关键顺序：服务器可能在 shell 一 accept 就立刻吐欢迎语 / 提示符，
+    // 如果等 shellOpen 的 Promise 回来才订阅 ssh:data，这些首批字节会被丢掉。
+    st.unSub = FRP.on('ssh:data', (payload) => {
+      if (!shellState.term) return;
+      if (payload && payload.closed) {
+        shellState.term.write('\r\n\x1b[33m[连接已关闭]\x1b[0m\r\n');
+        // 后端主动断（切服务器 / 网络断）：把本地状态收掉，回到「打开终端」卡。
+        setTimeout(() => { disposeShellTerm(false); renderServer(true); }, 400);
+        return;
+      }
+      if (payload && typeof payload.chunk === 'string') shellState.term.write(payload.chunk);
+    });
+    term.onData((data) => { FRP.shellInput(data); });
+
+    const res = await FRP.shellOpen({ rows, cols });
+    if (!res || !res.ok) throw new Error((res && res.error) || '打开终端失败');
+
+    st.open = true;
+    st.opening = false;
+    // 容器尺寸变化 → fit（本地重排）+ setWindow（远端 PTY 跟着变，vim 才不会错位）。
+    const shell = $('#ssh-term-shell');
+    if (shell && typeof ResizeObserver === 'function') {
+      st.resizeObs = new ResizeObserver(() => {
+        if (!shellState.term || !shellState.fit) return;
+        try {
+          shellState.fit.fit();
+          FRP.shellResize(shellState.term.rows, shellState.term.cols);
+        } catch { /* ignore */ }
+      });
+      st.resizeObs.observe(shell);
+    }
+    renderServer(true);
+    term.focus();
+  } catch (e) {
+    disposeShellTerm(false);
+    toast(String((e && e.message) || e), 'error');
+    renderServer(true);
+  }
+}
+
+function closeShellTerm() {
+  disposeShellTerm(true);
+  renderServer(true);
+}
+
 function renderServer(force = false) {
   if (!S.server.loaded) {
     $('#view').innerHTML = `<div class="view"><section class="card"><div class="empty"><span class="spinner"></span><h3>正在读取服务器连接状态</h3><p>请稍候…</p></div></section></div>`;
@@ -1696,6 +1848,8 @@ function renderServer(force = false) {
 
       ${nginxCardMarkup()}
 
+      ${terminalCardMarkup()}
+
       ${firewallCardMarkup()}
 
       <section class="card config-card">
@@ -1737,6 +1891,8 @@ function renderServer(force = false) {
 
   renderServerLogs();
   toggleWizardGroups();
+  // 终端会话跨重渲染存活：DOM 被 innerHTML 换掉后把 xterm 搬回新容器。
+  remountShellTerm();
   if (s.mode === 'wizard' && !s.previewText) schedulePreview(true);
   if (s.connected && !s.logs && !s.logsLoading) {
     s.logsLoading = true;
@@ -2144,6 +2300,8 @@ async function selectServerProfile(id) {
   if (S.server.switching) return;
   S.server.switching = true;
   const seq = serverSeq();
+  // 切档案会断开旧 SSH 连接，旧服务器上的终端会话必须一起收掉。
+  if (shellState.open || shellState.term) disposeShellTerm(false);
   try {
     const res = await FRP.serverSelect(id);
     if (serverSeqStale(seq)) return;
@@ -2899,6 +3057,8 @@ async function runServerSelfTest() {
 
 async function disconnectServer() {
   const seq = serverSeq();
+  // 断开连接时后端 shell 也一并关了；前端终端状态跟着收掉，避免悬挂的事件订阅。
+  if (shellState.open || shellState.term) disposeShellTerm(false);
   const res = await FRP.serverDisconnect();
   if (serverSeqStale(seq)) return;
   if (res && res.ok) {
@@ -3721,6 +3881,12 @@ async function handleAction(act, dataset, btn) {
         }
         break;
       }
+      case 'server.shell.open':
+        await openShellTerm();
+        break;
+      case 'server.shell.close':
+        closeShellTerm();
+        break;
       case 'server.firewall.refresh':
         await withBusy(btn, () => loadServerFirewall(false));
         break;

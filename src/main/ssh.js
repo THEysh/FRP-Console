@@ -100,10 +100,16 @@ class ServerSession {
     this.username = '';
     this.info = null;
     this.configPath = '';
+    this.shell = null;
+    // 连接代数：每次 connect 自增。旧连接的 close/error/ready 事件可能在新连接
+    // 建立后才异步到达，用代数判断「这事件还属于当前连接吗」，避免旧连接的
+    // close 把新连接的 connected 误清成 false（进而让新会话无法开 PTY）。
+    this._connGen = 0;
   }
 
   async connect({ host, port = 22, username, password, timeout = 15000 }) {
     this.disconnect();
+    const gen = ++this._connGen;
     return new Promise((resolve) => {
       let settled = false;
       const done = (result) => {
@@ -118,6 +124,7 @@ class ServerSession {
       this.username = username;
 
       client.on('ready', () => {
+        if (gen !== this._connGen) return; // 旧连接的迟到事件，忽略
         this.connected = true;
         done({ ok: true });
       });
@@ -125,10 +132,12 @@ class ServerSession {
         finish(prompts.map(() => password));
       });
       client.on('error', (err) => {
+        if (gen !== this._connGen) return;
         this.connected = false;
         done({ ok: false, error: friendlyError(err) });
       });
       client.on('close', () => {
+        if (gen !== this._connGen) return; // 旧连接的 close 不能清新连接的状态
         this.connected = false;
       });
 
@@ -150,6 +159,7 @@ class ServerSession {
   }
 
   disconnect() {
+    this.closeShell();
     if (this.client) {
       try { this.client.end(); } catch { /* ignore */ }
     }
@@ -159,6 +169,78 @@ class ServerSession {
     // 配置路径属于“这台服务器”，断开后必须清掉：
     // 否则换一台没有 frps.toml 的机器时，会拿上一台服务器的路径去读 / 写。
     this.configPath = '';
+  }
+
+  /* ---------------- 交互式终端（真 PTY）----------------
+   * exec 是「一问一答」：跑完收集 stdout 一次性返回；
+   * shell 是持续双向流：远端开一个真实的登录 shell（bash/zsh 由服务器决定），
+   * 终端仿真交给渲染层的 xterm.js，这里只搬运字节和窗口尺寸。
+   * 换服务器 / 断开连接时 disconnect() 会把 shell 一起关掉。 */
+  openShell({ rows = 30, cols = 100, onData, onClose } = {}) {
+    if (!this.connected || !this.client) {
+      return Promise.resolve({ ok: false, error: '尚未连接服务器' });
+    }
+    if (this.shell) {
+      return Promise.resolve({ ok: false, error: '终端已经打开' });
+    }
+    return new Promise((resolve) => {
+      let settled = false;
+      const done = (result) => {
+        if (settled) return;
+        settled = true;
+        resolve(result);
+      };
+      try {
+        this.client.shell({ term: 'xterm-256color', rows: Number(rows) || 30, cols: Number(cols) || 100 }, (err, stream) => {
+          if (err) return done({ ok: false, error: friendlyError(err) });
+          this.shell = stream;
+          const cleanup = () => {
+            if (this.shell === stream) this.shell = null;
+            if (onClose) onClose();
+          };
+          stream.on('data', (chunk) => {
+            if (onData) onData(chunk.toString('utf8'));
+          });
+          // 关闭顺序不定（服务器断 / 用户关 / 网络断），都走同一个 cleanup。
+          stream.on('close', cleanup);
+          stream.on('exit', cleanup);
+          stream.on('error', cleanup);
+          done({ ok: true });
+        });
+      } catch (err) {
+        done({ ok: false, error: friendlyError(err) });
+      }
+    });
+  }
+
+  shellWrite(text) {
+    if (!this.shell) return false;
+    try {
+      this.shell.write(String(text));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /* vim / htop 的全屏排版依赖 PTY 尺寸，窗口 resize 时同步过去。 */
+  shellResize(rows, cols) {
+    if (!this.shell) return false;
+    try {
+      this.shell.setWindow(Number(rows) || 30, Number(cols) || 100, 0, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  closeShell() {
+    const stream = this.shell;
+    this.shell = null;
+    if (!stream) return false;
+    try { stream.close(); } catch { /* ignore */ }
+    try { if (typeof stream.end === 'function') stream.end(); } catch { /* ignore */ }
+    return true;
   }
 
   exec(command, timeout = 15000) {

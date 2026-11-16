@@ -2751,6 +2751,41 @@ function registerIpc() {
     }
   });
 
+  /* ---------------- SSH 交互式终端（真 PTY）----------------
+   * 与其它 IPC 的「一问一答」不同：打开后主进程把远端输出持续推给
+   * 渲染层（ssh:data 事件），渲染层把按键 / 窗口尺寸送回来。
+   * 切换服务器 / 断开连接 → disconnect() → closeShell() → onClose，
+   * 渲染层会收到 { closed: true }，把界面收掉。 */
+  ipcMain.handle('server:shell-open', async (_event, payload = {}) => {
+    if (!serverSession.connected) return fail('尚未连接服务器');
+    const rows = Math.max(2, Math.min(200, Number(payload.rows) || 30));
+    const cols = Math.max(2, Math.min(500, Number(payload.cols) || 100));
+    const result = await serverSession.openShell({
+      rows,
+      cols,
+      onData: (chunk) => send('ssh:data', { chunk }),
+      onClose: () => send('ssh:data', { closed: true }),
+    });
+    if (!result.ok) return fail(result.error);
+    return ok({ host: serverSession.host, rows, cols });
+  });
+
+  // 按键流：一次一个字符 / 一个控制序列，走事件（on）而不是 invoke，
+  // 避免每个按键都创建一个 Promise 往返。
+  ipcMain.on('server:shell-input', (_event, payload) => {
+    if (payload && typeof payload.text === 'string') serverSession.shellWrite(payload.text);
+  });
+
+  // vim / htop 全屏排版需要 PTY 窗口尺寸跟着终端容器走。
+  ipcMain.on('server:shell-resize', (_event, payload) => {
+    if (payload) serverSession.shellResize(payload.rows, payload.cols);
+  });
+
+  ipcMain.handle('server:shell-close', async () => {
+    serverSession.closeShell();
+    return ok({});
+  });
+
   /*
    * 服务器页的检查是「服务器侧就绪」判定，不是全链路检测。
    *

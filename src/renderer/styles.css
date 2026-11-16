@@ -1308,6 +1308,19 @@ label .icon-btn svg { width: 13px; height: 13px; }
 .dw-inline-form .input, .dw-inline-form .select { flex: 1 1 160px; min-width: 140px; }
 .dw-inline-form .switch-row { margin: 0 4px; }
 
+/* ---------------- SSH 终端（xterm.js）---------------- */
+.term-shell {
+  margin: 0 16px 14px;
+  padding: 8px 10px;
+  background: #0d1117;
+  border: 1px solid rgba(148, 163, 184, .22);
+  border-radius: 10px;
+  /* 高度给一个舒适区间：太矮 vim/htop 排不下，太高把整页撑出屏。 */
+  height: clamp(320px, 46vh, 560px);
+  overflow: hidden;
+}
+.term-shell #ssh-term, .term-shell .xterm { height: 100%; }
+.term-shell .xterm-viewport { background-color: transparent !important; }
 
 @media (max-width: 1180px) {
   .srv-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
