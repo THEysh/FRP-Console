@@ -3050,7 +3050,7 @@ function renderBackups() {
     return `<div class="backup-list"><div class="muted">正在读取备份…</div></div>`;
   }
   if (!b.list.length) {
-    return `<div class="backup-list"><div class="muted">还没有备份。每次保存 <code>frpc.toml</code> 且内容有变化时，会自动在配置目录下的 <code>frp-console-backups</code> 里留一份（最多 30 份）。</div></div>`;
+    return `<div class="backup-list"><div class="muted">还没有备份。每次保存 <code>frpc.toml</code> 且内容有变化时，会自动在配置目录下的 <code>frp-console-backups</code> 里留一份（最多 10 份）。</div></div>`;
   }
   return `<div class="backup-list">${b.list.slice(0, 8).map((x, i) => backupRowHtml(x, i)).join('')}</div>`;
 }
@@ -3104,7 +3104,7 @@ function renderSettings(force = false) {
 
         <section class="card section">
           <div class="section-head">
-            <div class="section-title"><strong>配置备份</strong><span>每次保存 <code>frpc.toml</code> 且内容有变化时自动备份，最多保留 30 份。</span></div>
+            <div class="section-title"><strong>配置备份</strong><span>每次保存 <code>frpc.toml</code> 且内容有变化时自动备份，最多保留 10 份。</span></div>
             <div class="section-actions">
               <button class="btn small" type="button" data-act="backups.refresh">${icon('reload')}<span>刷新</span></button>
               <button class="btn small" type="button" data-act="backups.reveal">${icon('folder')}<span>打开备份目录</span></button>

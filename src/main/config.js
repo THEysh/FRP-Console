@@ -6,8 +6,8 @@ const toml = require('smol-toml');
 
 const PROXY_TYPES = ['tcp', 'udp', 'http', 'https', 'stcp', 'sudp', 'xtcp', 'tcpmux'];
 const HOST_TYPES = ['tcp', 'udp'];
-// 备份目录里保留多少份（够回退最近几十次改动，又不至于把磁盘占满）
-const BACKUP_KEEP = 30;
+// 备份目录里保留多少份（够回退最近十几次改动，又不至于把磁盘占满）
+const BACKUP_KEEP = 10;
 
 /* Chrome / Edge 会拒绝访问这些「不安全端口」，报 ERR_UNSAFE_PORT（浏览器在发出请求前就拦截，
  * 即使隧道是通的也打不开）。列表来自 Chromium net/base/port_util.cc 的 kRestrictedPorts。
