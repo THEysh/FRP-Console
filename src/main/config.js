@@ -9,6 +9,17 @@ const HOST_TYPES = ['tcp', 'udp'];
 // 备份目录里保留多少份（够回退最近几十次改动，又不至于把磁盘占满）
 const BACKUP_KEEP = 30;
 
+/* Chrome / Edge 会拒绝访问这些「不安全端口」，报 ERR_UNSAFE_PORT（浏览器在发出请求前就拦截，
+ * 即使隧道是通的也打不开）。列表来自 Chromium net/base/port_util.cc 的 kRestrictedPorts。
+ * 自动建议公网端口时跳过它们，手动填了也给出 warning，免得用户配好后发现浏览器打不开。 */
+const BROWSER_UNSAFE_PORTS = new Set([
+  1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 69, 77, 79, 87, 95,
+  101, 102, 103, 104, 109, 110, 111, 113, 115, 117, 119, 123, 135, 137, 139, 143, 161,
+  179, 389, 427, 465, 512, 513, 514, 515, 526, 530, 531, 532, 540, 548, 554, 556, 563,
+  587, 601, 636, 989, 990, 993, 995, 1719, 1720, 1723, 2049, 3659, 4045, 5060, 5061,
+  6000, 6566, 6665, 6666, 6667, 6668, 6669, 6697, 10080,
+]);
+
 const KNOWN_TOP_LEVEL = new Set([
   'serverAddr', 'serverPort', 'loginFailExit', 'auth', 'log', 'webServer', 'transport', 'proxies', 'visitors',
 ]);
@@ -186,9 +197,13 @@ function validate(model) {
     if (HOST_TYPES.includes(proxy.type)) {
       if (!Number.isInteger(proxy.remotePort) || proxy.remotePort < 1 || proxy.remotePort > 65535) {
         push('error', `proxies[${index}].remotePort`, `${label} 需要 1 - 65535 的公网端口`);
-      } else if (proxy.remotePort === model.serverPort) {
-        push('warn', `proxies[${index}].remotePort`, `${label} 的公网端口与服务器端口相同，可能冲突`);
       } else {
+        if (proxy.remotePort === model.serverPort) {
+          push('warn', `proxies[${index}].remotePort`, `${label} 的公网端口与服务器端口相同，可能冲突`);
+        }
+        if (BROWSER_UNSAFE_PORTS.has(proxy.remotePort)) {
+          push('warn', `proxies[${index}].remotePort`, `${label} 的公网端口 ${proxy.remotePort} 是浏览器（Chrome/Edge）的禁用端口，浏览器会拒绝访问（ERR_UNSAFE_PORT），建议换一个端口`);
+        }
         const key = `${proxy.type}:${proxy.remotePort}`;
         if (remotePorts.has(key)) push('error', `proxies[${index}].remotePort`, `${label} 的公网端口 ${proxy.remotePort} 与「${remotePorts.get(key)}」重复`);
         else remotePorts.set(key, label);
@@ -495,7 +510,7 @@ function suggestRemotePort(model, type = 'tcp') {
   }
   used.add(Number(model.serverPort));
   let port = 10000;
-  while (port < 65000 && used.has(port)) port += 1;
+  while (port < 65000 && (used.has(port) || BROWSER_UNSAFE_PORTS.has(port))) port += 1;
   return port;
 }
 
