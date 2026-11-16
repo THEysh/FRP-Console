@@ -1626,6 +1626,7 @@ function renderServer(force = false) {
             <button class="btn ghost" type="button" data-act="server.scroll.logs">${icon('terminal')}<span>实时日志</span></button>
             ${summary.webPort ? `<button class="btn ghost" type="button" data-act="server.open.dashboard">${icon('external')}<span>打开面板 :${summary.webPort}</span></button>` : ''}
             <button class="btn ghost" type="button" data-act="server.guide">${icon('shield')}<span>排错指南</span></button>
+            ${info.frpsInstalled ? `<button class="btn ghost danger-text" type="button" data-act="server.uninstall">${icon('trash')}<span>卸载</span></button>` : ''}
           </div>
         </div>
       </section>
@@ -1721,6 +1722,7 @@ function bootstrapCardMarkup(info, s) {
         <label class="check-line bc-sync"><input type="checkbox" id="bootstrap-sync" checked> 同时把本机 frpc 的服务器地址与 Token 改为本次配置，并重启隧道</label>
         <div class="bc-actions">
           <button class="btn primary" type="button" data-act="server.bootstrap" ${s.installBusy ? 'disabled' : ''}>${icon('download')}<span>${s.installBusy ? '正在初始化…' : '一键初始化并启动'}</span></button>
+          ${s.installBusy ? `<button class="btn ghost" type="button" data-act="server.bootstrap.cancel">${icon('x')}<span>取消</span></button>` : ''}
           <span class="field-hint">需要 root 或免密 sudo；上传约 18 MB，首次可能需要几十秒。</span>
         </div>
       </div>
@@ -2714,6 +2716,13 @@ async function runServerBootstrap(btn) {
     renderServer(true);
     return;
   }
+  if (res && res.cancelled) {
+    S.server.installProgress = { percent: 0, text: '已取消' };
+    renderServer(true);
+    toast('warn', '已取消初始化', '服务器上已安装的内容已回滚清理');
+    await loadServerLogs();
+    return;
+  }
   if (!res || !res.ok) {
     S.server.installProgress = { percent: Number(S.server.installProgress && S.server.installProgress.percent) || 0, text: (res && res.error) || '初始化失败' };
     renderServer(true);
@@ -2739,6 +2748,36 @@ async function runServerBootstrap(btn) {
   if (res.data && res.data.appState) S.state = res.data.appState;
   renderServer(true);
   await loadServerLogs();
+}
+
+async function runServerUninstall(btn) {
+  const info = S.server.info || {};
+  if (!info.frpsInstalled && !S.server.configPath && !(info.binaryPath && info.binaryPath !== 'frps')) {
+    toast('warn', '没有可卸载的 frps', '服务器上未检测到 frps 安装');
+    return;
+  }
+  const okConfirm = await confirmDialog({
+    title: '卸载服务器上的 frps',
+    body: '将停止并删除服务器上的 frps：删除二进制、删除 systemd 服务（frps.service）、备份后删除配置（备份保留为 .bak-uninstalled-时间戳）。本机 frpc 与隧道不受影响。确定继续吗？',
+    confirmText: '卸载',
+    cancelText: '取消',
+    danger: true,
+  });
+  if (!okConfirm) return;
+  await withBusy(btn, async () => {
+    const res = await FRP.serverUninstall({ removeConfig: true }).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+    if (res && res.ok) {
+      applyServerState(res.data && res.data.state);
+      if (res.data && res.data.appState) S.state = res.data.appState;
+      const removed = (res.data && res.data.removedBinary) ? `已删除 ${res.data.removedBinary}` : '';
+      const backup = (res.data && res.data.configBackup) ? `，配置备份：${res.data.configBackup}` : '';
+      toast('success', '已卸载服务器上的 frps', `${removed}${backup}`);
+    } else {
+      toastResult(res);
+    }
+    renderServer(true);
+    await loadServerLogs();
+  });
 }
 
 function updateBootstrapProgress(payload) {
@@ -3662,6 +3701,13 @@ async function handleAction(act, dataset, btn) {
         break;
       case 'server.bootstrap':
         await runServerBootstrap(btn);
+        break;
+      case 'server.bootstrap.cancel':
+        await FRP.serverBootstrapCancel();
+        toast('warn', '正在取消初始化…', '将在当前步骤完成后停止并清理已安装内容');
+        break;
+      case 'server.uninstall':
+        await runServerUninstall(btn);
         break;
       case 'server.selftest':
         await runServerSelfTest();

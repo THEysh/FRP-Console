@@ -2492,8 +2492,11 @@ function registerIpc() {
     return ok({ text: result.text, warnings: result.warnings || [] });
   });
 
+  let bootstrapCancelRequested = false;
+
   ipcMain.handle('server:bootstrap', async (event, payload = {}) => {
     if (!serverSession.connected) return fail('尚未连接服务器');
+    bootstrapCancelRequested = false;
     const epoch = sessionEpoch;
     const generated = frpsConfig.preview(serverConfig.content || '', payload.fields || {});
     if (!generated.ok) {
@@ -2522,7 +2525,9 @@ function registerIpc() {
       configPath,
       unitName,
       onProgress: sendProgress,
+      shouldCancel: () => bootstrapCancelRequested,
     });
+    if (result.cancelled) return fail(result.error || '初始化已取消', { cancelled: true, steps: result.steps || [] });
     if (!result.ok) return fail(result.error, { steps: result.steps || [] });
     // 初始化过程可能长达几十秒，期间切了档案就不再改写任何本机状态。
     if (epoch !== sessionEpoch) {
@@ -2563,6 +2568,24 @@ function registerIpc() {
     }
     await loadServerSnapshot({ inspect: true });
     return ok({ ...result, localSync, state: serverState(), appState: buildState() });
+  });
+
+  ipcMain.handle('server:bootstrap-cancel', async () => {
+    bootstrapCancelRequested = true;
+    return ok(true);
+  });
+
+  /* 卸载 frps：停服务/删 unit/删二进制/备份后删配置（可恢复）。 */
+  ipcMain.handle('server:uninstall', async (event, payload = {}) => {
+    if (!serverSession.connected) return fail('尚未连接服务器');
+    try {
+      const result = await serverSession.uninstall({ removeConfig: payload.removeConfig !== false });
+      if (!result.ok) return fail(result.error);
+      await loadServerSnapshot({ inspect: true });
+      return ok({ ...result, state: serverState(), appState: buildState() });
+    } catch (e) {
+      return fail(String((e && e.message) || e));
+    }
   });
 
   /* ---- nginx 反代（方案 Y）---- */

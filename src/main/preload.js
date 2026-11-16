@@ -85,6 +85,8 @@ contextBridge.exposeInMainWorld('FRP', {
   serverReadConfig: () => invoke('server:read-config'),
   serverPreview: (fields) => invoke('server:preview', { fields }),
   serverBootstrap: (fields, options = {}) => invoke('server:bootstrap', { fields, ...options }),
+  serverBootstrapCancel: () => invoke('server:bootstrap-cancel'),
+  serverUninstall: (payload) => invoke('server:uninstall', payload),
   serverSelfTest: (layer) => invoke('server:selftest', { layer }),
   serverNginxState: () => invoke('server:nginx-state'),
   serverNginxSetup: (payload) => invoke('server:nginx-setup', payload),

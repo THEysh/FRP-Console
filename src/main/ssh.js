@@ -436,7 +436,7 @@ class ServerSession {
     };
   }
 
-  async bootstrap({ content, localBinary, configPath = '/etc/frp/frps.toml', unitName = 'frps', onProgress }) {
+  async bootstrap({ content, localBinary, configPath = '/etc/frp/frps.toml', unitName = 'frps', onProgress, shouldCancel }) {
     if (!this.connected) return { ok: false, error: '尚未连接服务器', steps: [] };
     configPath = validConfigPath(configPath) || '/etc/frp/frps.toml';
     const steps = [];
@@ -449,6 +449,16 @@ class ServerSession {
     const sudo = await this.detectSudo();
     if (!sudo.ok) return { ok: false, error: sudo.error, steps };
     const prefix = sudo.prefix;
+    // 取消支持：shouldCancel 由上层（server:bootstrap）通过取消令牌提供。
+    // 每个关键步骤之间检查一次，取消即回滚已做的部分。
+    const cancel = () => !!(shouldCancel && shouldCancel());
+    const rollback = { prefix, remoteTmp: '', installedBinary: false, wroteConfig: false, backup: '', configPath, serviceName: unitName, unitInstalled: false };
+    const abort = async () => {
+      report('cancel', '已取消，正在清理已安装的内容…', 0);
+      await this._rollbackBootstrap(rollback);
+      return { ok: false, cancelled: true, error: '初始化已取消', steps };
+    };
+    if (cancel()) return abort();
     // 进度条区间：下载 1-8（在 server:bootstrap 里）→ 检查 10 → 上传 12-60 →
     // 安装 62 → 配置 72 → 服务 80-84 → 启动 90 → 验证 95 → 100。
     report('check', '检查服务器权限与架构', 10);
@@ -465,6 +475,8 @@ class ServerSession {
         return { ok: false, error: `本机没有可用的 ${arch} 版 frps 二进制，无法自动上传`, steps };
       }
       const remoteTmp = `/tmp/frps-console-frps-${Date.now()}`;
+      rollback.remoteTmp = remoteTmp;
+      if (cancel()) return abort();
       report('upload', `上传 frps（${arch}，约 ${Math.max(1, Math.round(fs.statSync(localBinary).size / 1048576))} MB）`, 12);
       let lastPercent = -1;
       let lastMb = -1;
@@ -476,6 +488,7 @@ class ServerSession {
         lastMb = mb;
         if (onProgress) { try { onProgress({ stage: 'upload', text: `上传 frps ${mb} / ${Math.max(1, Math.round(total / 1048576))} MB`, percent }); } catch { /* ignore */ } }
       });
+      if (cancel()) return abort();
       if (!upload.ok) return { ok: false, error: upload.error, steps };
 
       report('install', '安装 frps 到 /usr/local/bin/frps', 62);
@@ -484,15 +497,19 @@ class ServerSession {
         install = await this.exec(`${prefix}mkdir -p /usr/local/bin && ${prefix}install -m 755 ${shellQuote(remoteTmp)} /usr/local/bin/frps`, 20000);
       }
       await this.exec(`rm -f ${shellQuote(remoteTmp)} 2>/dev/null || true`, 6000);
+      rollback.remoteTmp = '';
       if (!install.ok) {
         return { ok: false, error: `安装 frps 失败：${(install.stderr || install.stdout || '未知错误').trim()}`, steps };
       }
+      rollback.installedBinary = true;
       binary = '/usr/local/bin/frps';
+      if (cancel()) return abort();
     } else {
       report('check', `检测到已安装 frps：${binary}`, 10);
     }
 
     const configDir = configPath.replace(/\/[^/]+$/, '') || '/etc/frp';
+    if (cancel()) return abort();
     report('config', `写入配置 ${configPath}`, 72);
     let result = await this.exec(`${prefix}mkdir -p ${shellQuote(configDir)}`, 10000);
     if (!result.ok) return { ok: false, error: `创建配置目录失败：${(result.stderr || '权限不足').trim()}`, steps };
@@ -520,6 +537,9 @@ class ServerSession {
     await this.exec(`rm -f ${tmpConfig} 2>/dev/null || true`, 6000);
     if (!result.ok) return { ok: false, error: `写入配置失败：${(result.stderr || '权限不足').trim()}`, steps };
     this.configPath = configPath;
+    rollback.wroteConfig = true;
+    rollback.backup = backup;
+    if (cancel()) return abort();
 
     const systemdOk = firstLine((await this.exec('[ -d /run/systemd/system ] && echo yes || true', 6000)).stdout) === 'yes';
     let serviceName = (this.info && this.info.hasUnit && this.info.serviceName) || unitName;
@@ -569,6 +589,8 @@ class ServerSession {
       const tmpUnit = '/tmp/frps-console-frps.service';
       result = await this.exec(`printf %s ${unitB64} | base64 -d > ${tmpUnit} && ${prefix}install -m 644 ${tmpUnit} /etc/systemd/system/${serviceName}.service && rm -f ${tmpUnit}`, 15000);
       if (!result.ok) return { ok: false, error: `创建 systemd 服务失败：${(result.stderr || '权限不足').trim()}`, steps };
+      rollback.unitInstalled = true;
+      rollback.serviceName = serviceName;
       await this.exec(`${prefix}systemctl daemon-reload`, 15000);
       const enable = await this.exec(`${prefix}systemctl enable -- ${shellQuote(serviceName)} 2>&1`, 15000);
       enabledState = firstLine((await this.exec(`${prefix}systemctl is-enabled -- ${shellQuote(serviceName)} 2>/dev/null || true`, 8000)).stdout);
@@ -577,6 +599,7 @@ class ServerSession {
         bootWarning = `frps 已在运行，但没能设成开机自启（systemctl is-enabled = ${enabledState || 'unknown'}）${why ? `：${why}` : ''}。服务器重启后需要手动执行 systemctl start ${serviceName}`;
       }
 
+      if (cancel()) return abort();
       report('start', `启动 ${serviceName}.service`, 90);
       const start = await this.sudoSystemctl('restart', shellQuote(serviceName));
       if (!start.ok) {
@@ -597,6 +620,7 @@ class ServerSession {
     let unitState = '';
     for (let attempt = 0; attempt < 6; attempt += 1) {
       await sleep(1200);
+      if (cancel()) return abort();
       after = await this.inspect();
       if (systemdOk) {
         unitState = firstLine((await this.exec(`systemctl is-active -- ${shellQuote(serviceName)} 2>/dev/null || true`, 6000)).stdout);
@@ -634,6 +658,77 @@ class ServerSession {
       info: after.info,
       firewall,
     };
+  }
+
+  // 取消初始化时回滚：删临时文件/已装二进制/已建 unit，恢复或删除已写的配置。
+  // state 由 bootstrap 在推进过程中逐步填充（见 bootstrap 内 rollback 对象）。
+  async _rollbackBootstrap(state) {
+    const prefix = state.prefix || '';
+    const cmds = [];
+    if (state.remoteTmp) cmds.push(`rm -f ${shellQuote(state.remoteTmp)} 2>/dev/null || true`);
+    if (state.installedBinary) cmds.push(`rm -f /usr/local/bin/frps 2>/dev/null || true`);
+    if (state.unitInstalled && state.serviceName) {
+      cmds.push(`${prefix}systemctl stop ${shellQuote(state.serviceName)} 2>/dev/null || true`);
+      cmds.push(`${prefix}systemctl disable ${shellQuote(state.serviceName)} 2>/dev/null || true`);
+      cmds.push(`rm -f /etc/systemd/system/${state.serviceName}.service 2>/dev/null || true`);
+      cmds.push(`${prefix}systemctl daemon-reload 2>/dev/null || true`);
+    }
+    if (state.wroteConfig && state.configPath) {
+      if (state.backup) cmds.push(`${prefix}cp -p ${shellQuote(state.backup)} ${shellQuote(state.configPath)} 2>/dev/null || true`);
+      else cmds.push(`rm -f ${shellQuote(state.configPath)} 2>/dev/null || true`);
+    }
+    for (const cmd of cmds) { try { await this.exec(cmd, 8000); } catch { /* ignore */ } }
+    return { rolledBack: cmds.length > 0 };
+  }
+
+  // 卸载 frps：停止并禁用服务、删 unit、删二进制；配置默认备份后删除（可恢复）。
+  async uninstall({ removeConfig = true } = {}) {
+    if (!this.connected) return { ok: false, error: '尚未连接服务器' };
+    const sudo = await this.detectSudo();
+    if (!sudo.ok) return { ok: false, error: sudo.error };
+    const prefix = sudo.prefix;
+    const steps = [];
+    const report = (text) => steps.push(text);
+    const bin = firstLine((await this.exec('command -v frps 2>/dev/null || true', 6000)).stdout)
+      || ((this.info && this.info.binaryPath && this.info.binaryPath !== 'frps') ? this.info.binaryPath : '');
+    const serviceName = (this.info && this.info.hasUnit && this.info.serviceName) || 'frps';
+    const systemdOk = firstLine((await this.exec('[ -d /run/systemd/system ] && echo yes || true', 6000)).stdout) === 'yes';
+    const hasUnit = systemdOk && !!(this.info && this.info.hasUnit);
+
+    if (hasUnit) {
+      report(`停止 ${serviceName}.service`);
+      await this.sudoSystemctl('stop', shellQuote(serviceName)).catch(() => {});
+      report(`禁用并删除 ${serviceName}.service`);
+      await this.exec(`${prefix}systemctl disable ${shellQuote(serviceName)} 2>/dev/null || true`, 10000);
+      await this.exec(`${prefix}rm -f /etc/systemd/system/${serviceName}.service`, 10000);
+      await this.exec(`${prefix}systemctl daemon-reload`, 12000);
+    }
+    if (this.info && this.info.processAlive && this.info.pids && this.info.pids.length) {
+      report('停止 frps 进程');
+      await this.exec(`${prefix}kill ${this.info.pids.join(' ')} 2>/dev/null || true`, 8000);
+      await sleep(800);
+    }
+
+    if (bin) {
+      report(`删除二进制 ${bin}`);
+      await this.exec(`${prefix}rm -f ${shellQuote(bin)}`, 10000);
+    }
+
+    let configBackup = '';
+    if (this.configPath) {
+      if (removeConfig) {
+        const stamp = firstLine((await this.exec('date +%Y%m%d-%H%M%S', 6000)).stdout);
+        configBackup = `${this.configPath}.bak-uninstalled-${stamp || 'manual'}`;
+        await this.exec(`${prefix}cp -p ${shellQuote(this.configPath)} ${shellQuote(configBackup)} 2>/dev/null || true`, 10000);
+        await this.exec(`${prefix}rm -f ${shellQuote(this.configPath)}`, 10000);
+        report(`配置已备份到 ${configBackup} 后删除`);
+      } else {
+        report(`保留配置 ${this.configPath}`);
+      }
+    }
+
+    await this.inspect().catch(() => {});
+    return { ok: true, removedBinary: bin || '', serviceName, configBackup, steps };
   }
 
   async readConfig() {
