@@ -27,10 +27,9 @@ const DEFAULT_SETTINGS = {
   // 方案 Y：服务器上已由 nginx 在 443 终止 TLS 并反代到 frps 的 vhostHTTPPort，
   // 此时 http/https 代理的公网地址统一是 https://域名（不带端口）。
   nginxProxyEnabled: false,
-  // Let's Encrypt / HTTPS 证书：默认走 staging 签发假证书，避免误用生产配额；
+  // Let's Encrypt / HTTPS 证书：只签生产证书。
   // dnsProvider 为空表示还没配 DNS 验证渠道（cloudflare 或 manual）。
   acmeEmail: '',
-  acmeStaging: true,
   dnsProvider: '',
   autoReload: true,
   pollIntervalMs: 3000,

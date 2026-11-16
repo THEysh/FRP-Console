@@ -1613,7 +1613,7 @@ function registerIpc() {
       'adminPort', 'adminUser', 'adminPassword', 'autoReload', 'pollIntervalMs', 'closeToTray',
       'startMinimized', 'launchTunnelOnStart', 'serviceAutoDetect', 'logBuffer', 'confirmStopService',
       'stripProxyEnv', 'launchAtLogin', 'vhostHttpPort', 'vhostHttpsPort',
-      'acmeEmail', 'acmeStaging', 'dnsProvider',
+      'acmeEmail', 'dnsProvider',
     ];
     const clean = {};
     for (const key of allowed) if (patch && Object.prototype.hasOwnProperty.call(patch, key)) clean[key] = patch[key];
@@ -2600,13 +2600,13 @@ function registerIpc() {
         return ok({ conflict: true, conflicts, installed: detect.installed, running: detect.running });
       }
       const certs = acmeManager.list();
-      const cert = certs.find((c) => !c.staging && c.exists) || certs.find((c) => c.exists) || null;
+      const cert = certs.find((c) => c.exists) || null;
       if (!cert) {
         return ok({
           installed: detect.installed,
           running: detect.running,
           certMissing: true,
-          message: 'nginx 已就绪，但还没有可用的证书。请先到「HTTPS 证书」页签发一张（关掉 STAGING 签真实证书），再回来配置反代。',
+          message: 'nginx 已就绪，但还没有可用的证书。请先到「HTTPS 证书」页签发一张，再回来配置反代。',
         });
       }
       const sync = await syncCertToServerNginx(cert);
@@ -2824,7 +2824,7 @@ function registerIpc() {
       // 1) vhostHTTPPort 变了 → 用新端口重写 nginx 反代配置（有证书才做）。
       if (remapResult.remapLabels.vhostHTTPPort) {
         const certs = acmeManager.list();
-        const cert = certs.find((c) => !c.staging && c.exists) || certs.find((c) => c.exists) || null;
+        const cert = certs.find((c) => c.exists) || null;
         if (cert && cert.crtPath && cert.keyPath) {
           nginxSync = await syncCertToServerNginx(cert).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
         }
@@ -2894,24 +2894,25 @@ function registerIpc() {
     if (!cert || !Array.isArray(cert.domains) || !cert.domains.length) {
       return { ok: false, error: '缺少证书信息' };
     }
+    const serverHost = serverSession.connected ? String(serverSession.host || '') : '';
     if (!serverSession.connected) {
       const r = { ok: false, error: '尚未连接服务器，证书已保存到本机但未上传到 nginx' };
-      acmeManager.markNginx(cert.domain, r);
+      acmeManager.markNginx(cert.domain, r, serverHost);
       return r;
     }
     const frpsHttpPort = (serverConfig.summary && Number(serverConfig.summary.vhostHTTPPort))
       || Number(settings.vhostHttpPort) || 8080;
     const upload = await serverSession.uploadCertToNginx(cert.domain, { certPath: cert.crtPath, keyPath: cert.keyPath });
-    if (!upload.ok) { acmeManager.markNginx(cert.domain, upload); return upload; }
+    if (!upload.ok) { acmeManager.markNginx(cert.domain, upload, serverHost); return upload; }
     const serverNames = serverSession.nginxServerName(cert.domains);
     const write = await serverSession.writeNginxProxyConfig({ serverNames, certDir: upload.dir, frpsHttpPort });
-    if (!write.ok) { acmeManager.markNginx(cert.domain, write); return write; }
+    if (!write.ok) { acmeManager.markNginx(cert.domain, write, serverHost); return write; }
     const reload = await serverSession.reloadNginx();
-    if (!reload.ok) { acmeManager.markNginx(cert.domain, reload); return reload; }
+    if (!reload.ok) { acmeManager.markNginx(cert.domain, reload, serverHost); return reload; }
     // 反代配置写成功并 reload 后，公网入口就是 nginx 443，代理地址不再带端口。
     setProfileNginxProxy(profileForSession(serverSession).id, true);
     const r = { ok: true, serverNames, certDir: upload.dir, frpsHttpPort };
-    acmeManager.markNginx(cert.domain, r);
+    acmeManager.markNginx(cert.domain, r, serverHost);
     return r;
   }
 
@@ -2923,21 +2924,17 @@ function registerIpc() {
     try {
       const domains = payload.domains;
       const email = String(payload.email || settings.acmeEmail || '').trim();
-      const staging = payload.staging !== undefined ? !!payload.staging : !!settings.acmeStaging;
       const provider = currentDnsProvider();
       if (!provider.ok) return fail(provider.error);
       const sendProgress = (data) => {
         try { event.sender.send('cert:progress', data); } catch { /* 窗口销毁时忽略 */ }
       };
       sendProgress({ label: '开始签发证书…', percent: 0 });
-      const result = await acmeManager.issue({ domains, email, staging, dns: provider.dns, onProgress: sendProgress });
+      const result = await acmeManager.issue({ domains, email, dns: provider.dns, onProgress: sendProgress });
       if (!result.ok) return fail(result.error);
-      // 生产证书签发后，自动上传到服务器 nginx 终止 TLS（方案 Y）。STAGING 假证书不部署。
-      let nginx = null;
-      if (!result.staging) {
-        sendProgress({ label: '部署到服务器 nginx（上传证书 + 重载）…', percent: 95 });
-        nginx = await syncCertToServerNginx(result);
-      }
+      // 证书签发后，自动上传到服务器 nginx 终止 TLS（方案 Y）。
+      sendProgress({ label: '部署到服务器 nginx（上传证书 + 重载）…', percent: 95 });
+      const nginx = await syncCertToServerNginx(result);
       sendProgress({ label: '完成', percent: 100 });
       pushState();
       return ok({ ...result, nginx });
@@ -2950,8 +2947,7 @@ function registerIpc() {
     try {
       const domain = String((payload && payload.domain) || '').trim();
       if (!domain) return fail('缺少域名');
-      const staging = payload.staging !== undefined ? !!payload.staging : !!settings.acmeStaging;
-      const existing = acmeManager.get(domain, { staging });
+      const existing = acmeManager.get(domain);
       const provider = currentDnsProvider();
       if (!provider.ok) return fail(provider.error);
       const email = existing && existing.email ? existing.email : String(settings.acmeEmail || '');
@@ -2959,14 +2955,11 @@ function registerIpc() {
         try { event.sender.send('cert:progress', data); } catch { /* 窗口销毁时忽略 */ }
       };
       sendProgress({ label: '开始续期…', percent: 0 });
-      const result = await acmeManager.renew(domain, { email, staging, dns: provider.dns, onProgress: sendProgress });
+      const result = await acmeManager.renew(domain, { email, dns: provider.dns, onProgress: sendProgress });
       if (!result.ok) return fail(result.error);
-      // 生产证书续期后，同样自动同步到 nginx。
-      let nginx = null;
-      if (!result.staging) {
-        sendProgress({ label: '部署到服务器 nginx（上传证书 + 重载）…', percent: 95 });
-        nginx = await syncCertToServerNginx(result);
-      }
+      // 证书续期后，同样自动同步到 nginx。
+      sendProgress({ label: '部署到服务器 nginx（上传证书 + 重载）…', percent: 95 });
+      const nginx = await syncCertToServerNginx(result);
       sendProgress({ label: '完成', percent: 100 });
       pushState();
       return ok({ ...result, nginx });
@@ -2993,8 +2986,7 @@ function registerIpc() {
   ipcMain.handle('cert:remove', async (event, payload = {}) => {
     const domain = String((payload && payload.domain) || '').trim();
     if (!domain) return fail('缺少域名');
-    const staging = payload.staging !== undefined ? !!payload.staging : undefined;
-    const result = acmeManager.removeLocal(domain, staging === undefined ? {} : { staging });
+    const result = acmeManager.removeLocal(domain);
     if (!result.ok) return fail(result.error);
     pushState();
     return ok({ removed: true });
@@ -3004,7 +2996,6 @@ function registerIpc() {
     dnsProvider: settings.dnsProvider || '',
     hasToken: settingsModule.hasCloudflareToken(),
     acmeEmail: settings.acmeEmail || '',
-    acmeStaging: !!settings.acmeStaging,
   }));
 
   /* 代理表单 / 健康检查共用的域名解析：只做软提示，不阻塞任何保存或判定。 */
@@ -3051,7 +3042,6 @@ function registerIpc() {
       if (!['', 'cloudflare'].includes(provider)) return fail('不支持的 DNS 服务商');
       const patch = { dnsProvider: provider };
       if (payload.acmeEmail !== undefined) patch.acmeEmail = String(payload.acmeEmail || '').trim();
-      if (payload.acmeStaging !== undefined) patch.acmeStaging = !!payload.acmeStaging;
 
       if (provider === 'cloudflare') {
         const token = String((payload && payload.token) || '').trim();

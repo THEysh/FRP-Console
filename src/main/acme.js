@@ -49,14 +49,6 @@ function certFolder(domain) {
   return String(domain || '').replace(/^\*\./, 'wildcard.').replace(/[\\/:*?"<>|]/g, '_');
 }
 
-/* STAGING 与生产证书分目录存放：生产沿用原来的 `wildcard.域名/`（不破坏已存在的
- * 生产证书路径），STAGING 放到 `wildcard.域名.staging/`。这样「误开 STAGING 再签」
- * 只会写进 .staging 目录，绝不会覆盖生产证书。 */
-function certFolderFor(domain, staging) {
-  const base = certFolder(domain);
-  return staging ? `${base}.staging` : base;
-}
-
 /* 通配符覆盖判定：`*.example.com` 覆盖 `app.example.com`，但不覆盖 `example.com` 本身、
  * 也不覆盖 `a.b.example.com`（只吃一层标签）。用于「填写的域名是否已被某张证书覆盖」的软提示。 */
 function coversDomain(pattern, host) {
@@ -106,42 +98,36 @@ class AcmeManager {
   async loadAccount() {
     const existing = readJson(this.accountFile, null);
     if (existing && existing.accountKey && typeof existing.accountKey === 'string') {
-      // accountUrls 按目录（staging/production）分开存：两个目录的账户 URL 不能混用，
-      // 否则签完 staging 再签 production 会拿 staging 的账户 ID 去 production 目录。
+      // 旧版本曾按 staging/production 分目录存 accountUrls；现在只签生产证书，
+      // 读取时兼容旧结构，直接取 production 那份。
       const urls = (existing.accountUrls && typeof existing.accountUrls === 'object')
         ? existing.accountUrls
         : {};
       return {
         accountKey: existing.accountKey,
-        accountUrls: {
-          staging: String(urls.staging || ''),
-          production: String(urls.production || ''),
-        },
+        accountUrl: String(urls.production || ''),
       };
     }
     // 首次：本地生成一把 2048 位 RSA 账户密钥（ACME 账户密钥，与证书密钥无关）。
     const accountKey = (await acme.crypto.createPrivateKey(2048)).toString('utf8');
-    const account = { accountKey, accountUrls: { staging: '', production: '' } };
+    const account = { accountKey, accountUrl: '' };
     writeJsonAtomic(this.accountFile, account);
     return account;
   }
 
-  async saveAccountUrl(accountUrl, staging) {
+  async saveAccountUrl(accountUrl) {
     const account = await this.loadAccount();
-    account.accountUrls[staging ? 'staging' : 'production'] = String(accountUrl || '');
+    account.accountUrl = String(accountUrl || '');
     writeJsonAtomic(this.accountFile, account);
   }
 
-  async clientFor({ staging, email }) {
+  async clientFor({ email }) {
     const account = await this.loadAccount();
-    const directoryUrl = staging
-      ? acme.directory.letsencrypt.staging
-      : acme.directory.letsencrypt.production;
-    const urlKey = staging ? 'staging' : 'production';
+    const directoryUrl = acme.directory.letsencrypt.production;
     const client = new acme.Client({
       directoryUrl,
       accountKey: account.accountKey,
-      accountUrl: account.accountUrls[urlKey] || undefined,
+      accountUrl: account.accountUrl || undefined,
       backoffAttempts: 20,
       backoffMin: 2000,
       backoffMax: 10000,
@@ -156,7 +142,7 @@ class AcmeManager {
    * domains 至少一项，第一项作为 CSR 的 commonName，其余进 altNames。
    * 返回 { ok, domain, notAfter, crtPath, keyPath, fullchainPath }。
    */
-  async issue({ domains, email = '', staging = true, dns, onProgress = null }) {
+  async issue({ domains, email = '', dns, onProgress = null }) {
     const prog = (label, percent) => {
       if (typeof onProgress === 'function') {
         try { onProgress({ label, percent }); } catch { /* 进度回调异常不影响签发 */ }
@@ -174,9 +160,8 @@ class AcmeManager {
     const commonName = unique[0];
 
     prog('初始化 ACME 客户端…', 5);
-    const { client, account } = await this.clientFor({ staging, email });
-    const urlKey = staging ? 'staging' : 'production';
-    const beforeUrl = account.accountUrls[urlKey] || '';
+    const { client, account } = await this.clientFor({ email });
+    const beforeUrl = account.accountUrl || '';
 
     try {
       prog('生成密钥与证书请求…', 10);
@@ -230,19 +215,19 @@ class AcmeManager {
       });
 
       if (!beforeUrl) {
-        await this.saveAccountUrl(client.getAccountUrl(), staging);
+        await this.saveAccountUrl(client.getAccountUrl());
       }
 
       prog('保存证书到本机…', 90);
-      return this.storeCertificate({ fullchain, key, domains: unique, email, staging });
+      return this.storeCertificate({ fullchain, key, domains: unique, email });
     } catch (error) {
       return { ok: false, error: String((error && error.message) || error) };
     }
   }
 
-  storeCertificate({ fullchain, key, domains, email, staging }) {
+  storeCertificate({ fullchain, key, domains, email }) {
     const primary = domains[0];
-    const folder = certFolderFor(primary, !!staging);
+    const folder = certFolder(primary);
     const dir = path.join(this.certsDir, folder);
     ensureDir(dir);
 
@@ -258,7 +243,6 @@ class AcmeManager {
     writeJsonAtomic(path.join(dir, 'metadata.json'), {
       domains,
       email: String(email || ''),
-      staging: !!staging,
       notBefore: info.notBefore ? info.notBefore.toISOString() : null,
       notAfter: info.notAfter ? info.notAfter.toISOString() : null,
       issuedAt: Date.now(),
@@ -268,7 +252,6 @@ class AcmeManager {
       ok: true,
       domain: primary,
       domains,
-      staging: !!staging,
       folder,
       notBefore: info.notBefore ? info.notBefore.toISOString() : null,
       notAfter: info.notAfter ? info.notAfter.toISOString() : null,
@@ -287,6 +270,8 @@ class AcmeManager {
     try {
       for (const entry of fs.readdirSync(this.certsDir, { withFileTypes: true })) {
         if (!entry.isDirectory()) continue;
+        // 旧版本曾把 STAGING 假证书放到 `<域名>.staging` 目录，这里直接跳过，不再显示。
+        if (entry.name.endsWith('.staging')) continue;
         const meta = readJson(path.join(this.certsDir, entry.name, 'metadata.json'), null);
         if (!meta || !Array.isArray(meta.domains) || !meta.domains.length) continue;
         const dir = path.join(this.certsDir, entry.name);
@@ -298,7 +283,6 @@ class AcmeManager {
           domain: meta.domains[0],
           domains: meta.domains,
           email: meta.email || '',
-          staging: !!meta.staging,
           notBefore: meta.notBefore || null,
           notAfter: meta.notAfter || null,
           daysLeft: daysLeft(meta.notAfter),
@@ -315,31 +299,32 @@ class AcmeManager {
     return result;
   }
 
-  get(domain, { staging } = {}) {
+  get(domain) {
     const primary = certFolder(domain);
     const matches = this.list().filter((c) => c.domain === domain || certFolder(c.domain) === primary);
-    if (staging !== undefined) return matches.find((c) => !!c.staging === !!staging) || null;
     return matches[0] || null;
   }
 
   /* 记录一张证书最近一次「部署到服务器 nginx」的结果（成功或失败都记），
    * 供证书列表/域名向导显示「已部署 / 未部署」，避免签了证书但没部署到 nginx
    * 时界面还显示一切就绪、浏览器访问 https://域名 却被拒绝。 */
-  markNginx(domain, nginxResult) {
+  markNginx(domain, nginxResult, serverHost = '') {
     const cert = this.get(String(domain || '').trim());
     if (!cert) return false;
     const metaPath = path.join(this.certsDir, cert.folder, 'metadata.json');
     const meta = readJson(metaPath, null) || {};
-    meta.nginx = nginxResult && typeof nginxResult === 'object' ? { ...nginxResult, at: Date.now() } : null;
+    meta.nginx = nginxResult && typeof nginxResult === 'object'
+      ? { ...nginxResult, serverHost: String(serverHost || ''), at: Date.now() }
+      : null;
     writeJsonAtomic(metaPath, meta);
     return true;
   }
 
   /* 续期：对同一批域名重新走一次签发。 */
-  async renew(domain, { email = '', staging = true, dns, onProgress = null } = {}) {
-    const existing = this.get(domain, { staging });
-    if (!existing) return { ok: false, error: `本地没有 ${domain} 的${staging ? ' STAGING ' : '生产 '}证书，请直接签发` };
-    return this.issue({ domains: existing.domains, email: email || existing.email, staging: !!existing.staging, dns, onProgress });
+  async renew(domain, { email = '', dns, onProgress = null } = {}) {
+    const existing = this.get(domain);
+    if (!existing) return { ok: false, error: `本地没有 ${domain} 的证书，请直接签发` };
+    return this.issue({ domains: existing.domains, email: email || existing.email, dns, onProgress });
   }
 
   /* 自动续期：把「剩余天数 ≤ days」的证书逐张重签，返回结果汇总。
@@ -356,7 +341,6 @@ class AcmeManager {
         const result = await this.issue({
           domains: cert.domains,
           email: cert.email,
-          staging: !!cert.staging,
           dns,
         });
         if (result.ok) renewed.push({ domain: cert.domain, daysLeft: result.daysLeft, notAfter: result.notAfter });
@@ -368,11 +352,11 @@ class AcmeManager {
     return { renewed, errors };
   }
 
-  removeLocal(domain, { staging } = {}) {
-    const entry = staging === undefined ? this.get(domain) : this.get(domain, { staging });
+  removeLocal(domain) {
+    const entry = this.get(domain);
     const dir = entry && entry.folder
       ? path.join(this.certsDir, entry.folder)
-      : path.join(this.certsDir, certFolderFor(domain, !!staging));
+      : path.join(this.certsDir, certFolder(domain));
     try {
       if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
       return { ok: true };
@@ -382,4 +366,4 @@ class AcmeManager {
   }
 }
 
-module.exports = { AcmeManager, daysLeft, certFolder, certFolderFor, coversDomain, readCertCoverage, dns01Name };
+module.exports = { AcmeManager, daysLeft, certFolder, coversDomain, readCertCoverage, dns01Name };

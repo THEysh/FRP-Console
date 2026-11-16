@@ -24,7 +24,7 @@ const S = {
   modalOpen: false,
   proxyEdit: null,
   update: null,
-  certs: { list: [], dns: { dnsProvider: '', hasToken: false, acmeEmail: '', acmeStaging: true }, loaded: false, busy: false, issuing: false, wizard: { domain: '', checking: false, dns: null, setA: false, result: null } },
+  certs: { list: [], dns: { dnsProvider: '', hasToken: false, acmeEmail: '' }, loaded: false, busy: false, issuing: false, wizard: { domain: '', checking: false, dns: null, setA: false, result: null } },
   lastKeys: {},
   viewScroll: {},
   busy: new Set(),
@@ -1466,35 +1466,46 @@ function renderServerLogs() {
 function nginxCardMarkup() {
   const n = S.server.nginx || {};
   if (!n || n.loading) {
-    return `<section class="card"><div class="card-head"><div class="ch-icon">${icon('globe')}</div><div class="grow"><h3>域名反代（nginx）</h3><p>检测服务器 nginx，让域名走 80/443、不用带端口。</p></div></div><div class="field-hint" style="padding:0 16px 12px">检测中…</div></section>`;
+    return `<section class="card"><div class="card-head"><div class="ch-icon">${icon('globe')}</div><div class="grow"><h3>HTTPS 域名反代（nginx）</h3><p>检测服务器 nginx，让域名走 80/443、不用带端口。</p></div></div><div class="field-hint" style="padding:0 16px 12px">检测中…</div></section>`;
   }
   if (n.error) {
-    return `<section class="card"><div class="card-head"><div class="ch-icon">${icon('globe')}</div><div class="grow"><h3>域名反代（nginx）</h3><p>检测服务器 nginx，让域名走 80/443、不用带端口。</p></div></div><div class="note warn" style="margin:0 16px 12px">${icon('alert')}<div>${esc(n.error)}</div></div></section>`;
+    return `<section class="card"><div class="card-head"><div class="ch-icon">${icon('globe')}</div><div class="grow"><h3>HTTPS 域名反代（nginx）</h3><p>检测服务器 nginx，让域名走 80/443、不用带端口。</p></div></div><div class="note warn" style="margin:0 16px 12px">${icon('alert')}<div>${esc(n.error)}</div></div></section>`;
   }
   const installed = !!n.installed;
-  const free = n.port80Free && n.port443Free;
-  const statusBadge = installed
-    ? `<span class="badge ${free ? '' : 'amber'}"><span class="bdot"></span>${n.version ? esc(n.version) : '已安装'} · ${free ? '80/443 空闲' : '80/443 被占'}</span>`
-    : `<span class="badge amber"><span class="bdot"></span>未安装</span>`;
-  const detail = installed
-    ? (free
-      ? 'nginx 已装且 80/443 空闲：配置后域名可直接 https:// 访问，不用带端口。'
-      : `80/443 正在被${[n.port80By, n.port443By].filter(Boolean).join('、') || '其它进程'}占用。反代配置会自动接管 frp 域名，不影响已有站点。`)
-    : '服务器还没装 nginx。一键配置会自动安装并写好反代规则。';
+  // 真冲突 = 80/443 被「非 nginx」的进程占用。nginx 自己占着 80/443 是正常就绪，
+  // 不能用 port80Free/port443Free（那会把 nginx 自身也算成「被占」）。
+  const conflict = !!(n.port80Conflict || n.port443Conflict);
+  let statusBadge;
+  let detail;
+  let setupLabel;
+  if (installed && !conflict) {
+    statusBadge = `<span class="badge green"><span class="bdot"></span>${n.version ? esc(n.version) : 'nginx'} · 就绪</span>`;
+    detail = 'nginx 已装，80/443 可用：配置后域名可直接 https:// 访问，不用带端口。';
+    setupLabel = '一键配置反代';
+  } else if (installed && conflict) {
+    const by = [n.port80By, n.port443By].filter(Boolean).join('、') || '其它进程';
+    statusBadge = '<span class="badge amber"><span class="bdot"></span>80/443 被占</span>';
+    detail = `80/443 正在被 ${by} 占用（不是 nginx），nginx 无法绑定标准端口。可点「清理占用并配置」终止这些进程后再配置。`;
+    setupLabel = '清理占用并配置';
+  } else {
+    statusBadge = '<span class="badge amber"><span class="bdot"></span>未安装</span>';
+    detail = '服务器还没装 nginx。一键配置会自动安装并写好反代规则。';
+    setupLabel = '安装 nginx 并配置';
+  }
   const certMissing = n.certMissing;
   return `
     <section class="card">
       <div class="card-head">
         <div class="ch-icon">${icon('globe')}</div>
-        <div class="grow"><h3>域名反代（nginx）</h3><p>${esc(detail)}</p></div>
+        <div class="grow"><h3>HTTPS 域名反代（nginx）</h3><p>${esc(detail)}</p></div>
         <div class="page-actions">
           ${statusBadge}
           <button class="btn" type="button" data-act="server.nginx.refresh">${icon('reload')}<span>重新检测</span></button>
-          <button class="btn primary" type="button" data-act="server.nginx.setup" ${S.server.nginxBusy ? 'disabled' : ''}>${S.server.nginxBusy ? '<span class="spinner-sm"></span>' : icon('globe')}<span>${S.server.nginxBusy ? '配置中…' : '一键配置反代'}</span></button>
+          <button class="btn primary" type="button" data-act="server.nginx.setup" ${S.server.nginxBusy ? 'disabled' : ''}>${S.server.nginxBusy ? '<span class="spinner-sm"></span>' : icon('globe')}<span>${S.server.nginxBusy ? '配置中…' : setupLabel}</span></button>
         </div>
       </div>
       ${certMissing
-        ? `<div class="note warn" style="margin:0 16px 12px">${icon('alert')}<div><strong>还没有可用证书</strong><br>反代需要一张证书来终止 HTTPS。请先到「HTTPS 证书」页签发一张真实证书（关掉 STAGING），再回来点「一键配置反代」。</div></div>`
+        ? `<div class="note warn" style="margin:0 16px 12px">${icon('alert')}<div><strong>还没有可用证书</strong><br>反代需要一张证书来终止 HTTPS。请先到「HTTPS 证书」页签发一张，再回来点「一键配置反代」。</div></div>`
         : ''}
       ${n.ok
         ? `<div class="note" style="margin:0 16px 12px">${icon('check')}<div><strong>反代已就绪</strong><br>${esc(n.serverNames || '')} → nginx 80/443 → frps HTTP vhost（${esc(String(n.frpsHttpPort || ''))}）。现在用 <code>https://你的域名</code> 就能访问，不带端口。</div></div>`
@@ -2813,15 +2824,19 @@ function certExpiryTone(days) {
 
 function certRow(c) {
   const tone = certExpiryTone(c.daysLeft);
+  const nginxOk = !!(c.nginx && c.nginx.ok);
+  const nginxHost = (c.nginx && c.nginx.serverHost) || '';
+  const deployedLabel = nginxOk ? `已部署到 ${nginxHost || 'nginx'}` : '未部署到 nginx';
+  const deployedBadge = nginxOk
+    ? `<span class="badge green">${esc(deployedLabel)}</span>`
+    : `<span class="badge amber" title="证书还没上传到服务器 nginx，https://域名 暂时访问不了">${esc(deployedLabel)}</span>`;
   return `
     <div class="cert-row">
       <div class="cert-main">
         <div class="cert-title">
           <strong>${esc(c.domain)}</strong>
-          ${c.staging ? '<span class="badge amber">STAGING</span>' : ''}
           ${c.domain.startsWith('*.') ? '<span class="badge">通配符</span>' : ''}
-          ${!c.staging && c.nginx && c.nginx.ok ? '<span class="badge green">已部署到 nginx</span>' : ''}
-          ${!c.staging && !(c.nginx && c.nginx.ok) ? '<span class="badge amber" title="证书还没上传到服务器 nginx，https://域名 暂时访问不了">未部署到 nginx</span>' : ''}
+          ${deployedBadge}
         </div>
         <div class="cert-meta mono">
           到期 ${c.notAfter ? new Date(c.notAfter).toLocaleString('zh-CN') : '—'}
@@ -2834,9 +2849,9 @@ function certRow(c) {
         </div>
       </div>
       <div class="cert-actions">
-        ${!c.staging ? `<button class="btn small" type="button" data-act="certs.nginx" data-domain="${esc(c.domain)}" title="上传到服务器 nginx 并配置反代">${icon('globe')}<span>部署到 nginx</span></button>` : ''}
-        <button class="btn small" type="button" data-act="certs.renew" data-domain="${esc(c.domain)}" data-staging="${c.staging ? '1' : '0'}">${icon('reload')}<span>续期</span></button>
-        <button class="btn small danger-text" type="button" data-act="certs.remove" data-domain="${esc(c.domain)}" data-staging="${c.staging ? '1' : '0'}">${icon('trash')}<span>删除</span></button>
+        <button class="btn small" type="button" data-act="certs.nginx" data-domain="${esc(c.domain)}" title="上传到服务器 nginx 并配置反代">${icon('globe')}<span>部署到 nginx</span></button>
+        <button class="btn small" type="button" data-act="certs.renew" data-domain="${esc(c.domain)}">${icon('reload')}<span>续期</span></button>
+        <button class="btn small danger-text" type="button" data-act="certs.remove" data-domain="${esc(c.domain)}">${icon('trash')}<span>删除</span></button>
       </div>
     </div>`;
 }
@@ -2860,8 +2875,8 @@ function domainWizardHtml() {
     return names.some((n) => n === domain || coversDomain(n, domain));
   }) || null) : null;
   const certCovers = !!coveringCert;
-  // 生产证书已覆盖，但还没部署到服务器 nginx 时，https://域名 实际访问不了，向导要提示。
-  const certNginxPending = !!(coveringCert && !coveringCert.staging && !(coveringCert.nginx && coveringCert.nginx.ok));
+  // 证书已覆盖，但还没部署到服务器 nginx 时，https://域名 实际访问不了，向导要提示。
+  const certNginxPending = !!(coveringCert && !(coveringCert.nginx && coveringCert.nginx.ok));
 
   const dnsOk = !!(dns && (dns.resolved || []).length && dns.pointsToServer);
   const dnsResolvedOther = !!(dns && (dns.resolved || []).length && !dns.pointsToServer);
@@ -2931,13 +2946,9 @@ function domainWizardHtml() {
             <div class="dw-inline-form">
               <input class="input" id="cert-domains" placeholder="example.com, *.example.com（逗号分隔）" value="${esc(w.domain || '')}" />
               <input class="input" id="cert-email" value="${esc(dnsCfg.acmeEmail || '')}" placeholder="联系邮箱（用于到期提醒）" />
-              <div class="switch-row">
-                <div class="sr-text"><strong>STAGING</strong><span>先用假证书试</span></div>
-                <button class="switch ${dnsCfg.acmeStaging !== false ? 'on' : ''}" type="button" data-act="toggle" data-field="cert-staging" aria-pressed="${dnsCfg.acmeStaging !== false}"></button>
-              </div>
               <button class="btn primary" type="button" data-act="certs.issue" ${S.certs.issuing ? 'disabled' : ''}>${S.certs.issuing ? '<span class="spinner-sm"></span>' : icon('shield')}<span>${S.certs.issuing ? '签发中，请稍候…' : '签发证书'}</span></button>
             </div>
-            <span style="font-size:11px">第一项作为主域名；通配符填 <code>*.example.com</code>。建议先用 STAGING 验证流程，再关掉签真实证书。</span>
+            <span style="font-size:11px">第一项作为主域名；通配符填 <code>*.example.com</code>。签发的是 Let's Encrypt 正式证书（有效期 90 天，到期前会自动续期）。</span>
           </div>
         </div>
 
@@ -2984,13 +2995,18 @@ function renderCerts(force = false) {
   const coveredText = coveredDomains.join('、');
   // 自动折叠：没手动点过「展开/收起」时，token 与证书都齐了就默认收起向导
   const expanded = w.expanded === undefined ? !(hasToken && certs.length) : w.expanded;
+  // 证书按服务器显示：顶部标注当前连接的服务器，每张证书的部署徽标带服务器名。
+  const serverHost = S.server.connected ? String(S.server.host || '') : '';
+  const serverCtx = serverHost
+    ? `<span class="badge">当前服务器 ${esc(serverHost)}</span>`
+    : '<span class="badge amber">未连接服务器</span>';
 
   $('#view').innerHTML = `
     <div class="view">
       <div class="page-head">
         <div class="page-title">
           <h1>HTTPS 证书</h1>
-          <p>可选功能：用 Let's Encrypt 给自定义域名签发证书，部署到服务器 nginx 终止 TLS，让域名直接 <code>https://</code> 访问、不带端口。不配置也能正常使用隧道。</p>
+          <p>给域名上 HTTPS：签证书 → 部署到服务器 → 浏览器就能 <code>https://</code> 访问、不带端口。不配置也能正常使用隧道。</p>
         </div>
       </div>
 
@@ -3004,8 +3020,11 @@ function renderCerts(force = false) {
 
       <section class="card section">
         <div class="section-head">
-          <div class="section-title"><strong>已签发证书</strong><span>${coveredDomains.length ? `已覆盖域名：${esc(coveredText)} · ` : ''}保存在本机 userData\\certs\\ 下；连上服务器后可「部署到 nginx」终止 TLS（私钥会同步到服务器 nginx）。</span></div>
-          <button class="btn small" type="button" data-act="certs.refresh">${icon('reload')}<span>刷新</span></button>
+          <div class="section-title"><strong>已签发证书</strong><span>${coveredDomains.length ? `已覆盖域名：${esc(coveredText)} · ` : ''}保存在本机 userData\\certs\\ 下；「部署到 nginx」会把证书上传到服务器终止 TLS。</span></div>
+          <div class="page-actions">
+            ${serverCtx}
+            <button class="btn small" type="button" data-act="certs.refresh">${icon('reload')}<span>刷新</span></button>
+          </div>
         </div>
         ${certs.length
           ? `<div class="cert-list">${certs.map(certRow).join('')}</div>`
@@ -3903,16 +3922,14 @@ async function handleAction(act, dataset, btn) {
         if (!domainsInput) { toast('error', '请填写要签发的域名'); break; }
         const domains = domainsInput.split(/[,，\s]+/).map((d) => d.trim()).filter(Boolean);
         const email = $('#cert-email') ? $('#cert-email').value.trim() : '';
-        const stagingBtn = document.querySelector('[data-field="cert-staging"]');
-        const staging = stagingBtn ? stagingBtn.classList.contains('on') : true;
-        // 记住邮箱与 STAGING 偏好（供下次进入与自动续期使用）
-        try { await FRP.saveSettings({ acmeEmail: email, acmeStaging: staging }); } catch (_) { /* 不影响签发 */ }
+        // 记住邮箱（供下次进入与自动续期使用）
+        try { await FRP.saveSettings({ acmeEmail: email }); } catch (_) { /* 不影响签发 */ }
         S.certs.issuing = true;
         renderCerts(true);
-        showCertProgress(staging ? '正在签发 STAGING 测试证书' : '正在签发正式证书');
+        showCertProgress('正在签发正式证书');
         const offProgress = FRP.on('cert:progress', updateCertProgress);
         try {
-          const res = await FRP.certIssue({ domains, email, staging });
+          const res = await FRP.certIssue({ domains, email });
           if (res && res.ok) {
             const nginx = res.data && res.data.nginx;
             if (nginx && nginx.ok) {
@@ -3934,11 +3951,10 @@ async function handleAction(act, dataset, btn) {
         break;
       }
       case 'certs.renew': {
-        const staging = dataset.staging === '1';
         showCertProgress('正在续期证书');
         const offProgress = FRP.on('cert:progress', updateCertProgress);
         try {
-          const res = await FRP.certRenew(dataset.domain, staging);
+          const res = await FRP.certRenew(dataset.domain);
           if (res && res.ok) {
             const nginx = res.data && res.data.nginx;
             toast('success', '证书已续期', `${res.data.domain} · 剩余 ${res.data.daysLeft} 天${nginx && nginx.ok ? ' · 已同步到 nginx' : ''}`);
@@ -3963,7 +3979,6 @@ async function handleAction(act, dataset, btn) {
       }
       case 'certs.remove': {
         const domain = dataset.domain;
-        const staging = dataset.staging === '1';
         openModal(`
           <div class="modal" style="width:440px">
             <div class="modal-head">
@@ -3972,7 +3987,7 @@ async function handleAction(act, dataset, btn) {
               <button class="icon-btn modal-close" type="button" data-act="modal.close">${icon('x')}</button>
             </div>
             <div class="modal-body">
-              <div class="note warn">${icon('alert')}<div>删除后，引用 <strong>${esc(domain)}</strong>${staging ? '<span class="badge amber">STAGING</span>' : ''} 证书的 https2http / https2https 代理会失去证书，公网访问会失败，直到重新签发并填回路径。</div></div>
+              <div class="note warn">${icon('alert')}<div>删除后，引用 <strong>${esc(domain)}</strong> 证书的 https2http / https2https 代理会失去证书，公网访问会失败，直到重新签发并填回路径。</div></div>
             </div>
             <div class="modal-foot">
               <span class="mf-left"></span>
@@ -3983,7 +3998,7 @@ async function handleAction(act, dataset, btn) {
         const delBtn = $('#cert-del-confirm');
         if (delBtn) delBtn.addEventListener('click', async () => {
           delBtn.disabled = true;
-          const res = await FRP.certRemove(domain, staging);
+          const res = await FRP.certRemove(domain);
           if (res && res.ok) {
             closeModal();
             toast('success', '已删除证书', domain);
