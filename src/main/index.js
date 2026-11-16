@@ -1782,6 +1782,68 @@ function registerIpc() {
     return ok({ state: result.state, reloaded: result.reloaded, restartRecommended: connChanged });
   });
 
+  /* frpc.toml 原文（配置编辑器用）：读、校验、保存。 */
+  const verifyFrpcRaw = async (content) => {
+    if (!paths.frpcPath || !fs.existsSync(paths.frpcPath)) return { ok: false, error: '未找到 frpc.exe，无法校验配置' };
+    const dir = paths.configPath ? path.dirname(paths.configPath) : (paths.frpcPath ? path.dirname(paths.frpcPath) : process.cwd());
+    const tmp = path.join(dir, `.frpc-verify-${process.pid}.toml`);
+    try {
+      fs.writeFileSync(tmp, String(content || ''), 'utf8');
+      const r = await execFileP(paths.frpcPath, ['verify', '-c', tmp], { timeout: 10000 });
+      const out = `${r.stdout || ''}\n${r.stderr || ''}`.trim();
+      if (r.ok) return { ok: true, output: out };
+      const firstErr = String(out || '').split(/\r?\n/).map((l) => l.trim()).filter(Boolean).find((l) => /error|invalid|fail|unknown/i.test(l)) || out;
+      return { ok: false, error: firstErr || '配置校验失败' };
+    } finally {
+      try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+    }
+  };
+
+  ipcMain.handle('config:raw', async () => {
+    try {
+      if (!paths.configPath) return fail('尚未配置 frpc.toml 路径');
+      if (!fs.existsSync(paths.configPath)) return fail('frpc.toml 不存在');
+      return ok({ content: fs.readFileSync(paths.configPath, 'utf8'), path: paths.configPath });
+    } catch (e) {
+      return fail(String((e && e.message) || e));
+    }
+  });
+
+  ipcMain.handle('config:verify-raw', async (event, payload = {}) => {
+    const content = String(payload.content || '');
+    if (!content.trim()) return fail('配置内容为空');
+    const verify = await verifyFrpcRaw(content);
+    return verify.ok ? ok({ valid: true, output: verify.output }) : fail(`配置校验不通过：${verify.error}`, { valid: false });
+  });
+
+  ipcMain.handle('config:save-raw', async (event, payload = {}) => {
+    const content = String(payload.content || '');
+    const restart = !!payload.restart;
+    if (!content.trim()) return fail('配置内容为空');
+    if (!paths.configPath) return fail('尚未配置 frpc.toml 路径');
+    const verify = await verifyFrpcRaw(content);
+    if (!verify.ok) return fail(`配置校验不通过：${verify.error}`, { valid: false });
+    const write = configModule.writeRawConfig(paths.configPath, content);
+    loadConfigFromDisk();
+    let restarted = false;
+    let reloadError = null;
+    if (restart) {
+      suppressExitUntil = Date.now() + 15000;
+      const r = await manager.restart({ runMode: settings.runMode });
+      restarted = r && r.ok;
+      if (!restarted) reloadError = (r && r.error) || '重启 frpc 失败';
+    } else if (manager && manager.apiOk) {
+      const r = await manager.reload().catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+      if (r && !r.ok) reloadError = r.error;
+    }
+    await manager.refresh().catch(() => {});
+    healthCache.clear();
+    scheduleHealth(900);
+    pushState();
+    if (reloadError) return fail(`配置已保存，但${restart ? '重启' : '热重载'}失败：${reloadError}`, { state: buildState(), changed: write.changed, backup: write.backup });
+    return ok({ state: buildState(), changed: write.changed, backup: write.backup, restarted });
+  });
+
   ipcMain.handle('proxy:save', async (event, payload) => {
     if (!model) return fail('配置尚未载入');
     const { mode = 'add', originalName = '', proxy: input } = payload || {};
@@ -2687,7 +2749,31 @@ function registerIpc() {
       const cfgPorts = serverConfig.summary ? serverSession.configPorts(serverConfig.content) : [];
       const proxyPorts = proxyRemotePorts();
       const allowed = await serverSession.readFirewallAllowed();
-      return ok({ ...det, ports: [...cfgPorts, ...proxyPorts], frpsPorts: cfgPorts, proxyPorts, allowed });
+      // 对每个 tcp 端口实测可达性（从本机连服务器端口）。用于区分两种「规则未放行」：
+      // ① 规则没写但实测通 —— 通常是云平台防火墙/安全组（阿里云轻量、腾讯云等）在服务器外放行，
+      //    服务器内 ufw 看到的是「未放行」，但实际不拦；② 规则没写且实测被拦 —— 才真的需要放行。
+      const reachMap = new Map();
+      const tcpPorts = [...cfgPorts, ...proxyPorts].filter((p) => p.proto === 'tcp' && p.port);
+      await Promise.all(tcpPorts.map(async (p) => {
+        const key = `tcp:${p.port}`;
+        if (reachMap.has(key)) return;
+        try {
+          const r = await tcpCheck(serverSession.host, Number(p.port), 2000);
+          reachMap.set(key, !!r.ok);
+        } catch { reachMap.set(key, null); }
+      }));
+      const markReachable = (list) => list.map((p) => {
+        if (p.proto !== 'tcp') return p;
+        const v = reachMap.get(`tcp:${p.port}`);
+        return v === undefined ? p : { ...p, reachable: v };
+      });
+      return ok({
+        ...det,
+        ports: [...markReachable(cfgPorts), ...markReachable(proxyPorts)],
+        frpsPorts: markReachable(cfgPorts),
+        proxyPorts: markReachable(proxyPorts),
+        allowed,
+      });
     } catch (e) {
       return fail(String((e && e.message) || e));
     }

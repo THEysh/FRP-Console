@@ -489,6 +489,21 @@ function writeConfig(configPath, model) {
   return { changed: true, backup, text };
 }
 
+/* 直接写 frpc.toml 原文（「配置编辑器」用）：保留用户手写的字段与注释，
+ * 不做 serialize 归一化。写前备份、临时文件原子替换，语义与 writeConfig 一致。 */
+function writeRawConfig(configPath, content) {
+  const text = String(content || '');
+  const previous = fs.existsSync(configPath) ? fs.readFileSync(configPath, 'utf8') : null;
+  if (previous !== null && configContentKey(previous) === configContentKey(text)) {
+    return { changed: false, backup: null, text: previous };
+  }
+  const backup = previous !== null ? backupConfig(configPath) : null;
+  const tmp = `${configPath}.tmp-${process.pid}`;
+  fs.writeFileSync(tmp, text, 'utf8');
+  fs.renameSync(tmp, configPath);
+  return { changed: true, backup, text };
+}
+
 /* 把管理 API 的监听信息写进 frpc.toml。
  * 调用方传进来的是整份 settings（字段叫 adminPort/adminUser/adminPassword），
  * 以前这里按 port/user/password 解构，于是永远落在默认值 7400/admin/admin上 ——
@@ -739,6 +754,7 @@ module.exports = {
   validate,
   serialize,
   writeConfig,
+  writeRawConfig,
   backupConfig,
   listBackups,
   restoreBackup,

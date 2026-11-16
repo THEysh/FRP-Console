@@ -52,7 +52,8 @@ const S = {
     config: '',
     summary: null,
     configError: '',
-    mode: 'wizard',
+    mode: 'frps',
+    frpcRaw: '',
     template: 'custom',
     wizard: null,
     wizardDirty: false,
@@ -1387,18 +1388,35 @@ function wizardPane() {
     </div>`;
 }
 
-function advancedPane() {
+function frpsPane() {
   return `
-    <div id="advanced-pane" class="advanced-pane ${S.server.mode === 'advanced' ? '' : 'hidden'}">
+    <div id="frps-pane" class="advanced-pane ${S.server.mode === 'frps' ? '' : 'hidden'}">
       <div class="adv-head">
-        <span class="field-hint">直接编辑完整 TOML，保留模板之外的字段；保存前同样会校验语法并备份。</span>
+        <span class="field-hint">服务器端 frps.toml。直接编辑完整 TOML，保存前会校验语法并备份。</span>
         <div class="page-actions">
           <button class="btn ghost" type="button" data-act="server.advanced.reload">${icon('download')}<span>重新读取</span></button>
           <button class="btn" type="button" data-act="server.save">${icon('check')}<span>仅保存</span></button>
-          <button class="btn primary" type="button" data-act="server.save.restart">${icon('restart')}<span>保存并重启</span></button>
+          <button class="btn primary" type="button" data-act="server.save.restart">${icon('restart')}<span>保存并重启 frps</span></button>
         </div>
       </div>
       <textarea class="textarea server-config" id="server-config" spellcheck="false" placeholder="frps 配置内容">${esc(S.server.config)}</textarea>
+    </div>`;
+}
+
+function frpcPane() {
+  return `
+    <div id="frpc-pane" class="advanced-pane ${S.server.mode === 'frpc' ? '' : 'hidden'}">
+      <div class="adv-head">
+        <span class="field-hint">本机 frpc.toml。直接编辑完整 TOML，校验语法通过后才能保存；写前自动备份。</span>
+        <div class="page-actions">
+          <button class="btn ghost" type="button" data-act="server.frpc.verify">${icon('check')}<span>校验语法</span></button>
+          <button class="btn ghost" type="button" data-act="server.frpc.reload">${icon('download')}<span>重新读取</span></button>
+          <button class="btn" type="button" data-act="server.frpc.save">${icon('check')}<span>仅保存</span></button>
+          <button class="btn primary" type="button" data-act="server.frpc.save.restart">${icon('restart')}<span>保存并重启 frpc</span></button>
+        </div>
+      </div>
+      <div class="note" id="frpc-verify-result" hidden></div>
+      <textarea class="textarea server-config" id="frpc-config" spellcheck="false" placeholder="frpc 配置内容（点击「重新读取」加载当前 frpc.toml）">${esc(S.server.frpcRaw || '')}</textarea>
     </div>`;
 }
 
@@ -1558,10 +1576,28 @@ function firewallCardMarkup() {
     const r = fwSpecRange(a.spec || `${a.port}/${a.proto}`);
     return r && r.proto === proto && port >= r.start && port <= r.end;
   });
-  const coverTag = (p) => covered(p.port, p.proto)
-    ? `<span class="tag ok">${esc(p.label)} ${p.port}/${p.proto} ✓</span>`
-    : `<span class="tag bad">${esc(p.label)} ${p.port}/${p.proto} 未放行</span>`;
-  const uncoveredCount = [...frpsPorts, ...proxyPorts].filter((p) => !covered(p.port, p.proto)).length;
+  const coverTag = (p) => {
+    if (!f.active) {
+      // 防火墙未启用 = 不拦截任何端口，谈不上「放行」，统一标绿，避免误导。
+      return `<span class="tag ok">${esc(p.label)} ${p.port}/${p.proto} 未启用不拦截</span>`;
+    }
+    if (covered(p.port, p.proto)) {
+      return `<span class="tag ok">${esc(p.label)} ${p.port}/${p.proto} ✓</span>`;
+    }
+    // 规则没写这条，但实测可达 —— 通常是云平台防火墙（阿里云轻量、腾讯云安全组等）
+    // 在服务器外放行，服务器内 ufw 看到「未放行」其实不拦。标中性色并说明，不再误导。
+    if (p.proto === 'tcp' && p.reachable === true) {
+      return `<span class="tag amber">${esc(p.label)} ${p.port}/${p.proto} 规则未放行 · 实测可达</span>`;
+    }
+    return `<span class="tag bad">${esc(p.label)} ${p.port}/${p.proto} 未放行</span>`;
+  };
+  const uncoveredCount = [...frpsPorts, ...proxyPorts].filter((p) => {
+    if (!f.active) return false; // 防火墙未启用不拦截，不算「未放行」
+    if (covered(p.port, p.proto)) return false; // 规则已覆盖
+    // 规则未覆盖：tcp 只有「实测被拦」才算真正需要放行；实测可达（云平台放行）不算。
+    if (p.proto === 'tcp') return p.reachable !== true;
+    return true; // udp 无法实测，保守算「未放行」
+  }).length;
   const statusBadge = f.active
     ? '<span class="badge amber"><span class="bdot"></span>已启用</span>'
     : '<span class="badge green"><span class="bdot"></span>未启用</span>';
@@ -1855,15 +1891,14 @@ function renderServer(force = false) {
       <section class="card config-card">
         <div class="card-head">
           <div class="ch-icon">${icon('edit')}</div>
-          <div class="grow"><h3>frps 配置</h3><p>${esc(s.configPath || '未找到配置文件')}${s.configError ? ` · ${esc(s.configError)}` : ''}</p></div>
-          <button class="icon-btn" type="button" data-act="server.copy.path" title="复制配置路径">${icon('copy')}</button>
+          <div class="grow"><h3>配置文件</h3><p>frps.toml（服务器端）+ frpc.toml（本机），直接编辑、校验语法、保存后重启对应进程。</p></div>
           <div class="mode-tabs">
-            <button class="mode-tab ${s.mode === 'wizard' ? 'active' : ''}" type="button" data-act="server.mode" data-mode="wizard">快速配置</button>
-            <button class="mode-tab ${s.mode === 'advanced' ? 'active' : ''}" type="button" data-act="server.mode" data-mode="advanced">高级编辑</button>
-          </div>        </div>
-        ${s.configPath ? '' : `<div class="note warn">${icon('alert')}<div>尚未找到 frps 配置文件。按向导生成后点击「一键初始化并启动」，控制台会创建 <code>/etc/frp/frps.toml</code>、安装 frps 并注册系统服务。</div></div>`}
-        ${wizardPane()}
-        ${advancedPane()}
+            <button class="mode-tab ${s.mode === 'frps' ? 'active' : ''}" type="button" data-act="server.mode" data-mode="frps">frps.toml</button>
+            <button class="mode-tab ${s.mode === 'frpc' ? 'active' : ''}" type="button" data-act="server.mode" data-mode="frpc">frpc.toml</button>
+          </div>
+        </div>
+        ${frpsPane()}
+        ${frpcPane()}
       </section>
 
       <section class="card">
@@ -2274,7 +2309,8 @@ async function autoConnectActiveProfile() {
     }
     S.server.wizard = null;
     S.server.wizardDirty = false;
-    S.server.mode = 'wizard';
+    S.server.mode = 'frps';
+    S.server.frpcRaw = '';
     S.server.previewText = '';
     S.server.logs = '';
     S.server.logsError = '';
@@ -2676,7 +2712,8 @@ async function connectServer(btn, options = undefined) {
     }
     S.server.wizard = null;
     S.server.wizardDirty = false;
-    S.server.mode = 'wizard';
+    S.server.mode = 'frps';
+    S.server.frpcRaw = '';
     S.server.template = 'custom';
     S.server.previewText = '';
     S.server.logs = '';
@@ -2828,33 +2865,80 @@ function applyServerTemplate(template) {
 }
 
 function setServerMode(mode) {
-  S.server.mode = mode === 'advanced' ? 'advanced' : 'wizard';
-  const wizard = $('#wizard-pane');
-  const advanced = $('#advanced-pane');
-  if (wizard) wizard.classList.toggle('hidden', S.server.mode !== 'wizard');
-  if (advanced) advanced.classList.toggle('hidden', S.server.mode !== 'advanced');
+  S.server.mode = mode === 'frpc' ? 'frpc' : 'frps';
+  const frps = $('#frps-pane');
+  const frpc = $('#frpc-pane');
+  if (frps) frps.classList.toggle('hidden', S.server.mode !== 'frps');
+  if (frpc) frpc.classList.toggle('hidden', S.server.mode !== 'frpc');
   document.querySelectorAll('.mode-tab').forEach((tab) => tab.classList.toggle('active', tab.dataset.mode === S.server.mode));
-  if (S.server.mode === 'advanced') {
+  if (S.server.mode === 'frps') {
     const area = $('#server-config');
     if (area && S.server.config && !area.value) area.value = S.server.config;
+  } else {
+    loadFrpcRaw();
   }
+}
+
+async function loadFrpcRaw() {
+  const res = await FRP.configRaw();
+  if (res && res.ok) {
+    S.server.frpcRaw = res.data.content;
+    const area = $('#frpc-config');
+    if (area) area.value = S.server.frpcRaw;
+  } else {
+    toastResult(res);
+  }
+}
+
+async function saveFrpcConfig(restart, btn) {
+  const area = $('#frpc-config');
+  if (!area) return;
+  const content = area.value;
+  if (!content.trim()) return toast('error', '配置内容为空');
+  await withBusy(btn, async () => {
+    const res = await FRP.configSaveRaw(content, restart);
+    if (!res || !res.ok) return toastResult(res);
+    S.server.frpcRaw = content;
+    setVerifyResult(null, '');
+    toast('success', restart ? 'frpc.toml 已保存并重启 frpc' : 'frpc.toml 已保存' + (res.data && res.data.changed === false ? '（内容无变化）' : ''));
+  });
+}
+
+function setVerifyResult(okFlag, msg) {
+  const box = $('#frpc-verify-result');
+  if (!box) return;
+  if (msg) {
+    box.hidden = false;
+    box.className = `note ${okFlag ? 'ok' : 'warn'}`;
+    box.textContent = msg;
+  } else {
+    box.hidden = true;
+    box.textContent = '';
+  }
+}
+
+async function verifyFrpcConfig(btn) {
+  const area = $('#frpc-config');
+  if (!area) return;
+  const content = area.value;
+  if (!content.trim()) return toast('error', '配置内容为空');
+  await withBusy(btn, async () => {
+    const res = await FRP.configVerifyRaw(content);
+    if (res && res.ok) {
+      setVerifyResult(true, '✓ 配置语法正确');
+    } else {
+      const msg = (res && res.error) || '校验失败';
+      setVerifyResult(false, msg);
+    }
+  });
 }
 
 async function saveServerConfig(restart, btn) {
   if (!S.server.configPath) return runServerBootstrap(btn);
-  let content = '';
-  if (S.server.mode === 'advanced') {
-    const area = $('#server-config');
-    if (!area) return;
-    content = area.value;
-    if (!content.trim()) return toast('error', '配置内容为空');
-  } else {
-    const fields = readWizardForm();
-    if (!fields) return;
-    const preview = await FRP.serverPreview(fields);
-    if (!preview || !preview.ok) return toastResult(preview);
-    content = preview.data.text;
-  }
+  const area = $('#server-config');
+  if (!area) return;
+  const content = area.value;
+  if (!content.trim()) return toast('error', '配置内容为空');
   await withBusy(btn, async () => {
     const seq = serverSeq();
     const res = await FRP.serverSaveConfig(content, restart);
@@ -4021,9 +4105,6 @@ async function handleAction(act, dataset, btn) {
       case 'server.selftest':
         await runServerSelfTest();
         break;
-      case 'server.template':
-        applyServerTemplate(dataset.template);
-        break;
       case 'server.gen.token': {
         const input = $('#wizard-form [name="token"]');
         if (input) {
@@ -4064,6 +4145,18 @@ async function handleAction(act, dataset, btn) {
         break;
       case 'server.advanced.reload':
         await loadServerConfig();
+        break;
+      case 'server.frpc.verify':
+        await verifyFrpcConfig(btn);
+        break;
+      case 'server.frpc.reload':
+        await loadFrpcRaw();
+        break;
+      case 'server.frpc.save':
+        await saveFrpcConfig(false, btn);
+        break;
+      case 'server.frpc.save.restart':
+        await saveFrpcConfig(true, btn);
         break;
       case 'server.copy.preview':
         await FRP.copy(S.server.previewText || '');
