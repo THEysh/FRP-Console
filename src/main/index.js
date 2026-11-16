@@ -2737,13 +2737,13 @@ function registerIpc() {
     }
   });
 
-  /* 撤销放行（删除防火墙规则）。payload.ports = [{port, proto}]。 */
+  /* 撤销放行（按规则 spec 删除）。payload.specs = ['7000/tcp', '1:65535/tcp', ...]。 */
   ipcMain.handle('server:firewall-close', async (_event, payload) => {
     if (!serverSession.connected) return fail('尚未连接服务器');
     try {
-      const ports = (payload && payload.ports) || [];
-      if (!Array.isArray(ports) || !ports.length) return fail('请先勾选要删除的端口');
-      const result = await serverSession.closeFirewallPorts(ports);
+      const specs = (payload && payload.specs) || [];
+      if (!Array.isArray(specs) || !specs.length) return fail('请先勾选要删除的规则');
+      const result = await serverSession.closeFirewallRules(specs);
       if (!result.ok) return fail(result.error, { manager: result.manager, removed: result.removed || [], notes: result.notes || [] });
       return ok(result);
     } catch (e) {

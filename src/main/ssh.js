@@ -1044,10 +1044,18 @@ class ServerSession {
     return out;
   }
 
-  // 撤销放行（删除防火墙规则）。ports = [{port, proto}]。
-  async closeFirewallPorts(ports) {
+  // 撤销放行（按「规则 spec」删除，spec 直接来自 readFirewallAllowed 的输出，如 '7000/tcp'、'1:65535/tcp'）。
+  // 按规则原文删，范围规则也能精确命中；按单端口删范围规则会报 Could not find，什么都删不掉。
+  async closeFirewallRules(specs) {
     if (!this.connected) return { ok: false, error: '尚未连接服务器' };
-    if (!ports || !ports.length) return { ok: true, removed: [], notes: ['没有要删除的端口'] };
+    const list = (specs || []).map((s) => String(s || '').trim()).filter(Boolean);
+    if (!list.length) return { ok: true, removed: [], notes: ['没有要删除的规则'] };
+    // spec 只允许「端口 或 端口范围/协议」两种形式（ufw 用 ':'、firewalld 用 '-'），防注入。
+    for (const spec of list) {
+      if (!/^[0-9]+(?::[0-9]+)?\/(tcp|udp)$/i.test(spec) && !/^[0-9]+(?:-[0-9]+)?\/(tcp|udp)$/i.test(spec)) {
+        return { ok: false, error: `规则格式不正确：${spec}` };
+      }
+    }
     const det = await this.detectFirewall();
     if (det.manager === 'none') return { ok: false, error: '服务器没有检测到防火墙' };
     if (!det.active) return { ok: false, error: `防火墙（${det.manager}）未启用，没有需要删除的规则` };
@@ -1058,36 +1066,41 @@ class ServerSession {
     const notes = [];
 
     if (det.manager === 'ufw') {
-      for (const { port, proto } of ports) {
-        // ufw allow 一条会同时生成 v4+v6 两条规则，删除时删两次清干净，第二次失败忽略。
+      for (const spec of list) {
+        // ufw delete 一条命令同时删 v4+v6；再删一次兜底（第二次找不到时忽略）。
         let hit = false;
         for (let i = 0; i < 2; i += 1) {
-          const r = await this.exec(`${prefix}ufw delete allow ${port}/${proto} 2>&1`, 15000);
+          const r = await this.exec(`${prefix}ufw delete allow ${spec} 2>&1`, 15000);
           const msg = `${r.stdout || ''}${r.stderr || ''}`;
-          if (r.ok || /Rule deleted|Deleting/i.test(msg)) hit = true;
+          if (r.ok && /Rule deleted|Deleting/i.test(msg)) hit = true;
+          else if (i === 0 && /Could not find/i.test(msg)) break; // 第一条就找不到，别再试第二次
         }
-        if (hit) removed.push(`${port}/${proto}`);
-        else notes.push(`${port}/${proto} 删除失败`);
+        if (hit) removed.push(spec);
+        else notes.push(`${spec} 删除失败：规则不存在`);
       }
-      return { ok: removed.length > 0, manager: 'ufw', removed, notes };
+      return { ok: removed.length > 0, manager: 'ufw', removed, notes, error: removed.length ? undefined : (notes.join('；') || '没有规则被删除') };
     }
 
     if (det.manager === 'firewalld') {
-      for (const { port, proto } of ports) {
-        const r = await this.exec(`${prefix}firewall-cmd --permanent --remove-port=${port}/${proto} 2>&1`, 15000);
-        if (r.ok) removed.push(`${port}/${proto}`);
-        else notes.push(`${port}/${proto} 删除失败：${firstLine(r.stderr || r.stdout)}`);
+      for (const spec of list) {
+        const r = await this.exec(`${prefix}firewall-cmd --permanent --remove-port=${spec} 2>&1`, 15000);
+        if (r.ok) removed.push(spec);
+        else notes.push(`${spec} 删除失败：${firstLine(r.stderr || r.stdout)}`);
       }
       await this.exec(`${prefix}firewall-cmd --reload 2>/dev/null || true`, 15000);
-      return { ok: removed.length > 0, manager: 'firewalld', removed, notes };
+      return { ok: removed.length > 0, manager: 'firewalld', removed, notes, error: removed.length ? undefined : (notes.join('；') || '没有规则被删除') };
     }
 
-    for (const { port, proto } of ports) {
-      const r = await this.exec(`${prefix}iptables -D INPUT -p ${proto} --dport ${port} -j ACCEPT 2>&1`, 15000);
-      if (r.ok) removed.push(`${port}/${proto}`);
-      else notes.push(`${port}/${proto} 删除失败：${firstLine(r.stderr || r.stdout)}`);
+    // 裸 iptables（规则不持久化，重启后丢失；仅兜底）
+    for (const spec of list) {
+      const m = /^([0-9]+)(?::|-([0-9]+))?\/(tcp|udp)$/i.exec(spec);
+      if (!m) { notes.push(`${spec} 删除失败：无法解析`); continue; }
+      const dport = m[2] ? `${m[1]}:${m[2]}` : `${m[1]}`;
+      const r = await this.exec(`${prefix}iptables -D INPUT -p ${m[3].toLowerCase()} --dport ${dport} -j ACCEPT 2>&1`, 15000);
+      if (r.ok) removed.push(spec);
+      else notes.push(`${spec} 删除失败：${firstLine(r.stderr || r.stdout)}`);
     }
-    return { ok: removed.length > 0, manager: 'iptables', removed, notes };
+    return { ok: removed.length > 0, manager: 'iptables', removed, notes, error: removed.length ? undefined : (notes.join('；') || '没有规则被删除') };
   }
 
   // 读当前配置并放开它要监听的端口（best-effort，出错返回 null，不阻断主流程）。

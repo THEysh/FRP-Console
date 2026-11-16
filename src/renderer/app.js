@@ -1531,6 +1531,15 @@ function nginxCardMarkup() {
     </section>`;
 }
 
+/* 解析规则 spec（ufw '7000/tcp'、'1:65535/tcp'；firewalld '8000-9000/tcp'）成范围。 */
+function fwSpecRange(spec) {
+  const m = /^([0-9]+)(?::([0-9]+)|-([0-9]+))?\/(tcp|udp)$/i.exec(String(spec || ''));
+  if (!m) return null;
+  const start = Number(m[1]);
+  const end = Number(m[2] || m[3] || m[1]);
+  return { start, end, proto: m[4].toLowerCase() };
+}
+
 function firewallCardMarkup() {
   const f = S.server.firewall || {};
   if (!f || f.loading) {
@@ -1542,17 +1551,24 @@ function firewallCardMarkup() {
   const managerLabel = { ufw: 'ufw', firewalld: 'firewalld', iptables: 'iptables', none: '无防火墙' }[f.manager] || esc(f.manager || '未知');
   const frpsPorts = Array.isArray(f.frpsPorts) && f.frpsPorts.length ? f.frpsPorts : (Array.isArray(f.ports) ? f.ports : []);
   const proxyPorts = Array.isArray(f.proxyPorts) && f.proxyPorts.length ? f.proxyPorts : [];
-  const frpsText = frpsPorts.length ? frpsPorts.map((p) => `${p.label} ${p.port}/${p.proto}`).join('、') : '（尚未读取到 frps 配置）';
-  const proxyRows = proxyPorts.map((p) => `<label class="check-inline"><input type="checkbox" class="fw-proxy-del" value="${p.port}/${p.proto}"><span class="mono">${esc(p.label)} ${p.port}/${p.proto}</span></label>`).join('');
+  const allowedRules = Array.isArray(f.allowed) ? f.allowed : [];
+  /* 一个端口算「已放行」= 存在协议匹配、且范围覆盖它的规则。 */
+  const covered = (port, proto) => allowedRules.some((a) => {
+    const r = fwSpecRange(a.spec || `${a.port}/${a.proto}`);
+    return r && r.proto === proto && port >= r.start && port <= r.end;
+  });
+  const coverTag = (p) => covered(p.port, p.proto)
+    ? `<span class="tag ok">${esc(p.label)} ${p.port}/${p.proto} ✓</span>`
+    : `<span class="tag bad">${esc(p.label)} ${p.port}/${p.proto} 未放行</span>`;
+  const uncoveredCount = [...frpsPorts, ...proxyPorts].filter((p) => !covered(p.port, p.proto)).length;
   const statusBadge = f.active
     ? '<span class="badge amber"><span class="bdot"></span>已启用</span>'
     : '<span class="badge green"><span class="bdot"></span>未启用</span>';
-  const allowed = Array.isArray(f.allowed) && f.allowed.length ? f.allowed : null;
   const notes = Array.isArray(f.notes) && f.notes.length ? f.notes : null;
   const busy = S.server.firewallBusy ? 'disabled' : '';
   const mainBtn = f.manager === 'none'
     ? `<button class="btn primary" type="button" data-act="server.firewall.install" ${busy}>${S.server.firewallBusy ? '<span class="spinner-sm"></span>' : icon('shield')}<span>${S.server.firewallBusy ? '安装中…' : '安装并启用防火墙'}</span></button>`
-    : `<button class="btn primary" type="button" data-act="server.firewall.open" ${busy}>${S.server.firewallBusy ? '<span class="spinner-sm"></span>' : icon('shield')}<span>${S.server.firewallBusy ? '放行中…' : '放行端口'}</span></button>`;
+    : `<button class="btn primary" type="button" data-act="server.firewall.open" ${busy}>${S.server.firewallBusy ? '<span class="spinner-sm"></span>' : icon('shield')}<span>${S.server.firewallBusy ? '放行中…' : '放行 frps 与代理端口'}</span></button>`;
   return `
     <section class="card">
       <div class="card-head">
@@ -1564,11 +1580,18 @@ function firewallCardMarkup() {
           ${mainBtn}
         </div>
       </div>
-      <div class="field-hint" style="padding:0 16px 6px">frps 端口：<span class="mono">${esc(frpsText)}</span></div>
-      ${proxyRows ? `<div style="padding:0 16px 6px"><div class="field-hint" style="padding:0 0 6px">代理映射端口（可勾选后删除放行）：</div><div style="display:flex; flex-wrap:wrap; gap:6px 14px; align-items:center;">${proxyRows}<button class="btn" type="button" data-act="server.firewall.close" ${busy}>${icon('trash')}<span>删除选中放行</span></button></div></div>` : ''}
-      ${allowed
-        ? `<div style="padding:0 16px 12px"><div class="field-hint" style="padding:0 0 6px">已放行（${allowed.length} 条，当前实际规则）：</div><div style="display:flex; flex-wrap:wrap; gap:6px;">${allowed.map((p) => `<span class="tag ok">${esc(p.spec || `${p.port}/${p.proto}`)}</span>`).join('')}</div></div>`
-        : ''}
+      ${frpsPorts.length ? `<div style="padding:0 16px 6px"><div class="field-hint" style="padding:0 0 6px">frps 端口放行状态：</div><div style="display:flex; flex-wrap:wrap; gap:6px;">${frpsPorts.map(coverTag).join('')}</div></div>` : ''}
+      ${proxyPorts.length ? `<div style="padding:0 16px 6px"><div class="field-hint" style="padding:0 0 6px">代理映射端口放行状态：</div><div style="display:flex; flex-wrap:wrap; gap:6px;">${proxyPorts.map(coverTag).join('')}</div></div>` : ''}
+      ${uncoveredCount ? `<div class="note warn" style="margin:0 16px 10px">${icon('alert')}<div>有 ${uncoveredCount} 个 frps / 代理端口还没被放行——点右上「放行 frps 与代理端口」一键补齐，或在下方手动放行。</div></div>` : ''}
+      ${allowedRules.length ? `
+      <div style="padding:0 16px 8px">
+        <div class="field-hint" style="padding:0 0 6px">已放行规则（${allowedRules.length} 条，当前实际规则，勾选后可删除）：</div>
+        <div style="display:flex; flex-wrap:wrap; gap:6px 14px; align-items:center; max-height:180px; overflow-y:auto;">
+          <label class="check-inline" style="color:var(--muted,inherit)"><input type="checkbox" id="fw-rule-all"><span>全选</span></label>
+          ${allowedRules.map((a) => `<label class="check-inline"><input type="checkbox" class="fw-rule-del" value="${esc(a.spec || `${a.port}/${a.proto}`)}"><span class="mono">${esc(a.spec || `${a.port}/${a.proto}`)}</span></label>`).join('')}
+        </div>
+        <div style="padding-top:8px;"><button class="btn" type="button" data-act="server.firewall.close" ${busy}>${icon('trash')}<span>删除选中规则</span></button></div>
+      </div>` : (f.manager !== 'none' ? '<div class="field-hint" style="padding:0 16px 10px">当前防火墙没有任何放行规则。</div>' : '')}
       ${notes
         ? `<div class="note warn" style="margin:0 16px 12px">${icon('alert')}<div>${esc(notes.join('；'))}</div></div>`
         : ''}
@@ -1584,7 +1607,7 @@ function firewallCardMarkup() {
         </select>
         <button class="btn" type="button" data-act="server.firewall.openports" ${busy}>${icon('plus')}<span>放行</span></button>
       </div>
-      <div class="field-hint" style="padding:0 16px 12px">支持单个端口、端口范围（1-65500）、逗号分隔多个；可连续多次放行，结果在上方累计显示。</div>
+      <div class="field-hint" style="padding:0 16px 12px">支持单个端口、端口范围（1-65500）、逗号分隔多个；放行 / 删除后列表实时刷新为防火墙里的真实规则。</div>
       `
         : ''}
     </section>`;
@@ -3769,10 +3792,9 @@ async function handleAction(act, dataset, btn) {
         try {
           const res = await FRP.serverFirewallOpenPorts({ text, proto });
           if (res && res.ok) {
+            /* 放行后重新读防火墙真实规则，列表立即出现刚放行的端口。 */
+            await loadServerFirewall(true);
             const now = (res.data && res.data.opened) || [];
-            const prev = (S.server.firewall && S.server.firewall.opened) || [];
-            const merged = [...new Set([...prev, ...now])];
-            S.server.firewall = { ...(S.server.firewall || {}), opened: merged, notes: (res.data && res.data.notes) || [] };
             toast(`已放行：${now.join('、')}`);
           } else {
             toast((res && res.error) || '放行失败', 'error');
@@ -3786,17 +3808,14 @@ async function handleAction(act, dataset, btn) {
         break;
       }
       case 'server.firewall.close': {
-        const checked = [...document.querySelectorAll('.fw-proxy-del:checked')];
-        if (!checked.length) { toast('请先勾选要删除放行的端口', 'error'); break; }
-        const ports = checked.map((c) => {
-          const [port, proto] = c.value.split('/');
-          return { port: Number(port), proto };
-        });
+        const checked = [...document.querySelectorAll('.fw-rule-del:checked')];
+        if (!checked.length) { toast('请先勾选要删除的规则', 'error'); break; }
+        const specs = checked.map((c) => c.value);
         if (S.server.firewallBusy) break;
         const okConfirm = await confirmDialog({
-          title: '删除防火墙放行',
-          body: `将删除以下 ${ports.length} 条防火墙放行规则：${ports.map((p) => `${p.port}/${p.proto}`).join('、')}。删除后这些端口将不再被防火墙放行，可能影响对应代理的公网访问。确定继续吗？`,
-          confirmText: '删除放行',
+          title: '删除防火墙规则',
+          body: `将从防火墙删除以下 ${specs.length} 条规则：${specs.map((s) => s).join('、')}。删除后这些端口将不再被放行，可能影响 frps 或代理的公网访问。确定继续吗？`,
+          confirmText: '删除规则',
           cancelText: '取消',
           danger: true,
         });
@@ -3804,13 +3823,15 @@ async function handleAction(act, dataset, btn) {
         S.server.firewallBusy = true;
         renderServer(true);
         try {
-          const res = await FRP.serverFirewallClose({ ports });
+          const res = await FRP.serverFirewallClose({ specs });
           await loadServerFirewall(true);
           if (res && res.ok) {
             const removed = (res.data && res.data.removed) || [];
-            toast(`已删除放行：${removed.join('、')}`);
+            const notes = (res.data && res.data.notes) || [];
+            toast(removed.length ? `已删除规则：${removed.join('、')}` : '没有规则被删除（规则可能已不存在）', removed.length ? undefined : 'error');
+            if (notes.length) toast(notes.join('；'), 'error');
           } else {
-            toast((res && res.error) || '删除放行失败', 'error');
+            toast((res && res.error) || '删除规则失败', 'error');
           }
         } finally {
           S.server.firewallBusy = false;
@@ -5081,6 +5102,12 @@ function bindStaticEvents() {
     const certFill = e.target.closest('#pf-plugin-cert-fill');
     if (certFill) {
       handleAction('proxyform.cert.fill', {}, certFill);
+      return;
+    }
+    const ruleAll = e.target.closest('#fw-rule-all');
+    if (ruleAll) {
+      /* 全选/清空「已放行规则」的勾选，不重渲染，保留用户已滚动的位置。 */
+      [...document.querySelectorAll('.fw-rule-del')].forEach((c) => { c.checked = ruleAll.checked; });
       return;
     }
     if (!e.target.closest('#wizard-form')) return;
