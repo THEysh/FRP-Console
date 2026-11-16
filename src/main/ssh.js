@@ -721,6 +721,23 @@ class ServerSession {
     };
   }
 
+  // 检测服务器防火墙类型与运行状态（ufw / firewalld / 裸 iptables / 无）。
+  // 只做只读探测，不改任何规则；放行端口交给 openFirewallPorts。
+  async detectFirewall() {
+    if (!this.connected) return { manager: 'none', active: false, statusText: '尚未连接服务器' };
+    const ufwActive = /status: active/i.test((await this.exec('command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | head -n 1 || true', 8000)).stdout || '');
+    if (ufwActive) return { manager: 'ufw', active: true, statusText: 'ufw 已启用（active）' };
+    const fwRunning = /running/.test((await this.exec('command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state 2>/dev/null || true', 8000)).stdout || '');
+    if (fwRunning) return { manager: 'firewalld', active: true, statusText: 'firewalld 正在运行' };
+    const ufwExists = firstLine((await this.exec('command -v ufw 2>/dev/null || true', 6000)).stdout);
+    if (ufwExists) return { manager: 'ufw', active: false, statusText: '已安装 ufw 但未启用（inactive），防火墙未拦截' };
+    const fwExists = firstLine((await this.exec('command -v firewall-cmd 2>/dev/null || true', 6000)).stdout);
+    if (fwExists) return { manager: 'firewalld', active: false, statusText: '已安装 firewalld 但未运行，防火墙未拦截' };
+    const ipt = await this.exec('command -v iptables >/dev/null 2>&1 && echo yes || true', 6000);
+    if (/yes/.test(ipt.stdout || '')) return { manager: 'iptables', active: true, statusText: '使用 iptables（规则不持久化，重启后丢失）' };
+    return { manager: 'none', active: false, statusText: '未检测到 ufw / firewalld / iptables' };
+  }
+
   // 自动放开 frps 需要监听的端口（ufw / firewalld / 裸 iptables），防止被防火墙拦截。
   async openFirewallPorts(ports) {
     if (!this.connected) return { ok: false, error: '尚未连接服务器' };

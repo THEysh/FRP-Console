@@ -1121,7 +1121,10 @@ async function loadServerState({ autoConnect = false } = {}) {
   if (res && res.ok) {
     applyServerState(res.data, seq);
     renderServer(true);
-    if (S.server.connected) loadServerNginx(true).catch(() => {});
+    if (S.server.connected) {
+      loadServerNginx(true).catch(() => {});
+      loadServerFirewall(true).catch(() => {});
+    }
     // 只在“第一次打开服务器页”时自动连；绑定变化之类的刷新不打扰已断开的会话。
     if (autoConnect) autoConnectActiveProfile().catch(() => {});
   } else if (res && !res.ok) toastResult(res);
@@ -1136,6 +1139,19 @@ async function loadServerNginx(silent = false) {
     S.server.nginx = { ...(S.server.nginx || {}), ...res.data, loading: false };
   } else {
     S.server.nginx = { ...(S.server.nginx || {}), loading: false, error: (res && res.error) || '检测 nginx 失败' };
+  }
+  if (S.view === 'server') renderServer(true);
+}
+
+async function loadServerFirewall(silent = false) {
+  if (!S.server.connected) return;
+  if (!silent) S.server.firewall = { ...(S.server.firewall || {}), loading: true };
+  if (S.view === 'server') renderServer(true);
+  const res = await FRP.serverFirewallState();
+  if (res && res.ok) {
+    S.server.firewall = { ...(S.server.firewall || {}), ...res.data, loading: false };
+  } else {
+    S.server.firewall = { ...(S.server.firewall || {}), loading: false, error: (res && res.error) || '检测防火墙失败' };
   }
   if (S.view === 'server') renderServer(true);
 }
@@ -1513,6 +1529,43 @@ function nginxCardMarkup() {
     </section>`;
 }
 
+function firewallCardMarkup() {
+  const f = S.server.firewall || {};
+  if (!f || f.loading) {
+    return `<section class="card"><div class="card-head"><div class="ch-icon">${icon('shield')}</div><div class="grow"><h3>服务器防火墙</h3><p>检测服务器防火墙，确保 frps 端口放行、客户端能连上。</p></div></div><div class="field-hint" style="padding:0 16px 12px">检测中…</div></section>`;
+  }
+  if (f.error) {
+    return `<section class="card"><div class="card-head"><div class="ch-icon">${icon('shield')}</div><div class="grow"><h3>服务器防火墙</h3><p>检测服务器防火墙，确保 frps 端口放行、客户端能连上。</p></div></div><div class="note warn" style="margin:0 16px 12px">${icon('alert')}<div>${esc(f.error)}</div></div></section>`;
+  }
+  const managerLabel = { ufw: 'ufw', firewalld: 'firewalld', iptables: 'iptables', none: '无防火墙' }[f.manager] || esc(f.manager || '未知');
+  const ports = Array.isArray(f.ports) ? f.ports : [];
+  const portText = ports.length ? ports.map((p) => `${p.label} ${p.port}/${p.proto}`).join('、') : '（尚未读取到 frps 配置）';
+  const statusBadge = f.active
+    ? '<span class="badge amber"><span class="bdot"></span>已启用</span>'
+    : '<span class="badge green"><span class="bdot"></span>未启用</span>';
+  const opened = Array.isArray(f.opened) && f.opened.length ? f.opened : null;
+  const notes = Array.isArray(f.notes) && f.notes.length ? f.notes : null;
+  return `
+    <section class="card">
+      <div class="card-head">
+        <div class="ch-icon">${icon('shield')}</div>
+        <div class="grow"><h3>服务器防火墙（${managerLabel}）</h3><p>${esc(f.statusText || '')}</p></div>
+        <div class="page-actions">
+          ${statusBadge}
+          <button class="btn" type="button" data-act="server.firewall.refresh">${icon('reload')}<span>重新检测</span></button>
+          <button class="btn primary" type="button" data-act="server.firewall.open" ${S.server.firewallBusy ? 'disabled' : ''}>${S.server.firewallBusy ? '<span class="spinner-sm"></span>' : icon('shield')}<span>${S.server.firewallBusy ? '放行中…' : '放行 frps 端口'}</span></button>
+        </div>
+      </div>
+      <div class="field-hint" style="padding:0 16px 12px">需要放行的端口：<span class="mono">${esc(portText)}</span></div>
+      ${opened
+        ? `<div class="note" style="margin:0 16px 12px">${icon('check')}<div><strong>已放行</strong><br>${esc(opened.join('、'))}</div></div>`
+        : ''}
+      ${notes
+        ? `<div class="note warn" style="margin:0 16px 12px">${icon('alert')}<div>${esc(notes.join('；'))}</div></div>`
+        : ''}
+    </section>`;
+}
+
 function renderServer(force = false) {
   if (!S.server.loaded) {
     $('#view').innerHTML = `<div class="view"><section class="card"><div class="empty"><span class="spinner"></span><h3>正在读取服务器连接状态</h3><p>请稍候…</p></div></section></div>`;
@@ -1594,6 +1647,8 @@ function renderServer(force = false) {
       <section class="card selftest-card" id="selftest-panel">${selftestMarkup()}</section>
 
       ${nginxCardMarkup()}
+
+      ${firewallCardMarkup()}
 
       <section class="card config-card">
         <div class="card-head">
@@ -2021,6 +2076,7 @@ async function autoConnectActiveProfile() {
     applyServerState(res.data, seq);
     S.server.nginx = null;      // 旧服务器的 nginx 状态不残留，连接后重新检测
     S.server.selftest = null;   // 旧服务器的就绪检查结果不残留
+    S.server.firewall = null;   // 旧服务器的防火墙状态不残留
   } catch (e) {
     toast('error', '自动连接失败', String((e && e.message) || e));
   } finally {
@@ -2029,6 +2085,7 @@ async function autoConnectActiveProfile() {
     if (S.server.connected) {
       loadServerLogs().catch(() => {});
       loadServerNginx(true).catch(() => {});
+      loadServerFirewall(true).catch(() => {});
     }
   }
 }
@@ -2419,6 +2476,7 @@ async function connectServer(btn, options = undefined) {
     applyServerState(res.data, seq);
     S.server.nginx = null;      // 旧服务器的 nginx 状态不残留，连接后重新检测
     S.server.selftest = null;   // 旧服务器的就绪检查结果不残留
+    S.server.firewall = null;   // 旧服务器的防火墙状态不残留
     renderServer(true);
     if (res.data && res.data.adoptProfile) {
       toast('success', '已连接并更新档案地址', `${username}@${host}:${port}`);
@@ -2427,6 +2485,7 @@ async function connectServer(btn, options = undefined) {
     }
     await loadServerLogs();
     loadServerNginx(true).catch(() => {});
+    loadServerFirewall(true).catch(() => {});
   });
 }
 
@@ -3572,6 +3631,28 @@ async function handleAction(act, dataset, btn) {
           await runNginxSetup();
         } finally {
           S.server.nginxBusy = false;
+          renderServer(true);
+        }
+        break;
+      }
+      case 'server.firewall.refresh':
+        await withBusy(btn, () => loadServerFirewall(false));
+        break;
+      case 'server.firewall.open': {
+        if (S.server.firewallBusy) break;
+        S.server.firewallBusy = true;
+        renderServer(true);
+        try {
+          const res = await FRP.serverFirewallOpen();
+          await loadServerFirewall(true);
+          if (res && res.ok) {
+            S.server.firewall = { ...(S.server.firewall || {}), opened: (res.data && res.data.opened) || [], notes: (res.data && res.data.notes) || [] };
+            toast(`已放行 frps 端口${(res.data && res.data.opened && res.data.opened.length) ? `：${res.data.opened.join('、')}` : ''}`);
+          } else {
+            toast((res && res.error) || '放行失败', 'error');
+          }
+        } finally {
+          S.server.firewallBusy = false;
           renderServer(true);
         }
         break;

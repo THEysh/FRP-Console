@@ -2634,6 +2634,29 @@ function registerIpc() {
     }
   });
 
+  /* 服务器防火墙：只读状态 + 一键放行 frps 需要监听的端口。 */
+  ipcMain.handle('server:firewall-state', async () => {
+    if (!serverSession.connected) return fail('尚未连接服务器');
+    try {
+      const det = await serverSession.detectFirewall();
+      const ports = serverConfig.summary ? serverSession.configPorts(serverConfig.content) : [];
+      return ok({ ...det, ports });
+    } catch (e) {
+      return fail(String((e && e.message) || e));
+    }
+  });
+
+  ipcMain.handle('server:firewall-open', async () => {
+    if (!serverSession.connected) return fail('尚未连接服务器');
+    try {
+      const result = await serverSession.openFirewallForConfig();
+      if (!result) return fail('没有可放行的端口（先确认服务器上已读取到 frps 配置）');
+      return ok(result);
+    } catch (e) {
+      return fail(String((e && e.message) || e));
+    }
+  });
+
   /*
    * 服务器页的检查是「服务器侧就绪」判定，不是全链路检测。
    *
