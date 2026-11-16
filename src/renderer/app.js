@@ -1110,7 +1110,7 @@ function applyServerState(data, seq) {
     const activeProfile = (S.server.profiles || []).find((p) => p.id === S.server.activeServerId);
     S.server.wizard = {
       ...wizardDefaults(),
-      token: (activeProfile && activeProfile.token) || randomToken(20),
+      token: (activeProfile && (activeProfile.clientToken || activeProfile.token)) || randomToken(20),
       webPassword: randomToken(14),
     };
     S.server.previewText = '';
@@ -3021,8 +3021,10 @@ async function applyServerConfigSave(res, restart, seq) {
 
 async function runServerBootstrap(btn) {
   if (S.server.installBusy) return;
-  const fields = readWizardForm();
-  if (!fields) return toast('error', '请先填写配置向导');
+  /* 1.2.49 起配置卡片改成了 frps.toml / frpc.toml 两个编辑器，不再渲染「服务端配置向导」
+   * 表单；一键初始化改用内存里的向导字段（连接时已按档案 token + 随机面板密码填好）。 */
+  const fields = S.server.wizard || wizardDefaults();
+  if (!fields || !Number(fields.bindPort)) return toast('error', '请先填写配置向导');
   S.server.installBusy = true;
   S.server.installProgress = { percent: 0, text: '正在检查服务器环境…' };
   const syncLocal = $('#bootstrap-sync') ? $('#bootstrap-sync').checked : true;

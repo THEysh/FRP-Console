@@ -459,6 +459,10 @@ node tools/cdp-shot.cjs .proxy-row out.png # 按选择器截单个元素
 
 ## 更新日志
 
+### 1.2.52
+
+- **修复「一键初始化 frps」提示「请先填写配置向导」**：1.2.49 把「配置文件」卡片改成了 frps.toml / frpc.toml 两个编辑器，但「一键初始化并启动」仍在读旧的配置向导表单，导致卸载 frps 后重装时点它直接提示「请先填写配置向导」、无法初始化。现在一键初始化改用内存里已自动填好的向导字段（连接时已按档案 Token + 随机面板密码生成），点一下就能直接装。
+
 ### 1.2.51
 
 - **修复终端 Ctrl+C 复制 / Ctrl+V 粘贴不生效**：xterm 6 的 `attachCustomKeyEventHandler` 回调参数是原生 KeyboardEvent，此前代码误当成 `{ domEvent }` 包装对象，导致 Ctrl+C/V 判断永远拿不到按键、功能从未真正生效。现已修正——选中文字后 Ctrl+C 复制选中内容（没选中仍发 `\x03` 中断），Ctrl+V 粘贴剪贴板。
