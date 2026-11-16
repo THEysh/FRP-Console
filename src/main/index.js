@@ -2686,7 +2686,8 @@ function registerIpc() {
       const det = await serverSession.detectFirewall();
       const cfgPorts = serverConfig.summary ? serverSession.configPorts(serverConfig.content) : [];
       const proxyPorts = proxyRemotePorts();
-      return ok({ ...det, ports: [...cfgPorts, ...proxyPorts], frpsPorts: cfgPorts, proxyPorts });
+      const allowed = await serverSession.readFirewallAllowed();
+      return ok({ ...det, ports: [...cfgPorts, ...proxyPorts], frpsPorts: cfgPorts, proxyPorts, allowed });
     } catch (e) {
       return fail(String((e && e.message) || e));
     }
@@ -2730,6 +2731,20 @@ function registerIpc() {
       if (!text) return fail('请输入要放行的端口');
       const result = await serverSession.openFirewallPortsManual(text, proto);
       if (!result.ok) return fail(result.error, { manager: result.manager, opened: result.opened || [], notes: result.notes || [] });
+      return ok(result);
+    } catch (e) {
+      return fail(String((e && e.message) || e));
+    }
+  });
+
+  /* 撤销放行（删除防火墙规则）。payload.ports = [{port, proto}]。 */
+  ipcMain.handle('server:firewall-close', async (_event, payload) => {
+    if (!serverSession.connected) return fail('尚未连接服务器');
+    try {
+      const ports = (payload && payload.ports) || [];
+      if (!Array.isArray(ports) || !ports.length) return fail('请先勾选要删除的端口');
+      const result = await serverSession.closeFirewallPorts(ports);
+      if (!result.ok) return fail(result.error, { manager: result.manager, removed: result.removed || [], notes: result.notes || [] });
       return ok(result);
     } catch (e) {
       return fail(String((e && e.message) || e));

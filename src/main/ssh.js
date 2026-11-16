@@ -993,6 +993,103 @@ class ServerSession {
     return { ok: opened.length > 0, manager: 'iptables', opened, notes, ranges };
   }
 
+  // 读防火墙「当前实际放行」的端口/范围规则（只读，不改任何规则）。
+  // 返回结构化数组 [{ port, proto, spec }]，spec 是展示文本（如 '7000/tcp'、'8000:9000/tcp'）。
+  async readFirewallAllowed() {
+    if (!this.connected) return [];
+    const det = await this.detectFirewall();
+    const out = [];
+    const seen = new Set();
+    const push = (spec, proto, port) => {
+      if (seen.has(spec)) return;
+      seen.add(spec);
+      out.push({ port, proto, spec });
+    };
+
+    if (det.manager === 'ufw' && det.active) {
+      const r = await this.exec('ufw status 2>/dev/null || true', 8000);
+      for (const line of String(r.stdout || '').split(/\r?\n/)) {
+        const m = /^\s*([0-9]+(?::[0-9]+)?)\/(tcp|udp)\b/i.exec(line);
+        if (!m) continue;
+        const portPart = m[1];
+        const port = portPart.includes(':') ? Number(portPart.split(':')[0]) : Number(portPart);
+        push(`${portPart}/${m[2].toLowerCase()}`, m[2].toLowerCase(), port);
+      }
+      return out;
+    }
+
+    if (det.manager === 'firewalld' && det.active) {
+      const r = await this.exec('firewall-cmd --list-ports 2>/dev/null || true', 8000);
+      for (const tok of String(r.stdout || '').trim().split(/\s+/)) {
+        const m = /^([0-9]+(?:-[0-9]+)?)\/(tcp|udp)$/i.exec(tok);
+        if (!m) continue;
+        push(`${m[1]}/${m[2].toLowerCase()}`, m[2].toLowerCase(), Number(m[1].split('-')[0]));
+      }
+      return out;
+    }
+
+    if (det.manager === 'iptables' && det.active) {
+      const r = await this.exec('iptables -L INPUT -n --line-numbers 2>/dev/null || true', 8000);
+      for (const line of String(r.stdout || '').split(/\r?\n/)) {
+        if (!/^\s*\d+\s+ACCEPT\s+/i.test(line)) continue;
+        const dm = /dpt(s)?:(\d+)(?::(\d+))?/.exec(line);
+        if (!dm) continue;
+        const pm = /\s(tcp|udp)\s/.exec(line);
+        const proto = pm ? pm[1].toLowerCase() : 'tcp';
+        push(`${dm[2]}${dm[3] ? `-${dm[3]}` : ''}/${proto}`, proto, Number(dm[2]));
+      }
+      return out;
+    }
+
+    return out;
+  }
+
+  // 撤销放行（删除防火墙规则）。ports = [{port, proto}]。
+  async closeFirewallPorts(ports) {
+    if (!this.connected) return { ok: false, error: '尚未连接服务器' };
+    if (!ports || !ports.length) return { ok: true, removed: [], notes: ['没有要删除的端口'] };
+    const det = await this.detectFirewall();
+    if (det.manager === 'none') return { ok: false, error: '服务器没有检测到防火墙' };
+    if (!det.active) return { ok: false, error: `防火墙（${det.manager}）未启用，没有需要删除的规则` };
+    const sudo = await this.detectSudo();
+    if (!sudo.ok) return { ok: false, error: sudo.error };
+    const prefix = sudo.prefix;
+    const removed = [];
+    const notes = [];
+
+    if (det.manager === 'ufw') {
+      for (const { port, proto } of ports) {
+        // ufw allow 一条会同时生成 v4+v6 两条规则，删除时删两次清干净，第二次失败忽略。
+        let hit = false;
+        for (let i = 0; i < 2; i += 1) {
+          const r = await this.exec(`${prefix}ufw delete allow ${port}/${proto} 2>&1`, 15000);
+          const msg = `${r.stdout || ''}${r.stderr || ''}`;
+          if (r.ok || /Rule deleted|Deleting/i.test(msg)) hit = true;
+        }
+        if (hit) removed.push(`${port}/${proto}`);
+        else notes.push(`${port}/${proto} 删除失败`);
+      }
+      return { ok: removed.length > 0, manager: 'ufw', removed, notes };
+    }
+
+    if (det.manager === 'firewalld') {
+      for (const { port, proto } of ports) {
+        const r = await this.exec(`${prefix}firewall-cmd --permanent --remove-port=${port}/${proto} 2>&1`, 15000);
+        if (r.ok) removed.push(`${port}/${proto}`);
+        else notes.push(`${port}/${proto} 删除失败：${firstLine(r.stderr || r.stdout)}`);
+      }
+      await this.exec(`${prefix}firewall-cmd --reload 2>/dev/null || true`, 15000);
+      return { ok: removed.length > 0, manager: 'firewalld', removed, notes };
+    }
+
+    for (const { port, proto } of ports) {
+      const r = await this.exec(`${prefix}iptables -D INPUT -p ${proto} --dport ${port} -j ACCEPT 2>&1`, 15000);
+      if (r.ok) removed.push(`${port}/${proto}`);
+      else notes.push(`${port}/${proto} 删除失败：${firstLine(r.stderr || r.stdout)}`);
+    }
+    return { ok: removed.length > 0, manager: 'iptables', removed, notes };
+  }
+
   // 读当前配置并放开它要监听的端口（best-effort，出错返回 null，不阻断主流程）。
   async openFirewallForConfig() {
     try {

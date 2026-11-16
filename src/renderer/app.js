@@ -1543,11 +1543,11 @@ function firewallCardMarkup() {
   const frpsPorts = Array.isArray(f.frpsPorts) && f.frpsPorts.length ? f.frpsPorts : (Array.isArray(f.ports) ? f.ports : []);
   const proxyPorts = Array.isArray(f.proxyPorts) && f.proxyPorts.length ? f.proxyPorts : [];
   const frpsText = frpsPorts.length ? frpsPorts.map((p) => `${p.label} ${p.port}/${p.proto}`).join('、') : '（尚未读取到 frps 配置）';
-  const proxyText = proxyPorts.length ? proxyPorts.map((p) => `${p.label} ${p.port}/${p.proto}`).join('、') : '';
+  const proxyRows = proxyPorts.map((p) => `<label class="check-inline"><input type="checkbox" class="fw-proxy-del" value="${p.port}/${p.proto}"><span class="mono">${esc(p.label)} ${p.port}/${p.proto}</span></label>`).join('');
   const statusBadge = f.active
     ? '<span class="badge amber"><span class="bdot"></span>已启用</span>'
     : '<span class="badge green"><span class="bdot"></span>未启用</span>';
-  const opened = Array.isArray(f.opened) && f.opened.length ? f.opened : null;
+  const allowed = Array.isArray(f.allowed) && f.allowed.length ? f.allowed : null;
   const notes = Array.isArray(f.notes) && f.notes.length ? f.notes : null;
   const busy = S.server.firewallBusy ? 'disabled' : '';
   const mainBtn = f.manager === 'none'
@@ -1565,9 +1565,9 @@ function firewallCardMarkup() {
         </div>
       </div>
       <div class="field-hint" style="padding:0 16px 6px">frps 端口：<span class="mono">${esc(frpsText)}</span></div>
-      ${proxyText ? `<div class="field-hint" style="padding:0 16px 12px">代理映射端口：<span class="mono">${esc(proxyText)}</span></div>` : ''}
-      ${opened
-        ? `<div style="padding:0 16px 12px"><div class="field-hint" style="padding:0 0 6px">已放行（${opened.length} 条，累计）：</div><div style="display:flex; flex-wrap:wrap; gap:6px;">${opened.map((p) => `<span class="tag ok">${esc(p)}</span>`).join('')}</div></div>`
+      ${proxyRows ? `<div style="padding:0 16px 6px"><div class="field-hint" style="padding:0 0 6px">代理映射端口（可勾选后删除放行）：</div><div style="display:flex; flex-wrap:wrap; gap:6px 14px; align-items:center;">${proxyRows}<button class="btn" type="button" data-act="server.firewall.close" ${busy}>${icon('trash')}<span>删除选中放行</span></button></div></div>` : ''}
+      ${allowed
+        ? `<div style="padding:0 16px 12px"><div class="field-hint" style="padding:0 0 6px">已放行（${allowed.length} 条，当前实际规则）：</div><div style="display:flex; flex-wrap:wrap; gap:6px;">${allowed.map((p) => `<span class="tag ok">${esc(p.spec || `${p.port}/${p.proto}`)}</span>`).join('')}</div></div>`
         : ''}
       ${notes
         ? `<div class="note warn" style="margin:0 16px 12px">${icon('alert')}<div>${esc(notes.join('；'))}</div></div>`
@@ -3782,6 +3782,39 @@ async function handleAction(act, dataset, btn) {
           renderServer(true);
           const again = $('#fw-manual-port');
           if (again) again.focus();
+        }
+        break;
+      }
+      case 'server.firewall.close': {
+        const checked = [...document.querySelectorAll('.fw-proxy-del:checked')];
+        if (!checked.length) { toast('请先勾选要删除放行的端口', 'error'); break; }
+        const ports = checked.map((c) => {
+          const [port, proto] = c.value.split('/');
+          return { port: Number(port), proto };
+        });
+        if (S.server.firewallBusy) break;
+        const okConfirm = await confirmDialog({
+          title: '删除防火墙放行',
+          body: `将删除以下 ${ports.length} 条防火墙放行规则：${ports.map((p) => `${p.port}/${p.proto}`).join('、')}。删除后这些端口将不再被防火墙放行，可能影响对应代理的公网访问。确定继续吗？`,
+          confirmText: '删除放行',
+          cancelText: '取消',
+          danger: true,
+        });
+        if (!okConfirm) break;
+        S.server.firewallBusy = true;
+        renderServer(true);
+        try {
+          const res = await FRP.serverFirewallClose({ ports });
+          await loadServerFirewall(true);
+          if (res && res.ok) {
+            const removed = (res.data && res.data.removed) || [];
+            toast(`已删除放行：${removed.join('、')}`);
+          } else {
+            toast((res && res.error) || '删除放行失败', 'error');
+          }
+        } finally {
+          S.server.firewallBusy = false;
+          renderServer(true);
         }
         break;
       }
