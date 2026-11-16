@@ -928,6 +928,64 @@ class ServerSession {
     return { ok: opened.length > 0, manager: 'iptables', opened, notes };
   }
 
+  // 手动放行任意端口/端口范围（用户输入，如 1-65500 / 8080 / 8000-9000,10000）。
+  // proto 只支持 tcp/udp（ufw/firewalld/iptables 都按协议分开）。
+  async openFirewallPortsManual(text, proto = 'tcp') {
+    if (!this.connected) return { ok: false, error: '尚未连接服务器' };
+    const parsed = parsePortInput(text);
+    if (!parsed.ok) return parsed;
+    const protoSafe = proto === 'udp' ? 'udp' : 'tcp';
+    const ranges = parsed.ranges;
+
+    // 先探测防火墙状态，给用户明确反馈，而不是默默走到 iptables 兜底。
+    const det = await this.detectFirewall();
+    if (det.manager === 'none') {
+      return { ok: false, manager: 'none', error: '服务器没有检测到防火墙（ufw/firewalld/iptables），请先「安装并启用防火墙」' };
+    }
+    if (!det.active) {
+      return { ok: false, manager: det.manager, error: `防火墙（${det.manager}）未启用，不会拦截端口，无需放行` };
+    }
+
+    const sudo = await this.detectSudo();
+    if (!sudo.ok) return { ok: false, error: sudo.error };
+    const prefix = sudo.prefix;
+    const opened = [];
+    const notes = [];
+
+    if (det.manager === 'ufw') {
+      for (const r of ranges) {
+        const spec = r.start === r.end ? `${r.start}/${protoSafe}` : `${r.start}:${r.end}/${protoSafe}`;
+        const rr = await this.exec(`${prefix}ufw allow ${spec} 2>&1`, 15000);
+        const msg = `${rr.stdout || ''}${rr.stderr || ''}`;
+        if (rr.ok || /Rule added|Skipping adding existing rule/i.test(msg)) opened.push(`${r.label}/${protoSafe}`);
+        else notes.push(`${r.label}/${protoSafe} 放行失败：${firstLine(rr.stderr || rr.stdout)}`);
+      }
+      return { ok: opened.length > 0, manager: 'ufw', opened, notes, ranges };
+    }
+
+    if (det.manager === 'firewalld') {
+      for (const r of ranges) {
+        const spec = r.start === r.end ? `${r.start}/${protoSafe}` : `${r.start}-${r.end}/${protoSafe}`;
+        const rr = await this.exec(`${prefix}firewall-cmd --permanent --add-port=${spec} 2>&1`, 15000);
+        const msg = `${rr.stdout || ''}${rr.stderr || ''}`;
+        if (rr.ok || /ALREADY_ENABLED/i.test(msg)) opened.push(`${r.label}/${protoSafe}`);
+        else notes.push(`${r.label}/${protoSafe} 放行失败：${firstLine(rr.stderr || rr.stdout)}`);
+      }
+      await this.exec(`${prefix}firewall-cmd --reload 2>/dev/null || true`, 15000);
+      return { ok: opened.length > 0, manager: 'firewalld', opened, notes, ranges };
+    }
+
+    // 裸 iptables（规则不持久化，重启后丢失；仅兜底）
+    for (const r of ranges) {
+      const dport = r.start === r.end ? `${r.start}` : `${r.start}:${r.end}`;
+      const cmd = `iptables -C INPUT -p ${protoSafe} --dport ${dport} -j ACCEPT 2>/dev/null || iptables -I INPUT -p ${protoSafe} --dport ${dport} -j ACCEPT`;
+      const rr = await this.exec(`${prefix}${cmd}`, 15000);
+      if (rr.ok) opened.push(`${r.label}/${protoSafe}`);
+      else notes.push(`${r.label}/${protoSafe} 放行失败：${firstLine(rr.stderr || rr.stdout)}`);
+    }
+    return { ok: opened.length > 0, manager: 'iptables', opened, notes, ranges };
+  }
+
   // 读当前配置并放开它要监听的端口（best-effort，出错返回 null，不阻断主流程）。
   async openFirewallForConfig() {
     try {
@@ -1356,4 +1414,33 @@ class ServerSession {
   }
 }
 
-module.exports = { ServerSession, parseServiceUnits, rankServiceUnits };
+// 解析用户手动输入的端口（支持单端口、范围、逗号/空格分隔），返回 { ok, ranges:[{start,end,label}] } 或 { ok:false, error }。
+function parsePortInput(text) {
+  const ranges = [];
+  const seen = new Set();
+  for (const part of String(text || '').split(/[,，;\s]+/)) {
+    const p = part.trim();
+    if (!p) continue;
+    let start;
+    let end;
+    if (/^\d{1,5}$/.test(p)) {
+      start = Number(p);
+      end = start;
+    } else {
+      const m = /^(\d{1,5})\s*[-–—:]\s*(\d{1,5})$/.exec(p);
+      if (!m) return { ok: false, error: `无法识别的端口：${p}` };
+      start = Number(m[1]);
+      end = Number(m[2]);
+      if (start > end) [start, end] = [end, start];
+    }
+    if (start < 1 || end > 65535) return { ok: false, error: `端口超出 1-65535 范围：${p}` };
+    const key = `${start}-${end}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    ranges.push({ start, end, label: start === end ? `${start}` : `${start}-${end}` });
+  }
+  if (!ranges.length) return { ok: false, error: '请输入要放行的端口' };
+  return { ok: true, ranges };
+}
+
+module.exports = { ServerSession, parseServiceUnits, rankServiceUnits, parsePortInput };

@@ -1570,6 +1570,20 @@ function firewallCardMarkup() {
       ${notes
         ? `<div class="note warn" style="margin:0 16px 12px">${icon('alert')}<div>${esc(notes.join('；'))}</div></div>`
         : ''}
+      ${f.manager !== 'none'
+        ? `
+      <div class="field-hint" style="padding:0 16px 6px">手动放行端口：</div>
+      <div style="padding:0 16px 12px; display:flex; gap:8px; align-items:center;">
+        <input id="fw-manual-port" type="text" placeholder="如 1-65500、8080、8000-9000,10000" style="flex:1; min-width:0;" ${busy ? 'disabled' : ''} />
+        <select id="fw-manual-proto" style="width:76px;" ${busy ? 'disabled' : ''}>
+          <option value="tcp">tcp</option>
+          <option value="udp">udp</option>
+        </select>
+        <button class="btn" type="button" data-act="server.firewall.openports" ${busy}>${icon('plus')}<span>放行</span></button>
+      </div>
+      <div class="field-hint" style="padding:0 16px 12px">支持单个端口、端口范围（如 1-65500 表示放行 1~65500）、逗号分隔多个。</div>
+      `
+        : ''}
     </section>`;
 }
 
@@ -3723,6 +3737,33 @@ async function handleAction(act, dataset, btn) {
             toast(`已安装并启用防火墙${(res.data && res.data.opened && res.data.opened.length) ? `，已放行：${res.data.opened.join('、')}` : ''}`);
           } else {
             toast((res && res.error) || '安装防火墙失败', 'error');
+          }
+        } finally {
+          S.server.firewallBusy = false;
+          renderServer(true);
+        }
+        break;
+      }
+      case 'server.firewall.openports': {
+        const input = $('#fw-manual-port');
+        const protoSel = $('#fw-manual-proto');
+        const text = (input && input.value || '').trim();
+        const proto = (protoSel && protoSel.value) || 'tcp';
+        if (!text) {
+          toast('请输入要放行的端口', 'error');
+          if (input) input.focus();
+          break;
+        }
+        if (S.server.firewallBusy) break;
+        S.server.firewallBusy = true;
+        renderServer(true);
+        try {
+          const res = await FRP.serverFirewallOpenPorts({ text, proto });
+          if (res && res.ok) {
+            S.server.firewall = { ...(S.server.firewall || {}), opened: (res.data && res.data.opened) || [], notes: (res.data && res.data.notes) || [] };
+            toast(`已放行：${((res.data && res.data.opened) || []).join('、')}`);
+          } else {
+            toast((res && res.error) || '放行失败', 'error');
           }
         } finally {
           S.server.firewallBusy = false;

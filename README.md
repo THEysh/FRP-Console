@@ -402,6 +402,10 @@ node tools/cdp-shot.cjs .proxy-row out.png # 按选择器截单个元素
 
 ## 更新日志
 
+### 1.2.43
+
+- **防火墙手动放行端口**：服务器页防火墙卡片新增「手动放行端口」输入框，可放行任意端口或端口范围（如 `1-65500` 表示放行 1~65500、`8000-9000` 表示放行 8000~9000，支持逗号/空格分隔多个，可选 tcp/udp）。适配 ufw（`allow start:end/proto`）、firewalld（`--add-port=start-end/proto`）、iptables 三种防火墙。
+
 ### 1.2.42
 
 - **无防火墙的服务器可一键安装**：服务器页防火墙卡片检测到服务器未安装 ufw / firewalld 时，显示「安装并启用防火墙」按钮；按发行版自动选择（Debian/Ubuntu → ufw，RHEL/CentOS/Fedora → firewalld），先放行 SSH 端口避免把自己踢下线，再放行 frps 与代理端口，最后启用。

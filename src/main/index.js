@@ -2717,6 +2717,21 @@ function registerIpc() {
     }
   });
 
+  /* 手动放行任意端口/端口范围（如 1-65500 / 8080 / 8000-9000,10000）。 */
+  ipcMain.handle('server:firewall-open-ports', async (_event, payload) => {
+    if (!serverSession.connected) return fail('尚未连接服务器');
+    try {
+      const text = String((payload && payload.text) || '').trim();
+      const proto = (payload && payload.proto) || 'tcp';
+      if (!text) return fail('请输入要放行的端口');
+      const result = await serverSession.openFirewallPortsManual(text, proto);
+      if (!result.ok) return fail(result.error, { manager: result.manager, opened: result.opened || [], notes: result.notes || [] });
+      return ok(result);
+    } catch (e) {
+      return fail(String((e && e.message) || e));
+    }
+  });
+
   /*
    * 服务器页的检查是「服务器侧就绪」判定，不是全链路检测。
    *
