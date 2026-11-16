@@ -459,6 +459,11 @@ node tools/cdp-shot.cjs .proxy-row out.png # 按选择器截单个元素
 
 ## 更新日志
 
+### 1.2.51
+
+- **修复终端 Ctrl+C 复制 / Ctrl+V 粘贴不生效**：xterm 6 的 `attachCustomKeyEventHandler` 回调参数是原生 KeyboardEvent，此前代码误当成 `{ domEvent }` 包装对象，导致 Ctrl+C/V 判断永远拿不到按键、功能从未真正生效。现已修正——选中文字后 Ctrl+C 复制选中内容（没选中仍发 `\x03` 中断），Ctrl+V 粘贴剪贴板。
+- **SSH 终端默认打开**：连上服务器后（自动连接 / 手动连接都算）自动打开终端，不用再点「打开终端」。
+
 ### 1.2.50
 
 - **SSH 终端支持 Ctrl+C 复制 / Ctrl+V 粘贴**：终端里默认 Ctrl+C 是「发送中断信号」、Ctrl+V 是字面量 `^V`，与桌面习惯不符。现在按选中状态区分——选中了文字时 Ctrl+C 复制选中内容（不发中断），没选中时仍发 `\x03` 中断当前命令；Ctrl+V 直接粘贴剪贴板内容（不再输入 `^V`）。

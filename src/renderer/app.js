@@ -1773,8 +1773,8 @@ async function openShellTerm() {
     // Ctrl+C 复制 / Ctrl+V 粘贴：终端里默认 Ctrl+C 是「发送中断信号」、Ctrl+V 是字面量 ^V，
     // 但桌面习惯是「选中后 Ctrl+C 复制、Ctrl+V 粘贴」。这里按选中状态区分：
     // 选中了文字 → Ctrl+C 复制（不发中断）；没选中 → 交回 xterm 发 \x03 中断。
-    term.attachCustomKeyEventHandler((arg) => {
-      const ev = (arg && arg.domEvent) || {};
+    // xterm 6 的 attachCustomKeyEventHandler 回调参数就是原生 KeyboardEvent（不是 { domEvent } 包装）。
+    term.attachCustomKeyEventHandler((ev) => {
       const ctrl = !!(ev.ctrlKey || ev.metaKey);
       if (ctrl && !ev.shiftKey && !ev.altKey) {
         const k = String(ev.key || '').toLowerCase();
@@ -2356,6 +2356,7 @@ async function autoConnectActiveProfile() {
       loadServerLogs().catch(() => {});
       loadServerNginx(true).catch(() => {});
       loadServerFirewall(true).catch(() => {});
+      openShellTerm().catch(() => {});   // SSH 终端默认打开
     }
   }
 }
@@ -2751,6 +2752,7 @@ async function connectServer(btn, options = undefined) {
     S.server.selftest = null;   // 旧服务器的就绪检查结果不残留
     S.server.firewall = null;   // 旧服务器的防火墙状态不残留
     renderServer(true);
+    openShellTerm().catch(() => {});   // SSH 终端默认打开
     if (res.data && res.data.adoptProfile) {
       toast('success', '已连接并更新档案地址', `${username}@${host}:${port}`);
     } else {
