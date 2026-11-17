@@ -1402,6 +1402,23 @@ label .icon-btn svg { width: 13px; height: 13px; }
 .cloud-hint li { margin: 1px 0; }
 .cloud-hint-warn { color: #f59e0b; }
 
+/* v1.2.61：卡片里的裸 SVG 必须给尺寸。
+ * 以前只有 .note svg 定过宽高，.cloud-hint-head 里的 icon('alert') 没有规则，
+ * SVG 会按默认行为撑满容器 —— 图标变成整张卡片那么大，还把下面的按钮整个盖住
+ * （点按钮其实点到了 SVG 上，看起来就是「复制按钮不起作用」）。 */
+.cloud-hint svg,
+.cloud-hint-head svg,
+.guide svg,
+.tag svg {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 15px;
+  max-width: 15px;
+  max-height: 15px;
+}
+.cloud-hint svg { pointer-events: none; }
+
+
 /* ???????????????v1.2.57? */
 .port-matrix-more {
   display: flex;

@@ -1722,8 +1722,7 @@ function firewallCardMarkup() {
         </ul>
         <p class="cloud-hint-warn">图省事可先放行 <b>1–65535 TCP + UDP</b>，但那等于把全部端口暴露到公网，只建议在自用/测试服务器上这么做；长期请按上面的端口清单精确放行。</p>
         <div class="page-actions" style="padding-top:4px">
-          <button class="btn" type="button" data-act="server.ports.copy">${icon('copy')}<span>复制全部端口规则</span></button>
-          <button class="btn" type="button" data-act="server.ports.copywide">${icon('copy')}<span>复制 1-65535 全放行</span></button>
+          <button class="btn" type="button" data-act="server.ports.copywide">${icon('copy')}<span>复制全端口放行（1-65535）</span></button>
         </div>
       </div>
       ${f.manager !== 'none'
