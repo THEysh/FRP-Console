@@ -459,6 +459,10 @@ node tools/cdp-shot.cjs .proxy-row out.png # 按选择器截单个元素
 
 ## 更新日志
 
+### 1.2.54
+
+- **修复终端 Ctrl+V 仍会粘贴两份**（例如复制 `pwd`，粘出来是 `pwdpwd`）：1.2.53 只解决了同一个按键被处理 3 次的问题，但真实按 Ctrl+V 时浏览器还会把剪贴板「原生粘贴」进终端的隐藏输入框，等于我们自己粘一次 + 浏览器再粘一次。现在按键处理会拦下浏览器的默认粘贴动作（`preventDefault`），只走我们这一条路径，一次 Ctrl+V 只粘一份。已在真机 bash 上用模拟键盘验证：粘贴一次只发送一份、命令回车正常执行、Ctrl+C 复制与中断都正常。
+
 ### 1.2.53
 
 - **修复终端 Ctrl+V 粘贴一次出现多份**：真实键盘按一次 Ctrl+V 会产生 keydown / keypress / keyup 三个事件，而 1.2.51 的按键处理对三种事件都各粘贴一次（例如粘贴 `sudo -n true` 结果出现三连 `sudo -n truesudo -n truesudo -n true`）。现在只在 keydown 时处理一次，keypress / keyup 不再重复触发；已在真机 bash 验证一次粘贴只发一份（命令行里文本出现两次属正常——一次是粘贴写入、一次是 shell 回显）。

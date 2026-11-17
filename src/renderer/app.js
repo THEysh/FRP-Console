@@ -1776,6 +1776,8 @@ async function openShellTerm() {
     // xterm 6 的 attachCustomKeyEventHandler 回调参数就是原生 KeyboardEvent（不是 { domEvent } 包装）。
     // 注意：xterm 对 keydown / keypress / keyup 三种事件都会调用这个 handler——
     // 必须只处理 keydown，否则按一次 Ctrl+V 会粘贴 3 份（真实键盘一次按键产生 3 个 DOM 事件）。
+    // 另外必须 preventDefault：真实的 Ctrl+V 按键若不被拦下，浏览器还会把剪贴板「原生粘贴」进
+    // xterm 的隐藏输入框，xterm 自己再发一遍 → 我们自己粘一次 + 原生粘一次 = 看到 pwdpwd 这种重复。
     term.attachCustomKeyEventHandler((ev) => {
       if (!ev || ev.type !== 'keydown') return true; // 只处理 keydown；keypress/keyup 交回 xterm
       const ctrl = !!(ev.ctrlKey || ev.metaKey);
@@ -1784,6 +1786,8 @@ async function openShellTerm() {
         if (k === 'c') {
           const sel = term.getSelection();
           if (sel) {
+            if (ev.preventDefault) ev.preventDefault();
+            if (ev.stopPropagation) ev.stopPropagation();
             FRP.copy(sel).catch(() => {});
             term.focus();
             return false; // 已处理：复制选中文字，不再发 \x03
@@ -1791,6 +1795,9 @@ async function openShellTerm() {
           return true; // 没选中 → 正常发 \x03 中断当前命令
         }
         if (k === 'v') {
+          // 拦下浏览器默认粘贴，只走我们这一条路径，避免重复粘贴两份。
+          if (ev.preventDefault) ev.preventDefault();
+          if (ev.stopPropagation) ev.stopPropagation();
           FRP.clipboardRead().then((res) => {
             const text = res && res.ok && res.data && res.data.text;
             if (text) term.paste(text);
