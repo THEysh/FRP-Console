@@ -10,11 +10,23 @@ const { logLevelOf, parseTimestamp } = require('./util');
  * 这类“自己轮询出来的”行在日志页里没有任何信息量，直接不收集。
  *
  * 注意 frp 0.61 的措辞是 `api request/response [/api/status]`（早先版本是
- * `Http request/response …`），只匹配旧写法会让噪声全部漏进来 —— 两种都要认。 */
-const ADMIN_POLL_NOISE = /\[client\/admin_api\.go:\d+\]\s*(?:Http\s+|api\s+)(?:request|response)\s+\[\/api\/status\]/i;
+ * `Http request/response …`），只匹配旧写法会让噪声全部漏进来 —— 两种都要认。
+ * `/api/config` 是控制台自己每分钟做一次「这个 frpc 是不是在用我的配置」的核对
+ * （frpc.js probeForeignOwner），同样是我们自己刷出来的，一并丢掉。 */
+const ADMIN_POLL_NOISE = /\[client\/admin_api\.go:\d+\]\s*(?:Http(?:\s+(?:get|post))?\s+|api\s+)(?:request|response)\s+\[\/api\/(?:status|config)\]/i;
+
+/* frpc 往控制台（log.to = "console"）输出时会给每行加 ANSI 颜色，
+ * 例如 `\u001b[0m\u001b[1;34m2026-11-18 …`。这些转义序列在日志页里就是
+ * 一串 `[0m[1;34m` 垃圾，必须在解析前剥掉（文件日志没有颜色，两种来源都能过一遍）。 */
+const ANSI_ESCAPE = /\u001b\[[0-9;?]*[A-Za-z]/g;
+
+function stripAnsi(text) {
+  const raw = String(text == null ? '' : text);
+  return raw.includes('\u001b') ? raw.replace(ANSI_ESCAPE, '') : raw;
+}
 
 function parseLine(raw, id) {
-  const text = raw.replace(/\r$/, '');
+  const text = stripAnsi(raw).replace(/\r$/, '');
   if (!text.trim()) return null;
   if (ADMIN_POLL_NOISE.test(text)) return null;
   const ts = parseTimestamp(text);
@@ -162,6 +174,27 @@ class LogFollower extends EventEmitter {
 
   recent(limit = this.maxLines) {
     return this.lines.slice(-limit);
+  }
+
+  /* 追加外部来源的行（frpc 子进程的 stdout/stderr）。
+   * log.to = "console" 时 frpc 只往标准输出写、不落文件，只跟随文件的话
+   * 日志页会一直停在上一次的内容；这里让进程输出也进同一个缓冲。
+   * console 输出的行常常没有时间戳前缀，补上接收时间，界面上才不会显示空白时间。 */
+  appendLines(text) {
+    const added = [];
+    for (const raw of String(text || '').split(/\r?\n/)) {
+      if (!raw.trim()) continue;
+      const line = parseLine(raw, ++this.seq);
+      if (!line) continue;
+      if (!line.ts) {
+        line.ts = Date.now();
+        line.time = new Date(line.ts).toLocaleTimeString('zh-CN', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      }
+      this.pushLine(line);
+      added.push(line);
+    }
+    if (added.length) this.emit('lines', added);
+    return added.length;
   }
 
   clear() {

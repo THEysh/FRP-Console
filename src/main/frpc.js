@@ -409,6 +409,10 @@ class FrpcManager extends EventEmitter {
       stream.setEncoding('utf8');
       stream.on('data', (chunk) => {
         this[key] = (this[key] + chunk).slice(-4000);
+        /* frpc 的 log.to 可能是 "console"（只写标准输出、不落文件），也可能被用户
+         * 指到别处。这时只跟随日志文件会让日志页永远停在上一次的内容，用户以为
+         * 隧道没动静。把进程输出也转发出去，由 index.js 塞进日志缓冲。 */
+        if (String(chunk || '').trim()) this.emit('output', chunk, key === 'stderrTail' ? 'stderr' : 'stdout');
       });
     };
     if (child.stdout) collect(child.stdout, 'stdoutTail');

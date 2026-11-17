@@ -444,6 +444,8 @@ function layerFailText(counts) {
   // 域名没解析/没指过来时别再说「公网不可达」：那句话会把人骗去查防火墙
   if (counts.dnsFailed) return `${counts.dnsFailed} 个域名没解析到服务器`;
   if (counts.unhealthyPublic) return `${counts.unhealthyPublic} 个公网不可达`;
+  // start = [...] 里没列出来的代理：不是坏了，是被配置排除了
+  if (counts.startExcluded) return `${counts.startExcluded} 个不在 start 列表里`;
   return '存在隧道或公网检查失败';
 }
 
@@ -560,7 +562,8 @@ function renderOverview(force = false) {
       /* 有访问路径时，展示/复制/打开都用带上路径的链接——
        * 根路径常常是 404，用户点开只会看到 "404 page not found"。 */
       const link = p.openUrl || p.publicAddress;
-      const dotColor = online ? 'var(--green)' : (failed && p.health.pathMissing) ? 'var(--amber)' : failed ? 'var(--red)' : 'var(--amber)';
+      const soft = failed && (p.health.pathMissing || p.health.startExcluded);
+      const dotColor = online ? 'var(--green)' : soft ? 'var(--amber)' : failed ? 'var(--red)' : 'var(--amber)';
       const dotTip = online ? '三层连通' : failed ? (p.health.reason || '链路异常') : '正在检测连通性';
       const canOpen = !!openableLink(link) && ['http', 'https', 'tcp', 'tcpmux'].includes(p.type);
       return `
@@ -687,7 +690,7 @@ function renderOverview(force = false) {
         <div class="card metric">
           <div class="metric-top"><span class="metric-label">${term('连通性异常', '三层（本地服务 → 隧道 → 公网）中至少一层没通的映射数；点击可看是哪条、哪一层。')}</span><span class="metric-icon">${icon('cpu')}</span></div>
           <div class="metric-value">${config.serverAddr ? esc((counts.unhealthy || 0) + (counts.path404 || 0)) : '—'}</div>
-          <div class="metric-foot"><span class="${!config.serverAddr ? '' : (counts.unhealthy ? 'down' : (counts.path404 ? 'down' : counts.unchecked > 0 ? '' : 'up'))}">${!config.serverAddr ? '尚未开始检测' : counts.unhealthy ? layerFailText(counts) : counts.path404 ? `${counts.path404} 条路径 404（隧道通，改访问路径即可）` : counts.unchecked > 0 ? `${counts.unchecked} 条还没测完` : '全部代理三层全通（本地 → 隧道 → 公网）'}</span></div>
+          <div class="metric-foot"><span class="${!config.serverAddr ? '' : (counts.unhealthy ? 'down' : (counts.path404 || counts.startExcluded ? 'down' : counts.unchecked > 0 ? '' : 'up'))}">${!config.serverAddr ? '尚未开始检测' : counts.unhealthy ? layerFailText(counts) : counts.path404 ? `${counts.path404} 条路径 404（隧道通，改访问路径即可）` : counts.startExcluded ? `${counts.startExcluded} 个被 start 列表排除（frpc 不会启动它们）` : counts.unchecked > 0 ? `${counts.unchecked} 条还没测完` : '全部代理三层全通（本地 → 隧道 → 公网）'}</span></div>
         </div>
       </section>
 
@@ -833,17 +836,27 @@ function renderProxies(force = false) {
 function openableLink(link) {
   const text = String(link || '');
   if (!text || text.includes('*')) return '';
-  return text;
+  /* 只有 http(s) 才谈得上「打开」：tcpmux 的地址是 http-connect://域名，
+   * 交给浏览器只会弹一个没反应的标签页。复制按钮不受影响。 */
+  return /^https?:\/\//i.test(text) ? text : '';
 }
 
 function proxyRowHtml(p) {
   const failed = p.health && !p.health.ok;
   /* 路径 404：隧道与端口都通，只是路径不对 —— 用橙色，别和「断链」混成一片红。 */
   const pathMissing = !!(failed && p.health.pathMissing);
+  /* 被 frpc.toml 里的 start = [...] 排除：既不是网络也不是本地服务的问题，
+   * 是这份配置压根没让它启动，同样用橙色。这个事实来自配置（p.startExcluded），
+   * 不依赖健康检查有没有跑过 —— 隧道停着的时候也要说清楚。 */
+  const startSkipped = !!p.startExcluded;
+  const softFail = pathMissing || startSkipped;
   const tip = healthTip(p.health);
-  const status = p.status === 'running'
+  const status = startSkipped
+    /* frpc 根本不会启动它：不给「未同步」这种含糊状态，直接说是配置里的 start 名单排除了 */
+    ? `<span class="badge amber" title="${esc(tip)}"><span class="bdot"></span>不在 start 列表</span>`
+    : p.status === 'running'
     ? (failed
-      ? `<span class="badge ${pathMissing ? 'amber' : 'red'}" title="${esc(tip)}"><span class="bdot"></span>${esc(p.health.reason || '链路异常')}</span>`
+      ? `<span class="badge ${softFail ? 'amber' : 'red'}" title="${esc(tip)}"><span class="bdot"></span>${esc(p.health.reason || '链路异常')}</span>`
       : '<span class="badge green"><span class="bdot"></span>在线</span>')
     : p.status === 'pending'
       ? '<span class="badge amber"><span class="bdot"></span>同步中</span>'
@@ -851,8 +864,10 @@ function proxyRowHtml(p) {
   const health = p.health
     ? (p.health.ok
       ? `<span class="health-hint" title="${esc(tip)}">${icon('check')}三层连通 · ${esc(p.health.ms)}ms</span>`
-      : `<span class="health-hint ${pathMissing ? '' : 'bad'}" title="${esc(tip)}">${icon('alert')}${esc(p.health.reason || p.health.error || '链路异常')}</span>`)
-    : '';
+      : `<span class="health-hint ${softFail ? '' : 'bad'}" title="${esc(tip)}">${icon('alert')}${esc(p.health.reason || p.health.error || '链路异常')}</span>`)
+    : startSkipped
+      ? `<span class="health-hint" title="frpc.toml 里有 start 列表，这条代理不在名单里">${icon('alert')}不在 start 列表里（frpc 不会启动它）</span>`
+      : '';
   // DNS 软检查：不参与三层判定，只给 http/https 代理一个「域名没解析/没指向服务器」的提醒。
   const dnsLayer = p.health && p.health.layers && p.health.layers.dns;
   let dnsHint = '';
@@ -985,6 +1000,17 @@ function logLineHtml(l) {
   </div>`;
 }
 
+/* 日志从哪来：frpc 的 log.to 决定它写文件还是写标准输出。
+ * 设成 "console" 时文件里不会有新内容，早点说清楚，免得以为日志页冻住了。 */
+function logsSourceLine() {
+  const cfg = (S.state && S.state.config) || {};
+  const raw = cfg.log && cfg.log.to;
+  const list = Array.isArray(raw) ? raw.map((v) => String(v)) : raw ? [String(raw)] : [];
+  const toFile = list.some((v) => v && v !== 'console');
+  if (!toFile) return 'frpc 把日志写到控制台（log.to = console）：下面显示的是进程输出。';
+  return 'frpc 会持续写入日志文件，控制台实时跟随。';
+}
+
 function filteredLogs() {
   if (!S.logLevel) return S.logs;
   return S.logs.filter((l) => String(l.level || '').toLowerCase() === S.logLevel);
@@ -1000,7 +1026,7 @@ function renderLogs(force = false) {
       <div class="page-head">
         <div class="page-title">
           <h1>实时日志</h1>
-          <p>frpc 会持续写入日志文件，控制台实时跟随。共缓存 ${S.logs.length} 条。</p>
+          <p>${logsSourceLine()}共缓存 ${S.logs.length} 条。</p>
         </div>
         <div class="page-actions">
           <button class="btn" type="button" data-act="logs.export" ${S.logs.length ? '' : 'disabled'}>${icon('download')}<span>导出</span></button>
@@ -1504,9 +1530,11 @@ function serverProxyRows() {
     const health = p.health;
     const ok = p.status === 'running' && health && health.ok;
     const failed = health && !health.ok;
-    /* 「路径 404」用橙色：隧道是通的，只是路径不对，不是断链。 */
-    const tone = ok ? 'green' : (failed && health.pathMissing) ? 'amber' : failed ? 'red' : 'amber';
-    const text = ok ? '三层连通' : failed ? (health.reason || '链路异常') : '待检测';
+    /* 「路径 404」与「被 start 列表排除」用橙色：隧道本身没问题，不是断链。
+     * 后者来自配置标记，健康检查没跑过（隧道停着）时也要显示。 */
+    const skipped = !!p.startExcluded;
+    const tone = ok ? 'green' : (skipped || (failed && health.pathMissing)) ? 'amber' : failed ? 'red' : 'amber';
+    const text = ok ? '三层连通' : skipped ? '不在 start 列表' : failed ? (health.reason || '链路异常') : '待检测';
     const link = p.openUrl || p.publicAddress;
     const target = link || (p.remotePort ? `${(S.state.config && S.state.config.serverAddr) || ''}:${p.remotePort}` : '-');
     return `

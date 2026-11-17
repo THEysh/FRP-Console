@@ -153,6 +153,15 @@ function readConfig(configPath) {
   return model;
 }
 
+/* frpc 顶层 start = ["a","b"] 是「只启动这些代理」的白名单。
+ * 它不在 KNOWN_TOP_LEVEL 里，所以原样留在 _extra 中（保存时会写回去），
+ * 这里只负责把它读出来，给校验与健康检查用。 */
+function startNamesOf(model) {
+  const raw = model && model._extra && model._extra.start;
+  if (!Array.isArray(raw)) return [];
+  return raw.map((name) => String(name == null ? '' : name).trim()).filter(Boolean);
+}
+
 function validate(model, options = {}) {
   const errors = [];
   const warnings = [];
@@ -170,6 +179,10 @@ function validate(model, options = {}) {
 
   const names = new Map();
   const remotePorts = new Map();
+  /* frpc 顶层的 start = [...] 是「只启动列出的这些代理」的白名单（手改配置时常见）。
+   * 只要某个代理不在列表里，frpc 根本不会去连它 —— 界面上以前只会显示「隧道未建立」，
+   * 用户在本地端口、token、防火墙上查一圈也查不出来。这里提前说清楚。 */
+  const startNames = startNamesOf(model);
   for (const [index, proxy] of model.proxies.entries()) {
     const label = proxy.name || `第 ${index + 1} 个代理`;
     if (!proxy.name) {
@@ -187,6 +200,11 @@ function validate(model, options = {}) {
       }
       if (names.has(proxy.name)) push('error', `proxies[${index}].name`, `代理名称「${proxy.name}」与「${names.get(proxy.name)}」重复`);
       else names.set(proxy.name, label);
+
+      if (startNames.length && !startNames.includes(proxy.name)) {
+        const listed = startNames.slice(0, 4).join('、') + (startNames.length > 4 ? ` 等 ${startNames.length} 个` : '');
+        push('warn', `proxies[${index}].name`, `${label} 不在配置的 start 列表里（start = [${listed}]），frpc 只启动列表里的代理，这个代理不会生效；在一个编辑器里删掉 start 或把「${proxy.name}」加进去即可`);
+      }
     }
 
     if (!PROXY_TYPES.includes(proxy.type)) {
@@ -792,6 +810,7 @@ module.exports = {
   randomRemotePort,
   portInAllowList,
   formatAllowPorts,
+  startNamesOf,
   publicAddressFor,
   makeProxy,
 };

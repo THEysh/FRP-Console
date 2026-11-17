@@ -1078,7 +1078,14 @@ function lastConnectProblem() {
 
 function runtimeView(runtime) {
   const apiOk = !!runtime.connected;
-  const declared = model ? (model.proxies || []).length : 0;
+  /* 只有 frpc 真的会去启动的代理才算「本该注册」：
+   * 配置里有 start = [...] 时，名单外的代理 frpc 根本不管，
+   * 把它们算进来会让「一个都没注册上」成立，于是把好好的隧道报成
+   * 「frpc 连不上 frps / Token 校验失败」。 */
+  const startNames = model ? configModule.startNamesOf(model) : [];
+  const declared = model
+    ? (model.proxies || []).filter((p) => !startNames.length || startNames.includes(p.name)).length
+    : 0;
   const registered = manager ? manager.proxyStatus.size : 0;
   /* 只在“本该连着”的时候去翻失败记录：
    * 隧道是活的（进程/服务/API 任一在），或者刚异常退出（lastExit.error 非空）。
@@ -1172,6 +1179,21 @@ function dropProxyOpenPath(name) {
   settings = settingsModule.save({ proxyOpenPaths: map });
 }
 
+/* frpc.toml 顶层的 start = [...] 是「只启动列出的这些代理」的白名单。
+ * 控制台自己增删代理时要同步它，否则「界面上新建了、隧道里却没有这条」会让人
+ * 以为是端口或 token 的问题。只动这一个名字，其它条目原样保留；
+ * 配置里没有 start 时什么也不做（默认就是全部启动）。 */
+function startListPatch(model, { add = '', remove = '' } = {}) {
+  const raw = model && model._extra && model._extra.start;
+  if (!Array.isArray(raw) || !raw.length) return null;
+  const before = raw.map((n) => String(n == null ? '' : n));
+  const next = before.filter((n) => !remove || n !== remove);
+  const added = !!add && !next.includes(add);
+  if (added) next.push(add);
+  const changed = added || next.length !== before.length;
+  return changed ? { list: next, added } : null;
+}
+
 /* 启动时清理访问路径的历史脏数据：代理已经删掉的、类型不允许的、字符不合规的一律丢掉。
  * 返回被清理掉的条数（只在确实有变化时写盘，避免每次启动都改 settings.json）。 */
 function pruneOpenPaths() {
@@ -1210,6 +1232,9 @@ function buildState() {
    * 代理表会一直显示“同步中”。用登录状态判定才会落回“未同步”。 */
   const runtime = runtimeView(manager.snapshot());
   const validation = model ? configModule.validate(model, { allowPorts: serverAllowPorts() }) : { errors: [], warnings: [] };
+  /* 配置里有 start = [...] 时，不在这份名单里的代理 frpc 根本不会启动。
+   * 让它单独成一档，否则界面会把它报成「隧道未建立」，把人骗去查端口和 token。 */
+  const startNames = model ? configModule.startNamesOf(model) : [];
   const proxies = (model ? model.proxies : []).map((proxy) => {
     // 管理端口上是别人的 frpc 时，它报的代理状态与本配置无关，一律当作没同步
     const st = runtime.foreign ? null : manager.proxyStatus.get(proxy.name) || null;
@@ -1234,6 +1259,7 @@ function buildState() {
       statusError: st && st.err ? st.err : '',
       runtimeLocal: st ? st.local_addr : '',
       runtimeRemote: st ? st.remote_addr : '',
+      startExcluded: startNames.length > 0 && !startNames.includes(proxy.name),
       health,
     };
   });
@@ -1279,12 +1305,19 @@ function buildState() {
       /* 公网层失败里，「域名没解析 / 没指向这台服务器」跟「端口不通」是两回事：
        * 前者要改 DNS 记录，后者要查防火墙。概览分开计数，用户才知道该点哪里。 */
       const dnsFailed = failed.filter((p) => /^域名/.test(String(p.health.reason || ''))).length;
+      /* 被 start 列表排除的代理：不是"坏了"，是我们压根没让它起来。
+       * 单独一档，否则「N 个隧道未建立」会把人骗去查网络。
+       * 条数按代理自己的标记数（不是 health 缓存）：隧道停着时缓存是空的，
+       * 但「被 start 排除」这个事实来自配置，跟隧道有没有跑无关。 */
+      const startExcluded = proxies.filter((p) => p.startExcluded).length;
+      const startExcludedFailed = failed.filter((p) => p.health.startExcluded).length;
       return {
         total: proxies.length,
         online: verified.filter((p) => p.health.ok && p.status === 'running').length,
-        unhealthy: failed.length - path404,
+        unhealthy: failed.length - path404 - startExcludedFailed,
         path404,
         dnsFailed,
+        startExcluded,
         // 这一轮还没测完（或代理刚加进来）的条数：界面上既不能说在线也不能说异常
         unchecked: proxies.length - verified.length,
         unhealthyLocal: layerFailed('local'),
@@ -1581,6 +1614,11 @@ async function checkProxyHealth(p, ctx) {
   const at = Date.now();
   const layers = {};
   const type = p.type || 'tcp';
+  /* start 列表外的代理 frpc 不会启动：本地服务通不通都没意义，
+   * 直接给定这一档原因，别让它落到「隧道未建立」把人骗去查网络。 */
+  if (p.startExcluded) {
+    return [p.name, { ok: false, startExcluded: true, reason: '不在 start 列表里（frpc 不会启动它）', ms: 0, error: null, layers, at }];
+  }
   let local;
   if (type === 'udp' || type === 'sudp') {
     // UDP 是无连接的，没有 TCP 三次握手可用来判断「本地服务是否在听」；
@@ -1816,9 +1854,24 @@ async function checkHealth() {
     healthCache.clear();
     return;
   }
+  /* frpc 没在跑（没启动 / 已停止 / 管理 API 不可达）时不要做检查：
+   * 隧道层必然失败，于是每条代理都被判成「隧道未建立」，概览一片红字
+   * 「16 个隧道未建立」——用户明明是自己没启动，却像是全坏了。
+   * 清掉缓存，界面回到「待检测」，等隧道起来再测。 */
+  {
+    const snap = manager ? manager.snapshot() : null;
+    /* connected = 本机管理 API 有响应且不是别人的 frpc（snapshot 里没有 apiOk 字段） */
+    if (!snap || !snap.connected) {
+      healthCache.clear();
+      return;
+    }
+  }
   // plugin 代理里，socks5/http_proxy/static_file 等没有可探测的本地后端，跳过；
   // 但 https2http/https2https 有 plugin.localAddr 后端 + https vhost 公网入口，正常测。
+  const startNames = configModule.startNamesOf(model);
   const targets = model.proxies.filter((p) => {
+    // 被 start 列表排除的代理不探测（下面直接写一条明确原因），别白花时间也别误报
+    if (startNames.length && !startNames.includes(p.name)) return false;
     if (!p.plugin) return true;
     const pt = p.plugin && p.plugin.type;
     return pt === 'https2http' || pt === 'https2https';
@@ -1853,6 +1906,14 @@ async function checkHealth() {
     }
   });
   for (const item of results) if (item) healthCache.set(item[0], item[1]);
+  /* 被 start 列表排除的代理也给一条结果：否则它们既不在「在线」也不在「异常」，
+   * 只会挂在「还没测完」，界面上永远显示「待检测」。 */
+  if (startNames.length) {
+    for (const p of model.proxies) {
+      if (startNames.includes(p.name)) continue;
+      healthCache.set(p.name, { ok: false, startExcluded: true, reason: '不在 start 列表里（frpc 不会启动它）', ms: 0, error: null, layers: {}, at: started });
+    }
+  }
   // 配置里已经删掉的代理要顺手清掉，否则以后加回同名代理会读到上一次的旧结果
   const alive = new Set(model.proxies.map((p) => p.name));
   for (const name of Array.from(healthCache.keys())) if (!alive.has(name)) healthCache.delete(name);
@@ -2316,6 +2377,14 @@ function registerIpc() {
     if (mode === 'add' && model.proxies.some((p) => p.name === proxy.name)) {
       return { ok: false, error: `代理名称「${proxy.name}」已存在`, validation: configModule.validate(next, { allowPorts: serverAllowPorts() }) };
     }
+    /* frpc 顶层 start = [...] 是「只启动列表里的代理」的白名单（手改配置时常见）。
+     * 在界面上新建/改名的代理如果不在名单里，frpc 会静默跳过它 —— 用户只会看到
+     * 「隧道未建立」。这里把它补进名单，并把这件事说出来，而不是让配置偷偷失效。 */
+    const startPatch = startListPatch(next, {
+      add: proxy.name,
+      remove: mode === 'edit' && originalName && originalName !== proxy.name ? originalName : '',
+    });
+    if (startPatch) next._extra = { ...(next._extra || {}), start: startPatch.list };
     const validation = configModule.validate(next, { allowPorts: serverAllowPorts() });
     if (validation.errors.length) {
       return { ok: false, error: validation.errors[0].message, errors: validation.errors, validation };
@@ -2356,6 +2425,9 @@ function registerIpc() {
     if (openPathIgnored) {
       proxyWarnings.push(`${proxy.type} 类型的代理没有「访问路径」：已忽略填写的 ${rawOpenPath}`);
     }
+    if (startPatch && startPatch.added) {
+      proxyWarnings.push(`配置里有 start 列表（只启动列出的代理）：已把「${proxy.name}」加进列表，否则 frpc 会跳过这条代理`);
+    }
     /* 方案 Y：用户填了 https 类型或 TLS 插件，被自动纠正成纯 http 时明确告知，
      * 免得「我明明选了 https 怎么变成 http」的困惑。 */
     const wantedTls = String(input.type || '').toLowerCase() === 'https' || !!(input.plugin && input.plugin.type);
@@ -2391,6 +2463,10 @@ function registerIpc() {
     }, { nginxProxyEnabled: yModeEnabled() });
     healthCache.delete(name);
     dropProxyOpenPath(name);
+    /* 删掉的代理还留在 start 名单里是无害的（frpc 忽略不存在的名字），
+     * 但会越积越脏，顺手清掉；名单本身不动其它条目。 */
+    const startPatch = startListPatch(next, { remove: name });
+    if (startPatch) next._extra = { ...(next._extra || {}), start: startPatch.list };
     const result = await applyAndMaybeReload(next);
     if (!result.ok) return result;
     pushState();
@@ -4660,6 +4736,18 @@ async function bootstrap() {
         message: (info && info.error) || 'frpc 已退出',
       });
     }
+  });
+  /* frpc 自己的输出（stdout/stderr）：log.to = "console" 或用户把日志指到别处时，
+   * 日志文件里什么都不会有，只跟随文件会让日志页看起来冻住了。进程输出按行补齐后
+   * 塞进同一个缓冲（分块可能把一行切开，所以按流各留一个半行缓冲）。 */
+  const outputPartial = { stdout: '', stderr: '' };
+  manager.on('output', (chunk, stream) => {
+    const key = stream === 'stderr' ? 'stderr' : 'stdout';
+    const buf = (outputPartial[key] || '') + chunk;
+    const parts = buf.split(/\r?\n/);
+    outputPartial[key] = parts.pop() || '';
+    const text = parts.join('\n');
+    if (text.trim()) follower.appendLines(text);
   });
   follower.start();
   /* 这几步拿的都是"锦上添花"的信息，读不到不该让整个启动失败。
