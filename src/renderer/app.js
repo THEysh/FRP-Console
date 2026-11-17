@@ -1774,7 +1774,10 @@ async function openShellTerm() {
     // 但桌面习惯是「选中后 Ctrl+C 复制、Ctrl+V 粘贴」。这里按选中状态区分：
     // 选中了文字 → Ctrl+C 复制（不发中断）；没选中 → 交回 xterm 发 \x03 中断。
     // xterm 6 的 attachCustomKeyEventHandler 回调参数就是原生 KeyboardEvent（不是 { domEvent } 包装）。
+    // 注意：xterm 对 keydown / keypress / keyup 三种事件都会调用这个 handler——
+    // 必须只处理 keydown，否则按一次 Ctrl+V 会粘贴 3 份（真实键盘一次按键产生 3 个 DOM 事件）。
     term.attachCustomKeyEventHandler((ev) => {
+      if (!ev || ev.type !== 'keydown') return true; // 只处理 keydown；keypress/keyup 交回 xterm
       const ctrl = !!(ev.ctrlKey || ev.metaKey);
       if (ctrl && !ev.shiftKey && !ev.altKey) {
         const k = String(ev.key || '').toLowerCase();

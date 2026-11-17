@@ -459,6 +459,10 @@ node tools/cdp-shot.cjs .proxy-row out.png # 按选择器截单个元素
 
 ## 更新日志
 
+### 1.2.53
+
+- **修复终端 Ctrl+V 粘贴一次出现多份**：真实键盘按一次 Ctrl+V 会产生 keydown / keypress / keyup 三个事件，而 1.2.51 的按键处理对三种事件都各粘贴一次（例如粘贴 `sudo -n true` 结果出现三连 `sudo -n truesudo -n truesudo -n true`）。现在只在 keydown 时处理一次，keypress / keyup 不再重复触发；已在真机 bash 验证一次粘贴只发一份（命令行里文本出现两次属正常——一次是粘贴写入、一次是 shell 回显）。
+
 ### 1.2.52
 
 - **修复「一键初始化 frps」提示「请先填写配置向导」**：1.2.49 把「配置文件」卡片改成了 frps.toml / frpc.toml 两个编辑器，但「一键初始化并启动」仍在读旧的配置向导表单，导致卸载 frps 后重装时点它直接提示「请先填写配置向导」、无法初始化。现在一键初始化改用内存里已自动填好的向导字段（连接时已按档案 Token + 随机面板密码生成），点一下就能直接装。
