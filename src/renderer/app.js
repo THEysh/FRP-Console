@@ -1515,7 +1515,10 @@ function renderServerLogs() {
 
 function nginxCardMarkup() {
   const n = S.server.nginx || {};
-  if (!n || n.loading) {
+  /* 状态还没拉回来时不能断言「未安装」——以前 `!n` 对空对象恒为假，
+   * 结果卡片直接落到 installed=false 分支，写着「服务器还没装 nginx」，
+   * 用户看到的第一眼就是假结论（连接成功的头几百毫秒就是这样）。 */
+  if (!S.server.nginx || n.loading) {
     return `<section class="card"><div class="card-head"><div class="ch-icon">${icon('globe')}</div><div class="grow"><h3>HTTPS 域名反代（nginx）</h3><p>检测服务器 nginx，让域名走 80/443、不用带端口。</p></div></div><div class="field-hint" style="padding:0 16px 12px">检测中…</div></section>`;
   }
   if (n.error) {
@@ -1525,13 +1528,29 @@ function nginxCardMarkup() {
   // 真冲突 = 80/443 被「非 nginx」的进程占用。nginx 自己占着 80/443 是正常就绪，
   // 不能用 port80Free/port443Free（那会把 nginx 自身也算成「被占」）。
   const conflict = !!(n.port80Conflict || n.port443Conflict);
+  /* 只有「80 段 + 443 段都写过」才算 https 真的能用。以前只要 nginx 在跑、端口没被占
+   * 就挂绿「就绪」，于是删掉证书、443 段被摘掉之后，卡片还写着「80/443 可用」，
+   * 用户拿域名用 https 访问却直接被拒——假绿 (1.2.68)。 */
+  const certsList = Array.isArray(n.certs) ? n.certs : (n.certs ? [n.certs] : []);
+  const hasTls = certsList.length > 0;
+  const httpsListening = !n.port443Free;
   let statusBadge;
   let detail;
   let setupLabel;
   if (installed && !conflict) {
-    statusBadge = `<span class="badge green"><span class="bdot"></span>${n.version ? esc(n.version) : 'nginx'} · 就绪</span>`;
-    detail = 'nginx 已装，80/443 可用：配置后域名可直接 https:// 访问，不用带端口。';
-    setupLabel = '一键配置反代';
+    if (n.proxyConfigured && !hasTls) {
+      statusBadge = `<span class="badge amber"><span class="bdot"></span>已配 80 · 缺 443 证书</span>`;
+      detail = httpsListening
+        ? '443 端口有监听，但我们的 frp-console.conf 里没有 ssl 证书段——你的域名走 https 会落到别的站点（证书不匹配）。'
+        : 'frp-console.conf 里没有 ssl 证书段，443 也没有监听：现在域名只能走 http://域名。';
+      setupLabel = '配置 HTTPS 反代';
+    } else {
+      statusBadge = `<span class="badge green"><span class="bdot"></span>${n.version ? esc(n.version) : 'nginx'} · 就绪</span>`;
+      detail = hasTls
+        ? 'nginx 已装，80/443 都已配置：域名可直接用 https:// 访问，不用带端口。'
+        : 'nginx 已装，80/443 可用：配置后域名可直接 https:// 访问，不用带端口。';
+      setupLabel = '一键配置反代';
+    }
   } else if (installed && conflict) {
     const by = [n.port80By, n.port443By].filter(Boolean).join('、') || '其它进程';
     statusBadge = '<span class="badge amber"><span class="bdot"></span>80/443 被占</span>';
@@ -1547,8 +1566,11 @@ function nginxCardMarkup() {
    * frp-console.conf 里到底配了哪些域名」直接摊开，用户一眼能看出自己的域名
    * 在不在里面（以前只笼统显示「反代已就绪」，域名没配也不知道）。 */
   const namesText = Array.isArray(n.serverNames) ? n.serverNames.join('、') : String(n.serverNames || '');
-  const certsText = Array.isArray(n.certs) ? n.certs.join('、') : String(n.certs || '');
-  const configuredNote = (n.proxyConfigured && namesText && !n.ok)
+  const certsText = certsList.join('、');
+  /* `n.ok` 服务端从来没给过（nginx:state 只回 detectNginx 的字段），
+   * 所以「反代已就绪」这条提示一直是死代码。改成按「配置在 + 有证书」自己算。 */
+  const ready = !!(n.proxyConfigured && hasTls);
+  const configuredNote = (n.proxyConfigured && namesText && !ready)
     ? `<div class="note" style="margin:0 16px 12px">${icon('globe')}<div><strong>nginx 已配置的域名</strong><br>${esc(namesText)}${certsText ? `<br><span class="field-hint mono">${esc(certsText)}</span>` : ''}<br>你的域名不在这个列表里时，https 访问会落到默认站点（证书不匹配、浏览器会告警）。</div></div>`
     : '';
   return `
@@ -1566,8 +1588,8 @@ function nginxCardMarkup() {
         ? `<div class="note warn" style="margin:0 16px 12px">${icon('alert')}<div><strong>还没有可用证书</strong><br>反代需要一张证书来终止 HTTPS。请先到「HTTPS 证书」页签发一张，再回来点「一键配置反代」。</div></div>`
         : ''}
       ${configuredNote}
-      ${n.ok
-        ? `<div class="note" style="margin:0 16px 12px">${icon('check')}<div><strong>反代已就绪</strong><br>${esc(namesText || '你的域名')} → nginx 80/443 → frps HTTP vhost（${esc(String(n.frpsHttpPort || ''))}）。现在用 <code>https://你的域名</code> 就能访问，不带端口。</div></div>`
+      ${ready
+        ? `<div class="note" style="margin:0 16px 12px">${icon('check')}<div><strong>反代已就绪</strong><br>${esc(namesText || '你的域名')} → nginx 80/443${n.frpsHttpPort ? ` → frps HTTP vhost（${esc(String(n.frpsHttpPort))}）` : ' → frps HTTP vhost'}。现在用 <code>https://你的域名</code> 就能访问，不带端口。</div></div>`
         : ''}
     </section>`;
 }
@@ -3657,7 +3679,7 @@ function certOverviewHtml() {
     ? `<div class="field-hint" style="padding:0 16px 10px">还没连服务器：连上后会自动扫一遍它上面的证书（宝塔 / certbot / nginx），只读不改。</div>`
     : srvSt.error
       ? `<div class="note warn" style="margin:0 16px 10px">${icon('alert')}<div>${esc(srvSt.error)}</div></div>`
-      : srvSt.loading && !srvSt.loaded
+      : (!srvSt.loaded || srvSt.loading)
         ? `<div class="field-hint" style="padding:0 16px 10px">正在扫描 ${esc(S.server.host || '服务器')} 上的证书…</div>`
         : `<div class="field-hint" style="padding:0 16px 10px">${esc(S.server.host || '服务器')} 上找到 ${srv.length} 张证书${srvSt.scannedAt ? ` · ${new Date(srvSt.scannedAt).toLocaleTimeString('zh-CN')} 扫描` : ''}${srvOnly.length ? `，其中 ${srvOnly.length} 张本机还没有` : ''}${srvSt.truncated ? ' · 证书较多，只显示前 ' + srv.length + ' 张' : ''}</div>`;
 

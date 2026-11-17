@@ -41,6 +41,43 @@ function posixBasename(p) {
   return i < 0 ? s : s.slice(i + 1);
 }
 
+/* 从 nginx 配置文本里摘掉「body 中出现任一 needle」的 server { … } 块。
+ * 只按大括号配对切 server 块，块外的注释和空行原样保留；
+ * 块没闭合（配置本身就是坏的）就整段留着不动，交由 nginx -t 判定。 */
+function removeServerBlocks(text, needles) {
+  const list = (needles || []).filter(Boolean);
+  const lines = String(text || '').split('\n');
+  const out = [];
+  let buf = [];
+  let depth = 0;
+  let inBlock = false;
+  let removed = 0;
+  for (const line of lines) {
+    const opens = (line.match(/\{/g) || []).length;
+    const closes = (line.match(/\}/g) || []).length;
+    if (!inBlock && /\bserver\s*\{/.test(line)) {
+      inBlock = true;
+      depth = 0;
+      buf = [];
+    }
+    if (inBlock) {
+      buf.push(line);
+      depth += opens - closes;
+      if (depth <= 0) {
+        inBlock = false;
+        const body = buf.join('\n');
+        if (list.some((n) => body.includes(n))) removed += 1;
+        else out.push(...buf);
+        buf = [];
+      }
+      continue;
+    }
+    out.push(line);
+  }
+  if (inBlock && buf.length) out.push(...buf);
+  return { text: out.join('\n'), removed };
+}
+
 function firstLine(value) {
   return String(value || '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean)[0] || '';
 }
@@ -1291,7 +1328,12 @@ class ServerSession {
     let version = '';
     if (installed) {
       const v = await this.exec('nginx -v 2>&1 | head -n 1 || true', 6000);
-      version = firstLine(`${v.stdout || ''}${v.stderr || ''}`).replace(/^nginx version:\s*/i, '');
+      /* `nginx -v` 的输出是「nginx version: nginx/1.26.3」，两层前缀都要剥掉，
+       * 否则界面写成「nginx/1.26.3 · 就绪」，看起来像版本号写重了。 */
+      version = firstLine(`${v.stdout || ''}${v.stderr || ''}`)
+        .replace(/^nginx version:\s*/i, '')
+        .replace(/^nginx\//i, '')
+        .trim();
     }
     const ss = await this.exec("ss -lntp 2>/dev/null | grep -E ':(80|443)\\s' || true", 10000);
     const listeners = this.parseListeners(ss.stdout || '');
@@ -1425,6 +1467,10 @@ class ServerSession {
   /* 解析 scanCertificates 的原始输出。抽成独立方法便于单测。 */
   parseCertificates(text) {
     const out = [];
+    /* 同一个证书文件常被多个 server 块引用（80/443、多域名站点、alias），
+     * 而扫描脚本的声音来自「grep ssl_certificate」和「ls 宝塔 cert 目录」两条线，
+     * 不去重的话列表里会出现 3 条一模一样的 ja.theysh.cn，用户以为签了好几张。 */
+    const seen = new Set();
     const blocks = String(text || '').split(/@@CERT /).slice(1);
     for (const block of blocks) {
       const end = block.indexOf('@@END');
@@ -1432,6 +1478,9 @@ class ServerSession {
       const lines = body.split('\n');
       const path = (lines.shift() || '').trim();
       if (!path) continue;
+      const dedupeKey = path.toLowerCase();
+      if (seen.has(dedupeKey)) continue;
+      seen.add(dedupeKey);
       const detail = lines.join('\n');
       const keyMatch = detail.match(/@@KEY\s+(\S+)/);
       const subject = (detail.match(/subject\s*=.*?(?:CN\s*=\s*)([^,\n\/]+)/i) || [])[1] || '';
@@ -1618,8 +1667,25 @@ class ServerSession {
     const reload = await this.reloadNginx();
     if (!reload.ok) {
       /* 强制删除时不要把文件搬回去：用户已经确认「这张证书没用了」，
-       * 搬回只会让他再点一次。改成如实告知「重载失败，重启 nginx 前先修配置」。 */
+       * 搬回只会让他再点一次。改成如实告知「重载失败，重启 nginx 前先修配置」。
+       * 但如果是**我们自己生成的** frp-console.conf 还指着这张证书，
+       * 那就是我们留下的雷——顺手把那个 server 块摘掉再重载，别让用户踩到。 */
       if (force) {
+        const repair = await this.stripCertFromOwnConfig({ certPath: cert, keyPath: key });
+        if (repair.ok && repair.changed) {
+          const again = await this.reloadNginx();
+          if (again.ok) {
+            return {
+              ok: true,
+              deleted: moved,
+              trash,
+              reloaded: true,
+              repaired: repair.confPath,
+              repairedBackup: repair.backup,
+              warning: `已自动移除 ${posixBasename(repair.confPath)} 里引用这张证书的 server 块（备份 ${posixBasename(repair.backup)}），nginx 已重新加载。`,
+            };
+          }
+        }
         return {
           ok: true,
           deleted: moved,
@@ -1778,6 +1844,42 @@ class ServerSession {
     await this.exec(`rm -f ${tmp} 2>/dev/null || true`, 6000);
     if (!install.ok) return { ok: false, error: `写入 nginx 配置失败：${(install.stderr || install.stdout || '权限不足').trim()}` };
     return { ok: true, confPath, content: conf };
+  }
+
+  /* 我们自己生成的 frp-console.conf 里，把「引用了某张已删证书」的 server 块摘掉。
+   * 强制删除证书的现场是：文件删了，我们的 443 段还指着它 → nginx -t 失败 →
+   * 站点靠旧 worker 撑着，用户重启 nginx 就整站起不来。这个文件是我们自己生成的，
+   * 摘掉对应块是安全且可预期的修复，比只弹一句警告有用。 */
+  async stripCertFromOwnConfig({ certPath, keyPath } = {}) {
+    if (!this.connected) return { ok: true, changed: false };
+    const needles = [certPath, keyPath].map((s) => String(s || '').trim()).filter(Boolean);
+    if (!needles.length) return { ok: true, changed: false };
+    const confInfo = await this.detectNginxConfDir();
+    const confPath = `${confInfo.dir}/frp-console.conf`;
+    const cat = await this.exec(`cat ${shellQuote(confPath)} 2>/dev/null || true`, 8000);
+    const original = String(cat.stdout || '');
+    if (!original.trim()) return { ok: true, changed: false };
+    const stripped = removeServerBlocks(original, needles);
+    if (!stripped.removed) return { ok: true, changed: false };
+    const sudo = await this.detectSudo();
+    if (!sudo.ok) return sudo;
+    const prefix = sudo.prefix;
+    const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
+    const backup = `${confPath}.bak-frpconsole-${stamp}`;
+    await this.exec(`${prefix}cp -p ${shellQuote(confPath)} ${shellQuote(backup)} 2>/dev/null || true`, 8000);
+    const b64 = Buffer.from(stripped.text, 'utf8').toString('base64');
+    const tmp = '/tmp/frp-console-nginx.strip.conf';
+    await this.exec(`printf %s ${b64} | base64 -d > ${tmp}`, 15000);
+    const install = await this.exec(`${prefix}install -m 644 ${tmp} ${shellQuote(confPath)}`, 10000);
+    await this.exec(`rm -f ${tmp} 2>/dev/null || true`, 6000);
+    if (!install.ok) return { ok: false, changed: false, error: `写入 nginx 配置失败：${(install.stderr || install.stdout || '权限不足').trim()}` };
+    const test = await this.exec(`${prefix}nginx -t 2>&1`, 15000);
+    const testText = `${test.stdout || ''}\n${test.stderr || ''}`;
+    if (!test.ok && !/syntax is ok|test is successful/i.test(testText)) {
+      await this.exec(`${prefix}cp -p ${shellQuote(backup)} ${shellQuote(confPath)} 2>/dev/null || true`, 8000);
+      return { ok: false, changed: false, error: `摘掉引用块后 nginx 校验仍失败，已还原配置：${(test.stderr || test.stdout || '').trim()}` };
+    }
+    return { ok: true, changed: true, removed: stripped.removed, confPath, backup };
   }
 
   /* nginx -t 校验 + reload。 */
@@ -2051,4 +2153,4 @@ function parsePortInput(text) {
   return { ok: true, ranges };
 }
 
-module.exports = { ServerSession, parseServiceUnits, rankServiceUnits, parsePortInput };
+module.exports = { ServerSession, parseServiceUnits, rankServiceUnits, parsePortInput, removeServerBlocks };

@@ -199,6 +199,26 @@ function findServerProfile(id) {
   return serverProfiles().find((item) => item.id === target) || null;
 }
 
+/* 按「同一台机器」找档案：host + SSH 端口 + 用户名 三者都相同就认为是同一个目标。
+ * 连接的入口（连接表单）不给 id，以前一律 upsert 新建，于是用户每连一次就多一条
+ * 同名档案——实测一个账号里能攒出 25 条 154.36.178.154。 */
+function findServerProfileByTarget({ host, port, username } = {}) {
+  const h = String(host || '').toLowerCase();
+  const p = Number(port);
+  const u = String(username || '');
+  if (!h || !p) return null;
+  const list = serverProfiles().filter((item) => String(item.host || '').toLowerCase() === h
+    && Number(item.port) === p && String(item.username || '') === u);
+  if (!list.length) return null;
+  /* 有多条历史重复档案时，优先用最近连过的、且存了密码的那条，避免用户被要求重输密码。 */
+  return list.sort((a, b) => {
+    const ap = settingsModule.hasServerSecret(a.id) ? 1 : 0;
+    const bp = settingsModule.hasServerSecret(b.id) ? 1 : 0;
+    if (ap !== bp) return bp - ap;
+    return (Number(b.lastConnectedAt) || 0) - (Number(a.lastConnectedAt) || 0);
+  })[0];
+}
+
 function activeServerProfile() {
   return findServerProfile(settings.activeServerId) || serverProfiles()[0] || null;
 }
@@ -1482,13 +1502,20 @@ async function checkProxyHealth(p, ctx) {
     let error = pub.error || null;
     let hint = '';
     const pubDomain = (type === 'http' || type === 'https') ? configModule.firstDomainOf(p) : '';
+    const recentNginx = (lastNginxState && lastNginxState.serverHost === serverSession.host
+      && Date.now() - lastNginxState.at < 120000) ? lastNginxState : null;
     if (pub.blocked === 'icp') {
       reason = '公网端口被云厂商备案拦截';
       hint = '这个域名没有在服务器所属云厂商备案，HTTP 端口（80/8080）上的请求会被直接换成备案提示页。要么完成备案，要么改成走 443：在「HTTPS 证书」页把该域名部署到 nginx，然后用 https://域名 访问。';
+    } else if (vhostOpts.nginxProxyEnabled && recentNginx && recentNginx.port443Free === true) {
+      /* Y 模式（走 nginx 443）下，探测目标是 https://<服务器IP>/。443 根本没人监听时，
+       * 拿到的只是 ECONNREFUSED，说成「公网不可达」会让人去查安全组——查半天也查不出。
+       * 真正的原因是 nginx 上没有 443 段（常见于证书被删/还没签发）。 */
+      reason = 'nginx 没有监听 443';
+      error = `探测目标 https://${serverSession.host}/ 连不上：服务器上 443 没有任何监听，frp-console.conf 里也没有 ssl 证书段`;
+      hint = '到「HTTPS 证书」页签发或导入一张覆盖该域名的证书，然后「部署到 nginx」，它会补上 443 段与证书';
     } else if (pubDomain && /frps 上没有匹配到该域名/.test(String(pub.error || ''))) {
-      const ng = (lastNginxState && lastNginxState.serverHost === serverSession.host
-        && Date.now() - lastNginxState.at < 120000) ? lastNginxState : null;
-      const names = (ng && Array.isArray(ng.serverNames)) ? ng.serverNames : [];
+      const names = (recentNginx && Array.isArray(recentNginx.serverNames)) ? recentNginx.serverNames : [];
       const covered = names.some((n) => coversDomain(n, pubDomain));
       if (vhostOpts.nginxProxyEnabled && names.length && !covered) {
         reason = 'nginx 上没有这个域名';
@@ -2553,6 +2580,9 @@ function registerIpc() {
         });
       }
     }
+    /* 表单连接没带档案时，先看是不是连「同一台机器」——有就复用，别每次新建一条同名档案。
+     * 复用后仍会走下面的 upsert 更新地址/端口，并把 activeServerId 指过去。 */
+    if (!profile) profile = findServerProfileByTarget({ host, port, username });
     const wasNew = !profile;
     if (!profile) profile = upsertServerProfile({ host, port, username, name: host });
     if (!password) password = settingsModule.readServerSecret(profile.id);
@@ -3207,7 +3237,7 @@ function registerIpc() {
       return ok({ layer, ok: true, ms: Date.now() - startedAt, detail: `服务端与 ${tokenSource} 的 Token 一致（${serverToken.slice(0, 4)}…，${serverToken.length} 位）` });
     }
 
-    return fail('未知的检测层');
+    return fail(`未知的检测层（可用：ssh / service / bindPort / token）：${layer}`);
   });
 
   ipcMain.handle('server:control', async (event, payload = {}) => {
