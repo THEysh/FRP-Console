@@ -1602,7 +1602,7 @@ function firewallCardMarkup() {
   const busy = S.server.firewallBusy ? 'disabled' : '';
   const mainBtn = f.manager === 'none'
     ? `<button class="btn primary" type="button" data-act="server.firewall.install" ${busy}>${S.server.firewallBusy ? '<span class="spinner-sm"></span>' : icon('shield')}<span>${S.server.firewallBusy ? '安装中…' : '安装并启用防火墙'}</span></button>`
-    : `<button class="btn primary" type="button" data-act="server.firewall.open" ${busy}>${S.server.firewallBusy ? '<span class="spinner-sm"></span>' : icon('shield')}<span>${S.server.firewallBusy ? '放行中…' : '放行 frps 与代理端口'}</span></button>`;
+    : `<button class="btn primary" type="button" data-act="server.firewall.open" ${busy}>${S.server.firewallBusy ? '<span class="spinner-sm"></span>' : icon('shield')}<span>${S.server.firewallBusy ? '放行中…' : '一键放行全部端口'}</span></button>`;
 
   /* ---- 矩阵：监听 / 规则 / 实测 三信号 + 结论（v1.2.56） ---- */
   const rows = Array.isArray(f.matrix) ? f.matrix : [];
@@ -1626,13 +1626,27 @@ function firewallCardMarkup() {
   };
   const GROUP_LABEL = { frps: 'frps 端口', proxy: '代理映射端口', system: '系统端口（SSH / nginx）' };
   const groupOrder = ['frps', 'proxy', 'system'];
+  /* 代理一多（几十条）矩阵会把页面撑得很长、把真正有问题的行埋掉。
+   * 超过 12 行时默认只显示「有问题的行」，其余折叠，给一个按钮展开。 */
+  const showAll = !!S.server.portShowAll;
+  const collapsed = rows.length > 12 && !showAll;
+  const visibleRows = collapsed ? rows.filter((r) => r.tone !== 'ok') : rows;
+  const hiddenCount = rows.length - visibleRows.length;
+  const moreHtml = rows.length > 12 ? `
+        <div class="port-matrix-more">
+          <span class="field-hint">${collapsed
+            ? (hiddenCount ? `已折叠 ${hiddenCount} 个正常的端口` : '所有端口都正常')
+            : `显示全部 ${rows.length} 个端口`}</span>
+          <button class="btn tiny" type="button" data-act="server.ports.showall">${collapsed ? '显示全部' : '只看有问题的'}</button>
+        </div>` : '';
   const matrixHtml = rows.length ? `
       <div class="port-matrix-wrap">
         <table class="port-matrix">
           <thead><tr><th>用途</th><th>端口</th><th>监听</th><th>规则</th><th>实测</th><th>结论</th><th></th></tr></thead>
           <tbody>
+            ${visibleRows.length ? '' : '<tr><td colspan="7" class="pm-muted" style="padding:12px 14px">没有需要处理的端口</td></tr>'}
             ${groupOrder.map((g) => {
-              const list = rows.filter((r) => r.group === g);
+              const list = visibleRows.filter((r) => r.group === g);
               if (!list.length) return '';
               return `<tr class="pm-group"><td colspan="7">${GROUP_LABEL[g] || g}</td></tr>`
                 + list.map((r) => `
@@ -1641,13 +1655,16 @@ function firewallCardMarkup() {
                     <td class="mono">${r.port}/${esc(r.proto)}</td>
                     <td>${r.listen === false && r.proto === 'tcp' ? cell('no') : cell(tri(r.listen))}</td>
                     <td>${f.active ? cell(r.rule ? 'yes' : 'no') : '<span class="pm pm-muted">—</span>'}</td>
-                    <td>${r.proto === 'udp' ? cell('reach', 'udp') : cell(tri(r.reachable))}</td>
+                    <td>${r.proto === 'udp'
+                      ? (r.reachable === false ? cell('no') : cell('reach', 'udp'))
+                      : cell(tri(r.reachable))}</td>
                     <td class="pm-text pm-${esc(r.tone || 'ok')}">${esc(r.text || '')}</td>
                     <td class="pm-act">${rowAction(r)}</td>
                   </tr>`).join('');
             }).join('')}
           </tbody>
         </table>
+        ${moreHtml}
       </div>` : '';
   const conclusionHtml = conclusion ? `
       <div class="note ${conclusion.level === 'ok' ? '' : 'warn'}" style="margin:0 16px 10px">
@@ -4123,6 +4140,11 @@ async function handleAction(act, dataset, btn) {
           || '入方向（允许）：\nTCP  1-65535  0.0.0.0/0  允许\nUDP  1-65535  0.0.0.0/0  允许';
         await FRP.copy(wide);
         toast('warn', '已复制「1-65535 全放行」', '这只适合自用/测试服务器：等于把全部端口暴露到公网，用完记得按清单收紧');
+        break;
+      }
+      case 'server.ports.showall': {
+        S.server.portShowAll = !S.server.portShowAll;
+        renderServer(true);
         break;
       }
       case 'server.firewall.open': {

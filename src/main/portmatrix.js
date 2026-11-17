@@ -38,6 +38,11 @@ function judgePortRow({ label, port, proto, listen, rule, reachable, fwActive, g
     return { ...row, code: 'ok', tone: 'ok', text: '未启用防火墙，不拦截', action: '' };
   }
   if (row.proto === 'udp') {
+    /* UDP 没有握手，只有两种情况能下结论：服务器回了 ICMP 端口不可达（reachable=false，
+     * 说明包确实到了、但没人监听），或只是发出去没有回应（未知，不能算故障）。 */
+    if (reachable === false) {
+      return { ...row, code: 'udp-closed', tone: 'bad', text: '服务器回了 ICMP 端口不可达：包能到，但没有程序监听这个 UDP 端口', action: 'service' };
+    }
     if (rule) return { ...row, code: 'ok', tone: 'ok', text: '规则已放行（UDP 无握手，无法实测）', action: '' };
     return { ...row, code: 'likely-fw-blocked', tone: 'bad', text: '规则未放行，UDP 代理很可能被拦', action: 'open' };
   }
@@ -69,7 +74,7 @@ function buildPortMatrix({ cfgPorts, proxyPorts, sysPorts, allowed, fwActive, li
         label: p.label || '',
         port: Number(p.port),
         proto: p.proto || 'tcp',
-        reachable: p.proto === 'tcp' && typeof p.reachable === 'boolean' ? p.reachable : null,
+        reachable: typeof p.reachable === 'boolean' ? p.reachable : null,
       });
     }
   };
@@ -100,7 +105,7 @@ function summarizeMatrix(rows) {
   const by = (code) => list.filter((r) => r.code === code);
   const cloudBlocked = by('cloud-blocked');
   const fwBlocked = [...by('fw-blocked'), ...by('likely-fw-blocked')];
-  const notListening = by('not-listening');
+  const notListening = [...by('not-listening'), ...by('udp-closed')];
   const tunnelStopped = by('tunnel-stopped');
   const needsWork = cloudBlocked.length + fwBlocked.length + notListening.length;
   let text = '全部需要放行的端口都通';

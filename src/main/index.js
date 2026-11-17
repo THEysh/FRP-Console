@@ -2783,6 +2783,27 @@ function registerIpc() {
     return out;
   }
 
+  /* 系统端口（SSH + nginx 80/443）：判定和「一键放行」都要用。
+   * nginx 状态用 60 秒缓存，缺失时现查一次（否则刚打开服务器页时矩阵里没有 443）。 */
+  async function collectSystemPorts() {
+    const out = [];
+    if (serverSession.port) out.push({ port: Number(serverSession.port), proto: 'tcp', label: 'SSH' });
+    let ng = (lastNginxState && lastNginxState.serverHost === serverSession.host && Date.now() - lastNginxState.at < 60000)
+      ? lastNginxState
+      : null;
+    if (!ng) {
+      try {
+        ng = { ...(await serverSession.detectNginx()), at: Date.now(), serverHost: serverSession.host };
+        lastNginxState = ng;
+      } catch { ng = null; }
+    }
+    if (ng && ng.installed) {
+      out.push({ port: 443, proto: 'tcp', label: 'nginx' });
+      out.push({ port: 80, proto: 'tcp', label: 'nginx' });
+    }
+    return out;
+  }
+
   ipcMain.handle('server:firewall-state', async () => {
     if (!serverSession.connected) return fail('尚未连接服务器');
     try {
@@ -2791,27 +2812,16 @@ function registerIpc() {
       const proxyPorts = proxyRemotePorts();
       /* 系统端口也要参与判定：SSH 是管理通道，nginx 80/443 是方案 Y 的公网入口。
        * 以前这两类完全不在清单里，用户根本看不到「443 有没有被放行」。 */
-      const sysPorts = [];
-      if (serverSession.port) sysPorts.push({ port: Number(serverSession.port), proto: 'tcp', label: 'SSH' });
-      /* nginx 的 80/443 是方案 Y 的公网入口，必须进清单。缓存缺失/过期就现查一次：
-       * 否则用户刚打开服务器页时拿到的矩阵里根本没有 443（这正是他们踩的那个坑）。 */
-      let ng = (lastNginxState && lastNginxState.serverHost === serverSession.host && Date.now() - lastNginxState.at < 60000)
-        ? lastNginxState
-        : null;
-      if (!ng) {
-        try {
-          ng = { ...(await serverSession.detectNginx()), at: Date.now(), serverHost: serverSession.host };
-          lastNginxState = ng;
-        } catch { ng = null; }
-      }
-      if (ng && ng.installed) {
-        sysPorts.push({ port: 443, proto: 'tcp', label: 'nginx' });
-        sysPorts.push({ port: 80, proto: 'tcp', label: 'nginx' });
-      }
+      const sysPorts = await collectSystemPorts();
       const [allowed, listenPorts] = await Promise.all([
         serverSession.readFirewallAllowed(),
         serverSession.readListenPorts().catch(() => null),
       ]);
+      /* 我们现在就通过这条 SSH 连接在说话 —— 那 SSH 端口必然在监听。
+       * ss 偶尔读不到（权限、容器内无 ss、输出格式不同）时，别把管理通道误判成「没有程序监听」。 */
+      if (listenPorts && listenPorts.tcp && serverSession.port) {
+        listenPorts.tcp.add(Number(serverSession.port));
+      }
       // S3：从本机实测（TCP 全部实测；UDP 无握手，只在矩阵里按规则给「很可能被拦」）。
       const reachMap = new Map();
       const tcpTargets = [...new Map([...cfgPorts, ...proxyPorts, ...sysPorts]
@@ -2821,9 +2831,20 @@ function registerIpc() {
         const r = await probePort({ host: serverSession.host, port: Number(p.port), timeout: 2000 });
         reachMap.set(`tcp:${p.port}`, r.ok === true);
       }));
-      const withReach = (list) => (list || []).map((p) => (p.proto === 'tcp'
-        ? { ...p, reachable: reachMap.has(`tcp:${p.port}`) ? reachMap.get(`tcp:${p.port}`) : null }
-        : p));
+      /* UDP 也要探一次：没有握手，但服务器会回 ICMP 端口不可达。
+       * 拿到 ICMP 就说明「包到了、没人听」，这是 UDP 唯一能确诊的信号。最多探 4 个，避免拖慢刷新。 */
+      const udpTargets = [...new Map([...cfgPorts, ...proxyPorts, ...sysPorts]
+        .filter((p) => p.proto === 'udp' && p.port)
+        .map((p) => [Number(p.port), p])).values()].slice(0, 4);
+      await Promise.all(udpTargets.map(async (p) => {
+        const r = await probeUdp({ host: serverSession.host, port: Number(p.port), timeout: 1200 }).catch(() => null);
+        if (r && r.kind === 'refused') reachMap.set(`udp:${p.port}`, false);
+        else if (r && r.ok) reachMap.set(`udp:${p.port}`, true);
+      }));
+      const withReach = (list) => (list || []).map((p) => ({
+        ...p,
+        reachable: reachMap.has(`${p.proto}:${p.port}`) ? reachMap.get(`${p.proto}:${p.port}`) : null,
+      }));
       const frpsWithReach = withReach(cfgPorts);
       const proxyWithReach = withReach(proxyPorts);
       const sysWithReach = withReach(sysPorts);
@@ -2878,7 +2899,10 @@ function registerIpc() {
     try {
       const cfgPorts = serverConfig.summary ? serverSession.configPorts(serverConfig.content) : [];
       const proxyPorts = proxyRemotePorts();
-      const ports = [...cfgPorts, ...proxyPorts];
+      /* 系统端口（SSH、nginx 80/443）也要放：否则用户点完「一键放行」，
+       * 矩阵里的 443 依然是红的——那正是这次要解决的场景。 */
+      const sysPorts = await collectSystemPorts();
+      const ports = [...cfgPorts, ...proxyPorts, ...sysPorts];
       if (!ports.length) return fail('没有可放行的端口（先确认服务器上已读取到 frps 配置或本机代理映射）');
       const result = await serverSession.openFirewallPorts(ports);
       return ok(result);
@@ -2893,7 +2917,10 @@ function registerIpc() {
     try {
       const cfgPorts = serverConfig.summary ? serverSession.configPorts(serverConfig.content) : [];
       const proxyPorts = proxyRemotePorts();
-      const ports = [...cfgPorts, ...proxyPorts];
+      /* 装防火墙的那一刻如果漏掉 SSH / nginx 端口，用户一开防火墙就把自己锁在门外
+       * （SSH 断了就再也进不来）。installFirewall 内部已经先放行 SSH，这里把系统端口一并交进去。 */
+      const sysPorts = await collectSystemPorts();
+      const ports = [...cfgPorts, ...proxyPorts, ...sysPorts];
       const result = await serverSession.installFirewall(ports);
       if (!result.ok) return fail(result.error, { manager: result.manager, opened: result.opened || [], notes: result.notes || [] });
       return ok(result);
