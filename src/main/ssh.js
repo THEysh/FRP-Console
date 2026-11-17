@@ -28,6 +28,19 @@ function shellQuote(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }
 
+/* 远端路径都是 POSIX 的，这里不用 node:path（它在 Windows 上按反斜杠解析）。 */
+function posixDirname(p) {
+  const s = String(p || '');
+  const i = s.lastIndexOf('/');
+  return i <= 0 ? '/' : s.slice(0, i);
+}
+
+function posixBasename(p) {
+  const s = String(p || '');
+  const i = s.lastIndexOf('/');
+  return i < 0 ? s : s.slice(i + 1);
+}
+
 function firstLine(value) {
   return String(value || '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean)[0] || '';
 }
@@ -1476,6 +1489,129 @@ class ServerSession {
       if (!key.ok) return { ok: false, error: `读取私钥失败：${key.error}` };
     }
     return { ok: true, certPem: cert.text, keyPem: key.text };
+  }
+
+  /* 找出哪些 nginx 配置引用了指定证书/私钥文件。
+   * 删除前的安全检查：还有站点在用它就不能删 —— 文件没了 nginx reload 会直接失败，
+   * 站点当场断（比「删不掉」严重得多）。用 -R 是为了跟进 sites-enabled 里的符号链接。 */
+  async findCertReferences({ certPath, keyPath } = {}) {
+    if (!this.connected) return { ok: false, error: '尚未连接服务器' };
+    const targets = [certPath, keyPath].map((p) => String(p || '').trim()).filter(Boolean);
+    if (!targets.length) return { ok: true, references: [], sites: [] };
+    const quotes = targets.map(shellQuote).join(' ');
+    const cmd = [
+      'set +e',
+      `for p in ${quotes}; do`,
+      '  grep -RnFI -e "$p" /etc/nginx /www/server/panel/vhost 2>/dev/null',
+      'done',
+    ].join('\n');
+    const res = await this.exec(cmd, 15000);
+    const references = [];
+    const files = [];
+    for (const raw of String(res.stdout || '').split('\n')) {
+      const line = raw.trim();
+      if (!line) continue;
+      const m = line.match(/^([^:]+):(\d+):(.*)$/);
+      if (!m) continue;
+      const file = m[1];
+      if (!files.includes(file)) files.push(file);
+      references.push({ file, line: Number(m[2]), content: m[3].trim().slice(0, 200) });
+    }
+    if (!references.length) return { ok: true, references: [], sites: [] };
+    /* 再从命中的配置里取 server_name，好告诉用户「是哪个站点在引用」。 */
+    const list = files.map(shellQuote).join(' ');
+    const names = await this.exec([
+      'set +e',
+      `for f in ${list}; do`,
+      '  echo "@@F $f"',
+      `  grep -hoE '^[[:space:]]*server_name[[:space:]]+[^;]+;' "$f" 2>/dev/null | head -n 3`,
+      'done',
+    ].join('\n'), 12000);
+    const siteMap = new Map();
+    let current = '';
+    for (const raw of String(names.stdout || '').split('\n')) {
+      const line = raw.trim();
+      if (!line) continue;
+      if (line.startsWith('@@F ')) {
+        current = line.slice(4).trim();
+        if (!siteMap.has(current)) siteMap.set(current, []);
+        continue;
+      }
+      const m = line.match(/server_name\s+([^;]+);/);
+      if (m && current) {
+        for (const n of m[1].split(/\s+/)) {
+          const v = n.trim();
+          if (v && !siteMap.get(current).includes(v)) siteMap.get(current).push(v);
+        }
+      }
+    }
+    const sites = [];
+    for (const ref of references) {
+      for (const n of siteMap.get(ref.file) || []) if (!sites.includes(n)) sites.push(n);
+    }
+    return { ok: true, references, sites };
+  }
+
+  /* 从服务器删除一张证书（证书 + 私钥），删完 nginx -t && reload。
+   * 三道闸：① certbot 托管的 /etc/letsencrypt 直接拒绝（该用 certbot delete）
+   *        ② 只允许删 /etc/nginx、宝塔 vhost/cert 白名单内的路径
+   *        ③ 还有站点引用就拒绝（列出引用它的站点与配置行）
+   * 不真删：搬进 /tmp/frp-console-cert-trash-<时间戳>/，误删还能手动搬回；
+   * reload 失败会自动搬回原处。 */
+  async deleteRemoteCert({ certPath, keyPath } = {}) {
+    if (!this.connected) return { ok: false, error: '尚未连接服务器' };
+    const cert = String(certPath || '').trim();
+    const key = String(keyPath || '').trim();
+    if (!cert) return { ok: false, error: '缺少证书路径' };
+    if (/^\/etc\/letsencrypt\//.test(cert)) {
+      return { ok: false, error: '这张证书由 certbot 托管，请在服务器执行 certbot delete --cert-name <域名>（直接删文件会让续期配置变成死链）' };
+    }
+    const ALLOWED = /^\/(etc\/nginx|www\/server\/panel\/vhost\/cert)\//;
+    if (!ALLOWED.test(cert)) return { ok: false, error: `拒绝删除白名单之外的路径：${cert}` };
+    if (key && !ALLOWED.test(key)) return { ok: false, error: `拒绝删除白名单之外的路径：${key}` };
+    const refs = await this.findCertReferences({ certPath: cert, keyPath: key });
+    if (!refs.ok) return refs;
+    if (refs.references.length) {
+      const where = refs.sites.length ? refs.sites.join('、') : refs.references.map((r) => r.file).join('、');
+      return {
+        ok: false,
+        blocked: true,
+        references: refs.references,
+        sites: refs.sites,
+        error: `还有站点在引用这张证书（${where}），已拒绝删除；要删请先把这些站点的 ssl_certificate 换掉。`,
+      };
+    }
+    const sudo = await this.detectSudo();
+    if (!sudo.ok) return sudo;
+    const prefix = sudo.prefix;
+    const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
+    const trash = `/tmp/frp-console-cert-trash-${stamp}`;
+    const mk = await this.exec(`${prefix}mkdir -p ${shellQuote(trash)}`, 8000);
+    if (!mk.ok) return { ok: false, error: `创建回收目录失败：${(mk.stderr || '').trim() || '权限不足'}` };
+    const moveIn = (p) => this.exec(`${prefix}mv -f ${shellQuote(p)} ${shellQuote(`${trash}/`)}`, 10000);
+    const moveBack = (p) => this.exec(`${prefix}mv -f ${shellQuote(`${trash}/${posixBasename(p)}`)} ${shellQuote(p)}`, 10000);
+    const moved = [cert];
+    const put = await moveIn(cert);
+    if (!put.ok) return { ok: false, error: `删除证书失败：${(put.stderr || '').trim() || cert}` };
+    if (key) {
+      const putKey = await moveIn(key);
+      if (!putKey.ok) {
+        await moveBack(cert);
+        return { ok: false, error: `删除私钥失败：${(putKey.stderr || '').trim() || key}` };
+      }
+      moved.push(key);
+    }
+    /* 一证一目錄的情况（/etc/nginx/ssl/<域名>/）顺手把空目录也清掉。 */
+    const dir = posixDirname(cert);
+    if (dir !== '/etc/nginx' && dir !== '/www/server/panel/vhost/cert') {
+      await this.exec(`${prefix}rmdir ${shellQuote(dir)} 2>/dev/null || true`, 6000);
+    }
+    const reload = await this.reloadNginx();
+    if (!reload.ok) {
+      for (const p of moved) await moveBack(p);
+      return { ok: false, error: `删除后 nginx 重载失败，文件已搬回原处：${reload.error}` };
+    }
+    return { ok: true, deleted: moved, trash, reloaded: true };
   }
 
   /* nginx server_name：多个域名空格分隔，通配符 `*.x` 原样传给 nginx。 */

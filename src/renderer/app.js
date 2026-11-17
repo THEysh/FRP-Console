@@ -3455,6 +3455,9 @@ async function loadServerCerts({ force = false } = {}) {
 function serverCertRow(c, { hasLocal = false } = {}) {
   const tone = c.daysLeft === null || c.daysLeft === undefined ? 'amber' : certExpiryTone(c.daysLeft);
   const src = CERT_SOURCE_LABEL[c.source] || c.source || '未知';
+  /* certbot 托管的证书不给「从服务器删除」的入口：文件删了 renewal 配置还在，
+   * 下次 certbot renew 直接报错，站点也没证书了。 */
+  const certbotManaged = c.source === 'le';
   const names = (Array.isArray(c.altNames) && c.altNames.length ? c.altNames : [c.domain]).filter(Boolean);
   const namesText = names.slice(0, 4).join('、') + (names.length > 4 ? ` 等 ${names.length} 个` : '');
   const daysText = c.daysLeft === null || c.daysLeft === undefined ? '到期未知' : `剩余 ${c.daysLeft} 天`;
@@ -3480,6 +3483,9 @@ function serverCertRow(c, { hasLocal = false } = {}) {
       <div class="cert-actions">
         <button class="btn small" type="button" data-act="cert.import" data-domain="${esc(c.domain || '')}" data-cert-path="${esc(c.certPath)}" data-key-path="${esc(c.keyPath || '')}" title="把这张证书复制进本机库，之后可以统一查看/续期/部署" ${c.keyPath ? '' : 'disabled'}>${icon('down')}<span>导入到本机</span></button>
         <button class="btn small" type="button" data-act="cert.reissue" data-domain="${esc(c.domain || '')}" title="用本机的 ACME 渠道重新签一张同域名证书（需要已配置 DNS Token）">${icon('reload')}<span>用 ACME 重签</span></button>
+        ${certbotManaged
+          ? `<button class="btn small danger-text" type="button" disabled title="这张证书由 certbot 托管，直接删文件会让续期配置变成死链；请在服务器执行 certbot delete --cert-name ${esc(c.domain || '')}">${icon('trash')}<span>删除</span></button>`
+          : `<button class="btn small danger-text" type="button" data-act="cert.server.remove" data-domain="${esc(c.domain || '')}" data-cert-path="${esc(c.certPath)}" data-key-path="${esc(c.keyPath || '')}" title="从服务器删除证书文件（删前先检查有没有站点在引用，删完自动重载 nginx）">${icon('trash')}<span>删除</span></button>`}
         ${hasLocal ? '<span class="badge">本机已有</span>' : ''}
       </div>
     </div>`;
@@ -5038,6 +5044,56 @@ async function handleAction(act, dataset, btn) {
         if (S.view === 'certs') renderCerts(true);
         break;
       }
+      case 'cert.server.remove': {
+        const domain = dataset.domain || '';
+        const certPath = dataset.certPath || '';
+        const keyPath = dataset.keyPath || '';
+        if (!certPath) { toast('warn', '缺少证书路径', '重新扫描服务器后再试'); break; }
+        const files = [certPath, keyPath].filter(Boolean);
+        const okDel = await confirmDialog({
+          title: `从服务器删除 ${domain || certPath}？`,
+          danger: true,
+          body: `将从服务器删除下面这些文件（删除前会自动检查有没有站点还在引用）：\n\n${files.map((f) => `· ${f}`).join('\n')}\n\n文件会先移进服务器 /tmp 下的回收目录，nginx 校验通过后重载；如果弄错了可以从那里搬回来。`,
+          confirmText: '删除',
+        });
+        if (!okDel) break;
+        await withBusy(btn, async () => {
+          const res = await FRP.certServerRemove({ domain, certPath, keyPath });
+          if (!res || !res.ok) {
+            const refs = (res && res.references) || [];
+            if (refs.length) {
+              const who = (res.sites || []).length
+                ? (res.sites || []).map((s) => `<strong>${esc(s)}</strong>`).join('、')
+                : refs.map((r) => `<code>${esc(r.file)}</code>`).join('、');
+              openModal(`
+                <div class="modal" style="width:520px">
+                  <div class="modal-head">
+                    <div class="mh-icon" style="color:var(--amber)">${icon('alert')}</div>
+                    <div class="grow"><h3>有站点还在用这张证书</h3><p>为避免站点断连，已拒绝删除。</p></div>
+                    <button class="icon-btn modal-close" type="button" data-act="modal.close">${icon('x')}</button>
+                  </div>
+                  <div class="modal-body">
+                    <div class="note warn">${icon('alert')}<div>引用它的站点：${who}</div></div>
+                    <div class="cert-paths mono" style="margin-top:10px">
+                      ${refs.map((r) => `<div><code>${esc(r.file)}:${esc(String(r.line))}</code> ${esc(r.content)}</div>`).join('')}
+                    </div>
+                    <div class="field-hint" style="margin-top:10px">要删这张证书，请先把上面这些站点的 <code>ssl_certificate</code> / <code>ssl_certificate_key</code> 换成别的证书（或在 nginx 里停用该站点），再回来删除。</div>
+                  </div>
+                  <div class="modal-foot"><span class="mf-left"></span><button class="btn primary" type="button" data-act="modal.close">知道了</button></div>
+                </div>`);
+              return;
+            }
+            return toastResult(res);
+          }
+          const moved = (res.data && res.data.deleted) || [];
+          const trash = (res.data && res.data.trash) || '';
+          toast('success', '已从服务器删除证书', `${domain || certPath}${trash ? ` · 已移入 ${trash}` : ''}`);
+          try { await loadServerCerts({ force: true }); } catch { /* ignore */ }
+          if (moved.length && S.view === 'certs') renderCerts(true);
+        });
+        break;
+      }
+
       case 'dw.check':
         await refreshDomainWizard();
         break;

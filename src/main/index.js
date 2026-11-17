@@ -3533,6 +3533,28 @@ function registerIpc() {
     }
   });
 
+  /* 从服务器删除一张证书：先查「还有没有站点在引用」，无引用才删，删完 reload nginx。
+   * 服务器上的证书可能正被某个站点的 ssl_certificate 引用，删掉会直接让站点断连，
+   * 所以这一步必须在主进程里做完检查再动文件（不能只靠前端确认框）。 */
+  ipcMain.handle('cert:server-remove', async (event, payload = {}) => {
+    try {
+      if (!serverSession.connected) return fail('尚未连接服务器');
+      const certPath = String((payload && payload.certPath) || '').trim();
+      const keyPath = String((payload && payload.keyPath) || '').trim();
+      const res = await serverSession.deleteRemoteCert({ certPath, keyPath });
+      if (!res.ok) {
+        if (res.blocked) return fail(res.error, { blocked: true, references: res.references || [], sites: res.sites || [] });
+        return fail(res.error);
+      }
+      /* 删完让下一次扫描重新读盘，别拿缓存里的旧列表糊弄用户。 */
+      serverCertScanCache = { at: 0, host: '', certs: [], truncated: false };
+      pushState();
+      return ok(res);
+    } catch (e) {
+      return fail(String((e && e.message) || e));
+    }
+  });
+
   ipcMain.handle('dns:state', async () => ok({
     dnsProvider: settings.dnsProvider || '',
     hasToken: settingsModule.hasCloudflareToken(),
