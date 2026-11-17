@@ -3427,10 +3427,14 @@ function renderDnsPanel() {
 function dnsSourceRow(s) {
   const recs = (s.records || []).map((r) => `${r.type} ${esc(r.value)}${r.ttl ? ` <span class="pm pm-muted">ttl=${r.ttl}</span>` : ''}`);
   const body = recs.length ? recs.join('<br>') : `<span class="pm pm-muted">${esc(s.error || '无结果')}</span>`;
-  const tone = s.ok ? 'pm-ok' : 'pm-bad';
+  const tone = s.ok && s.trusted !== false ? 'pm-ok' : (s.ok ? 'pm-warn' : 'pm-bad');
+  /* 被劫持/透明代理污染的来源要显式标出来，否则用户会以为「权威 NS 也说有」。 */
+  const guard = s.trusted === false
+    ? `<div class="field-hint" style="margin:2px 0 0;color:var(--red)">可能被本机 DNS 拦截/透明代理污染，结果不可信</div>`
+    : '';
   return `<tr>
-      <td class="pm-label">${esc(s.label || s.id)}<div class="field-hint mono" style="margin:0">${esc(s.server || '')}</div></td>
-      <td><span class="pm ${tone}">${s.ok ? '✓' : '✗'}</span></td>
+      <td class="pm-label">${esc(s.label || s.id)}<div class="field-hint mono" style="margin:0">${esc(s.server || '')}</div>${guard}</td>
+      <td><span class="pm ${tone}">${s.ok ? (s.trusted === false ? '?' : '✓') : '✗'}</span></td>
       <td class="mono">${body}</td>
       <td class="mono">${s.ms != null ? `${s.ms} ms` : '—'}</td>
     </tr>`;
@@ -3509,7 +3513,9 @@ function dnsPanelMarkup() {
             <tbody>${sources.length ? sources.map(dnsSourceRow).join('') : '<tr><td colspan="4" class="pm-muted" style="padding:12px 14px">查询中…</td></tr>'}</tbody>
           </table>
         </div>
-        ${d && d.soaMinTtl ? `<div class="field-hint">这个域名的 SOA 负缓存上限是 ${Math.round(d.soaMinTtl / 60)} 分钟：刚在 Cloudflare 加完记录时，本机/运营商 DNS 可能还会继续返回「不存在」，最多等这么久才全世界生效。公共 DNS（1.1.1.1）通常立刻就能查到。</div>` : ''}
+        ${d && d.soaMinTtl ? `<div class="field-hint">${judge && judge.stale
+          ? `这个域名的 SOA 负缓存上限是 ${Math.round(d.soaMinTtl / 60)} 分钟。记录已删除，但本机/运营商 DNS 还会在旧记录的 TTL 内继续返回它——等 TTL 过期或执行 ipconfig /flushdns 就一致了。`
+          : `这个域名的 SOA 负缓存上限是 ${Math.round(d.soaMinTtl / 60)} 分钟：刚在 Cloudflare 加完记录时，本机/运营商 DNS 可能还会继续返回「不存在」，最多等这么久才全世界生效。公共 DNS（1.1.1.1）通常立刻就能查到。`}</div>` : ''}
 
         <div class="field-hint" style="margin:14px 0 6px">Cloudflare 里的记录</div>
         ${cfBlock}
@@ -5461,6 +5467,7 @@ function refreshDomainReadiness() {
         case 'public-only': return '公共 DNS 已解析，本机解析器还没更新';
         case 'elsewhere': return `解析到 ${(judge.addrs || []).slice(0, 2).join('、')}，未指向服务器`;
         case 'missing': return '未解析（没有这条记录）';
+        case 'stale': return '记录已删除（本机还缓存着旧值）';
         case 'unreachable': return 'DNS 查询失败（本机出网可能受限）';
         default: return judge.title || '解析结果不确定';
       }

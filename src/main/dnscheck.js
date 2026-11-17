@@ -164,6 +164,35 @@ function apexOf(name) {
   return parts.slice(-2).join('.');
 }
 
+/* ------------------------------------------------------------------ */
+/* 「DNS 是否被本地拦截/劫持」自检                                       */
+/* ------------------------------------------------------------------ */
+
+/* 往 TEST-NET-1（192.0.2.123，永远不该有 DNS 服务）发一次查询：
+ * 如果 5 毫秒就有人答了，说明本机/运营商在网络层做了 DNS 劫持或透明代理，
+ * 那么「本机解析器」和「权威 NS 直连」拿到的结果都不可信（多是劫持方的缓存），
+ * 只有走 HTTPS 的 DoH 是干净的。真机上很多国产安全软件/加速器就是这么干的。 */
+function probeDnsInterception(name = 'example.com') {
+  const started = Date.now();
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (payload) => { if (!settled) { settled = true; resolve({ ...payload, ms: Date.now() - started }); } };
+    const timer = setTimeout(() => finish({ intercepted: false, answered: false }), 900);
+    try {
+      const r = new dns.Resolver({ timeout: 600, tries: 1 });
+      r.setServers(['192.0.2.123']);
+      r.resolve4(name, (err, addrs) => {
+        clearTimeout(timer);
+        if (err) return finish({ intercepted: false, answered: false });
+        finish({ intercepted: true, answered: true, addrs: addrs || [] });
+      });
+    } catch {
+      clearTimeout(timer);
+      finish({ intercepted: false, answered: false });
+    }
+  });
+}
+
 async function authoritativeQuery(name) {
   const work = (async () => {
   const apex = apexOf(name);
@@ -179,6 +208,9 @@ async function authoritativeQuery(name) {
     return { id: 'authoritative', label: `权威 NS（${host}）`, server: host, ok: false, records: [], error: 'NS 没有可用 A 记录', nsHosts };
   }
   const started = Date.now();
+  /* 先确认本机 53 端口有没有被劫持：被劫持时「直连权威 NS」其实是在问劫持方的缓存，
+   * 拿到的结果是旧值，不能当证据（这正是「CF 里已删、面板却说权威还有」的来源）。 */
+  const intercept = await probeDnsInterception(name);
   const result = await new Promise((resolve) => {
     let settled = false;
     const timer = setTimeout(() => { if (!settled) { settled = true; resolve({ ok: false, error: 'UDP 53 超时（本机出网可能拦了 DNS）' }); } }, 3000);
@@ -192,6 +224,7 @@ async function authoritativeQuery(name) {
       else resolve({ ok: true, records: (addrs || []).map((v) => ({ type: 'A', value: v, ttl: 0 })) });
     });
   });
+  const intercepted = !!intercept.intercepted;
   return {
     id: 'authoritative',
     label: `权威 NS（${host}）`,
@@ -201,10 +234,15 @@ async function authoritativeQuery(name) {
     ms: Date.now() - started,
     error: result.error || '',
     nsHosts,
+    intercepted,
+    trusted: !intercepted,
+    interceptNote: intercepted
+      ? `本机 UDP 53 被拦截/透明代理（往 192.0.2.123 发查询也在 ${intercept.ms} ms 内被应答），这次结果可能是劫持方缓存，不能作为依据`
+      : '',
   };
   })();
   /* 权威 NS 只是「多一个佐证」，本机 53 出网被拦时不该拖慢整体（UDP 超时 3 秒 + 两次 DoH）。 */
-  return withCap(work, 4200, { id: 'authoritative', label: '权威 NS', server: '', ok: false, records: [], error: '查询超时（本机 UDP 53 可能被拦）' });
+  return withCap(work, 4200, { id: 'authoritative', label: '权威 NS', server: '', ok: false, records: [], error: '查询超时（本机 UDP 53 可能被拦）', trusted: false });
 }
 
 /* ------------------------------------------------------------------ */
@@ -239,10 +277,15 @@ function judgeResolution({ sources, serverAddr, cfRecord = null, name = '' }) {
   const auth = list.find((s) => s.id === 'authoritative');
   const publicRecords = mergeRecords(publicSources);
   const localRecords = (local && local.records) || [];
-  const authRecords = (auth && auth.records) || [];
+  /* 权威 NS 直连一旦被本机 DNS 劫持/透明代理污染（见 probeDnsInterception），
+   * 它给的多半是劫持方的缓存，不能当证据用。 */
+  const authTrusted = !auth || auth.trusted !== false;
+  const authRecords = authTrusted ? ((auth && auth.records) || []) : [];
   const publicAddrs = publicRecords.filter((r) => IPV4.test(r.value)).map((r) => r.value);
   const localAddrs = localRecords.filter((r) => IPV4.test(r.value)).map((r) => r.value);
   const authAddrs = authRecords.filter((r) => IPV4.test(r.value)).map((r) => r.value);
+  const untrustedAddrs = (!authTrusted && auth ? (auth.records || []) : [])
+    .filter((r) => IPV4.test(r.value)).map((r) => r.value);
   const allFailed = list.every((s) => !s.ok);
   /* 公共 DoH「有没有应答」：应答了 NXDOMAIN 和「根本没连上」是两件事，
    * 前者能确定记录不存在，后者只能说明本机网络有问题。 */
@@ -252,6 +295,29 @@ function judgeResolution({ sources, serverAddr, cfRecord = null, name = '' }) {
   const matchesServer = !!(server && IPV4.test(server) && (publicAddrs.includes(server) || localAddrs.includes(server)));
   const nxdomainEverywhere = list.length > 0 && list.every((s) => !s.ok && /NXDOMAIN|ENOTFOUND|不存/.test(String(s.error || '')));
   const proxied = !!(cfRecord && cfRecord.proxied);
+
+  if (publicNx) {
+    const staleAddrs = [...new Set([...localAddrs, ...authAddrs])];
+    if (staleAddrs.length) {
+      return {
+        verdict: 'stale',
+        tone: 'warn',
+        title: '记录已删除，本机缓存还留着旧值',
+        detail: `公共 DNS（1.1.1.1 / 8.8.8.8）已明确返回 NXDOMAIN —— ${name || '这个域名'} 在 Cloudflare 里已经没有对应记录。但本机解析器/本地缓存仍能解析到 ${staleAddrs.join('、')}，这是缓存残留：A 记录的 TTL（通常 120 秒）到期、或执行一次 ipconfig /flushdns 之后就会消失，公网新访问已经拿不到这个域名。`,
+        addrs: staleAddrs,
+        matchesServer: false,
+        stale: true,
+      };
+    }
+    return {
+      verdict: 'missing',
+      tone: 'amber',
+      title: '没有这条记录',
+      detail: `公共 DNS 明确返回 NXDOMAIN：${name || '该域名'} 在权威 DNS 里不存在。${untrustedAddrs.length ? `本机 UDP 53 被拦截/透明代理污染，它还报 ${untrustedAddrs.join('、')}（旧缓存），已忽略。` : ''}请在 Cloudflare 里加一条 A 记录（指向服务器 IP），灰云（仅 DNS）最省事。`,
+      addrs: [],
+      matchesServer: false,
+    };
+  }
 
   if (publicRecords.length || localRecords.length || authRecords.length) {
     if (publicAddrs.length && !localAddrs.length) {
@@ -290,11 +356,15 @@ function judgeResolution({ sources, serverAddr, cfRecord = null, name = '' }) {
       };
     }
     if (matchesServer) {
+      const who = [];
+      if (publicAddrs.includes(server)) who.push('公共 DNS');
+      if (localAddrs.includes(server)) who.push('本机解析器');
+      if (authAddrs.includes(server)) who.push('权威 NS');
       return {
         verdict: 'ok',
         tone: 'ok',
         title: `已解析到 ${server}`,
-        detail: authAddrs.length ? '权威 NS、公共 DNS、本机解析器三方一致。' : '公共 DNS 与本机解析器一致。',
+        detail: `${who.join(' / ') || '部分来源'} 返回了 ${server}${who.length >= 3 ? '（三方一致）' : ''}。`,
         addrs: [...new Set([...publicAddrs, ...localAddrs])],
         matchesServer,
       };
