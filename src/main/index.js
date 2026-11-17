@@ -4447,7 +4447,11 @@ async function syncCertToServerNginx(cert) {
   ipcMain.handle('window:control', async (event, action) => {
     if (!win) return fail('窗口不可用');
     if (action === 'minimize') win.minimize();
-    else if (action === 'maximize') {
+    else if (action === 'restore') {
+      // 从最小化/隐藏里叫回来：两条路一起走，免得“点了没反应”
+      if (win.isMinimized()) win.restore();
+      showMainWindow();
+    } else if (action === 'maximize') {
       if (win.isMaximized()) win.unmaximize();
       else win.maximize();
     } else if (action === 'hide') {
@@ -4458,6 +4462,9 @@ async function syncCertToServerNginx(cert) {
     } else if (action === 'show') {
       showMainWindow();
     } else if (action === 'close') win.close();
+    /* 以前不认识的动作会一声不响地走完全程并返回 ok —— 调用方（或脚本）以为生效了，
+     * 实际什么也没发生。明确拒绝比默默忽略好查。 */
+    else return fail(`不认识的动作「${String(action || '')}」，可用：minimize / restore / maximize / hide / show / close`);
     refreshTray();
     return ok({ maximized: win.isMaximized(), visible: win.isVisible() });
   });

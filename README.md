@@ -490,6 +490,11 @@ node tools/cdp-shot.cjs .proxy-row out.png # 按选择器截单个元素
 
 ## 更新日志
 
+### 1.2.79
+
+- **顶层字段类型写错时不再"看着正常、一启动就崩"**：`frpc.toml` 里 `proxies` 写成字符串（`proxies = "oops"`）、`auth`/`log`/`webServer` 写成非表时，frpc 用 Go 严格反序列化会拒绝整份配置；控制台以前把这几个字段当"没有"，代理列表一片空白、看着一切正常，点启动才蹦出 `cannot unmarshal string into Go value of type v1.ClientConfig`。现在解析时就把类型不符的地方记下来，校验里直接报「proxies 的类型不对：应该是数组（每段用 [[proxies]] 开头），当前是字符串（frpc 会拒绝整份配置）」。
+- **窗口动作不认识时不再"假装成功"**：`window:control` 以前对不认识的动作一声不响地走完全程并返回 ok（脚本/调用方以为生效了）。现在明确回「不认识的动作「x」，可用：minimize / restore / maximize / hide / show / close」，并补上 `restore`（从最小化/隐藏叫回来）。
+
 ### 1.2.78
 
 - **配置里有 `start = [...]` 时不再一片"隧道未建立"**：frpc 顶层可以写 `start = ["a","b"]` 表示"只启动列表里的代理"（手改配置时常见）。以前被排除的代理会被判成「隧道未建立」，隧道明明是好的，界面却是一排红字；更糟的是当成 `start` 只剩一个已删除的名字时，`registered === 0` 会被判成「frpc 连不上 frps / Token 校验失败」，把人骗去查 Token。现在：被排除的代理单独显示橙色「不在 start 列表」并给出原因，登录判定只按"真的会启动的代理"算，概览另起一句「N 个被 start 列表排除」；在界面上新增/改名的代理会自动补进 `start` 名单并提示，删除代理时顺手清掉名单里的旧名字。

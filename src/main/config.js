@@ -121,12 +121,39 @@ function normalizeProxy(raw, options = {}) {
   return proxy;
 }
 
+function typeNameOf(value) {
+  if (Array.isArray(value)) return '数组';
+  if (isPlainObject(value)) return '表';
+  if (value === null) return 'null';
+  if (typeof value === 'string') return '字符串';
+  if (typeof value === 'number') return '数字';
+  if (typeof value === 'boolean') return '布尔值';
+  return typeof value;
+}
+
 function normalize(raw, options = {}) {
   const src = isPlainObject(raw) ? raw : {};
   const extras = {};
   for (const [key, value] of Object.entries(src)) {
     if (!KNOWN_TOP_LEVEL.has(key)) extras[key] = value;
   }
+  /* frpc 用 Go 的 TOML 反序列化，类型是严格匹配的：proxies 写成字符串、auth 写成布尔，
+   * frpc 启动时直接报 `cannot unmarshal … into Go value of type …`。
+   * 我们这边以前会把这类字段当"没有"静默吞掉 —— 界面上代理列表空白、看着一切正常，
+   * 一启动却蹦出 Go 原文。这里把类型不符记下来，交给 validate() 明确报错。 */
+  const shapeErrors = [];
+  const expect = (key, label, ok, wanted) => {
+    const value = src[key];
+    /* null 代表"这段没写"（normalize 出来的模型会带 null，TOML 本身没有 null），不算类型错 */
+    if (value === undefined || value === null || ok(value)) return;
+    shapeErrors.push(`${label} 的类型不对：应该是${wanted}，当前是${typeNameOf(value)}（frpc 会拒绝整份配置）`);
+  };
+  expect('proxies', 'proxies', Array.isArray, '数组（每段用 [[proxies]] 开头）');
+  expect('visitors', 'visitors', Array.isArray, '数组（每段用 [[visitors]] 开头）');
+  expect('auth', 'auth', isPlainObject, '「[auth] 表」');
+  expect('log', 'log', isPlainObject, '「[log] 表」');
+  expect('webServer', 'webServer', isPlainObject, '「[webServer] 表」');
+  expect('transport', 'transport', isPlainObject, '「[transport] 表」');
   const model = {
     serverAddr: typeof src.serverAddr === 'string' ? src.serverAddr.trim() : '',
     serverPort: toInt(src.serverPort, 7000) ?? 7000,
@@ -138,6 +165,7 @@ function normalize(raw, options = {}) {
     proxies: Array.isArray(src.proxies) ? src.proxies.map((p) => normalizeProxy(p, options)) : [],
     visitors: Array.isArray(src.visitors) ? src.visitors.map((v) => (isPlainObject(v) ? { ...v } : v)) : [],
     _extra: extras,
+    _shapeErrors: shapeErrors,
   };
   return model;
 }
@@ -172,6 +200,8 @@ function validate(model, options = {}) {
   else if (/\s/.test(model.serverAddr)) push('error', 'serverAddr', '服务器地址不能包含空格');
   else if (/^[a-z]+:\/\//i.test(model.serverAddr)) push('error', 'serverAddr', '服务器地址只填主机名或 IP，不要带 http:// 前缀');
   else if (!/^[A-Za-z0-9.-]+$/.test(model.serverAddr)) push('warn', 'serverAddr', '服务器地址看起来不是常见的主机名或 IP');
+  // 顶层字段类型不对（proxies = "oops" 这种）：frpc 会整份拒绝，界面上却像是"没有代理"
+  for (const message of (model && model._shapeErrors) || []) push('error', 'config', message);
   if (!Number.isInteger(model.serverPort) || model.serverPort < 1 || model.serverPort > 65535) {
     push('error', 'serverPort', '服务器端口必须在 1 - 65535 之间');
   }
