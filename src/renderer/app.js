@@ -1561,6 +1561,20 @@ function renderServerLogs() {
   if (expBtn) expBtn.textContent = S.server.logExpanded ? '收起' : '展开全部';
 }
 
+/* 「其它站点配置」的悬空引用：把那段配置原文摊开给用户看（只读）。
+ * 光给路径用户没法判断该不该动，尤其宝塔那种一个站点一个文件的布局。 */
+function confViewFor(file) {
+  const v = S.server.confView;
+  if (!v || !v.file || v.file !== file || !Array.isArray(v.lines)) return null;
+  return v;
+}
+
+function confViewMarkup(v) {
+  const body = v.lines.map((l) => `${String(l.no).padStart(4, ' ')} | ${l.text}`).join('\n');
+  return `<pre class="mono conf-view" style="margin:6px 0 2px;padding:8px 10px;background:var(--bg-2);border-radius:8px;overflow:auto;max-height:220px;font-size:12px;line-height:1.5">${esc(body)}</pre>
+    <div class="field-hint">第 ${v.startLine}–${v.startLine + v.lines.length - 1} 行（共 ${v.totalLines} 行）${v.hitLine ? `，命中的是第 ${v.hitLine} 行` : ''}</div>`;
+}
+
 /* 配置体检结果（1.2.72）：nginx -t 通不通 + 有没有引用已经不存在的证书文件。
  * 两种情况都要显式说出来，因为它们的后果都是「平时没事、重启 nginx 整站起不来」。 */
 function nginxHealthMarkup() {
@@ -1584,7 +1598,17 @@ function nginxHealthMarkup() {
   const listHtml = missing.length
     ? `<ul style="margin:8px 0 0;padding-left:18px">${missing.slice(0, 8).map((m) => {
       const sites = (m.sites || []).filter(Boolean).join('、');
-      return `<li><code>${esc(m.path)}</code>${sites ? `（站点 ${esc(sites)}）` : ''}${m.ours ? '' : ' · 其它站点配置'}</li>`;
+      const file = (m.files || [])[0] || '';
+      const isForeign = !m.ours && file;
+      return `<li><code>${esc(m.path)}</code>${sites ? `（站点 ${esc(sites)}）` : ''}${m.ours ? '' : ' · 其它站点配置'}`
+        + (isForeign
+          ? `<div class="page-actions" style="margin:6px 0 2px">
+               <button class="btn tiny" type="button" data-act="server.nginx.view" data-file="${esc(file)}" data-path="${esc(m.path)}">查看这段配置</button>
+               <button class="btn tiny" type="button" data-act="server.nginx.commentref" data-file="${esc(file)}" data-path="${esc(m.path)}">注释掉这条引用</button>
+             </div>
+             ${confViewFor(file) ? confViewMarkup(confViewFor(file)) : ''}`
+          : '')
+        + '</li>';
     }).join('')}${missing.length > 8 ? `<li>…还有 ${missing.length - 8} 处</li>` : ''}</ul>`
     : '';
   const tone = testBad || ours.length ? 'error' : 'warn';
@@ -1681,6 +1705,7 @@ function nginxCardMarkup() {
         <div class="page-actions">
           ${statusBadge}
           <button class="btn" type="button" data-act="server.nginx.refresh">${icon('reload')}<span>重新检测</span></button>
+          ${hasTls ? '' : `<button class="btn" type="button" data-act="nav" data-view="certs">${icon('shield')}<span>去签发证书</span></button>`}
           <button class="btn primary" type="button" data-act="server.nginx.setup" ${S.server.nginxBusy ? 'disabled' : ''}>${S.server.nginxBusy ? '<span class="spinner-sm"></span>' : icon('globe')}<span>${S.server.nginxBusy ? '配置中…' : setupLabel}</span></button>
         </div>
       </div>
@@ -2651,6 +2676,8 @@ async function autoConnectActiveProfile() {
     applyServerState(res.data, seq);
     S.server.nginx = null;      // 旧服务器的 nginx 状态不残留，连接后重新检测
     S.server.selftest = null;   // 旧服务器的就绪检查结果不残留
+    S.server.nginxHealth = null; // 体检结果同理（1.2.73）
+    S.server.confView = null;
     S.server.firewall = null;   // 旧服务器的防火墙状态不残留
     S.certs.server = { loaded: false, loading: false, certs: [], host: '', scannedAt: 0, truncated: false, error: '' }; // 换服务器后证书列表要重扫
   } catch (e) {
@@ -3089,6 +3116,8 @@ async function connectServer(btn, options = undefined) {
     applyServerState(res.data, seq);
     S.server.nginx = null;      // 旧服务器的 nginx 状态不残留，连接后重新检测
     S.server.selftest = null;   // 旧服务器的就绪检查结果不残留
+    S.server.nginxHealth = null; // 体检结果同理（1.2.73）
+    S.server.confView = null;
     S.server.firewall = null;   // 旧服务器的防火墙状态不残留
     S.certs.server = { loaded: false, loading: false, certs: [], host: '', scannedAt: 0, truncated: false, error: '' }; // 换服务器后证书列表要重扫
     renderServer(true);
@@ -4806,6 +4835,43 @@ async function handleAction(act, dataset, btn) {
       case 'server.nginx.health':
         await withBusy(btn, () => loadServerNginxHealth({ force: true, silent: false }));
         break;
+      case 'server.nginx.view': {
+        const file = dataset.file || '';
+        const path = dataset.path || '';
+        await withBusy(btn, async () => {
+          const res = await FRP.serverNginxConfView({ file, paths: [path] });
+          if (res && res.ok) {
+            S.server.confView = res.data;
+            renderServer(true);
+          } else {
+            toastResult(res);
+          }
+        });
+        break;
+      }
+      case 'server.nginx.commentref': {
+        const file = dataset.file || '';
+        const path = dataset.path || '';
+        const okGo = await confirmDialog({
+          title: '注释掉这条引用',
+          body: `将在 <code>${esc(file)}</code> 里把引用 <code>${esc(path)}</code> 的那几行注释掉（不删文件、不删站点），先备份成 <code>.bak-frpconsole-*</code>，再 <code>nginx -t</code> 校验并 reload；失败会自动还原。<br><br>之后这个站点就没有可用证书了——如果它还要用 https，请到证书页签发或选择另一张证书。`,
+          confirmText: '注释并重载',
+        });
+        if (!okGo) break;
+        await withBusy(btn, async () => {
+          const res = await FRP.serverNginxCommentRef({ file, paths: [path] });
+          if (res && res.ok) {
+            if (res.data && res.data.health) S.server.nginxHealth = res.data.health;
+            S.server.confView = null;
+            toast('success', '已注释掉悬空引用', res.data.backup ? `备份：${res.data.backup}` : '');
+            await loadServerNginx(true);
+          } else {
+            toastResult(res);
+          }
+          renderServer(true);
+        });
+        break;
+      }
       case 'server.nginx.repair': {
         if (S.server.nginxRepairBusy) break;
         const health = S.server.nginxHealth || {};

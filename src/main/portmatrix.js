@@ -20,9 +20,14 @@ function parseRuleSpec(spec) {
 }
 
 /* 单行判定。listen / rule / reachable 允许为 null（未知），此时给保守结论。 */
-function judgePortRow({ label, port, proto, listen, rule, reachable, fwActive, group, tunnelActive }) {
-  const row = { label: label || '', port: Number(port), proto: proto || 'tcp', group: group || 'frps', listen, rule, reachable, code: 'ok', tone: 'ok', text: '', action: '' };
+function judgePortRow({ label, port, proto, listen, rule, reachable, fwActive, group, tunnelActive, optional }) {
+  const row = { label: label || '', port: Number(port), proto: proto || 'tcp', group: group || 'frps', listen, rule, reachable, optional: !!optional, code: 'ok', tone: 'ok', text: '', action: '' };
   if (listen === false) {
+    /* 443 这类「可选入口」：服务器上没配 https 站点时本来就不该有人监听，
+     * 报成「没有程序在监听」会把整张表刷成红色、还拉高问题计数（1.2.73）。 */
+    if (row.optional) {
+      return { ...row, code: 'not-enabled', tone: 'muted', text: '未启用（这台服务器还没有配这个入口）', action: '' };
+    }
     /* 代理端口由 frps 代表监听：本机隧道没连这台服务器时，这些端口当然没人听，
      * 这属于「隧道没跑」而不是「端口有问题」，不能刷成一片红色告警。 */
     if (row.group === 'proxy' && tunnelActive === false) {
@@ -75,6 +80,7 @@ function buildPortMatrix({ cfgPorts, proxyPorts, sysPorts, allowed, fwActive, li
         port: Number(p.port),
         proto: p.proto || 'tcp',
         reachable: typeof p.reachable === 'boolean' ? p.reachable : null,
+        optional: !!p.optional,
       });
     }
   };
@@ -96,6 +102,7 @@ function buildPortMatrix({ cfgPorts, proxyPorts, sysPorts, allowed, fwActive, li
     reachable: r.reachable,
     fwActive,
     tunnelActive,
+    optional: r.optional,
   }));
 }
 
@@ -107,6 +114,7 @@ function summarizeMatrix(rows) {
   const fwBlocked = [...by('fw-blocked'), ...by('likely-fw-blocked')];
   const notListening = [...by('not-listening'), ...by('udp-closed')];
   const tunnelStopped = by('tunnel-stopped');
+  const notEnabled = by('not-enabled');
   const needsWork = cloudBlocked.length + fwBlocked.length + notListening.length;
   let text = '全部需要放行的端口都通';
   let level = 'ok';
@@ -120,6 +128,8 @@ function summarizeMatrix(rows) {
   } else if (tunnelStopped.length) {
     text = `没有端口阻塞；但隧道没连这台服务器，${tunnelStopped.length} 个代理端口还没注册`;
     level = 'warn';
+  } else if (notEnabled.length) {
+    text = `需要放行的端口都通；另有 ${notEnabled.length} 个入口还没启用（不影响使用）`;
   }
   return {
     level,
@@ -127,8 +137,9 @@ function summarizeMatrix(rows) {
     cloudBlocked: cloudBlocked.length,
     fwBlocked: fwBlocked.length,
     notListening: notListening.length,
+    notEnabled: notEnabled.length,
     tunnelStopped: tunnelStopped.length,
-    ok: list.length - needsWork - tunnelStopped.length,
+    ok: list.length - needsWork - tunnelStopped.length - notEnabled.length,
     total: list.length,
   };
 }

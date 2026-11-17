@@ -3094,6 +3094,39 @@ function registerIpc() {
     }
   });
 
+  /* 「其它站点配置」里的悬空引用：只读查看 + 注释掉那条引用（1.2.73）。
+   * 不是我们生成的配置，所以不做整块删除，只把引用那几行注释掉并留 backup。 */
+  ipcMain.handle('server:nginx-conf-view', async (event, payload = {}) => {
+    if (!serverSession.connected) return fail('尚未连接服务器');
+    try {
+      const view = await serverSession.readConfAround({
+        file: payload && payload.file,
+        paths: (payload && payload.paths) || [],
+      });
+      if (!view.ok) return fail(view.error);
+      return ok(view);
+    } catch (e) {
+      return fail(String((e && e.message) || e));
+    }
+  });
+
+  ipcMain.handle('server:nginx-comment-ref', async (event, payload = {}) => {
+    if (!serverSession.connected) return fail('尚未连接服务器');
+    try {
+      const res = await serverSession.commentCertRef({
+        file: payload && payload.file,
+        paths: (payload && payload.paths) || [],
+      });
+      if (!res.ok) return fail(res.error || '注释失败');
+      nginxHealthCache = null;
+      const health = await serverSession.checkNginxHealth().catch(() => null);
+      if (health && health.ok) nginxHealthCache = { at: Date.now(), host: serverSession.host, data: health };
+      return ok({ ...res, health: health && health.ok ? health : null });
+    } catch (e) {
+      return fail(String((e && e.message) || e));
+    }
+  });
+
   /* 服务器防火墙：只读状态 + 一键放行 frps 需要监听的端口。 */
   /* 本机 frpc 指向当前服务器时，代理映射的 remotePort 也在 frps 上监听、同样需要防火墙放行。 */
   function proxyRemotePorts() {
@@ -3130,8 +3163,16 @@ function registerIpc() {
       } catch { ng = null; }
     }
     if (ng && ng.installed) {
-      out.push({ port: 443, proto: 'tcp', label: 'nginx' });
-      out.push({ port: 80, proto: 'tcp', label: 'nginx' });
+      /* 443/80 是「方案 Y 的入口」，不是必须存在的端口：服务器上还没配 https 站点时 443 本来
+       * 就不该有人监听。标成 optional，矩阵里显示「未启用」而不是「没有程序监听」的红色告警，
+       * 也不计入问题数（1.2.73）。 */
+      const hasTls = Array.isArray(ng.certs) && ng.certs.length > 0;
+      const httpsLive = ng.port443Free === false;
+      const httpLive = ng.port80Free === false;
+      if (httpsLive || (ng.proxyConfigured && hasTls)) out.push({ port: 443, proto: 'tcp', label: 'nginx' });
+      else out.push({ port: 443, proto: 'tcp', label: 'nginx', optional: true });
+      if (httpLive || ng.proxyConfigured) out.push({ port: 80, proto: 'tcp', label: 'nginx' });
+      else out.push({ port: 80, proto: 'tcp', label: 'nginx', optional: true });
     }
     return out;
   }

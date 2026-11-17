@@ -105,6 +105,8 @@ contextBridge.exposeInMainWorld('FRP', {
   serverNginxFree: () => invoke('server:nginx-free'),
   serverNginxHealth: (payload) => invoke('server:nginx-health', payload),
   serverNginxRepair: (payload) => invoke('server:nginx-repair', payload),
+  serverNginxConfView: (payload) => invoke('server:nginx-conf-view', payload),
+  serverNginxCommentRef: (payload) => invoke('server:nginx-comment-ref', payload),
   serverVhostEnable: (payload) => invoke('server:vhost-enable', payload),
   serverFirewallState: () => invoke('server:firewall-state'),
   serverFirewallOpen: () => invoke('server:firewall-open'),

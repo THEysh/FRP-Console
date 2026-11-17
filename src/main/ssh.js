@@ -2046,6 +2046,78 @@ class ServerSession {
     return { ok: true, changed: true, confPath, backup, reloaded: !!reload.ok, note: '已摘掉引用缺失证书的块并重新加载 nginx' };
   }
 
+  /* 只读：把某个配置里「引用这些证书」的那几行连同上下文取出来，给用户看现场。
+   * 体检报出「其它站点配置引用了不存在的证书」时，光给路径用户没法判断该不该动。 */
+  async readConfAround({ file, paths = [], context = 6 } = {}) {
+    if (!this.connected) return { ok: false, error: '尚未连接服务器' };
+    const target = String(file || '').trim();
+    if (!/^\/(etc\/nginx|www\/server\/panel\/vhost)\//.test(target)) {
+      return { ok: false, error: `只支持查看 nginx 目录下的配置：${target}` };
+    }
+    const needles = (Array.isArray(paths) ? paths : []).map((p) => String(p || '').trim()).filter(Boolean);
+    const cat = await this.exec(`cat ${shellQuote(target)} 2>/dev/null || true`, 12000);
+    const all = String(cat.stdout || '').split('\n');
+    if (!all.length || (all.length === 1 && !all[0].trim())) return { ok: false, error: `读不到 ${target}` };
+    const hit = all.findIndex((line) => needles.some((n) => line.includes(n)));
+    const start = Math.max(0, (hit < 0 ? 0 : hit) - context);
+    const end = Math.min(all.length, (hit < 0 ? 0 : hit) + context + 1);
+    return {
+      ok: true,
+      file: target,
+      totalLines: all.length,
+      hitLine: hit >= 0 ? hit + 1 : 0,
+      startLine: start + 1,
+      lines: all.slice(start, end).map((text, i) => ({ no: start + i + 1, text })),
+    };
+  }
+
+  /* 「其它站点」里那条悬空引用，给一个固定动作：把那几行**注释掉**（不删文件、不删整块），
+   * 备份 + nginx -t + reload，失败还原。为什么不是删块：那不是我们生成的配置，
+   * 注释掉既解除了悬空引用，又把原文留在文件里，用户随时能改回来。 */
+  async commentCertRef({ file, paths = [] } = {}) {
+    if (!this.connected) return { ok: false, error: '尚未连接服务器' };
+    const target = String(file || '').trim();
+    if (!/^\/(etc\/nginx|www\/server\/panel\/vhost)\//.test(target)) {
+      return { ok: false, error: `只支持修改 nginx 目录下的配置：${target}` };
+    }
+    const needles = (Array.isArray(paths) ? paths : []).map((p) => String(p || '').trim()).filter(Boolean);
+    if (!needles.length) return { ok: false, error: '没有指定要处理的证书路径' };
+    const cat = await this.exec(`cat ${shellQuote(target)} 2>/dev/null || true`, 12000);
+    const original = String(cat.stdout || '');
+    if (!original.trim()) return { ok: false, error: `读不到 ${target}` };
+    const stamp = new Date().toISOString().slice(0, 16).replace('T', ' ');
+    const lines = original.split('\n');
+    let changedLines = 0;
+    const next = lines.map((line) => {
+      if (/^\s*#/.test(line)) return line;
+      if (!/ssl_certificate(_key)?\s+[^;]+;/.test(line)) return line;
+      if (!needles.some((n) => line.includes(n))) return line;
+      changedLines += 1;
+      return `# ${line.trimEnd()}   # 由 FRP 控制台注释：证书文件不存在（${stamp}）`;
+    });
+    if (!changedLines) return { ok: true, changed: false, note: '没有找到需要注释的行（可能已被处理）' };
+    const sudo = await this.detectSudo();
+    if (!sudo.ok) return sudo;
+    const prefix = sudo.prefix;
+    const stampFile = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
+    const backup = `${target}.bak-frpconsole-${stampFile}`;
+    await this.exec(`${prefix}cp -p ${shellQuote(target)} ${shellQuote(backup)} 2>/dev/null || true`, 8000);
+    const b64 = Buffer.from(next.join('\n'), 'utf8').toString('base64');
+    const tmp = '/tmp/frp-console-nginx.comment.conf';
+    await this.exec(`printf %s ${b64} | base64 -d > ${tmp}`, 15000);
+    const install = await this.exec(`${prefix}install -m 644 ${tmp} ${shellQuote(target)}`, 10000);
+    await this.exec(`rm -f ${tmp} 2>/dev/null || true`, 6000);
+    if (!install.ok) return { ok: false, error: `写入失败：${(install.stderr || install.stdout || '权限不足').trim()}` };
+    const test = await this.exec(`${prefix}nginx -t 2>&1`, 15000);
+    const testText = `${test.stdout || ''}\n${test.stderr || ''}`.trim();
+    if (/\[emerg\]|\[error\]/i.test(testText)) {
+      await this.exec(`${prefix}cp -p ${shellQuote(backup)} ${shellQuote(target)} 2>/dev/null || true`, 8000);
+      return { ok: false, error: `注释后 nginx -t 失败，已还原：${testText.split('\n').slice(0, 3).join(' ')}` };
+    }
+    const reload = await this.reloadNginx();
+    return { ok: true, changed: true, file: target, backup, changedLines, reloaded: !!reload.ok };
+  }
+
   /* 我们自己生成的 frp-console.conf 里，把「引用了某张已删证书」的 server 块摘掉。
    * 强制删除证书的现场是：文件删了，我们的 443 段还指着它 → nginx -t 失败 →
    * 站点靠旧 worker 撑着，用户重启 nginx 就整站起不来。这个文件是我们自己生成的，
