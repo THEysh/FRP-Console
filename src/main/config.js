@@ -636,6 +636,14 @@ function vhostPortOf(type, options = {}) {
 function probeTargetFor(model, proxy, options = {}) {
   if (!model.serverAddr) return null;
   const type = proxy.type || 'tcp';
+  /* 访问路径：很多服务根路径回 404、真正入口在 /panel/ 这类子路径上。
+   * 探测必须打到真正入口，否则「隧道通、页面 404」和「一切正常」看起来一样。 */
+  const openPath = (() => {
+    const raw = String(proxy.openPath || '').trim();
+    if (!raw) return '/';
+    return (raw.startsWith('/') ? raw : `/${raw}`).replace(/\/{2,}/g, '/');
+  })();
+  const openPathLabel = openPath === '/' ? '' : openPath;
   if (type === 'http' || type === 'https') {
     const domain = firstDomainOf(proxy);
     if (!domain) return null;
@@ -645,11 +653,12 @@ function probeTargetFor(model, proxy, options = {}) {
     if (options.nginxProxyEnabled) {
       return {
         kind: 'http',
-        url: `https://${model.serverAddr}/`,
+        url: `https://${model.serverAddr}${openPath}`,
         host: domain,
         servername: domain,
         rejectUnauthorized: false,
         port: 443,
+        openPath: openPathLabel,
         display: publicAddressFor(model, proxy, options),
       };
     }
@@ -658,7 +667,14 @@ function probeTargetFor(model, proxy, options = {}) {
     const domain = firstDomainOf(proxy);
     if (!domain) return null;
     const port = vhostPortOf('http', options);
-    return { kind: 'http', url: `http://${model.serverAddr}:${port}/`, host: domain, port, display: publicAddressFor(model, proxy, options) };
+    return {
+      kind: 'http',
+      url: `http://${model.serverAddr}:${port}${openPath}`,
+      host: domain,
+      port,
+      openPath: openPathLabel,
+      display: publicAddressFor(model, proxy, options),
+    };
   }
   if (type === 'https') {
     const domain = firstDomainOf(proxy);
@@ -666,18 +682,19 @@ function probeTargetFor(model, proxy, options = {}) {
     const port = vhostPortOf('https', options);
     return {
       kind: 'http',
-      url: `https://${model.serverAddr}:${port}/`,
+      url: `https://${model.serverAddr}:${port}${openPath}`,
       /* Host 头也要带上域名：frps 做 TLS 终止（https2http/https2https）时会按 Host
        * 校验请求是不是发给这个代理的，只填 SNI、不填 Host 会得到 421。 */
       host: domain,
       servername: domain,
       rejectUnauthorized: false,
       port,
+      openPath: openPathLabel,
       display: publicAddressFor(model, proxy, options),
     };
   }
   if (HOST_TYPES.includes(type) && proxy.remotePort) {
-    return { kind: 'tcp', host: model.serverAddr, port: Number(proxy.remotePort), display: publicAddressFor(model, proxy, options) };
+    return { kind: 'tcp', host: model.serverAddr, port: Number(proxy.remotePort), openPath: openPathLabel, display: publicAddressFor(model, proxy, options) };
   }
   return null;
 }

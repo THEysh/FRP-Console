@@ -178,9 +178,16 @@ function healthTip(h) {
   const parts = [
     label('本地服务', h.layers.local),
     label('隧道', h.layers.tunnel),
-    label('公网', h.layers.public),
+    /* 404 时说「通（但返回 404）」比说「不通」准确：TCP/TLS/HTTP 都成功了。 */
+    h.pathMissing ? '公网：通，但返回 404' : label('公网', h.layers.public),
   ];
-  return parts.join(' · ');
+  const hint = h.layers.public && h.layers.public.hint;
+  return hintsText(parts.join(' · '), hint);
+}
+
+/* 提示文案拼接：有细节时换行显示（title 支持换行）。 */
+function hintsText(base, hint) {
+  return hint ? `${base}\n${hint}` : base;
 }
 
 /* ---------------------------- 提示条 ----------------------------- */
@@ -541,19 +548,23 @@ function renderOverview(force = false) {
     .map((p) => {
       const failed = p.health && !p.health.ok;
       const online = p.status === 'running' && p.health && p.health.ok;
-      const dotColor = online ? 'var(--green)' : failed ? 'var(--red)' : 'var(--amber)';
+      /* 有访问路径时，展示/复制/打开都用带上路径的链接——
+       * 根路径常常是 404，用户点开只会看到 "404 page not found"。 */
+      const link = p.openUrl || p.publicAddress;
+      const dotColor = online ? 'var(--green)' : (failed && p.health.pathMissing) ? 'var(--amber)' : failed ? 'var(--red)' : 'var(--amber)';
       const dotTip = online ? '三层连通' : failed ? (p.health.reason || '链路异常') : '正在检测连通性';
+      const canOpen = !!link && ['http', 'https', 'tcp', 'tcpmux'].includes(p.type);
       return `
         <div class="addr-row">
           <span class="ar-dot" title="${esc(dotTip)}" style="background:${dotColor}"></span>
           <div class="ar-main">
             <span class="ar-name">${esc(p.name)}</span>
-            <span class="ar-addr" title="${esc(p.publicAddress)}">${esc(p.publicAddress)}</span>
+            <span class="ar-addr" title="${esc(link)}">${esc(link)}</span>
           </div>
           <div class="ar-actions">
-            <button class="icon-btn" type="button" data-act="copy" data-text="${esc(p.publicAddress)}" title="复制地址">${icon('copy')}</button>
-            ${(p.type === 'http' || p.type === 'https')
-              ? `<button class="icon-btn" type="button" data-act="open" data-url="${esc(p.publicAddress)}" title="在浏览器中打开">${icon('external')}</button>`
+            <button class="icon-btn" type="button" data-act="copy" data-text="${esc(link)}" title="复制地址">${icon('copy')}</button>
+            ${canOpen
+              ? `<button class="icon-btn" type="button" data-act="open" data-url="${esc(link)}" title="在浏览器中打开">${icon('external')}</button>`
               : `<button class="icon-btn" type="button" data-act="probe.remote" data-host="${esc(config.serverAddr || '')}" data-port="${esc(p.remotePort || '')}" data-name="${esc(p.name)}" title="测试公网端口">${icon('activity')}</button>`}
           </div>
         </div>`;
@@ -611,6 +622,13 @@ function renderOverview(force = false) {
       <div style="margin-top:10px"><button class="btn small" type="button" data-act="nav" data-view="proxies">${icon('link')}<span>去代理映射看是哪条</span></button></div>
     </div></div>`);
   }
+  /* 路径 404 单独一条：隧道是通的，只是访问的路径在目标服务上不存在
+   *（最常见：入口在 /panel/ 这类子路径）。混进「连通性异常」会把人拉去查安全组。 */
+  if (counts.path404 > 0) {
+    issues.push(`<div class="note warn">${icon('alert')}<div>有 ${counts.path404} 条代理公网返回 <b>404</b>：隧道和端口都通了，只是这个路径在目标服务上不存在（不少服务的根路径就是 404，入口在 <code>/panel/</code> 这类子路径）。
+      <div style="margin-top:10px"><button class="btn small" type="button" data-act="nav" data-view="proxies">${icon('link')}<span>去代理映射填「访问路径」</span></button></div>
+    </div></div>`);
+  }
 
   $('#view').innerHTML = `
     <div class="view">
@@ -658,8 +676,8 @@ function renderOverview(force = false) {
         </div>
         <div class="card metric">
           <div class="metric-top"><span class="metric-label">${term('连通性异常', '三层（本地服务 → 隧道 → 公网）中至少一层没通的映射数；点击可看是哪条、哪一层。')}</span><span class="metric-icon">${icon('cpu')}</span></div>
-          <div class="metric-value">${config.serverAddr ? esc(counts.unhealthy || 0) : '—'}</div>
-          <div class="metric-foot"><span class="${!config.serverAddr ? '' : counts.unhealthy ? 'down' : counts.unchecked > 0 ? '' : 'up'}">${!config.serverAddr ? '尚未开始检测' : counts.unhealthy ? layerFailText(counts) : counts.unchecked > 0 ? `${counts.unchecked} 条还没测完` : '全部代理三层全通（本地 → 隧道 → 公网）'}</span></div>
+          <div class="metric-value">${config.serverAddr ? esc((counts.unhealthy || 0) + (counts.path404 || 0)) : '—'}</div>
+          <div class="metric-foot"><span class="${!config.serverAddr ? '' : (counts.unhealthy ? 'down' : (counts.path404 ? 'down' : counts.unchecked > 0 ? '' : 'up'))}">${!config.serverAddr ? '尚未开始检测' : counts.unhealthy ? layerFailText(counts) : counts.path404 ? `${counts.path404} 条路径 404（隧道通，改访问路径即可）` : counts.unchecked > 0 ? `${counts.unchecked} 条还没测完` : '全部代理三层全通（本地 → 隧道 → 公网）'}</span></div>
         </div>
       </section>
 
@@ -802,10 +820,12 @@ function renderProxies(force = false) {
 
 function proxyRowHtml(p) {
   const failed = p.health && !p.health.ok;
+  /* 路径 404：隧道与端口都通，只是路径不对 —— 用橙色，别和「断链」混成一片红。 */
+  const pathMissing = !!(failed && p.health.pathMissing);
   const tip = healthTip(p.health);
   const status = p.status === 'running'
     ? (failed
-      ? `<span class="badge red" title="${esc(tip)}"><span class="bdot"></span>${esc(p.health.reason || '链路异常')}</span>`
+      ? `<span class="badge ${pathMissing ? 'amber' : 'red'}" title="${esc(tip)}"><span class="bdot"></span>${esc(p.health.reason || '链路异常')}</span>`
       : '<span class="badge green"><span class="bdot"></span>在线</span>')
     : p.status === 'pending'
       ? '<span class="badge amber"><span class="bdot"></span>同步中</span>'
@@ -813,7 +833,7 @@ function proxyRowHtml(p) {
   const health = p.health
     ? (p.health.ok
       ? `<span class="health-hint" title="${esc(tip)}">${icon('check')}三层连通 · ${esc(p.health.ms)}ms</span>`
-      : `<span class="health-hint bad" title="${esc(tip)}">${icon('alert')}${esc(p.health.reason || p.health.error || '链路异常')}</span>`)
+      : `<span class="health-hint ${pathMissing ? '' : 'bad'}" title="${esc(tip)}">${icon('alert')}${esc(p.health.reason || p.health.error || '链路异常')}</span>`)
     : '';
   // DNS 软检查：不参与三层判定，只给 http/https 代理一个「域名没解析/没指向服务器」的提醒。
   const dnsLayer = p.health && p.health.layers && p.health.layers.dns;
@@ -825,9 +845,12 @@ function proxyRowHtml(p) {
       dnsHint = `<span class="health-hint" title="域名已解析，但未指向当前服务器">${icon('alert')}域名未指向服务器</span>`;
     }
   }
-  const publicCell = p.publicAddress
+  /* 带访问路径的链接（例如 http://1.2.3.4:45446/panel/）：展示、复制、打开都用它。 */
+  const link = p.openUrl || p.publicAddress;
+  const publicCell = link
     ? `<div class="pub-cell">
-        <code title="${esc(p.publicAddress)}">${esc(p.publicAddress)}</code>
+        <code title="${esc(link)}">${esc(link)}</code>
+        ${p.openPath ? `<div class="muted" style="font-size:10px">访问路径 ${esc(p.openPath)}</div>` : ''}
         <div class="muted" style="font-size:10px">${esc(p.runtimeRemote || '')}${p.runtimeRemote && p.runtimeLocal ? ' · ' : ''}${esc(p.runtimeLocal || '')}</div>
       </div>`
     : '<span class="muted" style="font-size:11.5px">未分配</span>';
@@ -850,9 +873,9 @@ function proxyRowHtml(p) {
       <td>
         <div class="trow-actions">
           <button class="icon-btn" type="button" data-act="proxy.test-local" data-name="${esc(p.name)}" data-port="${esc(p.localPort)}" title="测试本机端口">${icon('activity')}</button>
-          ${p.publicAddress ? `<button class="icon-btn" type="button" data-act="copy" data-text="${esc(p.publicAddress)}" title="复制公网地址">${icon('copy')}</button>` : ''}
-          ${(p.type === 'http' || p.type === 'https') && p.publicAddress
-            ? `<button class="icon-btn" type="button" data-act="open" data-url="${esc(p.publicAddress)}" title="打开公网地址">${icon('external')}</button>` : ''}
+          ${link ? `<button class="icon-btn" type="button" data-act="copy" data-text="${esc(link)}" title="复制公网地址">${icon('copy')}</button>` : ''}
+          ${link && ['http', 'https', 'tcp', 'tcpmux'].includes(p.type)
+            ? `<button class="icon-btn" type="button" data-act="open" data-url="${esc(link)}" title="打开公网地址">${icon('external')}</button>` : ''}
           <button class="icon-btn" type="button" data-act="proxy.edit" data-name="${esc(p.name)}" title="编辑">${icon('edit')}</button>
           <button class="icon-btn danger" type="button" data-act="proxy.delete" data-name="${esc(p.name)}" title="删除">${icon('trash')}</button>
         </div>
@@ -1444,15 +1467,17 @@ function serverProxyRows() {
     const health = p.health;
     const ok = p.status === 'running' && health && health.ok;
     const failed = health && !health.ok;
-    const tone = ok ? 'green' : failed ? 'red' : 'amber';
+    /* 「路径 404」用橙色：隧道是通的，只是路径不对，不是断链。 */
+    const tone = ok ? 'green' : (failed && health.pathMissing) ? 'amber' : failed ? 'red' : 'amber';
     const text = ok ? '三层连通' : failed ? (health.reason || '链路异常') : '待检测';
-    const target = p.publicAddress || (p.remotePort ? `${(S.state.config && S.state.config.serverAddr) || ''}:${p.remotePort}` : '-');
+    const link = p.openUrl || p.publicAddress;
+    const target = link || (p.remotePort ? `${(S.state.config && S.state.config.serverAddr) || ''}:${p.remotePort}` : '-');
     return `
       <div class="sp-row" title="${esc(healthTip(health))}">
         <div class="sp-main"><strong>${esc(p.name)}</strong><small>${esc((p.type || '').toUpperCase())}</small></div>
         <div class="sp-addr mono">${esc(target)}</div>
         <span class="badge ${tone}"><span class="bdot"></span>${esc(text)}</span>
-        <button class="icon-btn" type="button" data-act="copy" data-text="${esc(p.publicAddress || '')}" title="复制公网地址">${icon('copy')}</button>
+        <button class="icon-btn" type="button" data-act="copy" data-text="${esc(link || '')}" title="复制公网地址">${icon('copy')}</button>
       </div>`;
   }).join('');
 }
@@ -5665,6 +5690,7 @@ function openProxyEditor({ mode, proxy = null, preset = null }) {
     pluginCrtPath: current.plugin ? current.plugin.crtPath || '' : '',
     pluginKeyPath: current.plugin ? current.plugin.keyPath || '' : '',
     pluginHostHeaderRewrite: current.plugin ? current.plugin.hostHeaderRewrite || '' : '',
+    openPath: current.openPath || '',
   };
   S.proxyEdit = { mode, originalName: current.name || '' };
   const types = ['tcp', 'udp', 'http', 'https'];
@@ -5712,6 +5738,11 @@ function openProxyEditor({ mode, proxy = null, preset = null }) {
             </div>
             <div class="field-hint" id="pf-remote-status">服务器上对外开放的端口，注意不要与已有服务冲突。</div>
             <div class="field-hint" id="pf-fw-status" style="display:flex;flex-wrap:wrap;gap:6px;align-items:center"></div>
+          </div>
+          <div class="field span-2" id="pf-openpath-field">
+            <label>访问路径（可选）</label>
+            <input class="input" id="pf-openpath" name="openPath" value="${esc(initial.openPath)}" placeholder="例如 /panel/（留空 = 根路径 /）" spellcheck="false" />
+            <div class="field-hint">不少服务根路径直接 404、真正的入口在子路径（如 <code>/panel/</code>）。填了之后：<b>复制/打开的链接</b>和<b>公网连通性探测</b>都会走这条路径；配了 nginx 域名反代时还会给根路径加一条 302 跳过来。</div>
           </div>
           <div class="field span-2 hidden" id="pf-domain-field">
             <label>自定义域名（逗号分隔）</label>
@@ -5838,9 +5869,12 @@ function setProxyFormType(type) {
   const remoteField = $('#pf-remote-field');
   const domainField = $('#pf-domain-field');
   const pluginField = $('#pf-plugin-field');
+  const openPathField = $('#pf-openpath-field');
   if (remoteField) remoteField.classList.toggle('hidden', !needsRemote);
   if (domainField) domainField.classList.toggle('hidden', !domainType);
   if (pluginField) pluginField.classList.toggle('hidden', !domainType);
+  /* 访问路径只对能被浏览器打开的类型有意义：udp/sudp/stcp/xtcp 没有可访问的 URL。 */
+  if (openPathField) openPathField.classList.toggle('hidden', ['udp', 'sudp', 'stcp', 'xtcp'].includes(type));
   // 切到 tcp/udp 时，插件字段一起收起；再切回 http/https 时按当前插件类型恢复显示
   if (!domainType) setProxyPluginFields('');
   else refreshProxyPluginFields();
@@ -6004,6 +6038,7 @@ async function submitProxyForm(form, mode) {
   const pluginCrtPath = ($('#pf-plugin-crt') ? $('#pf-plugin-crt').value : '').trim();
   const pluginKeyPath = ($('#pf-plugin-key') ? $('#pf-plugin-key').value : '').trim();
   const pluginHostHeaderRewrite = ($('#pf-plugin-host') ? $('#pf-plugin-host').value : '').trim();
+  const openPathRaw = ($('#pf-openpath') ? $('#pf-openpath').value : '').trim();
 
   if (!name) return showError('请填写代理名称');
   if (!/^[A-Za-z0-9_.-]+$/.test(name)) return showError('名称建议只包含字母、数字、点、下划线或短横线');
@@ -6021,6 +6056,9 @@ async function submitProxyForm(form, mode) {
     customDomains: domains,
     useCompression,
     useEncryption,
+    /* 访问路径只存在我们这边（frpc.toml 不认），主进程按代理名记进 settings。
+     * udp/stcp/xtcp 没有可访问的 URL，填了也没意义，直接丢掉。 */
+    openPath: ['udp', 'sudp', 'stcp', 'xtcp'].includes(type) ? '' : openPathRaw,
   };
   if (pluginType) {
     input.plugin = {

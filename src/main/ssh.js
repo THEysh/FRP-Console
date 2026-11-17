@@ -1834,7 +1834,7 @@ class ServerSession {
   }
 
   /* 写 frp-console.conf：80/443 终止 TLS，反代给 frps 的 HTTP vhost。confDir 缺省自动探测（宝塔/标准）。 */
-  async writeNginxProxyConfig({ serverNames, certDir, frpsHttpPort = 8080, confDir }) {
+  async writeNginxProxyConfig({ serverNames, certDir, frpsHttpPort = 8080, confDir, rootRedirect = '' }) {
     if (!this.connected) return { ok: false, error: '尚未连接服务器' };
     const sudo = await this.detectSudo();
     if (!sudo.ok) return sudo;
@@ -1844,12 +1844,23 @@ class ServerSession {
       confDir = info.dir;
     }
     const confPath = `${confDir}/frp-console.conf`;
+    /* 根路径 302：很多服务根路径是 404，入口在 /panel/ 这类子路径上。
+     * nginx 已经在这里替用户终止 TLS，顺手把 / 跳过去，根路径也就可用了。 */
+    const redirectPath = String(rootRedirect || '').trim();
+    const redirectLines = redirectPath
+      ? [
+        '    location = / {',
+        `        return 302 ${redirectPath};`,
+        '    }',
+      ]
+      : [];
     const conf = [
       '# 由 FRP-Console 生成：nginx 在 80/443 终止 TLS，把 frp 域名的流量反代给 frps 的 HTTP vhost。',
       '# 修改后请执行 nginx -t && systemctl reload nginx。',
       'server {',
       '    listen 80;',
       `    server_name ${serverNames};`,
+      ...redirectLines,
       '    location / {',
       `        proxy_pass http://127.0.0.1:${frpsHttpPort};`,
       '        proxy_set_header Host $host;',
@@ -1864,6 +1875,7 @@ class ServerSession {
       `    server_name ${serverNames};`,
       `    ssl_certificate ${certDir}/fullchain.pem;`,
       `    ssl_certificate_key ${certDir}/key.pem;`,
+      ...redirectLines,
       '    location / {',
       `        proxy_pass http://127.0.0.1:${frpsHttpPort};`,
       '        proxy_set_header Host $host;',

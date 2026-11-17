@@ -1109,6 +1109,42 @@ function runtimeView(runtime) {
   };
 }
 
+/* ---------------- 代理「访问路径」（1.2.71） ----------------
+ * 不少服务根路径回 404（Go 的 http.NotFound 就是 "404 page not found" 这句话），
+ * 真正的入口在 /panel/ 这类子路径上。frp 只按 Host 路由、不做路径改写，
+ * 所以「点开就是对的页面」只能由我们记住这条路径：
+ *   · 生成链接 / 复制地址用它
+ *   · 健康检查第 3 层用它探测（否则永远只探根路径）
+ *   · 方案 Y（nginx 443）下可以顺手给根路径加一条 302 跳过去
+ * 注意：不能写进 frpc.toml —— frp 遇到未知字段会让整份配置 unmarshal 失败
+ *（tcpmux 写 remotePort 就是这么炸的），所以存 settings.proxyOpenPaths。 */
+function normalizeOpenPath(value) {
+  const s = String(value || '').trim();
+  if (!s) return '';
+  return (s.startsWith('/') ? s : `/${s}`).replace(/\/{2,}/g, '/');
+}
+
+function proxyOpenPath(name) {
+  const map = (settings && settings.proxyOpenPaths) || {};
+  return normalizeOpenPath(map[name]);
+}
+
+function setProxyOpenPath(name, value) {
+  const clean = normalizeOpenPath(value);
+  const map = { ...((settings && settings.proxyOpenPaths) || {}) };
+  if (clean) map[name] = clean;
+  else delete map[name];
+  settings = settingsModule.save({ proxyOpenPaths: map });
+  return clean;
+}
+
+function dropProxyOpenPath(name) {
+  const map = { ...((settings && settings.proxyOpenPaths) || {}) };
+  if (!(name in map)) return;
+  delete map[name];
+  settings = settingsModule.save({ proxyOpenPaths: map });
+}
+
 function buildState() {
   if (!manager) {
     return {
@@ -1132,11 +1168,22 @@ function buildState() {
     // 管理端口上是别人的 frpc 时，它报的代理状态与本配置无关，一律当作没同步
     const st = runtime.foreign ? null : manager.proxyStatus.get(proxy.name) || null;
     const health = healthCache.get(proxy.name) || null;
+    const openPath = proxyOpenPath(proxy.name);
+    const publicAddress = configModule.publicAddressFor(model, proxy, { ...settings, ...boundVhostPorts(), nginxProxyEnabled: yModeEnabled() });
     return {
       ...proxy,
       // 公网地址跟「隧道绑定档案」的 nginx 状态走，不再读全局（多服务器时全局是
       // 最后连过的那台的事实，拿来渲染别的服务器会显示成错的 https://域名）。
-      publicAddress: configModule.publicAddressFor(model, proxy, { ...settings, ...boundVhostPorts(), nginxProxyEnabled: yModeEnabled() }),
+      publicAddress,
+      openPath,
+      /* 点开就该是能用的页面：tcp 型是 http://IP:端口/panel/，http/https 型是 http(s)://域名/panel/。
+       * udp 没有可访问的 URL，保持空串。 */
+      openUrl: (() => {
+        if (proxy.type === 'udp' || proxy.type === 'sudp' || proxy.type === 'xtcp' || proxy.type === 'stcp') return '';
+        if (!publicAddress) return '';
+        const base = /^[a-z][a-z0-9+.-]*:\/\//i.test(publicAddress) ? publicAddress : `http://${publicAddress}`;
+        return openPath ? `${base.replace(/\/+$/, '')}${openPath}` : base;
+      })(),
       status: st && st.status ? st.status : runtime.loggedIn ? 'pending' : 'unknown',
       statusError: st && st.err ? st.err : '',
       runtimeLocal: st ? st.local_addr : '',
@@ -1180,10 +1227,14 @@ function buildState() {
       // 按失败的层级拆开计数：概览页据此说“是本地服务、隧道还是公网不通”，
       // 而不是笼统一句“未通过三层检查”，把人骗去查本地端口。
       const layerFailed = (name) => failed.filter((p) => p.health.layers && p.health.layers[name] && !p.health.layers[name].ok).length;
+      /* 「路径 404」单独成一档：隧道其实是通的，只是根路径（或填的访问路径）在目标服务上不存在。
+       * 混进「连通性异常」会让人去查安全组/隧道，查半天查不出。 */
+      const path404 = failed.filter((p) => p.health.pathMissing).length;
       return {
         total: proxies.length,
         online: verified.filter((p) => p.health.ok && p.status === 'running').length,
-        unhealthy: failed.length,
+        unhealthy: failed.length - path404,
+        path404,
         // 这一轮还没测完（或代理刚加进来）的条数：界面上既不能说在线也不能说异常
         unchecked: proxies.length - verified.length,
         unhealthyLocal: layerFailed('local'),
@@ -1531,10 +1582,37 @@ async function checkProxyHealth(p, ctx) {
       ? { servername: target.servername, rejectUnauthorized: target.rejectUnauthorized }
       : null;
     pub = await httpProbe(target.url, 5000, target.host ? { Host: target.host } : null, tlsOptions);
-    layers.public = { ok: !!pub.ok, ms: pub.ms || 0, error: pub.error || null, status: pub.status || 0, url: target.display || target.url };
+    /* 404 不是「连不上」：TCP 握手、TLS、HTTP 全都成功，只是这个路径在目标服务上不存在。
+     * 之前的判定（status < 500 就算通）会让「点开是 404」和「一切正常」长得一模一样，
+     * 所以这里单独打上 pathMissing，交给下面归类成「路径 404」一档。 */
+    if (pub.ok && Number(pub.status) === 404) {
+      pub = { ...pub, ok: false, pathMissing: true };
+    }
+    layers.public = {
+      ok: !!pub.ok, ms: pub.ms || 0, error: pub.error || null,
+      status: pub.status || 0, url: target.display || target.url,
+      path: target.openPath || '',
+      pathMissing: !!pub.pathMissing,
+    };
   } else {
     pub = await tcpCheck(target.host, target.port, 2500);
     layers.public = { ok: !!pub.ok, ms: pub.ms || 0, error: pub.error || null };
+    /* TCP 通了只说明端口在听：如果对方其实是 HTTP 服务，根路径照样可能回 404
+     *（Go 写的面板、Jellyfin 前置、部分 Web 后台都是这样），用户点开就是
+     * "404 page not found"。这里补一次软探测：
+     *   · 只在 TCP 通过时做，超时 1500ms，拿不到 HTTP 响应就当对方不是 HTTP 服务（RDP/SSH 等），完全静默
+     *   · 回 404 → 单独判成「路径 404」（隧道通、端口通，只是路径不对）
+     *   · 回 2xx/3xx → 说明这就是个正常 Web 服务，额外记一笔供界面展示 */
+    if (pub.ok && type !== 'tcpmux') {
+      const httpUrl = `http://${target.host}:${target.port}${target.openPath || '/'}`;
+      const probe = await httpProbe(httpUrl, 1500, null, null).catch(() => null);
+      if (probe && probe.status === 404) {
+        pub = { ...pub, ok: false, pathMissing: true, error: `HTTP ${httpUrl} 返回 404` };
+        layers.public = { ...layers.public, ok: false, status: 404, url: httpUrl, path: target.openPath || '', pathMissing: true };
+      } else if (probe && probe.ok) {
+        layers.public = { ...layers.public, status: probe.status || 0, url: httpUrl };
+      }
+    }
   }
   if (type === 'http' || type === 'https') {
     const domain = configModule.firstDomainOf(p);
@@ -1558,6 +1636,15 @@ async function checkProxyHealth(p, ctx) {
     if (pub.blocked === 'icp') {
       reason = '公网端口被云厂商备案拦截';
       hint = '这个域名没有在服务器所属云厂商备案，HTTP 端口（80/8080）上的请求会被直接换成备案提示页。要么完成备案，要么改成走 443：在「HTTPS 证书」页把该域名部署到 nginx，然后用 https://域名 访问。';
+    } else if (pub.pathMissing) {
+      /* 404 单独一档：隧道、TCP、TLS 全都通了，是这个路径在目标服务上不存在
+       *（最常见：服务入口在 /panel/ 这类子路径）。说成「公网不可达」会把人带偏。 */
+      const where = (target.kind === 'http' ? target.url : `http://${target.host}:${target.port}${target.openPath || '/'}`);
+      reason = p.openPath ? '访问路径 404' : '路径 404';
+      error = `${where} 返回 404 —— 隧道是通的，但目标服务上没有这个路径`;
+      hint = p.openPath
+        ? `代理里填的访问路径是 ${p.openPath}，服务上返回了 404：确认路径大小写、结尾斜杠（多数服务要 /panel/ 而不是 /panel），或问一下这个服务的真实入口`
+        : '很多服务（Go 面板、Jellyfin 前置等）根路径就是 404，入口在 /panel/ 之类的子路径：编辑这条代理，在「访问路径」里填上它，链接与检查都会跟着变';
     } else if (vhostOpts.nginxProxyEnabled && recentNginx && recentNginx.port443Free === true) {
       /* Y 模式（走 nginx 443）下，探测目标是 https://<服务器IP>/。443 根本没人监听时，
        * 拿到的只是 ECONNREFUSED，说成「公网不可达」会让人去查安全组——查半天也查不出。
@@ -1579,7 +1666,7 @@ async function checkProxyHealth(p, ctx) {
       }
     }
     layers.public.hint = hint;
-    return [p.name, { ok: false, reason, ms: (local.ms || 0) + (server.ms || 0) + (layers.public.ms || 0), error, layers, at }];
+    return [p.name, { ok: false, reason, ms: (local.ms || 0) + (server.ms || 0) + (layers.public.ms || 0), error, layers, at, pathMissing: !!pub.pathMissing }];
   }
   return [p.name, {
     ok: true,
@@ -1605,7 +1692,12 @@ async function checkHealth() {
     if (!p.plugin) return true;
     const pt = p.plugin && p.plugin.type;
     return pt === 'https2http' || pt === 'https2https';
-  });
+  }).map((p) => ({
+    /* 把「访问路径」挂到探测用的副本上（frpc.toml 里没有这个字段，存在 settings）。
+     * probeTargetFor 用它拼探测 URL，404 时才能说清是「路径不对」而不是「公网不可达」。 */
+    ...p,
+    openPath: proxyOpenPath(p.name),
+  }));
   const ctx = { serverAddr: model.serverAddr };
   let serverCheck = null;
   ctx.serverCheck = () => {
@@ -2057,6 +2149,10 @@ function registerIpc() {
     }
     const result = await applyAndMaybeReload(next);
     if (!result.ok) return result;
+    /* 访问路径存在我们这边（frpc.toml 不认这个字段）。改名时把旧名下的记录搬过来，
+     * 免得「改个名访问路径就丢了」。 */
+    if (mode === 'edit' && originalName && originalName !== proxy.name) dropProxyOpenPath(originalName);
+    setProxyOpenPath(proxy.name, input.openPath);
     // 地址是这次现填的：顺手把「本机隧道目标」记到这个档案上，概览和服务器页才不会
     // 出现「本机隧道还没有归属到任何档案」。
     if (seed) settings = settingsModule.save({ clientServerId: seed.id });
@@ -2079,6 +2175,7 @@ function registerIpc() {
       visitors: model.visitors,
     }, { nginxProxyEnabled: yModeEnabled() });
     healthCache.delete(name);
+    dropProxyOpenPath(name);
     const result = await applyAndMaybeReload(next);
     if (!result.ok) return result;
     pushState();
@@ -3468,7 +3565,25 @@ function registerIpc() {
 
   /* 方案 Y：把一张已签发的证书同步到服务器 nginx（上传证书 + 写反代配置 + reload）。
    * best-effort：服务器没连/没 nginx 时返回 ok:false 但不抛错，证书仍留在本机。 */
-  async function syncCertToServerNginx(cert) {
+  /* 方案 Y 下给根路径加一条 302：nginx 已经替我们终止 TLS 并反代给 frps，
+ * 这里顺手把「/」跳到用户填的访问路径（例如 /panel/），根路径也就可用了。
+ * 只对填了访问路径、且域名与本次写进 server_name 的域名匹配的代理生效。 */
+function nginxRootRedirectFor(serverNames) {
+  const names = String(serverNames || '').split(/\s+/).filter(Boolean).map((s) => s.toLowerCase());
+  if (!names.length) return '';
+  for (const proxy of (model && model.proxies) || []) {
+    const path = proxyOpenPath(proxy.name);
+    if (!path || path === '/') continue;
+    const domains = (Array.isArray(proxy.customDomains) ? proxy.customDomains : [])
+      .map((d) => String(d || '').toLowerCase())
+      .filter(Boolean);
+    const hit = domains.some((d) => names.includes(d) || names.some((n) => coversDomain(n, d) || coversDomain(d, n)));
+    if (hit) return path;
+  }
+  return '';
+}
+
+async function syncCertToServerNginx(cert) {
     if (!cert || !Array.isArray(cert.domains) || !cert.domains.length) {
       return { ok: false, error: '缺少证书信息' };
     }
@@ -3489,7 +3604,8 @@ function registerIpc() {
     const upload = await serverSession.uploadCertToNginx(cert.domain, { certPath: cert.crtPath, keyPath: cert.keyPath });
     if (!upload.ok) { acmeManager.markNginx(cert.domain, upload, serverHost); return upload; }
     const serverNames = serverSession.nginxServerName(cert.domains);
-    const write = await serverSession.writeNginxProxyConfig({ serverNames, certDir: upload.dir, frpsHttpPort });
+    const rootRedirect = nginxRootRedirectFor(serverNames);
+    const write = await serverSession.writeNginxProxyConfig({ serverNames, certDir: upload.dir, frpsHttpPort, rootRedirect });
     if (!write.ok) { acmeManager.markNginx(cert.domain, write, serverHost); return write; }
     const reload = await serverSession.reloadNginx();
     if (!reload.ok) { acmeManager.markNginx(cert.domain, reload, serverHost); return reload; }

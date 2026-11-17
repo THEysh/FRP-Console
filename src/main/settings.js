@@ -49,6 +49,10 @@ const DEFAULT_SETTINGS = {
   servers: [],
   activeServerId: '',
   clientServerId: '',
+  /* 代理的「访问路径」：很多服务（Go 写的面板、Jellyfin 的反代前置等）根路径直接 404，
+   * 真正入口在 /panel/ 这类子路径上。frpc 不认这个字段（未知字段会让整份配置 unmarshal 失败），
+   * 所以存在我们自己这边，按代理名索引，只用于生成链接与健康检查探测。 */
+  proxyOpenPaths: {},
 };
 
 function newServerId() {
