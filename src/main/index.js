@@ -2097,21 +2097,31 @@ function registerIpc() {
     return ok({ port: configModule.randomRemotePort(model, type, { allowPorts }) });
   });
 
-  ipcMain.handle('proxy:check-port', async (event, port) => {
-    const n = Number(port);
+  ipcMain.handle('proxy:check-port', async (event, payload) => {
+    /* 兼容旧调用（直接传数字）与新的 { port, proto }：proto 决定查哪条防火墙规则。 */
+    const raw = payload && typeof payload === 'object' ? payload.port : payload;
+    const proto = payload && typeof payload === 'object' && payload.proto === 'udp' ? 'udp' : 'tcp';
+    const n = Number(raw);
     if (!Number.isInteger(n) || n < 1 || n > 65535) return fail('端口必须是 1 - 65535 的整数');
     if (!serverSession.connected) return fail('尚未连接服务器，无法检测端口占用');
     const result = await serverSession.checkPortInUse(n);
     if (!result.ok) return fail(result.error);
     const allowPorts = (serverConfig.summary && serverConfig.summary.allowPorts) || [];
     const allowOk = configModule.portInAllowList(n, allowPorts);
+    /* 防火墙这一层单独查：端口没被占、allowPorts 也允许，但防火墙没放行的时候，
+     * 配好的隧道照样连不上（实测广州机就是这样，用户以为是程序坏了）。 */
+    const firewall = await serverSession.checkFirewallPort(n, proto).catch((error) => ({
+      ok: false, manager: '', active: false, allowed: null, detail: String((error && error.message) || error),
+    }));
     return ok({
       port: n,
+      proto,
       inUse: result.inUse,
       process: result.process,
       pid: result.pid,
       allowOk,
       allowPortsText: configModule.formatAllowPorts(allowPorts),
+      firewall,
     });
   });
 

@@ -57,7 +57,7 @@ contextBridge.exposeInMainWorld('FRP', {
   deleteProxy: (name) => invoke('proxy:delete', name),
   suggestPort: (type) => invoke('proxy:suggest-port', type),
   randomPort: (type) => invoke('proxy:random-port', type),
-  checkPort: (port) => invoke('proxy:check-port', port),
+  checkPort: (payload) => invoke('proxy:check-port', payload),
   startTunnel: () => invoke('tunnel:start'),
   stopTunnel: () => invoke('tunnel:stop'),
   restartTunnel: () => invoke('tunnel:restart'),
@@ -107,7 +107,7 @@ contextBridge.exposeInMainWorld('FRP', {
   serverFirewallState: () => invoke('server:firewall-state'),
   serverFirewallOpen: () => invoke('server:firewall-open'),
   serverFirewallInstall: () => invoke('server:firewall-install'),
-  serverFirewallOpenPorts: (payload) => invoke('server:firewall-open-ports', payload),
+  serverFirewallOpenPorts: (text, proto) => invoke('server:firewall-open-ports', (text && typeof text === 'object') ? text : { text, proto }),
   serverFirewallClose: (payload) => invoke('server:firewall-close', payload),
   serverProbePort: (payload) => invoke('server:probe-port', payload),
   // SSH 交互式终端：打开/关闭走 invoke；按键与尺寸调整是高频小消息，走 send。

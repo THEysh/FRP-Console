@@ -1753,9 +1753,6 @@ function firewallCardMarkup() {
           <li>华为云 ECS：控制台 → 安全组 → 入方向规则 → 添加规则</li>
         </ul>
         <p class="cloud-hint-warn">图省事可先放行 <b>1–65535 TCP + UDP</b>，但那等于把全部端口暴露到公网，只建议在自用/测试服务器上这么做；长期请按上面的端口清单精确放行。</p>
-        <div class="page-actions" style="padding-top:4px">
-          <button class="btn" type="button" data-act="server.ports.copywide">${icon('copy')}<span>复制全端口放行（1-65535）</span></button>
-        </div>
       </div>
       ${f.manager !== 'none'
         ? `
@@ -1963,6 +1960,59 @@ async function openShellTerm() {
 function closeShellTerm() {
   disposeShellTerm(true);
   renderServer(true);
+}
+
+/* 代理表单里「公网端口」的协议：udp 代理查 udp 规则，其余都按 tcp 查。 */
+function proxyFormProto() {
+  const t = $('#pf-type');
+  return t && t.value === 'udp' ? 'udp' : 'tcp';
+}
+
+/* 「检测」按钮的完整判定：服务器上有没有被占 → allowPorts 允不允许 → 防火墙放没放行。
+ * 前两层以前就有；第三层是 1.2.70 加的——三层都过才算「可用」，缺一层就是配好了也连不上。 */
+async function checkRemotePortUI() {
+  const input = $('#pf-remote');
+  const status = $('#pf-remote-status');
+  const fwBox = $('#pf-fw-status');
+  const port = input ? Number(input.value) : 0;
+  const say = (tone, text) => { if (status) { status.textContent = text; status.className = `field-hint${tone ? ` ${tone}` : ''}`; } };
+  const sayFw = (tone, text, showOpen) => {
+    if (!fwBox) return;
+    if (!text) { fwBox.innerHTML = ''; fwBox.className = 'field-hint'; return; }
+    fwBox.className = `field-hint${tone ? ` ${tone}` : ''}`;
+    fwBox.innerHTML = `<span>${esc(text)}</span>${showOpen
+      ? '<button class="btn tiny" type="button" data-act="proxyform.openfw" title="在服务器防火墙里放行这个端口">一键放行</button>'
+      : ''}`;
+  };
+  if (!input || !Number.isInteger(port) || port < 1 || port > 65535) {
+    say('warn', '先填一个 1 - 65535 的端口再检测');
+    sayFw('', '');
+    return;
+  }
+  say('', '正在连接服务器检测端口占用与防火墙…');
+  sayFw('', '');
+  const proto = proxyFormProto();
+  const res = await FRP.checkPort({ port, proto });
+  if (!res || !res.ok) {
+    say('warn', (res && res.error) || '检测失败');
+    return;
+  }
+  const d = res.data || {};
+  const fw = d.firewall || {};
+  if (d.inUse) {
+    const who = d.process ? `（被 ${d.process} 占用` + (d.pid ? `，PID ${d.pid}` : '') + '）' : '';
+    say('warn', `端口 ${port} 已被占用${who}，建议换一个`);
+  } else if (!d.allowOk) {
+    say('warn', `端口 ${port} 空闲，但不在服务器 allowPorts 允许范围` + (d.allowPortsText ? `（${d.allowPortsText}）` : '') + '，frps 会拒绝注册');
+  } else if (fw.allowed === false) {
+    say('warn', `端口 ${port} 空闲且 allowPorts 允许，但服务器防火墙（${fw.manager || '未知'}）没有放行，外面连不进来`);
+  } else {
+    say('ok', `端口 ${port} 可用（服务器未占用、allowPorts 允许${fw.allowed === true ? '、防火墙已放行' : ''}）`);
+  }
+  /* 防火墙一行单独说：已放行绿字，未放行橙字 + 一键放行，判断不了灰字也给放行按钮。 */
+  if (fw.allowed === true) sayFw('ok', `防火墙：${fw.detail || '已放行'}`, false);
+  else if (fw.allowed === false) sayFw('warn', `防火墙：${fw.detail || '没有放行这个端口'}`, true);
+  else if (fw.detail) sayFw('', `防火墙：${fw.detail}（${fw.manager || '未知'}）`, true);
 }
 
 function renderServer(force = false) {
@@ -4700,14 +4750,6 @@ async function handleAction(act, dataset, btn) {
         toast('success', '已复制端口规则清单', '粘到云控制台的「安全组 / 防火墙 → 入方向」里逐条添加');
         break;
       }
-      case 'server.ports.copywide': {
-        const texts = (S.server.firewall && S.server.firewall.ruleTexts) || null;
-        const wide = (texts && texts.wide)
-          || '入方向（允许）：\nTCP  1-65535  0.0.0.0/0  允许\nUDP  1-65535  0.0.0.0/0  允许';
-        await FRP.copy(wide);
-        toast('warn', '已复制「1-65535 全放行」', '这只适合自用/测试服务器：等于把全部端口暴露到公网，用完记得按清单收紧');
-        break;
-      }
       case 'server.ports.showall': {
         S.server.portShowAll = !S.server.portShowAll;
         renderServer(true);
@@ -5161,28 +5203,24 @@ async function handleAction(act, dataset, btn) {
         break;
       }
       case 'proxyform.checkport': {
+        await checkRemotePortUI();
+        break;
+      }
+      case 'proxyform.openfw': {
         const input = $('#pf-remote');
         const port = input ? Number(input.value) : 0;
-        const status = $('#pf-remote-status');
-        if (!input || !Number.isInteger(port) || port < 1 || port > 65535) {
-          if (status) { status.textContent = '先填一个 1 - 65535 的端口再检测'; status.className = 'field-hint warn'; }
+        if (!Number.isInteger(port) || port < 1 || port > 65535) {
+          toast('warn', '先填一个端口', '填好公网端口再放行');
           break;
         }
-        if (status) { status.textContent = '正在连接服务器检测端口占用…'; status.className = 'field-hint'; }
-        const res = await FRP.checkPort(port);
-        if (res && res.ok) {
-          const d = res.data;
-          if (d.inUse) {
-            const who = d.process ? `（被 ${d.process} 占用` + (d.pid ? `，PID ${d.pid}` : '') + '）' : '';
-            if (status) { status.textContent = `端口 ${port} 已被占用${who}，建议换一个`; status.className = 'field-hint warn'; }
-          } else if (!d.allowOk) {
-            if (status) { status.textContent = `端口 ${port} 空闲，但不在服务器 allowPorts 允许范围` + (d.allowPortsText ? `（${d.allowPortsText}）` : '') + '，frps 会拒绝注册'; status.className = 'field-hint warn'; }
-          } else {
-            if (status) { status.textContent = `端口 ${port} 可用（服务器未占用，且在 allowPorts 允许范围内）`; status.className = 'field-hint ok'; }
-          }
-        } else {
-          if (status) { status.textContent = (res && res.error) || '检测失败'; status.className = 'field-hint warn'; }
-        }
+        const proto = proxyFormProto();
+        await withBusy(btn, async () => {
+          const res = await FRP.serverFirewallOpenPorts(String(port), proto);
+          if (!res || !res.ok) return toastResult(res);
+          const opened = (res.data && res.data.opened) || [];
+          toast('success', `已放行 ${port}/${proto}`, opened.length ? opened.join('、') : '规则已存在');
+          await checkRemotePortUI();
+        });
         break;
       }
       case 'proxyform.type': {
@@ -5673,6 +5711,7 @@ function openProxyEditor({ mode, proxy = null, preset = null }) {
               <button class="btn" type="button" data-act="proxyform.checkport" title="连服务器检查端口占用">${icon('activity')}<span>检测</span></button>
             </div>
             <div class="field-hint" id="pf-remote-status">服务器上对外开放的端口，注意不要与已有服务冲突。</div>
+            <div class="field-hint" id="pf-fw-status" style="display:flex;flex-wrap:wrap;gap:6px;align-items:center"></div>
           </div>
           <div class="field span-2 hidden" id="pf-domain-field">
             <label>自定义域名（逗号分隔）</label>

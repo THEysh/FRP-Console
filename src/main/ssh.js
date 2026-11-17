@@ -1055,6 +1055,43 @@ class ServerSession {
     return { manager: 'none', active: false, statusText: '未检测到 ufw / firewalld / iptables' };
   }
 
+  /* 查一个端口在当前启用的防火墙里是否已放行。
+   * 返回 { ok, manager, active, allowed, detail }：
+   *   allowed === true  → 已放行
+   *   allowed === false → 没放行（可以一键放行）
+   *   allowed === null  → 判断不了（例如只跑裸 iptables），UI 只说「无法判断」并给一键放行。
+   * 目的：用户挑公网端口时，除了「服务器上有没有被占」「allowPorts 允不允许」，
+   * 还得知道「防火墙放没放」——三层都过才算能用，少一层就是白配。 */
+  async checkFirewallPort(port, proto = 'tcp') {
+    if (!this.connected) return { ok: false, error: '尚未连接服务器' };
+    const n = Number(port);
+    if (!Number.isInteger(n) || n < 1 || n > 65535) return { ok: false, error: '端口无效' };
+    const p = proto === 'udp' ? 'udp' : 'tcp';
+    const fw = await this.detectFirewall();
+    if (!fw.active) {
+      return { ok: true, manager: fw.manager, active: false, allowed: true, detail: '防火墙未启用，这个端口不会被本机防火墙拦截' };
+    }
+    if (fw.manager === 'ufw') {
+      const r = await this.exec('ufw status 2>/dev/null || true', 12000);
+      const verdict = ufwAllowsPort(r.stdout || '', n, p);
+      return { ok: true, manager: 'ufw', active: true, ...verdict };
+    }
+    if (fw.manager === 'firewalld') {
+      const r = await this.exec(`firewall-cmd --query-port=${n}/${p} 2>&1 || true`, 12000);
+      const text = `${r.stdout || ''}${r.stderr || ''}`;
+      if (/^yes/im.test(text)) return { ok: true, manager: 'firewalld', active: true, allowed: true, detail: `${n}/${p} 已在 firewalld 中放行` };
+      if (/^no/im.test(text)) return { ok: true, manager: 'firewalld', active: true, allowed: false, detail: `${n}/${p} 不在 firewalld 的放行列表里` };
+      return { ok: true, manager: 'firewalld', active: true, allowed: null, detail: firstLine(text) || '查询 firewalld 失败' };
+    }
+    if (fw.manager === 'iptables') {
+      const r = await this.exec(`iptables -C INPUT -p ${p} --dport ${n} -j ACCEPT 2>&1 || true`, 12000);
+      const text = `${r.stdout || ''}${r.stderr || ''}`;
+      if (!text.trim()) return { ok: true, manager: 'iptables', active: true, allowed: true, detail: `iptables 里有 ${n}/${p} 的 ACCEPT 规则` };
+      return { ok: true, manager: 'iptables', active: true, allowed: null, detail: 'iptables 规则较难判定，建议直接点放行' };
+    }
+    return { ok: true, manager: fw.manager, active: !!fw.active, allowed: null, detail: '无法判断当前防火墙状态' };
+  }
+
   // 自动放开 frps 需要监听的端口（ufw / firewalld / 裸 iptables），防止被防火墙拦截。
   async openFirewallPorts(ports) {
     if (!this.connected) return { ok: false, error: '尚未连接服务器' };
@@ -2125,6 +2162,43 @@ class ServerSession {
 }
 
 // 解析用户手动输入的端口（支持单端口、范围、逗号/空格分隔），返回 { ok, ranges:[{start,end,label}] } 或 { ok:false, error }。
+/* 从 `ufw status` 的文本里判断某个端口/协议是否已放行（纯函数，便于单测）。
+ * ufw 输出的「To」列可能是：45441/tcp、45441、16000:16002/udp、80,443/tcp、Anywhere。
+ * 第二列是动作：ALLOW / LIMIT（限速放行，也算放行）/ DENY / REJECT。 */
+function ufwAllowsPort(statusText, port, proto = 'tcp') {
+  const n = Number(port);
+  const p = proto === 'udp' ? 'udp' : 'tcp';
+  const lines = String(statusText || '').split(/\r?\n/);
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (/^Status:/i.test(line) || /^To\s+Action\s+From/i.test(line) || /^-{2,}/.test(line)) continue;
+    const tokens = line.split(/\s+/);
+    if (tokens.length < 2) continue;
+    const to = tokens[0];
+    const action = tokens[1].toUpperCase();
+    /* 只有放行类动作才算「已打开」。 */
+    if (action !== 'ALLOW' && action !== 'LIMIT' && action !== 'ALLOW IN') continue;
+    if (/^Anywhere/i.test(to)) {
+      return { allowed: true, detail: `ufw 有「所有端口放行」规则（${action}）` };
+    }
+    const [spec, specProto] = to.split('/');
+    if (specProto && specProto.toLowerCase() !== p) continue;
+    for (const piece of String(spec || '').split(',')) {
+      const part = piece.trim();
+      if (!part) continue;
+      const range = part.match(/^(\d+)(?::(\d+))?$/);
+      if (!range) continue;
+      const start = Number(range[1]);
+      const end = range[2] ? Number(range[2]) : start;
+      if (n >= start && n <= end) {
+        return { allowed: true, detail: `ufw 已放行 ${n}/${p}（规则 ${to} ${action}）` };
+      }
+    }
+  }
+  return { allowed: false, detail: `ufw 的放行列表里没有 ${n}/${p}` };
+}
+
 function parsePortInput(text) {
   const ranges = [];
   const seen = new Set();
@@ -2153,4 +2227,4 @@ function parsePortInput(text) {
   return { ok: true, ranges };
 }
 
-module.exports = { ServerSession, parseServiceUnits, rankServiceUnits, parsePortInput, removeServerBlocks };
+module.exports = { ServerSession, parseServiceUnits, rankServiceUnits, parsePortInput, removeServerBlocks, ufwAllowsPort };
