@@ -2705,6 +2705,18 @@ function registerIpc() {
     }
   });
 
+  /* 手动开启 vhost 端口（代理表单里「服务器未开 vhostHTTPPort」提示旁边的「一键开启」）。 */
+  ipcMain.handle('server:vhost-enable', async (event, payload = {}) => {
+    if (!serverSession.connected) return fail('尚未连接服务器');
+    try {
+      const r = await ensureVhostPort(payload && payload.kind === 'https' ? 'https' : 'http');
+      if (!r.ok) return fail(r.error || '开启 vhost 端口失败', { state: serverState() });
+      return ok({ ...r, state: serverState() });
+    } catch (e) {
+      return fail(String((e && e.message) || e), { state: serverState() });
+    }
+  });
+
   /* 终止占用 80/443 的非 nginx 进程，然后重新探测（供前端「终止占用进程并继续」调用）。 */
   ipcMain.handle('server:nginx-free', async () => {
     if (!serverSession.connected) return fail('尚未连接服务器');
@@ -3126,6 +3138,43 @@ function registerIpc() {
     return ok(await tcpCheck(host, port, payload.timeout || 3000));
   });
 
+  /* 方案 Y（nginx 在 80/443 终止 TLS → frps 的 vhost 端口 → frpc）的前提：
+   * frps 必须真的在监听一个 HTTP vhost 端口，nginx 才有上游可反代。
+   * 只在服务器上写 nginx 配置、却不管 frps.toml，就会出现「nginx 明明起着、访问却是 502」——
+   * nginx 的 proxy_pass 指向 127.0.0.1:8080，而 frps 根本没监听 8080。
+   * 这里在需要时把这个端口补进 frps.toml（顶层键）并重启 frps。 */
+  async function ensureVhostPort(kind = 'http') {
+    const isHttps = kind === 'https';
+    const key = isHttps ? 'vhostHTTPSPort' : 'vhostHTTPPort';
+    const settingKey = isHttps ? 'vhostHttpsPort' : 'vhostHttpPort';
+    const fallback = isHttps ? 8443 : 8080;
+    const current = serverConfig.summary ? Number(serverConfig.summary[key]) || 0 : 0;
+    if (current > 0) return { ok: true, key, port: current, changed: false };
+    if (!serverSession.connected) return { ok: false, key, error: '尚未连接服务器' };
+    if (!serverConfig.content) return { ok: false, key, error: '读不到服务器上的 frps 配置（/etc/frp/frps.toml）' };
+    const epoch = sessionEpoch;
+    let port = Number(settings[settingKey]) || fallback;
+    // 端口被别的服务占着时 frps 会起不来：先探测，占了就往后挪。
+    for (let i = 0; i < 20; i++) {
+      const probe = await serverSession.checkPortInUse(port).catch(() => ({ ok: false }));
+      if (!probe || !probe.ok || !probe.inUse) break;
+      port += 1;
+    }
+    if (epoch !== sessionEpoch) return { ok: false, key, error: '会话已切换' };
+    const next = frpsConfig.setTopLevelInt(serverConfig.content, key, port);
+    const written = await serverSession.writeConfig(next, { restart: true });
+    if (epoch !== sessionEpoch) return { ok: false, key, error: '会话已切换' };
+    if (!written.ok) return { ok: false, key, port, error: written.error || '写入 frps 配置失败' };
+    // 重读快照：summary / 档案 vhost 端口 / nginx 状态都会在这里对齐。
+    await loadServerSnapshot({ inspect: true, epoch });
+    const after = serverConfig.summary ? Number(serverConfig.summary[key]) || 0 : 0;
+    return {
+      ok: after > 0, key, port: after || port, changed: true,
+      backup: written.backup, restarted: written.restarted,
+      error: after > 0 ? '' : '写入后 frps 仍未监听该端口，请查看 frps 日志',
+    };
+  }
+
   /* 方案 Y：把一张已签发的证书同步到服务器 nginx（上传证书 + 写反代配置 + reload）。
    * best-effort：服务器没连/没 nginx 时返回 ok:false 但不抛错，证书仍留在本机。 */
   async function syncCertToServerNginx(cert) {
@@ -3138,8 +3187,14 @@ function registerIpc() {
       acmeManager.markNginx(cert.domain, r, serverHost);
       return r;
     }
-    const frpsHttpPort = (serverConfig.summary && Number(serverConfig.summary.vhostHTTPPort))
-      || Number(settings.vhostHttpPort) || 8080;
+    // 反代的上游是 frps 的 vhost HTTP 端口：没开就先补上，否则写出来的反代一定 502。
+    const vhost = await ensureVhostPort('http').catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+    if (!vhost.ok) {
+      const r = { ok: false, error: `服务器 frps 没有可用的 vhostHTTPPort（nginx 反代的上游）：${vhost.error || '未知原因'}` };
+      acmeManager.markNginx(cert.domain, r, serverHost);
+      return r;
+    }
+    const frpsHttpPort = Number(vhost.port) || 8080;
     const upload = await serverSession.uploadCertToNginx(cert.domain, { certPath: cert.crtPath, keyPath: cert.keyPath });
     if (!upload.ok) { acmeManager.markNginx(cert.domain, upload, serverHost); return upload; }
     const serverNames = serverSession.nginxServerName(cert.domains);
@@ -3149,7 +3204,7 @@ function registerIpc() {
     if (!reload.ok) { acmeManager.markNginx(cert.domain, reload, serverHost); return reload; }
     // 反代配置写成功并 reload 后，公网入口就是 nginx 443，代理地址不再带端口。
     setProfileNginxProxy(profileForSession(serverSession).id, true);
-    const r = { ok: true, serverNames, certDir: upload.dir, frpsHttpPort };
+    const r = { ok: true, serverNames, certDir: upload.dir, frpsHttpPort, vhost };
     acmeManager.markNginx(cert.domain, r, serverHost);
     return r;
   }

@@ -1180,7 +1180,10 @@ async function runNginxSetup() {
   if (res.data && res.data.certMissing) {
     toast('warn', '还差一张证书', res.data.message || '请先到「HTTPS 证书」页签发证书');
   } else {
-    toast('success', '反代已配置', res.data && res.data.serverNames ? `${res.data.serverNames} → nginx 80/443 → frps ${res.data.frpsHttpPort}` : 'nginx 反代已就绪');
+    const vhostNote = res.data && res.data.vhost && res.data.vhost.changed
+      ? `（顺带给 frps 开了 vhostHTTPPort ${res.data.frpsHttpPort} 并重启）`
+      : '';
+    toast('success', '反代已配置', res.data && res.data.serverNames ? `${res.data.serverNames} → nginx 80/443 → frps ${res.data.frpsHttpPort}${vhostNote}` : 'nginx 反代已就绪');
   }
   S.server.nginx = { ...(S.server.nginx || {}), ...(res.data || {}), ok: !!(res.data && res.data.ok) };
 }
@@ -4039,6 +4042,48 @@ async function handleAction(act, dataset, btn) {
         }
         break;
       }
+      case 'proxyform.vhost.enable': {
+        if (!S.server.connected) {
+          toast('warn', '先连服务器', '开启 vhost 端口需要先在「服务器」页连上这台服务器。');
+          break;
+        }
+        const kind = (dataset && dataset.kind) === 'https' ? 'https' : 'http';
+        const keyName = kind === 'https' ? 'vhostHTTPSPort' : 'vhostHTTPPort';
+        /* 这里刻意不用模态框确认：整个应用只有一个模态根节点，弹确认框会把正在填写的
+         * 代理表单顶掉（用户辛苦填的端口/域名全丢）。改成按钮上的二次点击确认。 */
+        if (!(dataset && dataset.confirm)) {
+          const fixBtn = btn || ($('#pf-domain-readiness')
+            ? $('#pf-domain-readiness').querySelector('button[data-act="proxyform.vhost.enable"]')
+            : null);
+          if (fixBtn) {
+            fixBtn.dataset.confirm = '1';
+            fixBtn.textContent = `确认开启 ${keyName}（会重启 frps）`;
+            fixBtn.classList.remove('small');
+            fixBtn.classList.add('primary');
+          }
+          toast('warn', '再点一次确认', `会在服务器 frps.toml 里补上 ${keyName} 并重启 frps，隧道会断开几秒再自动重连。`);
+          break;
+        }
+        if (btn) btn.disabled = true;
+        try {
+          const res = await FRP.serverVhostEnable({ kind });
+          if (!res || !res.ok) {
+            toast('error', '开启 vhost 端口失败', (res && res.error) || '未知原因');
+            break;
+          }
+          toast('success', `${keyName} 已开启`, `端口 ${res.data && res.data.port}，frps 已重启；nginx 反代的上游现在有响应了。`);
+          // 只把服务器摘要补回来，不要走 loadServerState（那会整页重渲染，把正在填写的代理表单冲掉）
+          const st = await FRP.serverState();
+          if (st && st.ok && st.data) {
+            S.server.summary = st.data.summary || S.server.summary;
+            S.server.config = st.data.config || S.server.config;
+          }
+          refreshDomainReadiness();
+        } finally {
+          if (btn) btn.disabled = false;
+        }
+        break;
+      }
       case 'server.firewall.install': {
         if (S.server.firewallBusy) break;
         const okConfirm = await confirmDialog({
@@ -4857,6 +4902,20 @@ function openProxyEditor({ mode, proxy = null, preset = null }) {
     });
   }
   setTimeout(() => { const name = $('#pf-name'); if (name) name.focus(); }, 30);
+  refreshServerSummarySilently();
+}
+
+/* 代理表单里的 vhost 徽标是按「服务器真实配置」判断的，而 S.server.summary 可能是早先
+ * 在别的页面缓存下来的旧值（服务器被改过、或在服务器页之外改了 frps.toml）。
+ * 打开表单时静默补一次最新快照，避免把已经开好的端口报成「没开」。 */
+async function refreshServerSummarySilently() {
+  if (!(S.server && S.server.connected)) return;
+  const res = await FRP.serverState();
+  if (!res || !res.ok || !res.data) return;
+  if (!document.querySelector('#pf-domains')) return;
+  S.server.summary = res.data.summary || S.server.summary;
+  S.server.config = res.data.config || S.server.config;
+  refreshDomainReadiness();
 }
 
 async function suggestRemotePort(type) {
@@ -4912,6 +4971,17 @@ function domainBadge(label, text, tone) {
   return `<span class="${cls}">${esc(label)} · ${esc(text)}</span>`;
 }
 
+/* 带「一键开启」按钮的徽标：用于 frps 没开 vhost 端口这种「能就地修好」的情况。
+ * nginx 反代的上游就是 frps 的 vhost 端口，没开时访问一定是 502，所以给个直接修好的入口。 */
+function domainBadgeFix(label, text, tone, kind) {
+  const cls = tone === 'ok' ? 'tag ok' : tone === 'bad' ? 'tag bad' : tone === 'amber' ? 'tag amber' : 'tag';
+  const canFix = !!(S.server && S.server.connected);
+  const fix = canFix
+    ? `<button class="btn small" type="button" data-act="proxyform.vhost.enable" data-kind="${esc(kind)}">开启 vhost 端口</button>`
+    : '';
+  return `<span class="${cls}">${esc(label)} · ${esc(text)}</span>${fix}`;
+}
+
 function vhostBadgeFor(type) {
   const settings = (S.state && S.state.settings) || {};
   const serverSummary = S.server && S.server.summary;
@@ -4919,7 +4989,7 @@ function vhostBadgeFor(type) {
     if (serverSummary && typeof serverSummary.vhostHTTPPort === 'number') {
       return serverSummary.vhostHTTPPort
         ? domainBadge('vhost', `服务器已开 HTTP 端口 ${serverSummary.vhostHTTPPort}`, 'ok')
-        : domainBadge('vhost', '服务器未开 vhostHTTPPort，http 代理会失败', 'bad');
+        : domainBadgeFix('vhost', 'frps 没开 vhostHTTPPort（nginx 反代的上游），http 代理会 502', 'bad', 'http');
     }
     return domainBadge('vhost', `按客户端设定 HTTP 端口 ${Number(settings.vhostHttpPort) || 80}`, '');
   }
@@ -4927,7 +4997,7 @@ function vhostBadgeFor(type) {
     if (serverSummary && typeof serverSummary.vhostHTTPSPort === 'number') {
       return serverSummary.vhostHTTPSPort
         ? domainBadge('vhost', `服务器已开 HTTPS 端口 ${serverSummary.vhostHTTPSPort}`, 'ok')
-        : domainBadge('vhost', '服务器未开 vhostHTTPSPort，https 代理会失败', 'bad');
+        : domainBadgeFix('vhost', 'frps 没开 vhostHTTPSPort，https 代理会失败', 'bad', 'https');
     }
     return domainBadge('vhost', `按客户端设定 HTTPS 端口 ${Number(settings.vhostHttpsPort) || 443}`, '');
   }
@@ -4991,7 +5061,14 @@ function refreshDomainReadiness() {
   syncBadges.push(domainBadge('DNS', '解析中…', ''));
   renderDomainReadiness(syncBadges);
 
-  FRP.dnsResolve(primary).then((res) => {
+  // DNS 查询可能因为本机解析器卡住而长时间不回，这里加超时兜底，
+  // 免得徽标永远停在「解析中…」（用户会以为程序没反应）。
+  const dnsAnswer = Promise.race([
+    FRP.dnsResolve(primary),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('DNS 解析超时')), 8000)),
+  ]);
+
+  dnsAnswer.then((res) => {
     const cur = $('#pf-domain-readiness');
     if (!cur) return;
     const nowType = $('#pf-type') ? $('#pf-type').value : '';

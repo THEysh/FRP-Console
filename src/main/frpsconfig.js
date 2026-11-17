@@ -215,6 +215,29 @@ function validateText(text) {
   return { ok: true, summary: value };
 }
 
+/* 在 TOML 文本里设置一个「顶层」整型键（如 vhostHTTPPort / vhostHTTPSPort）。
+ * 语义：
+ *  - 已存在该键 → 原地替换数值（保留其它行原样）；
+ *  - 不存在 → 插到第一个 [table] 之前（TOML 顶层键写在表之后会变成该表的字段，必须前置）；
+ *  - 找不到表头 → 追加到末尾（并跳过尾部空行）。
+ * 只做文本级修改，不重新序列化，避免把用户的注释、顺序、格式打乱。 */
+function setTopLevelInt(content, key, value) {
+  const text = String(content == null ? '' : content);
+  const lines = text.split(/\r?\n/);
+  const re = new RegExp(`^\\s*${key}\\s*=`);
+  for (let i = 0; i < lines.length; i++) {
+    if (re.test(lines[i])) {
+      lines[i] = `${key} = ${value}`;
+      return lines.join('\n');
+    }
+  }
+  let idx = lines.findIndex((line) => /^\s*\[/.test(line));
+  if (idx < 0) idx = lines.length;
+  while (idx > 0 && !lines[idx - 1].trim()) idx -= 1;
+  lines.splice(idx, 0, `${key} = ${value}`);
+  return lines.join('\n');
+}
+
 module.exports = {
   DEFAULT_FIELDS,
   parseConfig,
@@ -225,4 +248,5 @@ module.exports = {
   validateText,
   parseAllowPorts,
   allowPortsToText,
+  setTopLevelInt,
 };
