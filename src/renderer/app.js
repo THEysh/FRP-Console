@@ -441,6 +441,8 @@ function refreshMiniLog() {
 function layerFailText(counts) {
   if (counts.unhealthyLocal) return `${counts.unhealthyLocal} 个本地服务不通`;
   if (counts.unhealthyTunnel) return `${counts.unhealthyTunnel} 个隧道未建立`;
+  // 域名没解析/没指过来时别再说「公网不可达」：那句话会把人骗去查防火墙
+  if (counts.dnsFailed) return `${counts.dnsFailed} 个域名没解析到服务器`;
   if (counts.unhealthyPublic) return `${counts.unhealthyPublic} 个公网不可达`;
   return '存在隧道或公网检查失败';
 }
@@ -623,6 +625,7 @@ function renderOverview(force = false) {
     const parts = [];
     if (counts.unhealthyLocal) parts.push(`本地服务不通 ${counts.unhealthyLocal} 个`);
     if (counts.unhealthyTunnel) parts.push(`隧道未建立 ${counts.unhealthyTunnel} 个`);
+    if (counts.dnsFailed) parts.push(`域名没解析到服务器 ${counts.dnsFailed} 个`);
     if (counts.unhealthyPublic) parts.push(`公网不可达 ${counts.unhealthyPublic} 个`);
     const detail = parts.length ? `（${parts.join('、')}）` : '';
     issues.push(`<div class="note warn">${icon('alert')}<div>有 ${counts.unhealthy} 个代理未通过三层连通性检查${detail}，公网访问会失败。

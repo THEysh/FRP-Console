@@ -1896,8 +1896,12 @@ class ServerSession {
       };
     }
     /* 根路径 302：很多服务根路径是 404，入口在 /panel/ 这类子路径上。
-     * nginx 已经在这里替用户终止 TLS，顺手把 / 跳过去，根路径也就可用了。 */
-    const redirectPath = String(rootRedirect || '').trim();
+     * nginx 已经在这里替用户终止 TLS，顺手把 / 跳过去，根路径也就可用了。
+     * 这个值是裸插进配置行的（`return 302 <path>;`），所以在这里再挡一道：
+     * 只接受以 / 开头、不含空白/引号/分号/反斜杠/换行的路径，
+     * 免得一个坏路径把整份 nginx 配置写坏（`nginx -t` 失败后站点就起不来了）。 */
+    const rawRedirect = String(rootRedirect || '').trim();
+    const redirectPath = /^\/[^\s;"'\\\r\n]*$/.test(rawRedirect) ? rawRedirect : '';
     const redirectLines = redirectPath
       ? [
         '    location = / {',

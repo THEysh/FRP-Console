@@ -36,6 +36,30 @@ function spawnErrorText(error, frpcPath) {
   return `${raw}（${name}）`;
 }
 
+/* frpc 自己吐出来的「启动即失败」文本，翻成人话。
+ * 最常见的一种：管理 API 端口被别的 frpc 占着（另一份配置、安装版控制台、手工开的 frpc
+ * 都可能占 7400），frpc 直接以 Go 原文退出：
+ *   listen tcp 127.0.0.1:7400: bind: Only one usage of each socket address ...
+ * 这句话对用户毫无帮助 —— 他不知道 7400 是「我们自己配的管理端口」，也不知道该改哪儿。 */
+function adminPortBusyText(port) {
+  const p = Number(port) || 7400;
+  return `管理端口 ${p} 已被占用：本机还有另一个 frpc 在用它（另一份配置、另一个控制台实例，或手工开的 frpc）。`
+    + `到「设置」里换一个管理端口（例如 ${p + 12}）再启动，或者先关掉占用它的那个 frpc。`;
+}
+
+function startFailureText(text, adminPort) {
+  const raw = String(text || '').trim();
+  if (!raw) return raw;
+  const port = Number(adminPort) || 7400;
+  const bindConflict = /bind:\s*(Only one usage|address already in use)|EADDRINUSE/i.test(raw)
+    || /address already in use/i.test(raw);
+  if (bindConflict) {
+    if (new RegExp(`[:.]${port}\\b`).test(raw)) return `${adminPortBusyText(port)}（frpc 原文：${raw}）`;
+    return `frpc 启动失败：要监听的端口已被占用（${raw}）。如果占用的是管理端口，到「设置」里换一个；如果是代理端口，换一个公网端口。`;
+  }
+  return raw;
+}
+
 class FrpcManager extends EventEmitter {
   constructor(ctx) {
     super();
@@ -285,6 +309,13 @@ class FrpcManager extends EventEmitter {
     if (service.installed && service.state === 'running') {
       return { ok: false, error: '系统服务正在运行，请先停止它，或切换到系统服务模式' };
     }
+    /* 起进程前先看一眼管理端口：端口上已经有人（通常是另一份配置/安装版控制台的 frpc），
+     * frpc 必然 bind 失败 —— 而它只会吐一句 Go 原文，还要白等十几秒 API 超时。
+     * 这里提前判掉，直接给「换端口 / 关掉它」的处理办法。 */
+    const adminFree = await tcpCheck('127.0.0.1', this.admin.port, 700)
+      .then((r) => !(r && r.ok))
+      .catch(() => true);
+    if (!adminFree) return { ok: false, error: adminPortBusyText(this.admin.port) };
     return this.spawnManaged();
   }
 
@@ -386,7 +417,9 @@ class FrpcManager extends EventEmitter {
         code,
         signal,
         at: Date.now(),
-        error: intentional || code === 0 || signal ? null : (stderr || stdout || `frpc 退出（代码 ${code}）`).split(/\r?\n/).slice(-3).join(' '),
+        error: intentional || code === 0 || signal
+          ? null
+          : startFailureText((stderr || stdout || `frpc 退出（代码 ${code}）`).split(/\r?\n/).slice(-3).join(' '), this.admin.port),
       };
       this.emit('exit', this.lastExit);
       this.refresh().catch(() => {});

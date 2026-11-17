@@ -1121,10 +1121,29 @@ function runtimeView(runtime) {
  *   · 方案 Y（nginx 443）下可以顺手给根路径加一条 302 跳过去
  * 注意：不能写进 frpc.toml —— frp 遇到未知字段会让整份配置 unmarshal 失败
  *（tcpmux 写 remotePort 就是这么炸的），所以存 settings.proxyOpenPaths。 */
+/* 访问路径只接受 URL 路径字符。
+ * 这个值有三个去处：拼探测 URL、拼代理表里的可点链接、以及写进服务器 nginx 的
+ * `return 302 <path>;`（syncCertToServerNginx → writeNginxProxyConfig 直接插进配置行）。
+ * 最后那个是裸拼接：一个换行或分号就能插进任意 nginx 指令，轻则 `nginx -t` 失败把站点
+ * 弄挂，重则把站点指到别处。所以白名单收紧在这里——不合规的值一律不落盘，也不会写进
+ * 服务器配置（旧版本存下来的脏值也会被这里挡掉）。 */
+const OPEN_PATH_UNSAFE = /[^\w\-./~%!$&'()*+,=:@?]/;
+
 function normalizeOpenPath(value) {
-  const s = String(value || '').trim();
+  let s = String(value === undefined || value === null ? '' : value).trim();
   if (!s) return '';
-  return (s.startsWith('/') ? s : `/${s}`).replace(/\/{2,}/g, '/');
+  s = (s.startsWith('/') ? s : `/${s}`).replace(/\/{2,}/g, '/');
+  if (s.length > 200) s = s.slice(0, 200);
+  if (OPEN_PATH_UNSAFE.test(s) || s.includes('..')) return '';
+  return s;
+}
+
+/* 只有能直接点开 HTTP 的代理类型才谈得上「访问路径」：
+ * tcp 也算（1.2.71 起对 tcp 公网端口做 404 软探测），udp/stcp/sudp/xtcp/tcpmux 不是 HTTP。 */
+const OPEN_PATH_TYPES = ['tcp', 'http', 'https'];
+
+function openPathAllowedForType(type) {
+  return OPEN_PATH_TYPES.includes(String(type || '').toLowerCase());
 }
 
 function proxyOpenPath(name) {
@@ -1133,7 +1152,10 @@ function proxyOpenPath(name) {
 }
 
 function setProxyOpenPath(name, value) {
-  const clean = normalizeOpenPath(value);
+  /* 存的时候也过一遍类型闸：proxy:save 是唯一入口，但历史数据、以后的批量导入都可能
+   * 绕过它 —— 类型不允许就顺手把这条记录删掉，别让它留成下一次改类型的定时炸弹。 */
+  const existing = model && (model.proxies || []).find((p) => p.name === name);
+  const clean = existing && !openPathAllowedForType(existing.type) ? '' : normalizeOpenPath(value);
   const map = { ...((settings && settings.proxyOpenPaths) || {}) };
   if (clean) map[name] = clean;
   else delete map[name];
@@ -1146,6 +1168,25 @@ function dropProxyOpenPath(name) {
   if (!(name in map)) return;
   delete map[name];
   settings = settingsModule.save({ proxyOpenPaths: map });
+}
+
+/* 启动时清理访问路径的历史脏数据：代理已经删掉的、类型不允许的、字符不合规的一律丢掉。
+ * 返回被清理掉的条数（只在确实有变化时写盘，避免每次启动都改 settings.json）。 */
+function pruneOpenPaths() {
+  const map = (settings && settings.proxyOpenPaths) || {};
+  const names = Object.keys(map);
+  if (!names.length) return 0;
+  const byName = new Map(((model && model.proxies) || []).map((p) => [p.name, p]));
+  const next = {};
+  let dropped = 0;
+  for (const name of names) {
+    const proxy = byName.get(name);
+    const clean = proxy && openPathAllowedForType(proxy.type) ? normalizeOpenPath(map[name]) : '';
+    if (clean) next[name] = clean;
+    else dropped += 1;
+  }
+  if (dropped) settings = settingsModule.save({ proxyOpenPaths: next });
+  return dropped;
 }
 
 function buildState() {
@@ -1233,11 +1274,15 @@ function buildState() {
       /* 「路径 404」单独成一档：隧道其实是通的，只是根路径（或填的访问路径）在目标服务上不存在。
        * 混进「连通性异常」会让人去查安全组/隧道，查半天查不出。 */
       const path404 = failed.filter((p) => p.health.pathMissing).length;
+      /* 公网层失败里，「域名没解析 / 没指向这台服务器」跟「端口不通」是两回事：
+       * 前者要改 DNS 记录，后者要查防火墙。概览分开计数，用户才知道该点哪里。 */
+      const dnsFailed = failed.filter((p) => /^域名/.test(String(p.health.reason || ''))).length;
       return {
         total: proxies.length,
         online: verified.filter((p) => p.health.ok && p.status === 'running').length,
         unhealthy: failed.length - path404,
         path404,
+        dnsFailed,
         // 这一轮还没测完（或代理刚加进来）的条数：界面上既不能说在线也不能说异常
         unchecked: proxies.length - verified.length,
         unhealthyLocal: layerFailed('local'),
@@ -1692,6 +1737,21 @@ async function checkProxyHealth(p, ctx) {
     if (pub.blocked === 'icp') {
       reason = '公网端口被云厂商备案拦截';
       hint = '这个域名没有在服务器所属云厂商备案，HTTP 端口（80/8080）上的请求会被直接换成备案提示页。要么完成备案，要么改成走 443：在「HTTPS 证书」页把该域名部署到 nginx，然后用 https://域名 访问。';
+    } else if (pubDomain && dnsInfo && (dnsInfo.resolved.length === 0 || !dnsInfo.pointsToServer)) {
+      /* 域名没解析 / 解到别的机器：这是 http(s) 代理最常见的一类故障，
+       * 而探到的错误往往是 ECONNREFUSED / 404 / 502 之类，全被说成「公网不可达」的话，
+       * 用户会去翻防火墙、翻 frps 配置，其实是 DNS 根本没指过来。
+       * 这里直接用前面查到的 DNS 结果定因（没有 dnsInfo 时不猜）。 */
+      if (!dnsInfo.resolved.length) {
+        reason = '域名没有解析';
+        error = `${pubDomain} 查不到 A/AAAA 记录${dnsInfo.error ? `（${dnsInfo.error}）` : ''} —— 浏览器打开也会是「找不到服务器」`;
+        hint = `到域名服务商给 ${pubDomain} 加一条 A 记录指向 ${model.serverAddr}（Cloudflare 记得把云朵关掉，走灰云直连）；生效后本页下一轮检查会自动变绿。`;
+      } else {
+        reason = '域名没指向这台服务器';
+        error = `${pubDomain} 现在解析到 ${dnsInfo.resolved.join('、')}，而这条隧道连的是 ${model.serverAddr}`;
+        hint = `二选一：把 ${pubDomain} 的 A 记录改成 ${model.serverAddr}，或者换一个已经指向这台服务器的域名；DNS 缓存里可能还留着旧值，刚改完要等 TTL。`
+          + '（如果这个域名走的是 Cloudflare 代理，A 记录本来就会显示 CF 的地址而不是服务器 IP —— 那种情况属于正常，重点看上面公网那一层的报错。）';
+      }
     } else if (pub.pathMissing) {
       /* 404 单独一档：隧道、TCP、TLS 全都通了，是这个路径在目标服务上不存在
        *（最常见：服务入口在 /panel/ 这类子路径）。说成「公网不可达」会把人带偏。 */
@@ -2019,6 +2079,18 @@ function registerIpc() {
         if (st.isDirectory()) return fail(`这是一个文件夹，不是配置文件：${wanted}`);
       }
     }
+    /* frpc.exe 同理：填了但文件不存在就直接报错。
+     * 以前只存不查，refreshPaths 发现路径无效会静默回落成"自动发现"的那个，
+     * 接口还返回 ok —— 用户选错了 exe，界面看不出来，只有启动隧道时才莫名连到别的版本。 */
+    if (clean.frpcPath !== undefined) {
+      const wanted = String(clean.frpcPath || '').trim();
+      if (wanted) {
+        let st = null;
+        try { st = fs.statSync(wanted); } catch { st = null; }
+        if (!st) return fail(`frpc.exe 不存在：${wanted}`);
+        if (st.isDirectory()) return fail(`这是一个文件夹，不是可执行文件：${wanted}`);
+      }
+    }
     const adminBefore = { port: settings.adminPort, user: settings.adminUser, password: settings.adminPassword };
     settings = settingsModule.save(clean);
     const previousConfig = paths.configPath;
@@ -2236,7 +2308,42 @@ function registerIpc() {
     if (validation.errors.length) {
       return { ok: false, error: validation.errors[0].message, errors: validation.errors, validation };
     }
+    /* 访问路径：类型不对就忽略（udp/stcp 这类没有「点开」这回事），
+     * 字符不合规直接报错而不是悄悄丢掉——用户填了半天路径却什么都没保存，比报错更难查。 */
+    const rawOpenPath = String(input.openPath === undefined || input.openPath === null ? '' : input.openPath).trim();
+    let openPath = '';
+    let openPathIgnored = false;
+    if (rawOpenPath) {
+      if (!openPathAllowedForType(proxy.type)) {
+        // 类型不允许时静默忽略不礼貌，放进 warnings 里说明
+        openPathIgnored = true;
+      } else {
+        openPath = normalizeOpenPath(rawOpenPath);
+        if (!openPath) {
+          return {
+            ok: false,
+            error: `访问路径「${rawOpenPath}」不合法：只填路径部分，不能包含空格、引号、分号、换行等字符（例如 /panel/）`,
+            validation,
+          };
+        }
+      }
+    }
     const proxyWarnings = certCoverageWarnings(proxy);
+    /* 这条代理自己的校验警告（公网端口撞服务器端口、浏览器禁用端口、不在 allowPorts 里…）
+     * 以前只留在 state.validation 里，用户保存完只看到一句「已保存」，等 frps 拒绝注册才发现。
+     * 这里挑出属于这条代理的那几条，交给界面在保存后直接提示。 */
+    const savedIndex = next.proxies.findIndex((p) => p.name === proxy.name && p.type === proxy.type);
+    if (savedIndex >= 0) {
+      const prefix = `proxies[${savedIndex}].`;
+      for (const w of validation.warnings) {
+        if (w && typeof w.field === 'string' && w.field.startsWith(prefix) && !proxyWarnings.includes(w.message)) {
+          proxyWarnings.push(w.message);
+        }
+      }
+    }
+    if (openPathIgnored) {
+      proxyWarnings.push(`${proxy.type} 类型的代理没有「访问路径」：已忽略填写的 ${rawOpenPath}`);
+    }
     /* 方案 Y：用户填了 https 类型或 TLS 插件，被自动纠正成纯 http 时明确告知，
      * 免得「我明明选了 https 怎么变成 http」的困惑。 */
     const wantedTls = String(input.type || '').toLowerCase() === 'https' || !!(input.plugin && input.plugin.type);
@@ -2248,7 +2355,7 @@ function registerIpc() {
     /* 访问路径存在我们这边（frpc.toml 不认这个字段）。改名时把旧名下的记录搬过来，
      * 免得「改个名访问路径就丢了」。 */
     if (mode === 'edit' && originalName && originalName !== proxy.name) dropProxyOpenPath(originalName);
-    setProxyOpenPath(proxy.name, input.openPath);
+    setProxyOpenPath(proxy.name, openPath);
     // 地址是这次现填的：顺手把「本机隧道目标」记到这个档案上，概览和服务器页才不会
     // 出现「本机隧道还没有归属到任何档案」。
     if (seed) settings = settingsModule.save({ clientServerId: seed.id });
@@ -3803,6 +3910,14 @@ async function syncCertToServerNginx(cert) {
     try {
       const domains = payload.domains;
       const email = String(payload.email || settings.acmeEmail || '').trim();
+      /* 先看用户填的域名，再看渠道：没填域名却提示「尚未配置 DNS 验证渠道」，
+       * 会让人以为先去配 token 就能签 —— 其实什么都没填。 */
+      const wantedDomains = (Array.isArray(domains) ? domains : [domains])
+        .map((d) => String(d || '').trim().toLowerCase())
+        .filter(Boolean);
+      if (!wantedDomains.length) return fail('请先填写要签发的域名（第一项作为主域名）');
+      const badDomain = wantedDomains.find((d) => !/^(\*\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(d));
+      if (badDomain) return fail(`域名「${badDomain}」不合法：只填域名本身，通配符写成 *.example.com`);
       const provider = currentDnsProvider();
       if (!provider.ok) return fail(provider.error);
       const sendProgress = (data) => {
@@ -4487,6 +4602,10 @@ async function bootstrap() {
   /* 老数据里同一个 IP 可能堆着十几条档案（连接表单每连一次就新建一条）。
    * 先合并再往下走：后面的 activeServerId 兜底、托盘菜单、下拉列表都按「一台机器一条」来。 */
   dedupeServerProfiles();
+  /* 访问路径的历史脏数据：老版本不限字符、也不看代理类型，settings 里可能留着
+   * 「udp 代理带访问路径」或带分号/换行的路径（那种值会写进 nginx 的 return 302）。
+   * 启动时统一过一遍闸：类型不对或字符不合法的直接丢掉，免得以后改类型时突然生效。 */
+  pruneOpenPaths();
   // 兜底：有档案但没有 activeServerId 时固定下来，避免每次启动都靠“取第一个”的隐式行为。
   if (!settings.activeServerId && settings.servers.length) {
     const fallback = findServerProfile(settings.clientServerId) || settings.servers[0];
