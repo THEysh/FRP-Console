@@ -41,6 +41,42 @@ function posixBasename(p) {
   return i < 0 ? s : s.slice(i + 1);
 }
 
+/* 备份 / 停用 / 临时文件不参与「证书引用是否还有效」的判断：
+ * 它们不会被 nginx 加载，却是我们自己（或用户）生成的副本，会把结论带偏。
+ * 1.2.67 删证书时踩过一次（自己的备份挡住删除），1.2.72 体检又踩了一次，所以提成共享常量。 */
+const CERT_REF_IGNORED = /\.(bak|disabled|old|orig|save|swp|tmp|rpmnew|rpmsave)([-.]|$)|~$/i;
+
+/* 从 `grep -rnoE 'ssl_certificate…'` 的输出里解析出「哪个文件的哪一行引用了哪个文件」。
+ * 只收绝对路径（相对路径在 nginx 里是相对 prefix，判断存在性容易误报）。 */
+function parseCertRefs(grepText) {
+  const out = [];
+  for (const line of String(grepText || '').split('\n')) {
+    const m = line.match(/^([^:]+):(\d+):(.*)$/);
+    if (!m) continue;
+    if (CERT_REF_IGNORED.test(m[1])) continue;
+    /* 注释行里的 ssl_certificate 不算引用（真实的 grep 用 ^[[:space:]]*ssl_certificate 已经排掉，
+     * 这里再兜一层：值前面出现 # 就跳过）。 */
+    const ahead = m[3].slice(0, m[3].indexOf('ssl_certificate'));
+    if (ahead.includes('#')) continue;
+    const value = (m[3].match(/ssl_certificate(?:_key)?\s+([^;]+);/) || [])[1];
+    if (!value) continue;
+    const p = value.trim().replace(/^['"]|['"]$/g, '');
+    if (!p.startsWith('/')) continue;
+    out.push({ path: p, file: m[1], line: Number(m[2]) || 0 });
+  }
+  return out;
+}
+
+/* 批量 `test -e` 的输出里，只认我们打的 MISSING 标记。 */
+function parseMissingPaths(text) {
+  return String(text || '')
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l.startsWith('MISSING '))
+    .map((l) => l.slice('MISSING '.length))
+    .filter(Boolean);
+}
+
 /* 从 nginx 配置文本里摘掉「body 中出现任一 needle」的 server { … } 块。
  * 只按大括号配对切 server 块，块外的注释和空行原样保留；
  * 块没闭合（配置本身就是坏的）就整段留着不动，交由 nginx -t 判定。 */
@@ -1597,14 +1633,13 @@ class ServerSession {
     /* 只算「nginx 真的会加载」的配置：备份（.bak-frpconsole-*）、我们停用掉的
      * （.disabled-frpconsole-*）、以及各种 .old/.orig/~ 都不参与判断 —— 否则
      * 「先停用站点再删证书」会被自己刚生成的备份文件挡住，永远删不掉。 */
-    const IGNORED = /\.(bak|disabled|old|orig|save|swp|tmp|rpmnew|rpmsave)([-.]|$)|~$/i;
     for (const raw of String(res.stdout || '').split('\n')) {
       const line = raw.trim();
       if (!line) continue;
       const m = line.match(/^([^:]+):(\d+):(.*)$/);
       if (!m) continue;
       const file = m[1];
-      if (IGNORED.test(file)) continue;
+      if (CERT_REF_IGNORED.test(file)) continue;
       if (!files.includes(file)) files.push(file);
       references.push({ file, line: Number(m[2]), content: m[3].trim().slice(0, 200) });
     }
@@ -1844,6 +1879,22 @@ class ServerSession {
       confDir = info.dir;
     }
     const confPath = `${confDir}/frp-console.conf`;
+    /* 写前校验（1.2.72）：证书文件不在就别写进 nginx。
+     * 之前是先写配置再 reload，如果 certDir 里的文件缺失（上传失败、被清理），
+     * 就会留下一份「指向不存在证书」的配置——平时看不出，重启 nginx 就整站起不来。 */
+    const certFile = `${certDir}/fullchain.pem`;
+    const keyFile = `${certDir}/key.pem`;
+    const existence = await this.exec(
+      `[ -f ${shellQuote(certFile)} ] && echo CERT_OK || echo CERT_MISSING; [ -f ${shellQuote(keyFile)} ] && echo KEY_OK || echo KEY_MISSING`,
+      10000,
+    );
+    const exOut = String(existence.stdout || '');
+    if (!/CERT_OK/.test(exOut) || !/KEY_OK/.test(exOut)) {
+      return {
+        ok: false,
+        error: `证书文件不存在，已拒绝写入 nginx 配置（${shellQuote(certFile)} / ${shellQuote(keyFile)}）：请重新部署证书或检查上传是否成功`,
+      };
+    }
     /* 根路径 302：很多服务根路径是 404，入口在 /panel/ 这类子路径上。
      * nginx 已经在这里替用户终止 TLS，顺手把 / 跳过去，根路径也就可用了。 */
     const redirectPath = String(rootRedirect || '').trim();
@@ -1893,6 +1944,106 @@ class ServerSession {
     await this.exec(`rm -f ${tmp} 2>/dev/null || true`, 6000);
     if (!install.ok) return { ok: false, error: `写入 nginx 配置失败：${(install.stderr || install.stdout || '权限不足').trim()}` };
     return { ok: true, confPath, content: conf };
+  }
+
+  /* 配置体检（1.2.72）：nginx -t 能不能过 + 所有 ssl_certificate(_key) 指向的文件还在不在。
+   * 为什么需要：证书可能在「程序之外」被删掉（手动 rm / certbot / 换面板留旧配置），
+   * 配置里还指着它，nginx 平时靠旧 worker 撑着看不出问题，一旦 reload 或重启整站起不来。
+   * 全程只读：一条 nginx -t + 一条批量 test -f，不改任何东西。 */
+  async checkNginxHealth() {
+    if (!this.connected) return { ok: false, error: '尚未连接服务器' };
+    const sudo = await this.detectSudo();
+    const prefix = sudo.ok ? sudo.prefix : '';
+    const test = await this.exec(`${prefix}nginx -t 2>&1`, 20000);
+    const testText = `${test.stdout || ''}\n${test.stderr || ''}`.trim();
+    const testOk = /syntax is ok|test is successful/i.test(testText) && !/\[emerg\]|\[error\]/i.test(testText);
+
+    /* 收集所有被引用的证书/私钥路径，以及引用它的配置文件（用于回显「哪个站点」）。
+     * 范围与删除证书时的引用检查一致：/etc/nginx + 宝塔的 vhost 目录。 */
+    const grep = await this.exec(
+      "grep -rnoE '^[[:space:]]*ssl_certificate(_key)?[[:space:]]+[^;]+;' /etc/nginx /www/server/panel/vhost/nginx 2>/dev/null | head -n 400 || true",
+      20000,
+    );
+    const refs = parseCertRefs(String(grep.stdout || ''));
+    const unique = Array.from(new Set(refs.map((r) => r.path))).slice(0, 60);
+    let missing = [];
+    if (unique.length) {
+      const cmd = unique.map((p) => `[ -e ${shellQuote(p)} ] || echo ${shellQuote(`MISSING ${p}`)}`).join('; ');
+      const chk = await this.exec(cmd, 20000);
+      missing = parseMissingPaths(String(chk.stdout || ''));
+    }
+
+    /* 缺失文件 → 是哪个配置文件的哪个站点。只对缺失项做，最多 12 个文件。 */
+    const confInfo = await this.detectNginxConfDir();
+    const ownConf = `${confInfo.dir}/frp-console.conf`;
+    const detail = [];
+    for (const path of missing.slice(0, 12)) {
+      const owners = refs.filter((r) => r.path === path);
+      const files = Array.from(new Set(owners.map((o) => o.file))).slice(0, 6);
+      const sites = [];
+      for (const f of files) {
+        const names = await this.exec(`grep -hoE '^[[:space:]]*server_name[[:space:]]+[^;]+;' ${shellQuote(f)} 2>/dev/null | head -n 3 || true`, 8000);
+        for (const n of String(names.stdout || '').split('\n')) {
+          const v = (n.match(/server_name\s+([^;]+);/) || [])[1];
+          if (v) for (const one of v.trim().split(/\s+/)) if (one && !sites.includes(one)) sites.push(one);
+        }
+      }
+      detail.push({
+        path,
+        files,
+        sites,
+        ours: files.includes(ownConf),
+        foreign: files.some((f) => f !== ownConf),
+      });
+    }
+    return {
+      ok: true,
+      testOk,
+      testText: testText.split('\n').slice(0, 6).join('\n'),
+      refCount: refs.length,
+      fileCount: unique.length,
+      missing: detail,
+      missingCount: missing.length,
+      ownConf,
+      checkedAt: Date.now(),
+    };
+  }
+
+  /* 一键修复（1.2.72）：把「引用缺失证书」的 server 块从**我们自己生成的**
+   * frp-console.conf 里摘掉并 reload；别人家的配置（宝塔站点等）只报告，不动手。 */
+  async repairNginxCertRefs({ paths = [] } = {}) {
+    if (!this.connected) return { ok: false, error: '尚未连接服务器' };
+    const needles = (Array.isArray(paths) ? paths : []).map((p) => String(p || '').trim()).filter(Boolean);
+    if (!needles.length) return { ok: false, error: '没有需要修复的证书引用' };
+    const confInfo = await this.detectNginxConfDir();
+    const confPath = `${confInfo.dir}/frp-console.conf`;
+    const cat = await this.exec(`cat ${shellQuote(confPath)} 2>/dev/null || true`, 10000);
+    const original = String(cat.stdout || '');
+    if (!original.trim()) return { ok: true, changed: false, note: '没有 frp-console.conf，无需修复' };
+    const stripped = removeServerBlocks(original, needles);
+    if (!stripped.removed) {
+      return { ok: true, changed: false, note: '引用缺失证书的块不在 frp-console.conf 里（属于其它站点配置），未改动', confPath };
+    }
+    const sudo = await this.detectSudo();
+    if (!sudo.ok) return sudo;
+    const prefix = sudo.prefix;
+    const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
+    const backup = `${confPath}.bak-frpconsole-${stamp}`;
+    await this.exec(`${prefix}cp -p ${shellQuote(confPath)} ${shellQuote(backup)} 2>/dev/null || true`, 8000);
+    const b64 = Buffer.from(stripped.text, 'utf8').toString('base64');
+    const tmp = '/tmp/frp-console-nginx.repair.conf';
+    await this.exec(`printf %s ${b64} | base64 -d > ${tmp}`, 15000);
+    const install = await this.exec(`${prefix}install -m 644 ${tmp} ${shellQuote(confPath)}`, 10000);
+    await this.exec(`rm -f ${tmp} 2>/dev/null || true`, 6000);
+    if (!install.ok) return { ok: false, error: `写入 nginx 配置失败：${(install.stderr || install.stdout || '权限不足').trim()}` };
+    const test = await this.exec(`${prefix}nginx -t 2>&1`, 15000);
+    const testText = `${test.stdout || ''}\n${test.stderr || ''}`.trim();
+    if (/\[emerg\]|\[error\]/i.test(testText)) {
+      await this.exec(`${prefix}cp -p ${shellQuote(backup)} ${shellQuote(confPath)} 2>/dev/null || true`, 8000);
+      return { ok: false, error: `摘掉引用块后 nginx -t 仍失败，已还原：${testText.split('\n').slice(0, 3).join(' ')}` };
+    }
+    const reload = await this.reloadNginx();
+    return { ok: true, changed: true, confPath, backup, reloaded: !!reload.ok, note: '已摘掉引用缺失证书的块并重新加载 nginx' };
   }
 
   /* 我们自己生成的 frp-console.conf 里，把「引用了某张已删证书」的 server 块摘掉。
@@ -2239,4 +2390,4 @@ function parsePortInput(text) {
   return { ok: true, ranges };
 }
 
-module.exports = { ServerSession, parseServiceUnits, rankServiceUnits, parsePortInput, removeServerBlocks, ufwAllowsPort };
+module.exports = { ServerSession, parseServiceUnits, rankServiceUnits, parsePortInput, removeServerBlocks, ufwAllowsPort, parseCertRefs, parseMissingPaths };

@@ -151,6 +151,8 @@ let serverConfig = { path: '', content: '', summary: null, error: '' };
 let sessionServerId = '';
 /* 最近一次 nginx 检测结果（服务器页进来就会拉一次），端口矩阵用它补 80/443 的「谁在监听」信号。 */
 let lastNginxState = null;
+/* 配置体检缓存（1.2.72）：{at, host, data}；切服务器/修复后清掉。 */
+let nginxHealthCache = null;
 
 /* 服务器证书扫描结果缓存（按 host 记，60 秒内不重复 SSH 扫盘）。 */
 let serverCertScanCache = { at: 0, host: '', certs: [], truncated: false };
@@ -1803,6 +1805,34 @@ function tunnelPrerequisiteError() {
   return '';
 }
 
+/* 插件代理（https2http / https2https）引用的证书文件在本机不存在时，frpc 会拒绝加载
+ * 整份配置 —— 表现为「一条都连不上」，报错却是英文的证书读取失败。
+ * 启动前先扫一遍，把「哪条代理缺哪个文件」用中文说清楚（1.2.72）。 */
+function pluginCertProblems() {
+  const out = [];
+  for (const proxy of (model && model.proxies) || []) {
+    const plugin = proxy && proxy.plugin;
+    if (!plugin || !plugin.type) continue;
+    if (plugin.type !== 'https2http' && plugin.type !== 'https2https') continue;
+    const missing = [];
+    for (const [field, value] of [['crtPath', plugin.crtPath], ['keyPath', plugin.keyPath]]) {
+      const p = String(value || '').trim();
+      if (!p) { missing.push(`${field} 未填写`); continue; }
+      if (!fs.existsSync(p)) missing.push(`${field} 不存在：${p}`);
+    }
+    if (missing.length) out.push({ name: proxy.name, missing });
+  }
+  return out;
+}
+
+function pluginCertProblemError() {
+  const problems = pluginCertProblems();
+  if (!problems.length) return '';
+  const first = problems[0];
+  const names = problems.map((p) => p.name).join('、');
+  return `代理「${names}」的证书文件不可用（${first.missing.join('；')}）。frpc 会因此拒绝加载整份配置、所有代理都起不来——请到「代理映射」里重新选择证书，或到「HTTPS 证书」页重新签发/部署`;
+}
+
 function registerIpc() {
   const ok = (data) => ({ ok: true, data });
   const fail = (error, extra = {}) => ({ ok: false, error: typeof error === 'string' ? error : (error && error.message) || String(error), ...extra });
@@ -2227,6 +2257,10 @@ function registerIpc() {
      * 所以先在主进程里把缺的前提说清楚。 */
     const missing = tunnelPrerequisiteError();
     if (missing) return fail(missing, { state: buildState() });
+    /* 插件证书缺失会让 frpc 整份配置加载失败（不是这一条代理不通，是全部不通），
+     * 所以启动前就说清楚是哪几条、缺哪个文件，别等 frpc 报一段英文。 */
+    const certProblem = pluginCertProblemError();
+    if (certProblem) return fail(certProblem, { state: buildState() });
     await refreshService({ detect: true });
     const result = await manager.start({ runMode: settings.runMode });
     await manager.refresh().catch(() => {});
@@ -2248,6 +2282,8 @@ function registerIpc() {
   });
 
   ipcMain.handle('tunnel:restart', async () => {
+    const certProblem = pluginCertProblemError();
+    if (certProblem) return fail(certProblem, { state: buildState() });
     await refreshService({ detect: false });
     suppressExitUntil = Date.now() + 15000;
     const result = await manager.restart({ runMode: settings.runMode });
@@ -3022,6 +3058,42 @@ function registerIpc() {
     }
   });
 
+  /* 配置体检（1.2.72）：nginx -t + 所有 ssl_certificate 文件是否还在。
+   * 只读，缓存 60 秒（一次体检要跑 grep + test -f，别每次重画卡片都跑）。 */
+  ipcMain.handle('server:nginx-health', async (event, payload = {}) => {
+    if (!serverSession.connected) return fail('尚未连接服务器');
+    const force = !!(payload && payload.force);
+    const host = serverSession.host;
+    if (!force && nginxHealthCache && nginxHealthCache.host === host && Date.now() - nginxHealthCache.at < 60000) {
+      return ok(nginxHealthCache.data);
+    }
+    try {
+      const health = await serverSession.checkNginxHealth();
+      if (!health.ok) return fail(health.error || '配置体检失败');
+      nginxHealthCache = { at: Date.now(), host, data: health };
+      return ok(health);
+    } catch (e) {
+      return fail(String((e && e.message) || e));
+    }
+  });
+
+  /* 一键修复：只动我们自己生成的 frp-console.conf（别人家的配置只报告不碰）。 */
+  ipcMain.handle('server:nginx-repair', async (event, payload = {}) => {
+    if (!serverSession.connected) return fail('尚未连接服务器');
+    try {
+      const paths = Array.isArray(payload && payload.paths) ? payload.paths : [];
+      const repair = await serverSession.repairNginxCertRefs({ paths });
+      if (!repair.ok) return fail(repair.error || '修复失败');
+      nginxHealthCache = null;
+      /* 没有 frp-console.conf 时会话层已经处理；缓存清掉让界面重新体检一次 */
+      const health = await serverSession.checkNginxHealth().catch(() => null);
+      if (health && health.ok) nginxHealthCache = { at: Date.now(), host: serverSession.host, data: health };
+      return ok({ ...repair, health: health && health.ok ? health : null });
+    } catch (e) {
+      return fail(String((e && e.message) || e));
+    }
+  });
+
   /* 服务器防火墙：只读状态 + 一键放行 frps 需要监听的端口。 */
   /* 本机 frpc 指向当前服务器时，代理映射的 remotePort 也在 frps 上监听、同样需要防火墙放行。 */
   function proxyRemotePorts() {
@@ -3686,10 +3758,35 @@ async function syncCertToServerNginx(cert) {
   ipcMain.handle('cert:remove', async (event, payload = {}) => {
     const domain = String((payload && payload.domain) || '').trim();
     if (!domain) return fail('缺少域名');
+    /* 删本机证书前先看有没有代理在用它的文件：https2http/https2https 的 crtPath/keyPath
+     * 指向就是这张证书，删了之后 frpc 会拒绝加载整份配置（所有代理一起起不来）。
+     * 只提示+要求确认，不硬拦：用户可能就是要先删证书再改代理。 */
+    const cert = acmeManager.get(domain);
+    const certDirs = cert && cert.crtPath ? [path.dirname(cert.crtPath)] : [];
+    const usedBy = [];
+    for (const proxy of (model && model.proxies) || []) {
+      const plugin = proxy && proxy.plugin;
+      if (!plugin) continue;
+      for (const value of [plugin.crtPath, plugin.keyPath]) {
+        const p = String(value || '').trim();
+        if (!p) continue;
+        if (certDirs.includes(path.dirname(p))) { usedBy.push(proxy.name); break; }
+      }
+    }
+    if (payload.dryRun) {
+      /* 只查询「谁在用」，不删任何东西：确认框要在用户点删除之前就把风险摆出来。 */
+      return ok({ dryRun: true, usedBy, exists: !!cert });
+    }
+    if (usedBy.length && !payload.force) {
+      return fail(
+        `还有 ${usedBy.length} 条代理在用这张证书（${usedBy.join('、')}）：删掉后 frpc 会拒绝加载配置、所有代理一起起不来。确认要先删的话，请再点一次「仍然删除」`,
+        { usedBy },
+      );
+    }
     const result = acmeManager.removeLocal(domain);
     if (!result.ok) return fail(result.error);
     pushState();
-    return ok({ removed: true });
+    return ok({ removed: true, usedBy });
   });
 
   /* 把服务器上已有的证书（宝塔 / certbot）导入本机库，之后就能统一查看/续期/部署。 */

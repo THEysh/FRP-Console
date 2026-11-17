@@ -66,6 +66,10 @@ const S = {
     logExpanded: false,
     logErrorsOnly: false,
     selftest: null,
+    /* 配置体检（1.2.72）：nginx -t 结果 + 引用缺失证书的文件清单。 */
+    nginxHealth: null,
+    nginxHealthBusy: false,
+    nginxRepairBusy: false,
     installBusy: false,
     installProgress: null,
     error: '',
@@ -1151,6 +1155,7 @@ async function loadServerState({ autoConnect = false } = {}) {
     renderServer(true);
     if (S.server.connected) {
       loadServerNginx(true).catch(() => {});
+    loadServerNginxHealth({ force: false }).catch(() => {});
       loadServerFirewall(true).catch(() => {});
     }
     // 只在“第一次打开服务器页”时自动连；绑定变化之类的刷新不打扰已断开的会话。
@@ -1171,6 +1176,24 @@ async function loadServerNginx(silent = false) {
   if (S.view === 'server') renderServer(true);
 }
 
+/* 配置体检（1.2.72）：nginx -t + 所有 ssl_certificate 指向的文件是否还在。
+ * 这条链路能抓到「配置还在指、证书已经没了」——nginx 平时靠旧 worker 撑着看不出，
+ * 一旦 reload/重启就整站起不来，属于必须提前暴露的故障。 */
+async function loadServerNginxHealth({ force = false, silent = true } = {}) {
+  if (!S.server.connected) return;
+  if (S.server.nginxHealthBusy) return;
+  S.server.nginxHealthBusy = true;
+  try {
+    const res = await FRP.serverNginxHealth({ force });
+    if (res && res.ok) S.server.nginxHealth = { ...res.data, error: '' };
+    else if (res && !res.ok) S.server.nginxHealth = { error: res.error || '配置体检失败' };
+  } catch (e) {
+    S.server.nginxHealth = { error: String((e && e.message) || e) };
+  } finally {
+    S.server.nginxHealthBusy = false;
+  }
+  if (S.view === 'server') renderServer(true);
+}
 async function loadServerFirewall(silent = false) {
   if (!S.server.connected) return;
   if (!silent) S.server.firewall = { ...(S.server.firewall || {}), loading: true };
@@ -1538,6 +1561,58 @@ function renderServerLogs() {
   if (expBtn) expBtn.textContent = S.server.logExpanded ? '收起' : '展开全部';
 }
 
+/* 配置体检结果（1.2.72）：nginx -t 通不通 + 有没有引用已经不存在的证书文件。
+ * 两种情况都要显式说出来，因为它们的后果都是「平时没事、重启 nginx 整站起不来」。 */
+function nginxHealthMarkup() {
+  const h = S.server.nginxHealth;
+  if (!h) {
+    return `<div class="field-hint" style="padding:0 16px 12px">正在体检 nginx 配置…</div>`;
+  }
+  if (h.error) {
+    return `<div class="note warn" style="margin:0 16px 12px">${icon('alert')}<div><strong>配置体检失败</strong><br>${esc(h.error)}</div></div>`;
+  }
+  const missing = Array.isArray(h.missing) ? h.missing : [];
+  const ours = missing.filter((m) => m.ours);
+  const foreign = missing.filter((m) => !m.ours);
+  const testBad = h.testOk === false;
+  if (!testBad && !missing.length) {
+    return `<div class="note" style="margin:0 16px 12px">${icon('check')}<div><strong>配置体检通过</strong><br>nginx -t 正常；${Number(h.fileCount) || 0} 个证书/私钥文件都在（共 ${Number(h.refCount) || 0} 处引用）。</div></div>`;
+  }
+  const testLine = testBad
+    ? `<div class="mono" style="margin-top:6px;white-space:pre-wrap">${esc(h.testText || 'nginx -t 失败')}</div>`
+    : '';
+  const listHtml = missing.length
+    ? `<ul style="margin:8px 0 0;padding-left:18px">${missing.slice(0, 8).map((m) => {
+      const sites = (m.sites || []).filter(Boolean).join('、');
+      return `<li><code>${esc(m.path)}</code>${sites ? `（站点 ${esc(sites)}）` : ''}${m.ours ? '' : ' · 其它站点配置'}</li>`;
+    }).join('')}${missing.length > 8 ? `<li>…还有 ${missing.length - 8} 处</li>` : ''}</ul>`
+    : '';
+  const tone = testBad || ours.length ? 'error' : 'warn';
+  const title = testBad
+    ? (missing.length ? `nginx -t 失败，另有 ${missing.length} 处引用了不存在的证书` : 'nginx -t 失败')
+    : `${missing.length} 处引用了不存在的证书文件`;
+  /* nginx -t 通过但仍有悬空引用：说明引用它的配置没被加载（未 include 的片段/未启用站点），
+   * 不会立刻炸，但属于要清理的脏数据 —— 明确说清楚，别让用户以为「反正没影响」。 */
+  const benignNote = (!testBad && missing.length)
+    ? '<div class="field-hint" style="margin-top:6px">nginx -t 仍然通过，说明引用这些文件的配置没有被加载（未 include 的片段或未启用的站点）；不会立刻出事，但建议清理，免得哪天启用后重启就起不来。</div>'
+    : '';
+  return `
+    <div class="note ${tone}" style="margin:0 16px 12px">${icon('alert')}<div>
+      <strong>${esc(title)}</strong><br>
+      配置里还指着这些文件，但它们已经不在了。nginx 现在靠旧进程撑着，<b>一旦 reload 或重启就会整站起不来</b>。
+      ${testLine}
+      ${listHtml}
+      ${benignNote}
+      ${foreign.length ? `<div class="field-hint" style="margin-top:8px">其中 ${foreign.length} 处属于其它站点配置（宝塔/系统站点），不会自动改动；需要你到证书页用「换成别的证书」处理，或自行编辑那些配置文件。</div>` : ''}
+      <div class="page-actions" style="margin-top:10px">
+        <button class="btn small" type="button" data-act="server.nginx.health">${icon('reload')}<span>重新体检</span></button>
+        ${ours.length
+          ? `<button class="btn small primary" type="button" data-act="server.nginx.repair" ${S.server.nginxRepairBusy ? 'disabled' : ''}>${S.server.nginxRepairBusy ? '<span class="spinner-sm"></span>' : icon('check')}<span>${S.server.nginxRepairBusy ? '修复中…' : `修复我们自己的配置（${ours.length} 处）`}</span></button>`
+          : ''}
+      </div>
+    </div>`;
+}
+
 function nginxCardMarkup() {
   const n = S.server.nginx || {};
   /* 状态还没拉回来时不能断言「未安装」——以前 `!n` 对空对象恒为假，
@@ -1616,6 +1691,7 @@ function nginxCardMarkup() {
       ${ready
         ? `<div class="note" style="margin:0 16px 12px">${icon('check')}<div><strong>反代已就绪</strong><br>${esc(namesText || '你的域名')} → nginx 80/443${n.frpsHttpPort ? ` → frps HTTP vhost（${esc(String(n.frpsHttpPort))}）` : ' → frps HTTP vhost'}。现在用 <code>https://你的域名</code> 就能访问，不带端口。</div></div>`
         : ''}
+      ${installed ? nginxHealthMarkup() : ''}
     </section>`;
 }
 
@@ -2585,6 +2661,7 @@ async function autoConnectActiveProfile() {
     if (S.server.connected) {
       loadServerLogs().catch(() => {});
       loadServerNginx(true).catch(() => {});
+    loadServerNginxHealth({ force: false }).catch(() => {});
       loadServerFirewall(true).catch(() => {});
       openShellTerm().catch(() => {});   // SSH 终端默认打开
     }
@@ -3023,6 +3100,7 @@ async function connectServer(btn, options = undefined) {
     }
     await loadServerLogs();
     loadServerNginx(true).catch(() => {});
+    loadServerNginxHealth({ force: false }).catch(() => {});
     loadServerFirewall(true).catch(() => {});
   });
 }
@@ -4720,8 +4798,45 @@ async function handleAction(act, dataset, btn) {
         break;
       }
       case 'server.nginx.refresh':
-        await withBusy(btn, () => loadServerNginx(false));
+        await withBusy(btn, async () => {
+          await loadServerNginx(false);
+          await loadServerNginxHealth({ force: true, silent: false });
+        });
         break;
+      case 'server.nginx.health':
+        await withBusy(btn, () => loadServerNginxHealth({ force: true, silent: false }));
+        break;
+      case 'server.nginx.repair': {
+        if (S.server.nginxRepairBusy) break;
+        const health = S.server.nginxHealth || {};
+        const paths = (health.missing || []).filter((m) => m.ours).map((m) => m.path);
+        if (!paths.length) {
+          toast('warn', '没有需要修复的项', '我们自己的 frp-console.conf 里没有引用失效证书');
+          break;
+        }
+        const okGo = await confirmDialog({
+          title: '修复 nginx 配置',
+          body: `将从 <code>frp-console.conf</code> 里摘掉 ${paths.length} 个引用已失效证书的 server 块（先备份成 .bak-frpconsole-*），然后 nginx -t 校验并 reload。其它站点的配置不会动。`,
+          confirmText: '修复并重载',
+        });
+        if (!okGo) break;
+        S.server.nginxRepairBusy = true;
+        renderServer(true);
+        try {
+          const res = await FRP.serverNginxRepair({ paths });
+          if (res && res.ok) {
+            if (res.data && res.data.health) S.server.nginxHealth = res.data.health;
+            toast('success', '已修复 nginx 配置', res.data.note || '');
+            await loadServerNginx(true);
+          } else {
+            toastResult(res);
+          }
+        } finally {
+          S.server.nginxRepairBusy = false;
+          renderServer(true);
+        }
+        break;
+      }
       case 'server.nginx.setup': {
         if (S.server.nginxBusy) break;
         S.server.nginxBusy = true;
@@ -5515,26 +5630,32 @@ async function handleAction(act, dataset, btn) {
       }
       case 'certs.remove': {
         const domain = dataset.domain;
+        /* 先问主进程「有没有代理在用这张证书」：https2http/https2https 的 crtPath 指向它，
+         * 删了之后 frpc 会拒绝加载整份配置（所有代理一起起不来），必须在确认框里说清楚。 */
+        const probe = await FRP.certRemove(domain, { dryRun: true }).catch(() => null);
+        const usedBy = (probe && probe.usedBy) || [];
         openModal(`
-          <div class="modal" style="width:440px">
+          <div class="modal" style="width:460px">
             <div class="modal-head">
               <div class="mh-icon" style="color:var(--red)">${icon('trash')}</div>
               <div class="grow"><h3>删除证书</h3><p>只删除本机保存的证书与私钥，不会吊销 CA 侧已签发的证书。</p></div>
               <button class="icon-btn modal-close" type="button" data-act="modal.close">${icon('x')}</button>
             </div>
             <div class="modal-body">
-              <div class="note warn">${icon('alert')}<div>删除后，引用 <strong>${esc(domain)}</strong> 证书的 https2http / https2https 代理会失去证书，公网访问会失败，直到重新签发并填回路径。</div></div>
+              ${usedBy.length
+                ? `<div class="note error">${icon('alert')}<div><strong>有 ${usedBy.length} 条代理正在用这张证书</strong><br>${esc(usedBy.join('、'))}<br>删掉后 frpc 会拒绝加载整份配置，<b>所有代理一起起不来</b>。建议先把这些代理改成别的证书（或删掉它们），再删这张。</div></div>`
+                : `<div class="note warn">${icon('alert')}<div>删除后，引用 <strong>${esc(domain)}</strong> 证书的 https2http / https2https 代理会失去证书，公网访问会失败，直到重新签发并填回路径。</div></div>`}
             </div>
             <div class="modal-foot">
               <span class="mf-left"></span>
               <button class="btn" type="button" data-act="modal.close">取消</button>
-              <button class="btn danger" type="button" id="cert-del-confirm">${icon('trash')}<span>删除</span></button>
+              <button class="btn danger" type="button" id="cert-del-confirm">${icon('trash')}<span>${usedBy.length ? '仍然删除' : '删除'}</span></button>
             </div>
           </div>`);
         const delBtn = $('#cert-del-confirm');
         if (delBtn) delBtn.addEventListener('click', async () => {
           delBtn.disabled = true;
-          const res = await FRP.certRemove(domain);
+          const res = await FRP.certRemove(domain, { force: true });
           if (res && res.ok) {
             closeModal();
             toast('success', '已删除证书', domain);
