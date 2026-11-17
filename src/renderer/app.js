@@ -2100,6 +2100,8 @@ function renderServer(force = false) {
   toggleWizardGroups();
   // 终端会话跨重渲染存活：DOM 被 innerHTML 换掉后把 xterm 搬回新容器。
   remountShellTerm();
+  /* 连接表单里的「这台机器已有档案」提示要在渲染后立刻反映当前预填地址。 */
+  updateConnectHostNote();
   if (s.mode === 'wizard' && !s.previewText) schedulePreview(true);
   if (s.connected && !s.logs && !s.logsLoading) {
     s.logsLoading = true;
@@ -2174,7 +2176,15 @@ function profileBarMarkup(options = {}) {
   const rows = tunnelDiff(active, tunnel);
   const boundToActive = !!(active && tunnel && tunnel.profileId === active.id);
   const synced = boundToActive && !rows.length;
-  const profileOptions = profiles.map((p) => `<option value="${esc(p.id)}" ${p.id === s.activeServerId ? 'selected' : ''}>${esc(p.name || p.host)}${p.host ? ` · ${esc(p.host)}` : ''}${p.id === s.clientServerId ? '（本机隧道）' : ''}</option>`).join('');
+  const profileOptions = profiles.map((p) => `<option value="${esc(p.id)}" ${p.id === s.activeServerId ? 'selected' : ''}>${esc(p.name || p.host)}${p.host ? ` · ${esc(p.host)}:${esc(p.port || 22)}` : ''}${p.id === s.clientServerId ? '（本机隧道）' : ''}</option>`).join('');
+  /* 历史遗留：同一个 IP 可能堆着多条档案（老版本每连一次就新建一条）。
+   * 有重复时给一个「整理」入口；平时不出现，避免干扰。 */
+  const keyCounts = new Map();
+  for (const p of profiles) {
+    const k = profileKeyOf(p.host, p.port);
+    if (k) keyCounts.set(k, (keyCounts.get(k) || 0) + 1);
+  }
+  const dupExtra = [...keyCounts.values()].reduce((n, c) => n + (c > 1 ? c - 1 : 0), 0);
 
   /* 还没连上这台服务器时，讲“本机隧道指向别处”只会让人以为出错了。
    * 这时候该说的是下一步动作：连上去。 */
@@ -2210,6 +2220,7 @@ function profileBarMarkup(options = {}) {
           </select>
           <button class="btn" type="button" data-act="server.profile.new">${icon('plus')}<span>新建</span></button>
           <button class="btn ghost" type="button" data-act="server.profile.edit" ${active ? '' : 'disabled'}>${icon('edit')}<span>编辑</span></button>
+          ${dupExtra ? `<button class="btn ghost" type="button" data-act="server.profiles.dedupe" title="同一台机器（IP + SSH 端口）只保留一条档案，其余合并进来">${icon('box')}<span>整理重复（${dupExtra}）</span></button>` : ''}
           <button class="btn ghost danger-text" type="button" data-act="server.profile.delete" ${active ? '' : 'disabled'}>${icon('trash')}<span>删除</span></button>
         </div>
       </div>
@@ -2787,6 +2798,37 @@ function confirmDeleteServerProfile() {
   }
 }
 
+/* 档案身份 = host + SSH 端口（用户名只是登录属性）。与服务端 settings.serverProfileKey 保持一致。 */
+function profileKeyOf(host, port) {
+  const h = String(host || '').trim().toLowerCase().replace(/\.+$/, '');
+  const p = Number(port) || 22;
+  return h ? `${h}:${p}` : '';
+}
+
+/* 连接表单里实时告诉用户：这个地址已经有档案了（连接会更新它），还是会被新建一条。 */
+function updateConnectHostNote() {
+  const note = $('#cf-host-note');
+  const form = $('#server-form');
+  if (!note || !form) return;
+  const host = (form.querySelector('[name="host"]') || {}).value || '';
+  const port = (form.querySelector('[name="port"]') || {}).value || 22;
+  const key = profileKeyOf(host, port);
+  if (!key) {
+    note.className = 'field-hint';
+    note.textContent = '同一台机器（IP + SSH 端口）只保留一条档案；连已有的机器会更新那条，不会新建。';
+    return;
+  }
+  const hit = (S.server.profiles || []).find((p) => profileKeyOf(p.host, p.port) === key);
+  if (hit) {
+    const when = Number(hit.lastConnectedAt) ? new Date(Number(hit.lastConnectedAt)).toLocaleString('zh-CN', { hour12: false }) : '';
+    note.className = 'field-hint ok';
+    note.textContent = `已有档案「${hit.name || hit.host}」${when ? ` · 最近连接 ${when}` : ''}——连接会更新这条档案，不会新建。`;
+  } else {
+    note.className = 'field-hint';
+    note.textContent = '这台机器还没有档案，连接成功后会新建一条。';
+  }
+}
+
 function connectedFormMarkup() {
   const s = S.server;
   const saved = s.saved || {};
@@ -2813,6 +2855,7 @@ function connectedFormMarkup() {
           <div class="field span-2">
             <label>服务器 IP / 域名 <span class="req">*</span></label>
             <input class="input" name="host" value="${esc(defaultHost)}" placeholder="例如 frps.example.com" spellcheck="false">
+            <div class="field-hint" id="cf-host-note">同一台机器（IP + SSH 端口）只保留一条档案；连已有的机器会更新那条，不会新建。</div>
           </div>
           <div class="field">
             <label>SSH 端口</label>
@@ -4561,6 +4604,19 @@ async function handleAction(act, dataset, btn) {
       case 'server.profile.delete':
         confirmDeleteServerProfile();
         break;
+      case 'server.profiles.dedupe': {
+        await withBusy(btn, async () => {
+          const res = await FRP.serverProfilesDedupe();
+          if (!res || !res.ok) return toastResult(res);
+          applyServerState(res.data.state, serverSeq());
+          renderServer(true);
+          const d = res.data;
+          if (!d.changed) return toast('info', '没有重复档案', '每台机器（IP + SSH 端口）都只有一条。');
+          toast('success', '已合并重复档案', `${d.before} 条 → ${d.after} 条：${d.summary || ''}`);
+          if (d.backupError) toast('warn', '合并完成，但备份失败', d.backupError);
+        });
+        break;
+      }
       case 'server.profile.modal.save':
         await saveServerProfileModal(btn);
         break;
@@ -6262,6 +6318,11 @@ function bindStaticEvents() {
     handleAction(btn.dataset.act, btn.dataset, btn);
   });
   document.addEventListener('input', (e) => {
+    /* 连接表单填地址/端口时，实时提示「这台机器已有档案」。 */
+    if (e.target.closest('#server-form')) {
+      if (e.target.name === 'host' || e.target.name === 'port') updateConnectHostNote();
+      return;
+    }
     if (!e.target.closest('#wizard-form')) return;
     S.server.template = 'custom';
     S.server.wizardDirty = true;

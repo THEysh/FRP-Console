@@ -87,6 +87,7 @@ contextBridge.exposeInMainWorld('FRP', {
   serverSelect: (id) => invoke('server:select', { id }),
   serverProfileSave: (payload) => invoke('server:profile-save', payload),
   serverProfileDelete: (id, force) => invoke('server:profile-delete', { id, force }),
+  serverProfilesDedupe: () => invoke('server:profiles-dedupe'),
   serverProfileClearPassword: (id) => invoke('server:profile-clear-password', { id }),
   serverApply: (id, force) => invoke('server:apply', { id, force }),
   serverBindClient: (payload) => invoke('server:bind-client', payload),

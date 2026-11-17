@@ -199,16 +199,13 @@ function findServerProfile(id) {
   return serverProfiles().find((item) => item.id === target) || null;
 }
 
-/* 按「同一台机器」找档案：host + SSH 端口 + 用户名 三者都相同就认为是同一个目标。
+/* 按「同一台机器」找档案：host + SSH 端口相同就是同一个目标（用户名只是登录属性）。
  * 连接的入口（连接表单）不给 id，以前一律 upsert 新建，于是用户每连一次就多一条
  * 同名档案——实测一个账号里能攒出 25 条 154.36.178.154。 */
-function findServerProfileByTarget({ host, port, username } = {}) {
-  const h = String(host || '').toLowerCase();
-  const p = Number(port);
-  const u = String(username || '');
-  if (!h || !p) return null;
-  const list = serverProfiles().filter((item) => String(item.host || '').toLowerCase() === h
-    && Number(item.port) === p && String(item.username || '') === u);
+function findServerProfileByKey({ host, port } = {}) {
+  const key = settingsModule.serverProfileKey({ host, port });
+  if (!key) return null;
+  const list = serverProfiles().filter((item) => settingsModule.serverProfileKey(item) === key);
   if (!list.length) return null;
   /* 有多条历史重复档案时，优先用最近连过的、且存了密码的那条，避免用户被要求重输密码。 */
   return list.sort((a, b) => {
@@ -387,7 +384,9 @@ function migrateLegacyServerSecret() {
 }
 
 function upsertServerProfile(input, { activate = false } = {}) {
-  const current = input && input.id ? findServerProfile(input.id) : null;
+  /* 档案的身份是「哪台机器」（host + 端口），不是随机 id。没给 id 时先按主机键找一遍：
+   * 找到就更新那条，而不是再追加一条新档案（这是 1.2.69 之前堆积重复档案的根因）。 */
+  const current = (input && input.id ? findServerProfile(input.id) : null) || findServerProfileByKey(input);
   const patch = {};
   for (const [key, value] of Object.entries(input || {})) {
     if (value !== undefined) patch[key] = value;
@@ -405,6 +404,58 @@ function upsertServerProfile(input, { activate = false } = {}) {
     settings = settingsModule.save({ activeServerId: merged.id });
   }
   return findServerProfile(merged.id);
+}
+
+/* ---------------------- 服务器档案去重（1.2.69） ----------------------
+ * 档案的身份是「哪台机器」= host + SSH 端口。历史上连接表单不给 id 就新建一条，
+ * 于是同一个 IP 能堆出十几条同名档案（下拉里分不清、改错条目不生效）。
+ * 这里把同一台机器的多条合并成一条：先备份，再搬密码、再重指绑定关系。
+ * 幂等：没有重复时什么都不做，也不写盘。 */
+function dedupeServerProfiles({ backup = true } = {}) {
+  const before = serverProfiles();
+  const { servers, merged } = settingsModule.mergeDuplicateServers(before);
+  if (!merged.length) return { ok: true, changed: false, before: before.length, after: before.length, groups: [] };
+
+  let backupError = '';
+  if (backup) {
+    try {
+      const dir = path.join(settingsModule.dataDir(), 'backups');
+      fs.mkdirSync(dir, { recursive: true });
+      const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
+      const files = [
+        [settingsModule.settingsFile(), `settings.json.bak-dedupe-${stamp}`],
+        [settingsModule.serverSecretFile(), `server-secret.json.bak-dedupe-${stamp}`],
+      ];
+      for (const [src, name] of files) {
+        if (src && fs.existsSync(src)) fs.copyFileSync(src, path.join(dir, name));
+      }
+    } catch (e) {
+      backupError = String((e && e.message) || e);
+    }
+  }
+
+  /* 密码是按档案 id 存的：被并掉的 id 上的密码必须搬到保留项，否则用户会被要求重输。 */
+  for (const group of merged) {
+    if (!settingsModule.hasServerSecret(group.keepId)) {
+      const donor = group.dropped.find((id) => settingsModule.hasServerSecret(id));
+      if (donor) {
+        const secret = settingsModule.readServerSecret(donor);
+        if (secret) settingsModule.saveServerSecret(group.keepId, secret);
+      }
+    }
+    for (const dropped of group.dropped) settingsModule.clearServerSecret(dropped);
+  }
+
+  const remap = new Map();
+  for (const group of merged) for (const dropped of group.dropped) remap.set(dropped, group.keepId);
+  const activeServerId = remap.get(settings.activeServerId) || settings.activeServerId;
+  const clientServerId = remap.get(settings.clientServerId) || settings.clientServerId;
+  settings = settingsModule.save({ servers, activeServerId, clientServerId });
+
+  const summary = merged.map((g) => `${g.key} ×${g.dropped.length + 1} → 1`).join('、');
+  // eslint-disable-next-line no-console
+  console.log(`[profiles] 合并重复服务器档案：${before.length} → ${servers.length}（${summary}）`);
+  return { ok: true, changed: true, before: before.length, after: servers.length, groups: merged, summary, backupError };
 }
 
 /* --------------------------- 托盘 --------------------------- */
@@ -2328,6 +2379,16 @@ function registerIpc() {
 
   ipcMain.handle('server:state', async () => ok(serverState()));
 
+  /* 手动「整理重复档案」：与启动时的自动迁移同一套逻辑，幂等，随时可按。 */
+  ipcMain.handle('server:profiles-dedupe', async () => {
+    const result = dedupeServerProfiles();
+    if (result.changed) {
+      notify('info', '已合并重复的服务器档案', `${result.before} 条 → ${result.after} 条：${result.summary || ''}`);
+      pushState();
+    }
+    return ok({ ...result, state: serverState(), backupError: result.backupError || '' });
+  });
+
   ipcMain.handle('server:select', async (event, payload = {}) => {
     const profile = findServerProfile(payload.id);
     if (!profile) return fail('服务器档案不存在', { state: serverState() });
@@ -2582,7 +2643,7 @@ function registerIpc() {
     }
     /* 表单连接没带档案时，先看是不是连「同一台机器」——有就复用，别每次新建一条同名档案。
      * 复用后仍会走下面的 upsert 更新地址/端口，并把 activeServerId 指过去。 */
-    if (!profile) profile = findServerProfileByTarget({ host, port, username });
+    if (!profile) profile = findServerProfileByKey({ host, port });
     const wasNew = !profile;
     if (!profile) profile = upsertServerProfile({ host, port, username, name: host });
     if (!password) password = settingsModule.readServerSecret(profile.id);
@@ -4093,6 +4154,9 @@ async function bootstrap() {
   loadConfigFromDisk();
   ensureClientServerProfile();
   migrateLegacyServerSecret();
+  /* 老数据里同一个 IP 可能堆着十几条档案（连接表单每连一次就新建一条）。
+   * 先合并再往下走：后面的 activeServerId 兜底、托盘菜单、下拉列表都按「一台机器一条」来。 */
+  dedupeServerProfiles();
   // 兜底：有档案但没有 activeServerId 时固定下来，避免每次启动都靠“取第一个”的隐式行为。
   if (!settings.activeServerId && settings.servers.length) {
     const fallback = findServerProfile(settings.clientServerId) || settings.servers[0];

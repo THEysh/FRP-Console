@@ -97,6 +97,63 @@ function normalizeServers(list) {
   return result;
 }
 
+/* 服务器档案的身份 = 「哪台机器」= host + SSH 端口。
+ * username 只是登录属性，同一台机器换账号不该多出一条档案。
+ * host 归一：去空格、转小写、去掉结尾的根域点（example.com. 与 example.com 是同一台）。 */
+function serverProfileKey(profile = {}) {
+  const host = String(profile.host || '').trim().toLowerCase().replace(/\.+$/, '');
+  const port = Number(profile.port) || 22;
+  return host ? `${host}:${port}` : '';
+}
+
+/* 把「同一台机器」的多条档案合并成一条。返回 { servers, merged }，
+ * merged 里记录每个键被并掉的 id 列表与保留的 id，供调用方迁移密码与绑定关系。 */
+function mergeDuplicateServers(list) {
+  const groups = new Map();
+  const keyless = [];
+  for (const profile of Array.isArray(list) ? list : []) {
+    const key = serverProfileKey(profile);
+    if (!key) {
+      /* 没有地址的档案（半截新建、或用户清空了 host）不参与合并，也不能丢。 */
+      keyless.push(profile);
+      continue;
+    }
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(profile);
+  }
+  const merged = [];
+  const out = [...keyless];
+  for (const [key, items] of groups) {
+    if (items.length === 1) {
+      out.push(items[0]);
+      continue;
+    }
+    /* 保留哪一条：最近连接过的优先，其次 created 最早的（历史更长、地址更可信）。 */
+    const sorted = [...items].sort((a, b) => {
+      const at = Number(a.lastConnectedAt) || 0;
+      const bt = Number(b.lastConnectedAt) || 0;
+      if (at !== bt) return bt - at;
+      return (Number(a.createdAt) || 0) - (Number(b.createdAt) || 0);
+    });
+    const keep = { ...sorted[0] };
+    const ts = (v) => (Number(v) > 0 ? Number(v) : 0);
+    for (const other of sorted.slice(1)) {
+      /* 合并规则：保留项为空时才用别人的值；时间字段取极值。
+       * 服务器事实（nginx 反代、vhost 端口）跟着保留项走——它代表最近一次连上时的结论。 */
+      for (const field of ['clientToken', 'configPath', 'dashboardUrl', 'serviceName', 'frpcPath']) {
+        if (!keep[field] && other[field]) keep[field] = other[field];
+      }
+      if (!keep.clientPort && other.clientPort) keep.clientPort = other.clientPort;
+      const created = [ts(keep.createdAt), ts(other.createdAt)].filter(Boolean);
+      keep.createdAt = created.length ? Math.min(...created) : Date.now();
+      keep.lastConnectedAt = Math.max(ts(keep.lastConnectedAt), ts(other.lastConnectedAt));
+    }
+    out.push(keep);
+    merged.push({ key, keepId: keep.id, dropped: sorted.slice(1).map((item) => item.id) });
+  }
+  return { servers: out, merged };
+}
+
 let cached = null;
 // v1 的 settings.server.host 只在首次载入时存在，单独记一份，
 // 避免 save() 之后丢掉线索导致单密码永远无法迁移。
@@ -450,6 +507,8 @@ module.exports = {
   ensureDir,
   newServerId,
   normalizeServerProfile,
+  serverProfileKey,
+  mergeDuplicateServers,
   readServerSecret,
   hasServerSecret,
   hasLegacySecret,
