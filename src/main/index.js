@@ -3533,20 +3533,56 @@ function registerIpc() {
     }
   });
 
-  /* 从服务器删除一张证书：先查「还有没有站点在引用」，无引用才删，删完 reload nginx。
+  /* 从服务器删除一张证书：默认先查「还有没有站点在引用」，无引用才删，删完 reload nginx。
    * 服务器上的证书可能正被某个站点的 ssl_certificate 引用，删掉会直接让站点断连，
-   * 所以这一步必须在主进程里做完检查再动文件（不能只靠前端确认框）。 */
+   * 所以默认必须拦；但服务器是用户自己的，force=true 时按用户意愿执行
+   * （前端要先让他勾选「我知道后果」才带这个参数）。 */
   ipcMain.handle('cert:server-remove', async (event, payload = {}) => {
     try {
       if (!serverSession.connected) return fail('尚未连接服务器');
       const certPath = String((payload && payload.certPath) || '').trim();
       const keyPath = String((payload && payload.keyPath) || '').trim();
-      const res = await serverSession.deleteRemoteCert({ certPath, keyPath });
+      const force = !!(payload && payload.force);
+      const res = await serverSession.deleteRemoteCert({ certPath, keyPath, force });
       if (!res.ok) {
         if (res.blocked) return fail(res.error, { blocked: true, references: res.references || [], sites: res.sites || [] });
         return fail(res.error);
       }
       /* 删完让下一次扫描重新读盘，别拿缓存里的旧列表糊弄用户。 */
+      serverCertScanCache = { at: 0, host: '', certs: [], truncated: false };
+      pushState();
+      return ok(res);
+    } catch (e) {
+      return fail(String((e && e.message) || e));
+    }
+  });
+
+  /* 把引用某张证书的 nginx 配置改指到另一张证书（换证不换站点）。 */
+  ipcMain.handle('cert:replace-refs', async (event, payload = {}) => {
+    try {
+      if (!serverSession.connected) return fail('尚未连接服务器');
+      const res = await serverSession.replaceCertReference({
+        fromCert: String((payload && payload.fromCert) || '').trim(),
+        fromKey: String((payload && payload.fromKey) || '').trim(),
+        toCert: String((payload && payload.toCert) || '').trim(),
+        toKey: String((payload && payload.toKey) || '').trim(),
+      });
+      if (!res.ok) return fail(res.error, res.changed ? { changed: res.changed } : {});
+      serverCertScanCache = { at: 0, host: '', certs: [], truncated: false };
+      pushState();
+      return ok(res);
+    } catch (e) {
+      return fail(String((e && e.message) || e));
+    }
+  });
+
+  /* 停用引用某张证书的站点（配置文件改名成 .disabled-frpconsole-<时间戳>，随时可改回）。 */
+  ipcMain.handle('cert:disable-refs', async (event, payload = {}) => {
+    try {
+      if (!serverSession.connected) return fail('尚未连接服务器');
+      const files = Array.isArray(payload && payload.files) ? payload.files : [];
+      const res = await serverSession.disableNginxSites({ files });
+      if (!res.ok) return fail(res.error);
       serverCertScanCache = { at: 0, host: '', certs: [], truncated: false };
       pushState();
       return ok(res);

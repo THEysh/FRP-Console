@@ -3491,6 +3491,142 @@ function serverCertRow(c, { hasLocal = false } = {}) {
     </div>`;
 }
 
+/* 「有站点在引用这张证书」弹窗：不硬拒，给用户三条出路。
+ * ①换证书（站点不动、证书换个文件）②停用引用它的站点 ③确认没用就强制删除。
+ * 服务器是用户自己的，程序只负责把后果说清楚 + 每一步都留回滚。 */
+function openCertRefsModal({ domain, certPath, keyPath, refs = [], sites = [] }) {
+  const isOwnConf = (f) => /frp-console\.conf$/.test(String(f || ''));
+  const refFiles = Array.from(new Set(refs.map((r) => r.file)));
+  const disableable = refFiles.filter((f) => !isOwnConf(f));
+  const ownsConf = refFiles.some(isOwnConf);
+
+  /* 候选证书：服务器上现有的（除自己）+ 本机库里的，供「换成别的证书」用。 */
+  const candidates = [];
+  const pushCand = (c) => {
+    const cp = String((c && (c.certPath || c.crtPath)) || '').trim();
+    const kp = String((c && c.keyPath) || '').trim();
+    if (!cp || cp === certPath) return;
+    if (candidates.some((x) => x.certPath === cp)) return;
+    candidates.push({ certPath: cp, keyPath: kp, domain: String((c && c.domain) || ''), from: c.from || '', daysLeft: c.daysLeft });
+  };
+  for (const c of (S.certs.server && S.certs.server.certs) || []) pushCand({ ...c, from: '服务器' });
+  for (const c of S.certs.list || []) pushCand({ ...c, certPath: c.crtPath, from: '本机' });
+
+  const candOptions = candidates.length
+    ? candidates.map((c) => `<option value="${esc(c.certPath)}">${esc(c.domain || c.certPath)} · ${esc(c.from)} · ${c.daysLeft === null || c.daysLeft === undefined ? '到期未知' : `剩余 ${c.daysLeft} 天`}</option>`).join('')
+    : '<option value="">（没有其它可用证书）</option>';
+
+  const who = sites.length ? sites.map((s) => `<strong>${esc(s)}</strong>`).join('、') : refFiles.map((f) => `<code>${esc(f)}</code>`).join('、');
+
+  openModal(`
+    <div class="modal" style="width:620px">
+      <div class="modal-head">
+        <div class="mh-icon" style="color:var(--amber)">${icon('alert')}</div>
+        <div class="grow"><h3>还有站点在引用这张证书</h3><p>直接删会让这些站点在 nginx 重启后没有证书可用。你可以先断开引用，也可以确认没用了直接删。</p></div>
+        <button class="icon-btn modal-close" type="button" data-act="modal.close">${icon('x')}</button>
+      </div>
+      <div class="modal-body">
+        <div class="note warn">${icon('alert')}<div>引用它的站点：${who}</div></div>
+        <div class="cert-paths mono" style="margin-top:10px;max-height:130px;overflow:auto">
+          ${refs.map((r) => `<div><code>${esc(r.file)}:${esc(String(r.line))}</code> ${esc(r.content)}</div>`).join('')}
+        </div>
+
+        <div class="srv-section-title" style="margin-top:16px">① 换成别的证书（站点不动）</div>
+        <div class="row-inline" style="display:flex;gap:8px;align-items:center;margin-top:8px">
+          <select id="cr-target" class="input" style="flex:1" ${candidates.length ? '' : 'disabled'}>${candOptions}</select>
+          <button class="btn" type="button" id="cr-replace" ${candidates.length ? '' : 'disabled'}>换证书并删除旧的</button>
+        </div>
+        <div class="field-hint" style="margin-top:6px">把上面这些配置里的 <code>ssl_certificate</code> / <code>ssl_certificate_key</code> 改指到选中的证书，逐个文件 <code>nginx -t</code> 校验通过后重载；任一步失败会自动还原原文件。</div>
+
+        <div class="srv-section-title" style="margin-top:16px">② 停用引用它的站点（可随时改回）</div>
+        <div style="margin-top:8px">
+          <button class="btn" type="button" id="cr-disable" ${disableable.length ? '' : 'disabled'}>停用这些站点并删除证书</button>
+          <div class="field-hint" style="margin-top:6px">
+            ${disableable.length
+              ? `把 <code>${esc(disableable.map((f) => f.split('/').pop()).join('</code>、<code>'))}</code> 改名成 <code>*.disabled-frpconsole-&lt;时间戳&gt;</code>（nginx 只加载 *.conf，所以站点会下线），校验通过后重载；想恢复就把文件名改回去。`
+              : '这些引用都在本程序生成的 frp-console.conf 里，请到「服务器 → HTTPS 域名反代」卡片里重新配置。'}
+          </div>
+        </div>
+
+        <div class="srv-section-title" style="margin-top:16px">③ 确认这张证书没用了，直接删</div>
+        <div style="margin-top:8px">
+          <label class="field-hint" style="display:flex;gap:8px;align-items:flex-start">
+            <input type="checkbox" id="cr-ack" style="margin-top:2px" />
+            <span>我知道后果：证书删掉后这些站点会失去证书，<strong>下次重启 nginx 或服务器时 nginx 可能起不来</strong>，需要我自己去修配置。</span>
+          </label>
+          <button class="btn danger" type="button" id="cr-force" disabled style="margin-top:8px">${icon('trash')}<span>仍然删除</span></button>
+        </div>
+      </div>
+      <div class="modal-foot">
+        <span class="mf-left"></span>
+        <button class="btn" type="button" data-act="modal.close">取消</button>
+      </div>
+    </div>`);
+
+  const ack = $('#cr-ack');
+  const forceBtn = $('#cr-force');
+  if (ack && forceBtn) ack.addEventListener('change', () => { forceBtn.disabled = !ack.checked; });
+
+  /* 统一的收尾：成功就关窗 + 重扫；失败留在弹窗里让用户换条路。 */
+  const finish = async (btn, run, okTitle, okNote) => {
+    if (btn) btn.disabled = true;
+    try {
+      const res = await run();
+      if (res && res.ok) {
+        closeModal();
+        if (okNote) toast('success', okTitle, okNote);
+        else toast('success', okTitle);
+        try { await loadServerCerts({ force: true }); } catch { /* ignore */ }
+        try { await loadCerts({ silent: true }); } catch { /* ignore */ }
+        if (S.view === 'certs') renderCerts(true);
+        return;
+      }
+      toast('error', '操作失败', (res && res.error) || '未知错误');
+    } catch (e) {
+      toast('error', '操作失败', String((e && e.message) || e));
+    }
+    if (btn) btn.disabled = false;
+  };
+
+  const replaceBtn = $('#cr-replace');
+  if (replaceBtn) replaceBtn.addEventListener('click', () => {
+    const sel = $('#cr-target');
+    const target = sel ? candidates.find((c) => c.certPath === sel.value) : null;
+    if (!target) return toast('warn', '请选择一张证书');
+    finish(replaceBtn, async () => {
+      const rep = await FRP.certReplaceRefs({ fromCert: certPath, fromKey: keyPath, toCert: target.certPath, toKey: target.keyPath });
+      if (!rep || !rep.ok) return rep;
+      const del = await FRP.certServerRemove({ domain, certPath, keyPath });
+      if (!del || !del.ok) return { ok: false, error: `引用已换成 ${target.domain || target.certPath}，但删除旧证书失败：${(del && del.error) || '未知错误'}` };
+      return { ok: true, data: del.data, replaced: target.domain || target.certPath };
+    }, '已换证并删除旧证书', `${domain || certPath} → ${target.domain || target.certPath}`);
+  });
+
+  const disableBtn = $('#cr-disable');
+  if (disableBtn) disableBtn.addEventListener('click', () => {
+    finish(disableBtn, async () => {
+      const dis = await FRP.certDisableRefs({ files: disableable });
+      if (!dis || !dis.ok) return dis;
+      const del = await FRP.certServerRemove({ domain, certPath, keyPath });
+      if (!del || !del.ok) return { ok: false, error: `站点已停用，但删除证书失败：${(del && del.error) || '未知错误'}` };
+      return { ok: true, data: del.data };
+    }, '站点已停用，证书已删除', disableable.map((f) => `${f} → ${f.split('/').pop()}.disabled-frpconsole-*`).join('；'));
+  });
+
+  if (forceBtn) forceBtn.addEventListener('click', () => {
+    finish(forceBtn, async () => {
+      const res = await FRP.certServerRemove({ domain, certPath, keyPath, force: true });
+      if (res && res.ok && res.data && res.data.warning) toast('warn', '已强制删除', res.data.warning);
+      return res;
+    }, '已强制删除证书', domain || certPath);
+  });
+
+  if (ownsConf) {
+    const hint = $('#cr-disable') && $('#cr-disable').nextElementSibling;
+    if (hint) hint.textContent += '（frp-console.conf 是本程序生成的，删证书前建议先去「HTTPS 域名反代」卡片里把它改成不依赖这张证书。）';
+  }
+}
+
 /* 域名分组键：把 a.b.com / *.b.com 归到同一组 b.com；com.cn 这类二级后缀多留一段。 */
 function certGroupKey(domain) {
   const d = String(domain || '').replace(/^\*\./, '').toLowerCase();
@@ -5061,26 +5197,9 @@ async function handleAction(act, dataset, btn) {
           const res = await FRP.certServerRemove({ domain, certPath, keyPath });
           if (!res || !res.ok) {
             const refs = (res && res.references) || [];
+            /* 有站点引用：不硬拒，交给三选一弹窗（换证书 / 停用站点 / 强制删除）。 */
             if (refs.length) {
-              const who = (res.sites || []).length
-                ? (res.sites || []).map((s) => `<strong>${esc(s)}</strong>`).join('、')
-                : refs.map((r) => `<code>${esc(r.file)}</code>`).join('、');
-              openModal(`
-                <div class="modal" style="width:520px">
-                  <div class="modal-head">
-                    <div class="mh-icon" style="color:var(--amber)">${icon('alert')}</div>
-                    <div class="grow"><h3>有站点还在用这张证书</h3><p>为避免站点断连，已拒绝删除。</p></div>
-                    <button class="icon-btn modal-close" type="button" data-act="modal.close">${icon('x')}</button>
-                  </div>
-                  <div class="modal-body">
-                    <div class="note warn">${icon('alert')}<div>引用它的站点：${who}</div></div>
-                    <div class="cert-paths mono" style="margin-top:10px">
-                      ${refs.map((r) => `<div><code>${esc(r.file)}:${esc(String(r.line))}</code> ${esc(r.content)}</div>`).join('')}
-                    </div>
-                    <div class="field-hint" style="margin-top:10px">要删这张证书，请先把上面这些站点的 <code>ssl_certificate</code> / <code>ssl_certificate_key</code> 换成别的证书（或在 nginx 里停用该站点），再回来删除。</div>
-                  </div>
-                  <div class="modal-foot"><span class="mf-left"></span><button class="btn primary" type="button" data-act="modal.close">知道了</button></div>
-                </div>`);
+              openCertRefsModal({ domain, certPath, keyPath, refs, sites: (res && res.sites) || [] });
               return;
             }
             return toastResult(res);

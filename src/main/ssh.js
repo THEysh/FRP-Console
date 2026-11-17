@@ -1508,12 +1508,17 @@ class ServerSession {
     const res = await this.exec(cmd, 15000);
     const references = [];
     const files = [];
+    /* 只算「nginx 真的会加载」的配置：备份（.bak-frpconsole-*）、我们停用掉的
+     * （.disabled-frpconsole-*）、以及各种 .old/.orig/~ 都不参与判断 —— 否则
+     * 「先停用站点再删证书」会被自己刚生成的备份文件挡住，永远删不掉。 */
+    const IGNORED = /\.(bak|disabled|old|orig|save|swp|tmp|rpmnew|rpmsave)([-.]|$)|~$/i;
     for (const raw of String(res.stdout || '').split('\n')) {
       const line = raw.trim();
       if (!line) continue;
       const m = line.match(/^([^:]+):(\d+):(.*)$/);
       if (!m) continue;
       const file = m[1];
+      if (IGNORED.test(file)) continue;
       if (!files.includes(file)) files.push(file);
       references.push({ file, line: Number(m[2]), content: m[3].trim().slice(0, 200) });
     }
@@ -1558,7 +1563,7 @@ class ServerSession {
    *        ③ 还有站点引用就拒绝（列出引用它的站点与配置行）
    * 不真删：搬进 /tmp/frp-console-cert-trash-<时间戳>/，误删还能手动搬回；
    * reload 失败会自动搬回原处。 */
-  async deleteRemoteCert({ certPath, keyPath } = {}) {
+  async deleteRemoteCert({ certPath, keyPath, force = false } = {}) {
     if (!this.connected) return { ok: false, error: '尚未连接服务器' };
     const cert = String(certPath || '').trim();
     const key = String(keyPath || '').trim();
@@ -1569,17 +1574,21 @@ class ServerSession {
     const ALLOWED = /^\/(etc\/nginx|www\/server\/panel\/vhost\/cert)\//;
     if (!ALLOWED.test(cert)) return { ok: false, error: `拒绝删除白名单之外的路径：${cert}` };
     if (key && !ALLOWED.test(key)) return { ok: false, error: `拒绝删除白名单之外的路径：${key}` };
-    const refs = await this.findCertReferences({ certPath: cert, keyPath: key });
-    if (!refs.ok) return refs;
-    if (refs.references.length) {
-      const where = refs.sites.length ? refs.sites.join('、') : refs.references.map((r) => r.file).join('、');
-      return {
-        ok: false,
-        blocked: true,
-        references: refs.references,
-        sites: refs.sites,
-        error: `还有站点在引用这张证书（${where}），已拒绝删除；要删请先把这些站点的 ssl_certificate 换掉。`,
-      };
+    /* force=true 是「用户明确知道后果，仍然要删」：跳过引用检查，且重载失败也不回滚
+     * （文件都删了再搬回去没有意义）。前端的默认路径永远是 force=false。 */
+    if (!force) {
+      const refs = await this.findCertReferences({ certPath: cert, keyPath: key });
+      if (!refs.ok) return refs;
+      if (refs.references.length) {
+        const where = refs.sites.length ? refs.sites.join('、') : refs.references.map((r) => r.file).join('、');
+        return {
+          ok: false,
+          blocked: true,
+          references: refs.references,
+          sites: refs.sites,
+          error: `还有站点在引用这张证书（${where}），已拒绝删除；可以先「换成别的证书」或「停用这些站点」，确认没用也可以强制删除。`,
+        };
+      }
     }
     const sudo = await this.detectSudo();
     if (!sudo.ok) return sudo;
@@ -1608,10 +1617,112 @@ class ServerSession {
     }
     const reload = await this.reloadNginx();
     if (!reload.ok) {
+      /* 强制删除时不要把文件搬回去：用户已经确认「这张证书没用了」，
+       * 搬回只会让他再点一次。改成如实告知「重载失败，重启 nginx 前先修配置」。 */
+      if (force) {
+        return {
+          ok: true,
+          deleted: moved,
+          trash,
+          reloaded: false,
+          warning: `文件已删除，但 nginx 重载失败：${reload.error} —— 现在站点还靠旧的 worker 进程撑着，重启 nginx 或服务器之前，请先把引用它的配置改掉。`,
+        };
+      }
       for (const p of moved) await moveBack(p);
       return { ok: false, error: `删除后 nginx 重载失败，文件已搬回原处：${reload.error}` };
     }
     return { ok: true, deleted: moved, trash, reloaded: true };
+  }
+
+  /* 把「引用某张证书」的配置改指到另一张证书（换证不换站点）。
+   * 逐个文件：先备份 .bak-frpconsole-<时间戳>，再 sed 替换证书/私钥两行，
+   * 每改一个文件跑一次 nginx -t，失败立刻把这一个文件还原；全部通过再 reload。
+   * 这样最坏情况是「一个都没改」，不会把 nginx 留在起不来的状态。 */
+  async replaceCertReference({ fromCert, fromKey, toCert, toKey } = {}) {
+    if (!this.connected) return { ok: false, error: '尚未连接服务器' };
+    const oldCert = String(fromCert || '').trim();
+    const newCert = String(toCert || '').trim();
+    if (!oldCert || !newCert) return { ok: false, error: '缺少证书路径' };
+    if (oldCert === newCert) return { ok: false, error: '新旧证书是同一张' };
+    const oldKey = String(fromKey || '').trim();
+    const newKey = String(toKey || '').trim();
+    const refs = await this.findCertReferences({ certPath: oldCert, keyPath: oldKey });
+    if (!refs.ok) return refs;
+    if (!refs.references.length) return { ok: false, error: '没有找到引用这张证书的配置（可能已被改动，请重新扫描）' };
+    const sudo = await this.detectSudo();
+    if (!sudo.ok) return sudo;
+    const prefix = sudo.prefix;
+    const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
+    const esc = (v) => String(v).replace(/[\\|&]/g, (m) => `\\${m}`);
+    const files = Array.from(new Set(refs.references.map((r) => r.file)));
+    const changed = [];
+    const backups = [];
+    for (const file of files) {
+      const backup = `${file}.bak-frpconsole-${stamp}`;
+      const cp = await this.exec(`${prefix}cp -p ${shellQuote(file)} ${shellQuote(backup)}`, 10000);
+      if (!cp.ok) return { ok: false, error: `备份 ${file} 失败：${(cp.stderr || '').trim() || '权限不足'}` };
+      backups.push({ file, backup });
+      let sedExpr = `s|${esc(oldCert)}|${esc(newCert)}|g`;
+      if (oldKey && newKey) sedExpr += `; s|${esc(oldKey)}|${esc(newKey)}|g`;
+      const sed = await this.exec(`${prefix}sed -i ${shellQuote(sedExpr)} ${shellQuote(file)}`, 10000);
+      if (!sed.ok) {
+        await this.exec(`${prefix}cp -p ${shellQuote(backup)} ${shellQuote(file)}`, 10000);
+        return { ok: false, error: `改写 ${file} 失败：${(sed.stderr || '').trim() || '未知错误'}` };
+      }
+      /* 改完立刻验证：nginx -t 不过就把这一个文件还原，避免越改越乱。 */
+      const test = await this.exec(`${prefix}nginx -t 2>&1`, 15000);
+      const testText = `${test.stdout || ''}\n${test.stderr || ''}`;
+      if (!test.ok && !/syntax is ok|test is successful/i.test(testText)) {
+        await this.exec(`${prefix}cp -p ${shellQuote(backup)} ${shellQuote(file)}`, 10000);
+        return {
+          ok: false,
+          error: `换成 ${newCert} 后 nginx 校验失败，已还原 ${file}：${(test.stderr || test.stdout || '').trim()}`,
+          changed,
+        };
+      }
+      changed.push(file);
+    }
+    const reload = await this.reloadNginx();
+    if (!reload.ok) {
+      for (const b of backups) await this.exec(`${prefix}cp -p ${shellQuote(b.backup)} ${shellQuote(b.file)}`, 10000);
+      return { ok: false, error: `改写成功但 nginx 重载失败，已全部还原：${reload.error}` };
+    }
+    return { ok: true, changed, backups: backups.map((b) => b.backup), newCert, newKey };
+  }
+
+  /* 停用「引用某张证书」的站点：把配置文件改名成 *.disabled-frpconsole-<时间戳>。
+   * nginx 的 include 都是按 *.conf 匹配，改了后缀就不会再被加载；连同目录下的软链接一起处理。
+   * 全部改完跑 nginx -t，失败就把所有文件改回原名 —— 站点不会在「半停用」状态。 */
+  async disableNginxSites({ files } = {}) {
+    if (!this.connected) return { ok: false, error: '尚未连接服务器' };
+    const list = (Array.isArray(files) ? files : []).map((f) => String(f || '').trim()).filter(Boolean);
+    if (!list.length) return { ok: false, error: '没有要停用的配置' };
+    const sudo = await this.detectSudo();
+    if (!sudo.ok) return sudo;
+    const prefix = sudo.prefix;
+    const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
+    const done = [];
+    for (const file of list) {
+      const target = `${file}.disabled-frpconsole-${stamp}`;
+      const mv = await this.exec(`${prefix}mv -f ${shellQuote(file)} ${shellQuote(target)}`, 10000);
+      if (!mv.ok) {
+        for (const d of done) await this.exec(`${prefix}mv -f ${shellQuote(d.to)} ${shellQuote(d.from)}`, 10000);
+        return { ok: false, error: `停用 ${file} 失败：${(mv.stderr || '').trim() || '权限不足'}` };
+      }
+      done.push({ from: file, to: target });
+    }
+    const test = await this.exec(`${prefix}nginx -t 2>&1`, 15000);
+    const testText = `${test.stdout || ''}\n${test.stderr || ''}`;
+    if (!test.ok && !/syntax is ok|test is successful/i.test(testText)) {
+      for (const d of done) await this.exec(`${prefix}mv -f ${shellQuote(d.to)} ${shellQuote(d.from)}`, 10000);
+      return { ok: false, error: `停用后 nginx 校验失败，已全部恢复：${(test.stderr || test.stdout || '').trim()}` };
+    }
+    const reload = await this.reloadNginx();
+    if (!reload.ok) {
+      for (const d of done) await this.exec(`${prefix}mv -f ${shellQuote(d.to)} ${shellQuote(d.from)}`, 10000);
+      return { ok: false, error: `停用后 nginx 重载失败，已全部恢复：${reload.error}` };
+    }
+    return { ok: true, disabled: done };
   }
 
   /* nginx server_name：多个域名空格分隔，通配符 `*.x` 原样传给 nginx。 */
