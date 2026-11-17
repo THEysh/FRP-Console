@@ -2113,9 +2113,21 @@ function registerIpc() {
       clean.launchAtLogin = !!result.actual;
     }
     if (clean.pollIntervalMs !== undefined) clean.pollIntervalMs = Math.min(30000, Math.max(1000, Number(clean.pollIntervalMs) || 3000));
-    if (clean.adminPort !== undefined) clean.adminPort = Math.min(65535, Math.max(1, Number(clean.adminPort) || 7400));
-    if (clean.vhostHttpPort !== undefined) clean.vhostHttpPort = Math.min(65535, Math.max(1, Number(clean.vhostHttpPort) || 80));
-    if (clean.vhostHttpsPort !== undefined) clean.vhostHttpsPort = Math.min(65535, Math.max(1, Number(clean.vhostHttpsPort) || 443));
+    /* 端口类字段以前是「静默夹取」：填 70000 会变成 65535、填 0 会变回默认值，界面不吭声，
+     * 用户以为自己设成了 70000（或以为填 0 能关掉管理接口）。现在越界直接拒绝保存。 */
+    for (const [key, label, fallback] of [
+      ['adminPort', '管理 API 端口', 7400],
+      ['vhostHttpPort', 'frps 的 HTTP 端口', 80],
+      ['vhostHttpsPort', 'frps 的 HTTPS 端口', 443],
+    ]) {
+      if (clean[key] === undefined) continue;
+      if (clean[key] === null || clean[key] === '') { clean[key] = fallback; continue; }
+      const n = Number(clean[key]);
+      if (!Number.isInteger(n) || n < 1 || n > 65535) {
+        return fail(`${label}必须是 1 - 65535 的整数，收到「${clean[key]}」`);
+      }
+      clean[key] = n;
+    }
     /* 用户在设置页手填 vhost 端口时，隧道若绑定了档案，要同步写进该档案：
      * 探测/显示按绑定档案解析（boundVhostPorts），只改全局的话界面上看不到任何变化，
      * 用户会以为设置没生效。 */
@@ -2222,10 +2234,17 @@ function registerIpc() {
   });
 
   ipcMain.handle('paths:reveal', async (event, which) => {
-    const target = which === 'log' ? paths.logPath : which === 'frpc' ? paths.frpcPath : paths.configPath;
+    /* 以前未知类型会静默落回「配置文件」，调用方拿到 ok 但其实打开的是别的东西；
+     * 现在只认这三个，别的一律报错，找不到目标也如实说。 */
+    const known = { log: paths.logPath, frpc: paths.frpcPath, config: paths.configPath };
+    if (!Object.prototype.hasOwnProperty.call(known, which)) {
+      return fail(`不认识的路径类型「${which}」，可用：config / frpc / log`);
+    }
+    const target = known[which];
     if (!target) return fail('路径尚未设置');
-    if (fs.existsSync(target)) shell.showItemInFolder(target);
-    return ok({ revealed: true });
+    if (!fs.existsSync(target)) return fail(`文件不存在：${target}`);
+    shell.showItemInFolder(target);
+    return ok({ revealed: true, path: target });
   });
 
   ipcMain.handle('config:save', async (event, incoming) => {
