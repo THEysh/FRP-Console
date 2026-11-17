@@ -1396,7 +1396,7 @@ function frpsPane() {
   return `
     <div id="frps-pane" class="advanced-pane ${S.server.mode === 'frps' ? '' : 'hidden'}">
       <div class="adv-head">
-        <span class="field-hint">服务器端 frps.toml。直接编辑完整 TOML，保存前会校验语法并备份。</span>
+        <span class="path-chip" title="${esc(S.server.configPath || 'frps.toml')}">${esc(S.server.configPath || 'frps.toml')}</span>
         <div class="page-actions adv-actions">
           <div class="btn-cluster">
             <button class="btn ghost" type="button" data-act="server.advanced.reload">${icon('download')}<span>重新读取</span></button>
@@ -1413,10 +1413,11 @@ function frpsPane() {
 }
 
 function frpcPane() {
+  const frpcPath = (S.state && S.state.paths && S.state.paths.configPath) || 'frpc.toml';
   return `
     <div id="frpc-pane" class="advanced-pane ${S.server.mode === 'frpc' ? '' : 'hidden'}">
       <div class="adv-head">
-        <span class="field-hint">本机 frpc.toml。直接编辑完整 TOML，校验语法通过后才能保存；写前自动备份。</span>
+        <span class="path-chip" title="${esc(frpcPath)}">${esc(frpcPath)}</span>
         <div class="page-actions adv-actions">
           <div class="btn-cluster">
             <button class="btn ghost" type="button" data-act="server.frpc.reload">${icon('download')}<span>重新读取</span></button>
@@ -1437,7 +1438,7 @@ function frpcPane() {
 function serverProxyRows() {
   const proxies = (S.state && S.state.proxies) || [];
   if (!proxies.length) {
-    return `<tr><td colspan="5"><div class="empty small"><h3>还没有映射</h3><p>去「代理映射」新增一条，把本机服务发布到 frps。</p></div></td></tr>`;
+    return `<div class="empty small"><h3>还没有映射</h3><p>去「代理映射」新增一条，把本机服务发布到 frps。</p></div>`;
   }
   return proxies.map((p) => {
     const health = p.health;
@@ -1447,15 +1448,12 @@ function serverProxyRows() {
     const text = ok ? '三层连通' : failed ? (health.reason || '链路异常') : '待检测';
     const target = p.publicAddress || (p.remotePort ? `${(S.state.config && S.state.config.serverAddr) || ''}:${p.remotePort}` : '-');
     return `
-      <tr>
-        <td><div class="name-cell"><strong>${esc(p.name)}</strong><small>${esc((p.type || '').toUpperCase())}</small></div></td>
-        <td class="mono">127.0.0.1:${esc(p.localPort || '-')}</td>
-        <td class="mono">${esc(target)}</td>
-        <td><span class="badge ${tone}" title="${esc(healthTip(health))}"><span class="bdot"></span>${esc(text)}</span></td>
-        <td style="text-align:right">
-          <button class="icon-btn" type="button" data-act="copy" data-text="${esc(p.publicAddress || '')}" title="复制公网地址">${icon('copy')}</button>
-        </td>
-      </tr>`;
+      <div class="sp-row" title="${esc(healthTip(health))}">
+        <div class="sp-main"><strong>${esc(p.name)}</strong><small>${esc((p.type || '').toUpperCase())}</small></div>
+        <div class="sp-addr mono">${esc(target)}</div>
+        <span class="badge ${tone}"><span class="bdot"></span>${esc(text)}</span>
+        <button class="icon-btn" type="button" data-act="copy" data-text="${esc(p.publicAddress || '')}" title="复制公网地址">${icon('copy')}</button>
+      </div>`;
   }).join('');
 }
 
@@ -1507,11 +1505,12 @@ function renderServerLogs() {
           <span class="lr-body">${esc(item.body)}</span>
         </div>`).join('') : '<div class="muted" style="padding:12px">没有匹配的日志</div>'}
     </div>
-    <div class="log-actions">
-      <span class="field-hint">共 ${filtered.length} 行${S.server.logErrorsOnly ? '（仅错误）' : ''}，默认显示最近 10 行</span>
-      <button class="btn ghost small" type="button" data-act="server.logs.errors">${icon('alert')}<span>${S.server.logErrorsOnly ? '显示全部' : '只看错误'}</span></button>
-      <button class="btn ghost small" type="button" data-act="server.logs.expand">${icon('download')}<span>${S.server.logExpanded ? '收起' : '展开全部'}</span></button>
-    </div>`;
+    <div class="log-foot"><span class="field-hint">共 ${filtered.length} 行${S.server.logErrorsOnly ? '（仅错误）' : ''}${S.server.logExpanded ? '，已展开' : '，默认显示最近 10 行'}</span></div>`;
+  // 过滤/展开开关移到了卡片头，切状态后同步按钮文字。
+  const errBtn = document.querySelector('[data-act="server.logs.errors"] span');
+  if (errBtn) errBtn.textContent = S.server.logErrorsOnly ? '显示全部' : '只看错误';
+  const expBtn = document.querySelector('[data-act="server.logs.expand"] span');
+  if (expBtn) expBtn.textContent = S.server.logExpanded ? '收起' : '展开全部';
 }
 
 function nginxCardMarkup() {
@@ -2031,40 +2030,48 @@ function renderServer(force = false) {
 
       ${firewallCardMarkup()}
 
+      <div class="srv-section-title">配置管理</div>
+
       <section class="card config-card">
         <div class="card-head">
           <div class="ch-icon">${icon('edit')}</div>
-          <div class="grow"><h3>配置文件</h3><p>frps.toml（服务器端）+ frpc.toml（本机），直接编辑、校验语法、保存后重启对应进程。</p></div>
+          <div class="grow"><h3>配置文件</h3><p>直接编辑 TOML，保存前自动校验语法并备份；改完可一键重启对应进程。</p></div>
           <div class="mode-tabs">
-            <button class="mode-tab ${s.mode === 'frps' ? 'active' : ''}" type="button" data-act="server.mode" data-mode="frps">frps.toml</button>
-            <button class="mode-tab ${s.mode === 'frpc' ? 'active' : ''}" type="button" data-act="server.mode" data-mode="frpc">frpc.toml</button>
+            <button class="mode-tab ${s.mode === 'frps' ? 'active' : ''}" type="button" data-act="server.mode" data-mode="frps">frps.toml · 服务器</button>
+            <button class="mode-tab ${s.mode === 'frpc' ? 'active' : ''}" type="button" data-act="server.mode" data-mode="frpc">frpc.toml · 本机</button>
           </div>
         </div>
         ${frpsPane()}
         ${frpcPane()}
       </section>
 
-      <section class="card">
-        <div class="card-head">
-          <div class="ch-icon">${icon('link')}</div>
-          <div class="grow"><h3>当前映射</h3><p>本机 frpc 已配置的穿透规则，链路状态来自三层检查。</p></div>
-          <div class="page-actions">
-            <button class="btn ghost" type="button" data-act="goto.proxies">${icon('external')}<span>去代理映射</span></button>
-          </div>
-        </div>
-        <div class="table-wrap" id="server-proxies"><table class="table"><thead><tr><th>代理</th><th>本地</th><th>公网</th><th>链路</th><th></th></tr></thead><tbody>${serverProxyRows()}</tbody></table></div>
-      </section>
+      <div class="srv-section-title">运行监控</div>
 
-      <section class="card log-card" id="server-log-card">
-        <div class="card-head">
-          <div class="ch-icon">${icon('terminal')}</div>
-          <div class="grow"><h3>frps 日志</h3><p>${esc(s.logsSource || 'journalctl / docker logs / frps.log')} · 结构化展示最近 250 行</p></div>
-          <div class="page-actions">
-            <button class="btn ghost" type="button" data-act="server.logs.refresh">${icon('reload')}<span>刷新日志</span></button>
+      <div class="srv-monitor-grid">
+        <section class="card">
+          <div class="card-head">
+            <div class="ch-icon">${icon('link')}</div>
+            <div class="grow"><h3>本机映射${(S.state && S.state.proxies || []).length ? ` <span class="count-chip">${(S.state.proxies || []).length}</span>` : ''}</h3><p>frpc 当前规则 · 链路状态来自三层检查。</p></div>
+            <div class="page-actions">
+              <button class="btn ghost" type="button" data-act="goto.proxies">${icon('external')}<span>去代理映射</span></button>
+            </div>
           </div>
-        </div>
-        <div id="server-logs"></div>
-      </section>
+          <div class="server-proxy-list" id="server-proxies">${serverProxyRows()}</div>
+        </section>
+
+        <section class="card log-card" id="server-log-card">
+          <div class="card-head">
+            <div class="ch-icon">${icon('terminal')}</div>
+            <div class="grow"><h3>frps 日志</h3><p>结构化展示最近 250 行。</p></div>
+            <div class="page-actions">
+              <button class="btn ghost small" type="button" data-act="server.logs.errors">${icon('alert')}<span>${S.server.logErrorsOnly ? '显示全部' : '只看错误'}</span></button>
+              <button class="btn ghost small" type="button" data-act="server.logs.expand">${icon('download')}<span>${S.server.logExpanded ? '收起' : '展开全部'}</span></button>
+              <button class="btn ghost" type="button" data-act="server.logs.refresh">${icon('reload')}<span>刷新</span></button>
+            </div>
+          </div>
+          <div id="server-logs"></div>
+        </section>
+      </div>
     </div>`;
 
   renderServerLogs();
@@ -6161,8 +6168,11 @@ async function boot() {
         });
         if (S.lastKeys.serverProxies !== rowsKey) {
           S.lastKeys.serverProxies = rowsKey;
-          const body = $('#server-proxies tbody');
+          const body = $('#server-proxies');
           if (body) body.innerHTML = serverProxyRows();
+          // 数量徽标跟着映射条数走。
+          const countChip = document.querySelector('.srv-monitor-grid .count-chip');
+          if (countChip) countChip.textContent = String((st.proxies || []).length);
         }
       }
       // 本机隧道目标被别处改动（设置页保存、外部编辑 frpc.toml）时，
