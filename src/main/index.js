@@ -77,6 +77,7 @@ const frpsBinary = require('./frpsBinary');
 const updateModule = require('./update');
 const { AcmeManager, coversDomain, readCertCoverage } = require('./acme');
 const { CloudflareDns } = require('./dns');
+const dnsCheck = require('./dnscheck');
 const { execFileP, tcpCheck, httpProbe, hashText, randomToken, formatDuration } = require('./util');
 const { probePort, probeUdp, sshConnectHint, outboundHint } = require('./portprobe');
 const { parseRuleSpec, judgePortRow, buildPortMatrix, summarizeMatrix, buildRuleTexts } = require('./portmatrix');
@@ -1301,30 +1302,32 @@ function isIpLike(text) {
   return /^\d{1,3}(?:\.\d{1,3}){3}$/.test(String(text || '').trim());
 }
 
-/* 解析域名的 A/AAAA 记录，并判断是否指向当前 frps 服务器（只对 IPv4 serverAddr 可靠）。
- * 用于 http/https 代理的「域名解析」软检查：不参与三层判定，只是给用户一个提示。 */
+/* 解析域名的 A/AAAA/CNAME 记录，并判断是否指向当前 frps 服务器。
+ * v1.2.58 起不再只问本机解析器：同时查两个公共 DoH（1.1.1.1 / 8.8.8.8）+ 本机 + 权威 NS，
+ * 交叉给结论。原因见 src/main/dnscheck.js 头部注释（本机 DNS 超时 + NXDOMAIN 负缓存
+ * 会让「刚加完记录」的域名报「未解析」，误导用户以为 CF 没配好）。 */
 async function resolveDomainInfo(domain) {
-  const clean = String(domain || '').trim().toLowerCase().replace(/^\*\./, '');
-  if (!clean) return { resolved: [], pointsToServer: false, error: '缺少域名' };
+  const clean = String(domain || '').trim().toLowerCase();
+  if (!clean) return { resolved: [], pointsToServer: false, error: '缺少域名', sources: [] };
+  const server = String((model && model.serverAddr) || '').trim().toLowerCase();
   try {
-    const dns = require('node:dns').promises;
-    const [a4, a6] = await Promise.allSettled([dns.resolve4(clean), dns.resolve6(clean)]);
-    const resolved = [];
-    if (a4.status === 'fulfilled') resolved.push(...a4.value);
-    if (a6.status === 'fulfilled') resolved.push(...a6.value);
-    let error = '';
-    if (!resolved.length) {
-      const reason = a4.status === 'rejected' ? a4.reason : (a6.status === 'rejected' ? a6.reason : null);
-      error = String((reason && (reason.code || reason.message)) || '无解析记录');
-    }
-    const server = String((model && model.serverAddr) || '').trim().toLowerCase();
-    let pointsToServer = false;
-    if (resolved.length && server && isIpLike(server)) {
-      pointsToServer = resolved.some((ip) => String(ip).toLowerCase() === server);
-    }
-    return { resolved, pointsToServer, error };
+    const info = await dnsCheck.resolveName(clean);
+    const judge = dnsCheck.judgeResolution({ sources: info.sources, serverAddr: server, name: clean });
+    const addrs = judge.addrs || [];
+    return {
+      resolved: addrs,
+      pointsToServer: !!judge.matchesServer,
+      error: judge.verdict === 'ok' || judge.verdict === 'proxied' ? '' : judge.title,
+      verdict: judge.verdict,
+      tone: judge.tone,
+      title: judge.title,
+      detail: judge.detail,
+      soaMinTtl: info.soaMinTtl || 0,
+      sources: info.sources,
+      checkedAt: Date.now(),
+    };
   } catch (e) {
-    return { resolved: [], pointsToServer: false, error: String((e && (e.code || e.message)) || e) };
+    return { resolved: [], pointsToServer: false, error: String((e && (e.code || e.message)) || e), sources: [] };
   }
 }
 
@@ -3422,6 +3425,117 @@ function registerIpc() {
   /* 代理表单 / 健康检查共用的域名解析：只做软提示，不阻塞任何保存或判定。 */
   ipcMain.handle('dns:resolve', async (event, domain) => {
     return ok(await resolveDomainInfo(String(domain || '').trim()));
+  });
+
+  /* 证书页「DNS 记录」面板（v1.2.58）：
+   * 一次拿全 —— Cloudflare 里的记录 + 四个 DNS 来源的实际解析结果 + 结论。
+   * 面板与「检测」按钮共用同一份数据源（都在这里算），避免出现
+   * 「面板显示已解析、检测却报未解析」的矛盾。 */
+  ipcMain.handle('dns:inspect', async (_event, payload = {}) => {
+    try {
+      const name = String((payload && (payload.name || payload.domain)) || '').trim().toLowerCase();
+      if (!name) return fail('请先输入域名');
+      const [resolved, cf] = await Promise.all([
+        dnsCheck.resolveName(name),
+        (async () => {
+          try {
+            const provider = currentDnsProvider();
+            if (!provider.ok || !provider.dns || typeof provider.dns.listRecords !== 'function') {
+              return { configured: false, records: [], error: '' };
+            }
+            /* 再套一层总超时：DNS 解析必须能在几秒内给结果，
+             * 不能因为 Cloudflare API 慢就把整个面板拖住。 */
+            const r = await Promise.race([
+              provider.dns.listRecords(name),
+              new Promise((_, reject) => setTimeout(() => reject(new Error('Cloudflare API 超时（8 秒）')), 8000)),
+            ]);
+            return { configured: true, records: r.records || [], zenId: r.zoneId, error: '' };
+          } catch (e) {
+            return { configured: true, records: [], error: (e && e.message) || String(e) };
+          }
+        })(),
+      ]);
+      /* 橙云判断：找一条和这个域名同名（或通配符同名）的 A/AAAA/CNAME 记录 */
+      const plain = name.replace(/^\*\./, '');
+      const cfRecord = (cf.records || []).find((r) => ['A', 'AAAA', 'CNAME'].includes(r.type)
+        && (r.name === name || r.name === plain)) || null;
+      const server = String((model && model.serverAddr) || '').trim();
+      const judge = dnsCheck.judgeResolution({ sources: resolved.sources, serverAddr: server, cfRecord, name });
+      /* 通配符证书（*.x）没法直接查「*.x」判断生效，用一个随机子域探一下：
+       * 如果它能解析到同一个 IP，说明通配 A 记录已经生效。 */
+      let wildcardProbe = null;
+      if (name.startsWith('*.')) {
+        const apexName = name.slice(2);
+        const probe = `probe-${Math.random().toString(36).slice(2, 8)}.${apexName}`;
+        const r = await dnsCheck.dohQuery('cf', probe, 'A').catch(() => null);
+        const addrs = ((r && r.records) || []).filter((x) => x.type === 'A').map((x) => x.value);
+        wildcardProbe = { name: probe, ok: addrs.length > 0, addrs, error: (r && r.error) || '' };
+      }
+      /* A 记录查询不会带 SOA，拿不到负缓存上限；单独问一次 apex 的 SOA，
+       * 面板上就能告诉用户「最多等多少分钟才全世界生效」。 */
+      let soaMinTtl = resolved.soaMinTtl || 0;
+      if (!soaMinTtl) {
+        const apex = dnsCheck.apexOf(name);
+        const soa = await dnsCheck.dohQuery('cf', apex, 'SOA').catch(() => null);
+        soaMinTtl = (soa && soa.soaMinTtl) || 0;
+      }
+      return ok({
+        name,
+        apex: dnsCheck.apexOf(name),
+        sources: resolved.sources,
+        soaMinTtl,
+        cf,
+        cfRecord,
+        judge,
+        wildcardProbe,
+        serverAddr: server,
+        checkedAt: Date.now(),
+      });
+    } catch (e) {
+      return fail((e && e.message) || String(e));
+    }
+  });
+
+  ipcMain.handle('dns:add-record', async (_event, payload = {}) => {
+    try {
+      const provider = currentDnsProvider();
+      if (!provider.ok || !provider.dns || typeof provider.dns.createRecord !== 'function') {
+        return fail('尚未配置 DNS 验证渠道（需要 Cloudflare token）');
+      }
+      const domain = String((payload && (payload.domain || payload.name)) || '').trim();
+      if (!domain) return fail('缺少域名');
+      const type = String(payload.type || 'A').toUpperCase();
+      if (!['A', 'AAAA', 'CNAME', 'TXT', 'MX'].includes(type)) return fail(`不支持的记录类型 ${type}`);
+      const content = String(payload.content || '').trim();
+      if (!content) return fail('请填写记录内容（A 记录填 IP，CNAME 填目标域名）');
+      if (type === 'A' && !/^\d{1,3}(?:\.\d{1,3}){3}$/.test(content)) return fail('A 记录的内容必须是 IPv4 地址');
+      const rec = await provider.dns.createRecord(domain, {
+        type,
+        name: String(payload.name || domain).trim(),
+        content,
+        ttl: Number(payload.ttl) || 120,
+        proxied: payload.proxied === true,
+      });
+      return ok(rec);
+    } catch (e) {
+      return fail((e && e.message) || String(e));
+    }
+  });
+
+  ipcMain.handle('dns:del-record', async (_event, payload = {}) => {
+    try {
+      const provider = currentDnsProvider();
+      if (!provider.ok || !provider.dns || typeof provider.dns.deleteRecord !== 'function') {
+        return fail('尚未配置 DNS 验证渠道（需要 Cloudflare token）');
+      }
+      const domain = String((payload && (payload.domain || payload.name)) || '').trim();
+      const id = String((payload && payload.id) || '').trim();
+      if (!domain || !id) return fail('缺少域名或记录 id');
+      const r = await provider.dns.deleteRecord(domain, id);
+      return ok(r);
+    } catch (e) {
+      return fail((e && e.message) || String(e));
+    }
   });
 
   /* 验证已保存的 Cloudflare token 是否有效（不暴露 token 明文）。 */

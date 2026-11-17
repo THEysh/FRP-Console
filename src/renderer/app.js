@@ -3374,6 +3374,7 @@ function certRow(c) {
         </div>
       </div>
       <div class="cert-actions">
+        <button class="btn small" type="button" data-act="cert.dns" data-domain="${esc(c.domain)}" title="查看这个域名的 DNS 记录与解析结果（可增删）">${icon('globe')}<span>DNS 记录</span></button>
         <button class="btn small" type="button" data-act="certs.nginx" data-domain="${esc(c.domain)}" title="上传到服务器 nginx 并配置反代">${icon('globe')}<span>部署到 nginx</span></button>
         <button class="btn small" type="button" data-act="certs.renew" data-domain="${esc(c.domain)}">${icon('reload')}<span>续期</span></button>
         <button class="btn small danger-text" type="button" data-act="certs.remove" data-domain="${esc(c.domain)}">${icon('trash')}<span>删除</span></button>
@@ -3381,7 +3382,179 @@ function certRow(c) {
     </div>`;
 }
 
-/* ---------------- 域名就绪向导 ---------------- */
+/* ---------------- DNS 记录面板（v1.2.58） ----------------
+ * 证书页每个域名旁提供「DNS 记录」入口：在一个面板里同时看到
+ *   ① Cloudflare 里的记录（可增可删）  ② 四个 DNS 来源的实际解析结果
+ *   ③ 一句话结论（已解析 / 公共 DNS 有了但本机还没有 / 记录不存在 / 橙云代理）
+ * 数据源与「检测」按钮完全一致（都是 FRP.dnsInspect），不会再出现两边打架。 */
+function openDnsPanel(nameOrDomain) {
+  const fallback = (S.certs.list && S.certs.list[0] && S.certs.list[0].domain) || '';
+  const name = String(nameOrDomain || fallback || '').trim().toLowerCase();
+  if (!name) { toast('warn', '还没有域名', '先在下面签发一张证书，或填一个域名再查'); return; }
+  S.dns = { name, loading: true, data: null, error: '', busy: false, addError: '' };
+  openModal(dnsPanelMarkup());
+  loadDnsPanel();
+}
+
+async function loadDnsPanel() {
+  const st = S.dns;
+  if (!st) return;
+  st.loading = true;
+  st.error = '';
+  renderDnsPanel();
+  let res = null;
+  try {
+    res = await FRP.dnsInspect({ name: st.name });
+  } catch (e) {
+    res = { ok: false, error: String((e && e.message) || e) };
+  }
+  if (!S.dns || S.dns.name !== st.name) return;
+  st.loading = false;
+  st.at = Date.now();
+  if (res && res.ok) { st.data = res.data; st.error = ''; }
+  else { st.error = (res && res.error) || '查询失败'; }
+  renderDnsPanel();
+}
+
+function renderDnsPanel() {
+  if (!S.dns) return;
+  const root = $('#modal-root');
+  if (!root || !root.classList.contains('open')) return;
+  if (!root.querySelector('.dns-panel')) return;
+  openModal(dnsPanelMarkup());
+}
+
+function dnsSourceRow(s) {
+  const recs = (s.records || []).map((r) => `${r.type} ${esc(r.value)}${r.ttl ? ` <span class="pm pm-muted">ttl=${r.ttl}</span>` : ''}`);
+  const body = recs.length ? recs.join('<br>') : `<span class="pm pm-muted">${esc(s.error || '无结果')}</span>`;
+  const tone = s.ok ? 'pm-ok' : 'pm-bad';
+  return `<tr>
+      <td class="pm-label">${esc(s.label || s.id)}<div class="field-hint mono" style="margin:0">${esc(s.server || '')}</div></td>
+      <td><span class="pm ${tone}">${s.ok ? '✓' : '✗'}</span></td>
+      <td class="mono">${body}</td>
+      <td class="mono">${s.ms != null ? `${s.ms} ms` : '—'}</td>
+    </tr>`;
+}
+
+function dnsPanelMarkup() {
+  const st = S.dns || { name: '', loading: false, data: null, error: '', busy: false };
+  const d = st.data;
+  const judge = (d && d.judge) || null;
+  const cf = (d && d.cf) || null;
+  const sources = (d && d.sources) || [];
+  const isWildcard = String(st.name || '').startsWith('*.');
+  const tone = judge ? (judge.tone === 'ok' ? '' : 'warn') : '';
+  const when = st.at ? new Date(st.at).toLocaleTimeString('zh-CN') : '—';
+
+  const conclusion = st.loading && !d
+    ? '<div class="note"><span class="spinner-sm"></span><div>正在查询（本机解析器、1.1.1.1、8.8.8.8、权威 NS）…</div></div>'
+    : st.error
+      ? `<div class="note warn">${icon('alert')}<div><b>查询失败</b><div>${esc(st.error)}</div></div></div>`
+      : judge
+        ? `<div class="note ${tone}">${icon(judge.tone === 'ok' ? 'check' : 'alert')}<div><b>${esc(judge.title)}</b><div>${esc(judge.detail || '')}</div></div></div>`
+        : '';
+
+  const wildcardNote = isWildcard ? `
+      <div class="note" style="margin-top:10px">
+        ${icon('globe')}
+        <div><b>通配符记录</b>
+          <div>Cloudflare 里通配记录的名字存成 <code>*</code>（等价于 <code>*.${esc((d && d.apex) || '')}</code>）。
+          ${d && d.wildcardProbe
+            ? (d.wildcardProbe.ok
+              ? `已用随机子域 <code>${esc(d.wildcardProbe.name)}</code> 实测：能解析到 ${esc((d.wildcardProbe.addrs || []).join('、'))} ✅`
+              : `随机子域 <code>${esc(d.wildcardProbe.name)}</code> 探测失败（${esc(d.wildcardProbe.error || '没有返回记录')}）——通配 A 记录可能还没建或不生效。`)
+            : '正在用随机子域验证通配是否生效…'}
+          </div>
+        </div>
+      </div>` : '';
+
+  const cfBlock = !cf || !cf.configured
+    ? `<div class="field-hint">还没有配置 Cloudflare Token（下面的「DNS 验证渠道」填一次即可），此时只能看解析结果，无法在程序里增删记录。</div>`
+    : cf.error
+      ? `<div class="note warn">${icon('alert')}<div><b>读取 Cloudflare 记录失败</b><div>${esc(cf.error)}</div></div></div>`
+      : `<div class="port-matrix-wrap" style="max-height:230px">
+          <table class="port-matrix">
+            <thead><tr><th>类型</th><th>名称</th><th>内容</th><th>TTL</th><th>代理</th><th></th></tr></thead>
+            <tbody>
+              ${(cf.records || []).length ? (cf.records || []).map((r) => `<tr>
+                <td class="mono">${esc(r.type)}</td>
+                <td class="mono">${esc(r.name)}</td>
+                <td class="mono">${esc(r.content)}</td>
+                <td class="mono">${r.ttl === 1 ? '自动' : esc(String(r.ttl))}</td>
+                <td>${r.proxied ? '<span class="tag ok">橙云</span>' : '<span class="tag">灰云</span>'}</td>
+                <td class="pm-act"><button class="btn tiny danger-text" type="button" data-act="dns.del" data-id="${esc(r.id)}" data-type="${esc(r.type)}" data-content="${esc(r.content)}">删除</button></td>
+              </tr>`).join('') : '<tr><td colspan="6" class="pm-muted" style="padding:12px 14px">Cloudflare 里还没有这个域名的记录</td></tr>'}
+            </tbody>
+          </table>
+        </div>`;
+
+  const canProxy = true;
+  return `
+    <div class="modal dns-panel" style="width:860px">
+      <div class="modal-head">
+        <div class="mh-icon" style="color:var(--blue)">${icon('globe')}</div>
+        <div class="grow">
+          <h3>DNS 记录 · <span class="mono">${esc(st.name)}</span></h3>
+          <p>域名解析与 Cloudflare 记录（查询时间 ${esc(when)}）</p>
+        </div>
+        <button class="icon-btn" type="button" data-act="modal.close" title="关闭">✕</button>
+      </div>
+      <div class="modal-body">
+        ${conclusion}
+        ${wildcardNote}
+        <div class="field-hint" style="margin:12px 0 6px">解析结果对比（同一个域名，四个来源各自怎么说）</div>
+        <div class="port-matrix-wrap">
+          <table class="port-matrix">
+            <thead><tr><th>查询来源</th><th>结果</th><th>记录</th><th>耗时</th></tr></thead>
+            <tbody>${sources.length ? sources.map(dnsSourceRow).join('') : '<tr><td colspan="4" class="pm-muted" style="padding:12px 14px">查询中…</td></tr>'}</tbody>
+          </table>
+        </div>
+        ${d && d.soaMinTtl ? `<div class="field-hint">这个域名的 SOA 负缓存上限是 ${Math.round(d.soaMinTtl / 60)} 分钟：刚在 Cloudflare 加完记录时，本机/运营商 DNS 可能还会继续返回「不存在」，最多等这么久才全世界生效。公共 DNS（1.1.1.1）通常立刻就能查到。</div>` : ''}
+
+        <div class="field-hint" style="margin:14px 0 6px">Cloudflare 里的记录</div>
+        ${cfBlock}
+
+        ${cf && cf.configured ? `
+        <div class="field-hint" style="margin:14px 0 6px">新增记录</div>
+        <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:flex-end">
+          <div class="field" style="width:96px"><label>类型</label>
+            <select class="select" id="dns-add-type">
+              <option value="A">A</option><option value="AAAA">AAAA</option><option value="CNAME">CNAME</option><option value="TXT">TXT</option>
+            </select></div>
+          <div class="field" style="flex:1;min-width:180px"><label>名称</label>
+            <input class="input mono" id="dns-add-name" value="${esc(isWildcard ? `*.${esc((d && d.apex) || '')}` : st.name)}"></div>
+          <div class="field" style="flex:1;min-width:180px"><label>内容（IP / 目标域名 / 文本）</label>
+            <input class="input mono" id="dns-add-content" placeholder="${esc((d && d.serverAddr) || '1.2.3.4')}"></div>
+          <div class="field" style="width:96px"><label>TTL</label>
+            <input class="input mono" id="dns-add-ttl" type="number" min="1" value="120"></div>
+          <label class="check-inline" style="margin-bottom:10px"><input type="checkbox" id="dns-add-proxied"> 橙云代理</label>
+          <button class="btn primary" type="button" data-act="dns.add" ${st.busy ? 'disabled' : ''}>${icon('plus')}<span>添加</span></button>
+        </div>
+        ${st.addError ? `<div class="field-hint" style="color:var(--red)">${esc(st.addError)}</div>` : ''}
+        <div class="field-hint">提示：证书 + nginx 反代的场景建议用<b>灰云（仅 DNS）</b>，否则 Cloudflare 会先接管 TLS，我们签的证书就用不上了；要开橙云就别在本地做 https2http。</div>
+        ` : ''}
+      </div>
+      <div class="modal-foot">
+        <button class="btn" type="button" data-act="dns.refresh" ${st.loading ? 'disabled' : ''}>${icon('reload')}<span>${st.loading ? '查询中…' : '重新查询'}</span></button>
+        <button class="btn" type="button" data-act="modal.close">关闭</button>
+      </div>
+    </div>`;
+}
+
+/* 与检测同源的一次轻查询：只用来更新表单里的 DNS 徽标文案 */
+async function dnsBadgeInfo(domain) {
+  try {
+    const res = await Promise.race([
+      FRP.dnsInspect({ name: domain }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('DNS 查询超时')), 12000)),
+    ]);
+    if (res && res.ok && res.data) return res.data;
+    return { judge: { tone: 'warn', title: '查询失败', detail: (res && res.error) || '' }, sources: [] };
+  } catch (e) {
+    return { judge: { tone: 'warn', title: '查询超时', detail: String((e && e.message) || e) }, sources: [] };
+  }
+}
+
 /* 把「配置渠道 → DNS 解析 → 签发证书 → 填进代理」做成可交互四步，
  * 每步内联对应表单，小白不用懂 DNS/TXT/ACME：从上到下一条流水线。 */
 function domainWizardHtml() {
@@ -4728,6 +4901,75 @@ async function handleAction(act, dataset, btn) {
         }
         break;
       }
+      case 'cert.dns':
+      case 'certs.dns': {
+        openDnsPanel(dataset.domain || dataset.name || '');
+        break;
+      }
+      case 'dns.refresh': {
+        loadDnsPanel();
+        break;
+      }
+      case 'dns.add': {
+        if (!S.dns || S.dns.busy) break;
+        const type = ($('#dns-add-type') || {}).value || 'A';
+        const nameEl = $('#dns-add-name');
+        const contentEl = $('#dns-add-content');
+        const ttlEl = $('#dns-add-ttl');
+        const proxEl = $('#dns-add-proxied');
+        const content = contentEl ? contentEl.value.trim() : '';
+        if (!content) { toast('warn', '请填写记录内容', 'A 记录填服务器 IP，CNAME 填目标域名'); break; }
+        S.dns.busy = true;
+        S.dns.addError = '';
+        renderDnsPanel();
+        try {
+          const res = await FRP.dnsAddRecord({
+            domain: S.dns.name,
+            type,
+            name: (nameEl && nameEl.value.trim()) || S.dns.name,
+            content,
+            ttl: Number(ttlEl && ttlEl.value) || 120,
+            proxied: !!(proxEl && proxEl.checked),
+          });
+          S.dns.busy = false;
+          if (res && res.ok) {
+            toast('success', '记录已添加', `${res.data.type} ${res.data.name} → ${res.data.content}`);
+          } else {
+            S.dns.addError = (res && res.error) || '添加失败';
+            toastResult(res);
+          }
+        } catch (e) {
+          S.dns.busy = false;
+          S.dns.addError = String((e && e.message) || e);
+        }
+        renderDnsPanel();
+        if (!S.dns.addError) await loadDnsPanel();
+        break;
+      }
+      case 'dns.del': {
+        if (!S.dns || S.dns.busy) break;
+        const id = dataset.id || '';
+        const label = `${dataset.type || ''} ${dataset.content || ''}`.trim();
+        const okDel = await confirmDialog({
+          title: '删除 DNS 记录',
+          body: `确定要删除 Cloudflare 里的这条记录吗？<div class="mono" style="margin-top:8px">${esc(label)}</div><div class="field-hint">删除后公网立刻解析不到这个域名（按 TTL 生效），如需恢复要重新添加。</div>`,
+          confirmText: '删除',
+          danger: true,
+        });
+        /* confirmDialog 会复用同一个 #modal-root 并 closeModal，确认/取消都会把 DNS 面板顶掉，
+         * 所以这里先把面板放回去，用户取消也能继续看。 */
+        openModal(dnsPanelMarkup());
+        if (!okDel) break;
+        S.dns.busy = true;
+        renderDnsPanel();
+        let res = null;
+        try { res = await FRP.dnsDelRecord({ domain: S.dns.name, id }); } catch (e) { res = { ok: false, error: String((e && e.message) || e) }; }
+        S.dns.busy = false;
+        if (res && res.ok) toast('success', '记录已删除', label);
+        else toastResult(res);
+        await loadDnsPanel();
+        break;
+      }
       case 'certs.nginx': {
         await withBusy(btn, async () => {
           const res = await FRP.certNginxSync({ domain: dataset.domain });
@@ -5198,14 +5440,11 @@ function refreshDomainReadiness() {
   syncBadges.push(domainBadge('DNS', '解析中…', ''));
   renderDomainReadiness(syncBadges);
 
-  // DNS 查询可能因为本机解析器卡住而长时间不回，这里加超时兜底，
-  // 免得徽标永远停在「解析中…」（用户会以为程序没反应）。
-  const dnsAnswer = Promise.race([
-    FRP.dnsResolve(primary),
-    new Promise((_, reject) => setTimeout(() => reject(new Error('DNS 解析超时')), 8000)),
-  ]);
-
-  dnsAnswer.then((res) => {
+  /* DNS 检查走和「DNS 记录」面板同一个数据源（FRP.dnsInspect）：
+   * 同时问本机解析器 + 1.1.1.1 + 8.8.8.8 + 权威 NS，所以不会出现
+   * 「面板说已解析、检测说未解析」这种自相矛盾，也不会因为本机 DNS 卡住
+   * 20 秒而只显示一句「未解析」把用户引到错方向。 */
+  dnsBadgeInfo(primary).then((info) => {
     const cur = $('#pf-domain-readiness');
     if (!cur) return;
     const nowType = $('#pf-type') ? $('#pf-type').value : '';
@@ -5213,18 +5452,25 @@ function refreshDomainReadiness() {
     const nowText = ($('#pf-domains') ? $('#pf-domains').value.trim() : '');
     const nowDomains = nowText.split(/[,，\s]+/).map((d) => d.trim()).filter(Boolean);
     if (nowDomains[0] !== primary) return;
-    const info = (res && res.ok && res.data) ? res.data : { resolved: [], pointsToServer: false, error: '查询失败' };
-    const dnsBadge = (() => {
-      if (!info.resolved || !info.resolved.length) return domainBadge('DNS', '未解析（可能还没建 A 记录）', 'amber');
-      const server = (S.state && S.state.config && S.state.config.serverAddr) || '';
-      const addrText = info.resolved.slice(0, 3).join('、');
-      if (info.pointsToServer) return domainBadge('DNS', `已解析到 ${addrText}（指向服务器）`, 'ok');
-      return domainBadge('DNS', `已解析到 ${addrText}${server ? `（未指向服务器 ${server}）` : ''}`, 'amber');
+    const judge = (info && info.judge) || { tone: 'warn', title: '查询失败', detail: '' };
+    const tone = judge.tone === 'ok' ? 'ok' : (judge.tone === 'bad' ? 'bad' : 'amber');
+    const text = (() => {
+      switch (judge.verdict) {
+        case 'ok': return `已解析到 ${(judge.addrs || []).slice(0, 3).join('、') || '（见详情）'}`;
+        case 'proxied': return `已解析（橙云代理，返回 CF IP ${(judge.addrs || [])[0] || ''}）`;
+        case 'public-only': return '公共 DNS 已解析，本机解析器还没更新';
+        case 'elsewhere': return `解析到 ${(judge.addrs || []).slice(0, 2).join('、')}，未指向服务器`;
+        case 'missing': return '未解析（没有这条记录）';
+        case 'unreachable': return 'DNS 查询失败（本机出网可能受限）';
+        default: return judge.title || '解析结果不确定';
+      }
     })();
-    renderDomainReadiness([vhostBadgeFor(nowType), certBadgeFor(primary, currentProxyPlugin()), dnsBadge]);
-  }).catch(() => {
-    const cur = $('#pf-domain-readiness');
-    if (cur) renderDomainReadiness([vhostBadgeFor(type), certBadgeFor(primary, pluginType), domainBadge('DNS', '解析失败', 'amber')]);
+    const viewBtn = `<button class="btn tiny" type="button" data-act="cert.dns" data-domain="${esc(primary)}" title="查看各 DNS 来源的实际情况，或直接增删记录">查看 DNS</button>`;
+    renderDomainReadiness([
+      vhostBadgeFor(nowType),
+      certBadgeFor(primary, currentProxyPlugin()),
+      `${domainBadge('DNS', text, tone)}${viewBtn}`,
+    ]);
   });
 }
 

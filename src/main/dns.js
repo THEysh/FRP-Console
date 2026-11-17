@@ -1,7 +1,7 @@
 'use strict';
 
 /*
- * DNS-01 验证的域名服务商适配层。
+ * DNS-01 验证的域名服务商适配层 + 证书页的 DNS 记录面板（v1.2.58）。
  * 只依赖 Node 内置 https / url，不依赖 electron，方便用纯 node 单测。
  *
  * 每个 provider 实现三个方法，供 src/main/acme.js 的 ACME DNS-01 流程调用：
@@ -34,7 +34,7 @@ function apexOf(domain) {
   return parts.slice(-2).join('.');
 }
 
-function requestJson(url, { method = 'GET', headers = {}, body = null } = {}) {
+function requestJson(url, { method = 'GET', headers = {}, body = null, timeout = 12000 } = {}) {
   return new Promise((resolve, reject) => {
     const u = new URL(url);
     const req = https.request({
@@ -42,6 +42,7 @@ function requestJson(url, { method = 'GET', headers = {}, body = null } = {}) {
       port: u.port || 443,
       path: u.pathname + u.search,
       method,
+      timeout,
       headers: { 'Content-Type': 'application/json', ...headers },
     }, (res) => {
       let data = '';
@@ -52,6 +53,9 @@ function requestJson(url, { method = 'GET', headers = {}, body = null } = {}) {
         resolve({ status: res.statusCode, data: parsed, raw: data });
       });
     });
+    /* 没有超时的话，api.cloudflare.com 被网络挡掉时 IPC 会永远挂着，
+     * 前端只能干等（表现为「点开 DNS 面板一直转圈」）。 */
+    req.on('timeout', () => { req.destroy(new Error(`Cloudflare 请求超时（${Math.round(timeout / 1000)} 秒）`)); });
     req.on('error', reject);
     if (body) req.write(typeof body === 'string' ? body : JSON.stringify(body));
     req.end();
@@ -197,6 +201,78 @@ class CloudflareDns {
       throw new Error(cfError(create, `添加 A 记录 ${host} 失败`));
     }
     return { id: create.data.result.id, name: create.data.result.name, content: create.data.result.content, updated: true };
+  }
+  /* ---- 证书页「DNS 记录」面板用：任意类型记录的查/增/删（v1.2.58） ---- */
+
+  /* 列出某个域名下的记录。
+   * name 可以是 "finder.theysh.cn"、也可以是通配符 "*.theysh.cn"（Cloudflare 里存的就是 "*"）。
+   * zone 级别的全量记录用 listZoneRecords 取（用于「同 zone 其它记录」参考）。 */
+  async listRecords(domain, { type = '' } = {}) {
+    const zoneId = await this._zoneId(domain);
+    const name = String(domain || '').trim().toLowerCase().replace(/\.$/, '');
+    const qs = new URLSearchParams({ per_page: '100', order: 'name', direction: 'asc' });
+    if (name && !name.startsWith('*.')) qs.set('name', name);
+    if (type) qs.set('type', String(type).toUpperCase());
+    const res = await requestJson(`${this.base}/zones/${zoneId}/dns_records?${qs.toString()}`, {
+      method: 'GET',
+      headers: this._headers(),
+    });
+    if (res.status !== 200 || !res.data || !res.data.success) {
+      throw new Error(cfError(res, `列出 ${name} 的 DNS 记录失败`));
+    }
+    let records = (res.data.result || []).map((r) => ({
+      id: r.id,
+      type: r.type,
+      name: r.name,
+      content: r.content,
+      ttl: Number(r.ttl) || 0,
+      proxied: !!r.proxied,
+      proxiable: !!r.proxiable,
+      modified: r.modified_on || '',
+      created: r.created_on || '',
+    }));
+    /* 通配符：Cloudflare 的 API 用 name=*.x 过滤不生效，这里在本地按前缀筛一遍 */
+    if (name.startsWith('*.')) {
+      const apexName = name.slice(2);
+      records = records.filter((r) => r.name === `*.${apexName}` || r.name === apexName);
+    }
+    return { zoneId, name, records };
+  }
+
+  async createRecord(domain, { type, name, content, ttl = 120, proxied = false }) {
+    const zoneId = await this._zoneId(domain);
+    const fullName = String(name || '').trim() || stripWildcard(domain);
+    const body = {
+      type: String(type || 'A').toUpperCase(),
+      name: fullName,
+      content: String(content || '').trim(),
+      ttl: Number(ttl) || 120,
+    };
+    /* 只有 A/AAAA/CNAME 支持橙云代理，TXT 等传了会报错 */
+    if (body.type !== 'TXT') body.proxied = !!proxied;
+    const res = await requestJson(`${this.base}/zones/${zoneId}/dns_records`, {
+      method: 'POST',
+      headers: this._headers(),
+      body,
+    });
+    if (res.status !== 200 || !res.data || !res.data.success) {
+      throw new Error(cfError(res, `添加 ${body.type} 记录 ${fullName} 失败`));
+    }
+    const r = res.data.result;
+    return { id: r.id, type: r.type, name: r.name, content: r.content, ttl: r.ttl, proxied: !!r.proxied };
+  }
+
+  async deleteRecord(domain, id) {
+    if (!id) throw new Error('缺少记录 id');
+    const zoneId = await this._zoneId(domain);
+    const res = await requestJson(`${this.base}/zones/${zoneId}/dns_records/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+      headers: this._headers(),
+    });
+    if (res.status !== 200 || !res.data || !res.data.success) {
+      throw new Error(cfError(res, '删除 DNS 记录失败'));
+    }
+    return { id };
   }
 }
 
