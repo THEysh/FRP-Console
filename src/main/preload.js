@@ -70,6 +70,7 @@ contextBridge.exposeInMainWorld('FRP', {
   certRenew: (domain) => invoke('cert:renew', { domain }),
   certRemove: (domain) => invoke('cert:remove', { domain }),
   certNginxSync: (payload) => invoke('cert:nginx-sync', payload),
+  certServerScan: (payload) => invoke('cert:server-scan', payload),
   dnsState: () => invoke('dns:state'),
   dnsSave: (payload) => invoke('dns:save', payload),
   dnsResolve: (domain) => invoke('dns:resolve', domain),

@@ -1379,9 +1379,81 @@ class ServerSession {
     return { ok: true, dir };
   }
 
+  /* 服务器上已有的证书盘点（只读）。
+   * 一次 SSH 批量跑完：① nginx 配置里 ssl_certificate 指向的文件 ② 宝塔面板的 vhost/cert/*
+   * ③ letsencrypt/live/* ④ /etc/nginx/ssl/*。每条再用 openssl 读出 subject/issuer/到期/SAN，
+   * 让 UI 能列出「这台服务器上有哪些证书、域名是什么、到期还有多久」。
+   * 只读、不改任何文件；个别文件读不出就跳过（openssl 缺失时只回路径）。 */
+  async scanCertificates({ limit = 40, timeout = 20000 } = {}) {
+    if (!this.connected) return { ok: false, error: '尚未连接服务器' };
+    const script = [
+      'set +e',
+      'for f in \\',
+      "  $(grep -rhoE 'ssl_certificate[[:space:]]+[^;]+;' /etc/nginx /www/server/panel/vhost/nginx 2>/dev/null | sed -E 's/ssl_certificate[[:space:]]+//; s/;//'), \\",
+      '  $(ls -1 /www/server/panel/vhost/cert/*/fullchain.pem 2>/dev/null), \\',
+      '  $(ls -1 /etc/letsencrypt/live/*/fullchain.pem 2>/dev/null), \\',
+      '  $(ls -1 /etc/nginx/ssl/*/fullchain.pem 2>/dev/null); do',
+      '  [ -f "$f" ] || continue',
+      '  echo "@@CERT $f"',
+      '  openssl x509 -in "$f" -noout -subject -issuer -enddate -ext subjectAltName 2>/dev/null | head -n 14',
+      '  d=$(dirname "$f")',
+      '  for k in privkey.pem key.pem; do if [ -f "$d/$k" ]; then echo "@@KEY $d/$k"; break; fi; done',
+      '  echo "@@END"',
+      'done | head -n ' + String(Math.max(1, limit) * 20),
+      'echo "@@DONE"',
+    ].join('\n');
+    const res = await this.exec(script, timeout);
+    if (!res.ok && !/@@DONE/.test(res.stdout || '')) {
+      return { ok: false, error: res.stderr || res.error || '扫描失败' };
+    }
+    return { ok: true, certs: this.parseCertificates(res.stdout || ''), truncated: !/@@DONE/.test(res.stdout || '') };
+  }
+
+  /* 解析 scanCertificates 的原始输出。抽成独立方法便于单测。 */
+  parseCertificates(text) {
+    const out = [];
+    const blocks = String(text || '').split(/@@CERT /).slice(1);
+    for (const block of blocks) {
+      const end = block.indexOf('@@END');
+      const body = end >= 0 ? block.slice(0, end) : block;
+      const lines = body.split('\n');
+      const path = (lines.shift() || '').trim();
+      if (!path) continue;
+      const detail = lines.join('\n');
+      const keyMatch = detail.match(/@@KEY\s+(\S+)/);
+      const subject = (detail.match(/subject\s*=.*?(?:CN\s*=\s*)([^,\n\/]+)/i) || [])[1] || '';
+      /* issuer 优先取组织名（O = Let's Encrypt），取不到再退到 CN（CN 常是 R10/R11 这种中间证书代号） */
+      const issuerLine = (detail.match(/issuer\s*=([^\n]+)/i) || [])[1] || '';
+      const issuerOrg = (issuerLine.match(/\bO\s*=\s*([^,\n]+)/i) || [])[1] || '';
+      const issuerCn = (issuerLine.match(/\bCN\s*=\s*([^,\n]+)/i) || [])[1] || '';
+      const issuer = String(issuerOrg || issuerCn).trim();
+      const notAfterRaw = (detail.match(/notAfter\s*=\s*([^\n]+)/i) || [])[1] || '';
+      const sanLine = (detail.match(/Subject Alternative Name[\s\S]*?DNS:([^\n]+)/i) || [])[1] || '';
+      const altNames = sanLine
+        .split(',')
+        .map((s) => s.trim().replace(/^DNS:/i, '').trim())
+        .filter(Boolean);
+      const lower = path.toLowerCase();
+      const source = lower.includes('/www/server/panel/')
+        ? 'bt'
+        : lower.includes('letsencrypt')
+          ? 'le'
+          : 'nginx';
+      out.push({
+        certPath: path,
+        keyPath: keyMatch ? keyMatch[1].trim() : '',
+        domain: String(subject).trim(),
+        altNames,
+        issuer: String(issuer).trim(),
+        notAfterRaw: String(notAfterRaw).trim(),
+        source,
+      });
+    }
+    return out;
+  }
+
   /* nginx server_name：多个域名空格分隔，通配符 `*.x` 原样传给 nginx。 */
-  nginxServerName(domains) {
-    const names = (Array.isArray(domains) ? domains : [domains]).map((d) => String(d || '').trim()).filter(Boolean);
+  nginxServerName(domains) {    const names = (Array.isArray(domains) ? domains : [domains]).map((d) => String(d || '').trim()).filter(Boolean);
     return names.length ? names.join(' ') : 'localhost';
   }
 

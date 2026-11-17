@@ -1418,6 +1418,15 @@ label .icon-btn svg { width: 13px; height: 13px; }
 }
 .cloud-hint svg { pointer-events: none; }
 
+/* 服务器日志卡片顶部的统计条（启动时间 / 客户端连接 / 错误数）同样不能放养 SVG */
+.log-chips span svg {
+  width: 13px;
+  height: 13px;
+  flex: 0 0 13px;
+  max-width: 13px;
+  max-height: 13px;
+}
+
 
 /* ???????????????v1.2.57? */
 .port-matrix-more {

@@ -152,6 +152,9 @@ let sessionServerId = '';
 /* 最近一次 nginx 检测结果（服务器页进来就会拉一次），端口矩阵用它补 80/443 的「谁在监听」信号。 */
 let lastNginxState = null;
 
+/* 服务器证书扫描结果缓存（按 host 记，60 秒内不重复 SSH 扫盘）。 */
+let serverCertScanCache = { at: 0, host: '', certs: [], truncated: false };
+
 // 服务器 allowPorts（frps 对 remotePort 的白名单），未连服务器时为 []。
 function serverAllowPorts() {
   return (serverConfig.summary && serverConfig.summary.allowPorts) || [];
@@ -3442,6 +3445,37 @@ function registerIpc() {
     if (!result.ok) return fail(result.error);
     pushState();
     return ok({ removed: true });
+  });
+
+  /* 服务器上已有的证书盘点（只读）：nginx 引用的 + 宝塔 vhost/cert + letsencrypt/live + /etc/nginx/ssl。
+   * 结果按 host 缓存 60 秒，force=true 可强刷。 */
+  ipcMain.handle('cert:server-scan', async (event, payload = {}) => {
+    try {
+      if (!serverSession.connected) return fail('尚未连接服务器，无法读取服务器上的证书');
+      const force = !!(payload && payload.force);
+      const host = serverSession.host;
+      const fresh = serverCertScanCache.host === host && Date.now() - serverCertScanCache.at < 60000;
+      if (!force && fresh) {
+        return ok({ ...serverCertScanCache, cached: true, scannedAt: serverCertScanCache.at });
+      }
+      const scan = await serverSession.scanCertificates();
+      if (!scan.ok) return fail(scan.error || '扫描服务器证书失败');
+      const now = Date.now();
+      const certs = (scan.certs || []).map((c) => {
+        const t = Date.parse(c.notAfterRaw || '');
+        const notAfter = Number.isFinite(t) ? t : 0;
+        return {
+          ...c,
+          notAfter,
+          notAfterText: notAfter ? new Date(notAfter).toISOString().slice(0, 10) : '',
+          daysLeft: notAfter ? Math.floor((notAfter - now) / 86400000) : null,
+        };
+      });
+      serverCertScanCache = { at: now, host, certs, truncated: !!scan.truncated };
+      return ok({ ...serverCertScanCache, cached: false, scannedAt: now });
+    } catch (e) {
+      return fail(String((e && e.message) || e));
+    }
   });
 
   ipcMain.handle('dns:state', async () => ok({

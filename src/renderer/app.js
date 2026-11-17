@@ -24,7 +24,7 @@ const S = {
   modalOpen: false,
   proxyEdit: null,
   update: null,
-  certs: { list: [], dns: { dnsProvider: '', hasToken: false, acmeEmail: '' }, loaded: false, busy: false, issuing: false, wizard: { domain: '', checking: false, dns: null, setA: false, result: null } },
+  certs: { list: [], dns: { dnsProvider: '', hasToken: false, acmeEmail: '' }, loaded: false, busy: false, issuing: false, wizard: { domain: '', checking: false, dns: null, setA: false, result: null }, server: { loaded: false, loading: false, certs: [], host: '', scannedAt: 0, truncated: false, error: '' } },
   lastKeys: {},
   viewScroll: {},
   busy: new Set(),
@@ -2450,6 +2450,7 @@ async function autoConnectActiveProfile() {
     S.server.nginx = null;      // 旧服务器的 nginx 状态不残留，连接后重新检测
     S.server.selftest = null;   // 旧服务器的就绪检查结果不残留
     S.server.firewall = null;   // 旧服务器的防火墙状态不残留
+    S.certs.server = { loaded: false, loading: false, certs: [], host: '', scannedAt: 0, truncated: false, error: '' }; // 换服务器后证书列表要重扫
   } catch (e) {
     toast('error', '自动连接失败', String((e && e.message) || e));
   } finally {
@@ -2854,6 +2855,7 @@ async function connectServer(btn, options = undefined) {
     S.server.nginx = null;      // 旧服务器的 nginx 状态不残留，连接后重新检测
     S.server.selftest = null;   // 旧服务器的就绪检查结果不残留
     S.server.firewall = null;   // 旧服务器的防火墙状态不残留
+    S.certs.server = { loaded: false, loading: false, certs: [], host: '', scannedAt: 0, truncated: false, error: '' }; // 换服务器后证书列表要重扫
     renderServer(true);
     openShellTerm().catch(() => {});   // SSH 终端默认打开
     if (res.data && res.data.adoptProfile) {
@@ -3390,6 +3392,98 @@ function certRow(c) {
     </div>`;
 }
 
+/* ---------------- 服务器上的证书（v1.2.62，只读扫描） ----------------
+ * 本机 userData\certs 只是「本机签发/导入的」，服务器上往往还有企业面板（宝塔）或
+ * 别的工具签的证书。这张卡片把服务器上实际存在的证书列出来：域名、来源、到期、路径。
+ * 纯只读：只 grep 配置 + openssl 读文件，不改任何东西。 */
+const CERT_SOURCE_LABEL = { bt: '宝塔', le: "Let's Encrypt", nginx: 'nginx' };
+
+async function loadServerCerts({ force = false } = {}) {
+  const st = S.certs.server;
+  if (st.loading) return;
+  if (!S.server.connected) {
+    st.loaded = true;
+    st.certs = [];
+    st.host = '';
+    st.error = '未连接服务器';
+    if (S.view === 'certs') renderCerts(true);
+    return;
+  }
+  if (!force && st.loaded && st.host === String(S.server.host || '')) return;
+  st.loading = true;
+  try {
+    const res = await FRP.certServerScan({ force });
+    if (res && res.ok) {
+      st.certs = res.data.certs || [];
+      st.host = res.data.host || String(S.server.host || '');
+      st.scannedAt = res.data.scannedAt || Date.now();
+      st.truncated = !!res.data.truncated;
+      st.error = '';
+    } else {
+      st.error = (res && res.error) || '扫描服务器证书失败';
+    }
+    st.loaded = true;
+  } catch (e) {
+    st.error = String((e && e.message) || e);
+    st.loaded = true;
+  } finally {
+    st.loading = false;
+  }
+  if (S.view === 'certs') renderCerts(true);
+}
+
+function serverCertRow(c) {
+  const tone = c.daysLeft === null || c.daysLeft === undefined ? 'amber' : certExpiryTone(c.daysLeft);
+  const src = CERT_SOURCE_LABEL[c.source] || c.source || '未知';
+  const names = (Array.isArray(c.altNames) && c.altNames.length ? c.altNames : [c.domain]).filter(Boolean);
+  const namesText = names.slice(0, 4).join('、') + (names.length > 4 ? ` 等 ${names.length} 个` : '');
+  const daysText = c.daysLeft === null || c.daysLeft === undefined ? '到期未知' : `剩余 ${c.daysLeft} 天`;
+  return `
+    <div class="cert-row">
+      <div class="cert-main">
+        <div class="cert-title">
+          <strong>${esc(c.domain || c.certPath)}</strong>
+          <span class="badge">${esc(src)}</span>
+          ${String(c.domain || '').startsWith('*.') ? '<span class="badge">通配符</span>' : ''}
+        </div>
+        <div class="cert-meta mono">
+          覆盖 ${esc(namesText)}
+          · <span class="tag ${tone}">${esc(daysText)}</span>
+          ${c.issuer ? ` · 签发者 ${esc(c.issuer)}` : ''}
+        </div>
+        <div class="cert-paths mono">
+          <div>证书 <code>${esc(c.certPath)}</code> <button class="icon-btn" type="button" data-act="copy" data-text="${esc(c.certPath)}" title="复制路径">${icon('copy')}</button></div>
+          ${c.keyPath ? `<div>私钥 <code>${esc(c.keyPath)}</code> <button class="icon-btn" type="button" data-act="copy" data-text="${esc(c.keyPath)}" title="复制路径">${icon('copy')}</button></div>` : ''}
+        </div>
+      </div>
+    </div>`;
+}
+
+function serverCertsMarkup() {
+  const st = S.certs.server || {};
+  const host = st.host || (S.server.connected ? String(S.server.host || '') : '');
+  const sub = !S.server.connected
+    ? '连上服务器后，这里会列出它上面已有的证书（nginx / 宝塔 / Let\'s Encrypt）。只读扫描，不会改动任何文件。'
+    : `${host ? `${esc(host)} 上` : '服务器上'}找到 ${st.certs.length} 张证书${st.scannedAt ? ` · ${new Date(st.scannedAt).toLocaleTimeString('zh-CN')} 扫描` : ''}`;
+  const head = `
+        <div class="section-head">
+          <div class="section-title"><strong>服务器上的证书</strong><span>${sub}</span></div>
+          <div class="page-actions">
+            <button class="btn small" type="button" data-act="certs.server.scan" ${st.loading ? 'disabled' : ''}>${icon('reload')}<span>${st.loading ? '扫描中…' : '重新扫描'}</span></button>
+          </div>
+        </div>`;
+  if (!S.server.connected) return head;
+  if (st.error) return `${head}<div class="note warn" style="margin:0 16px 12px">${icon('alert')}<div>${esc(st.error)}</div></div>`;
+  if (st.loading && !st.loaded) {
+    return `${head}<div class="empty"><span class="spinner"></span><h3>正在扫描服务器证书</h3><p>读 nginx 配置、宝塔证书目录，再用 openssl 看每张证书的域名与到期日。</p></div>`;
+  }
+  if (!st.certs.length) {
+    return `${head}<div class="empty"><h3>这台服务器上没有找到证书</h3><p>看过的位置：nginx 的 <code>ssl_certificate</code>、<code>/www/server/panel/vhost/cert/*</code>、<code>/etc/letsencrypt/live/*</code>、<code>/etc/nginx/ssl/*</code>。用上面的向导签一张，签完「部署到 nginx」即可。</p></div>`;
+  }
+  const trunc = st.truncated ? `<div class="field-hint" style="padding:0 16px 12px">证书较多，只显示了前 ${st.certs.length} 张。</div>` : '';
+  return `${head}<div class="cert-list">${st.certs.map(serverCertRow).join('')}</div>${trunc}`;
+}
+
 /* ---------------- DNS 记录面板（v1.2.58） ----------------
  * 证书页每个域名旁提供「DNS 记录」入口：在一个面板里同时看到
  *   ① Cloudflare 里的记录（可增可删）  ② 四个 DNS 来源的实际解析结果
@@ -3742,7 +3836,15 @@ function renderCerts(force = false) {
           ? `<div class="cert-list">${certs.map(certRow).join('')}</div>`
           : `<div class="empty"><span class="spinner"></span><h3>还没有证书</h3><p>照上面向导「签发证书」一步签发第一张。签发后连上服务器即可「部署到 nginx」，让域名走 80/443。</p></div>`}
       </section>
+
+      <section class="card section">
+        ${serverCertsMarkup()}
+      </section>
     </div>`;
+
+  // 连上服务器才扫描；进页面自动扫一次（60 秒内主进程有缓存，不会反复 SSH）。
+  const srvSt = S.certs.server;
+  if (S.server.connected && !srvSt.loaded && !srvSt.loading) loadServerCerts();
 }
 
 /* ----------------------------- 设置 ------------------------------ */
@@ -4836,6 +4938,14 @@ async function handleAction(act, dataset, btn) {
       case 'certs.refresh':
         await loadCerts();
         break;
+      case 'certs.server.scan': {
+        if (!S.server.connected) { toast('warn', '还没连服务器', '到「服务器」页连上服务器后再扫描'); break; }
+        await loadServerCerts({ force: true });
+        const st = S.certs.server;
+        if (st.error) toast('error', '扫描失败', st.error);
+        else toast('ok', '扫描完成', `服务器上有 ${st.certs.length} 张证书`);
+        break;
+      }
       case 'dw.check':
         await refreshDomainWizard();
         break;
