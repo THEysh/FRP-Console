@@ -78,6 +78,7 @@ const updateModule = require('./update');
 const { AcmeManager, coversDomain, readCertCoverage } = require('./acme');
 const { CloudflareDns } = require('./dns');
 const dnsCheck = require('./dnscheck');
+const browserProbe = require('./netprobe');
 const { execFileP, tcpCheck, httpProbe, hashText, randomToken, formatDuration } = require('./util');
 const { probePort, probeUdp, sshConnectHint, outboundHint } = require('./portprobe');
 const { parseRuleSpec, judgePortRow, buildPortMatrix, summarizeMatrix, buildRuleTexts } = require('./portmatrix');
@@ -1515,6 +1516,18 @@ async function mapLimit(items, limit, worker) {
   return out;
 }
 
+/* 浏览器该打开的那个地址：target.display 就是界面上给用户看的公网地址
+ *（方案 Y 是 https://域名，vhost 是 http(s)://域名:端口），再把访问路径接上。
+ * 兜底探测要用它，不能用「连 IP + SNI」那条 URL —— 浏览器不会这么连。 */
+function browserUrlFor(target) {
+  if (!target) return '';
+  const base = String(target.display || '');
+  if (!/^https?:\/\//i.test(base)) return '';
+  const openPath = String(target.openPath || '');
+  if (!openPath) return base;
+  return `${base.replace(/\/+$/, '')}${openPath}`;
+}
+
 /* 单条代理的三层检查。任何异常都收敛成一条失败结果：
  * 一条代理出问题不能让整轮检查作废（以前 Promise.all 一 reject，整轮全丢）。 */
 async function checkProxyHealth(p, ctx) {
@@ -1575,6 +1588,17 @@ async function checkProxyHealth(p, ctx) {
     // 探测必须按隧道绑定档案解析，否则切档案后 http 代理会按错的服务器探测 443。
     nginxProxyEnabled: yModeEnabled(),
   };
+  /* 域名解析先查：界面要展示 DNS 层，兜底探测也要用它当前提——
+   * 只有「域名确实指向这台服务器」时，用浏览器栈探测才是对同一个入口的复验；
+   * 否则可能打开的是别人家的同名站点，反而制造假绿。 */
+  let dnsInfo = null;
+  if (type === 'http' || type === 'https') {
+    const domainForDns = configModule.firstDomainOf(p);
+    if (domainForDns) {
+      dnsInfo = await resolveDomainInfo(domainForDns);
+      layers.dns = { ok: dnsInfo.resolved.length > 0, skipped: false, resolved: dnsInfo.resolved, pointsToServer: dnsInfo.pointsToServer, error: dnsInfo.error };
+    }
+  }
   const target = configModule.probeTargetFor(model, p, vhostOpts);
   if (!target) {
     pub = { ok: false, ms: 0, error: type === 'http' || type === 'https' ? '缺少公网域名' : '缺少公网端口' };
@@ -1590,12 +1614,49 @@ async function checkProxyHealth(p, ctx) {
     if (pub.ok && Number(pub.status) === 404) {
       pub = { ...pub, ok: false, pathMissing: true };
     }
+    /* node 的 https 探测被重置时，用 Chromium 的网络栈再试一次（浏览器同款 ClientHello）。
+     * 实测：某个域名在云厂商那边没备案时，边缘会按 TLS 层直接 RST —— 同一台机器上
+     * Chrome 能正常打开，而 node 的 https（BoringSSL）和 PowerShell 的 schannel 都在
+     * 握手阶段收到 ECONNRESET。只认 node 这一条路，就会把「浏览器明明能开」说成
+     * 「公网不可达」。兜底探测成功时标注 via:'browser'，界面上说明是靠浏览器栈验证的。 */
+    let browserTry = null;
+    if (!pub.ok && !pub.pathMissing) {
+      const browserUrl = browserUrlFor(target);
+      /* 只在「域名确实解析到这台服务器」时复验：否则浏览器栈可能打开的是别人家的
+       * 同名站点（DNS 还没生效 / 解析被劫持），把故障说成通过。 */
+      const dnsPointsHere = !dnsInfo || dnsInfo.pointsToServer;
+      if (browserUrl && dnsPointsHere) {
+        browserTry = await browserProbe.probeWithChromium(browserUrl, 6000);
+        if (browserTry && browserTry.ok && Number(browserTry.status) === 404) {
+          pub = { ...pub, ok: false, pathMissing: true, error: `HTTP ${browserUrl} 返回 404` };
+        } else if (browserTry && browserTry.ok) {
+          pub = {
+            ok: true,
+            status: browserTry.status,
+            ms: (pub.ms || 0) + (browserTry.ms || 0),
+            error: null,
+            via: 'browser',
+            directError: pub.error || null,
+            browserUrl,
+          };
+        }
+      }
+    }
     layers.public = {
       ok: !!pub.ok, ms: pub.ms || 0, error: pub.error || null,
       status: pub.status || 0, url: target.display || target.url,
       path: target.openPath || '',
       pathMissing: !!pub.pathMissing,
+      via: pub.via || null,
+      directError: pub.directError || null,
+      browserUrl: (pub.via === 'browser' ? pub.browserUrl : '') || '',
+      browserError: (!pub.ok && browserTry && !browserTry.unavailable) ? (browserTry.error || '') : '',
+      browserUnavailable: !!(browserTry && browserTry.unavailable),
     };
+    if (pub.via === 'browser') {
+      layers.public.hint = `本机 node 直连被重置（${pub.directError || 'TLS 握手失败'}），用浏览器同款网络栈（Chromium）验证可以通过——隧道和域名本身是正常的。`
+        + '这类重置常见于云厂商对未备案域名的 443 拦截：浏览器能开，命令行/接口类客户端会被拦。';
+    }
   } else {
     pub = await tcpCheck(target.host, target.port, 2500);
     layers.public = { ok: !!pub.ok, ms: pub.ms || 0, error: pub.error || null };
@@ -1614,13 +1675,6 @@ async function checkProxyHealth(p, ctx) {
       } else if (probe && probe.ok) {
         layers.public = { ...layers.public, status: probe.status || 0, url: httpUrl };
       }
-    }
-  }
-  if (type === 'http' || type === 'https') {
-    const domain = configModule.firstDomainOf(p);
-    if (domain) {
-      const dnsInfo = await resolveDomainInfo(domain);
-      layers.dns = { ok: dnsInfo.resolved.length > 0, skipped: false, resolved: dnsInfo.resolved, pointsToServer: dnsInfo.pointsToServer, error: dnsInfo.error };
     }
   }
   if (!pub.ok) {
@@ -1654,6 +1708,18 @@ async function checkProxyHealth(p, ctx) {
       reason = 'nginx 没有监听 443';
       error = `探测目标 https://${serverSession.host}/ 连不上：服务器上 443 没有任何监听，frp-console.conf 里也没有 ssl 证书段`;
       hint = '到「HTTPS 证书」页签发或导入一张覆盖该域名的证书，然后「部署到 nginx」，它会补上 443 段与证书';
+    } else if (/ECONNRESET|EPROTO|ECONNABORTED|socket hang up|TLS|SSL/i.test(String(pub.error || ''))) {
+      /* TLS 层被重置 ≠ 公网不可达：端口是通的（前面 tunnel 层已经证明），
+       * 握手在中间被掐掉了。常见于云厂商对未备案域名的 443 拦截——
+       * 浏览器有时仍能打开（Chromium 的 ClientHello 被放行），
+       * node/schannel 这类客户端直接收到 RST。说成「公网不可达」会让人去查安全组。 */
+      reason = '公网 TLS 握手被中断';
+      error = `${target.kind === 'http' ? target.url : `https://${target.host}/`} 握手阶段收到 ${pub.error}（端口是通的，连接是被中途重置的）`;
+      hint = '先用浏览器打开这个域名确认：如果浏览器能打开、只有本机探测被重置，通常是云厂商按域名在做 TLS 层拦截（未备案最常见），隧道本身没问题；'
+        + '要彻底消除就到云厂商完成备案，或把域名解析到已备案的机器上。';
+      const browserErr = layers.public.browserError;
+      if (browserErr) hint += `\n浏览器同款网络栈（Chromium）也没能打开：${browserErr}`;
+      else if (layers.public.browserUnavailable) hint += '\n（本次没能用浏览器网络栈复核：只在 Electron 主进程里可用。）';
     } else if (pubDomain && /frps 上没有匹配到该域名/.test(String(pub.error || ''))) {
       const names = (recentNginx && Array.isArray(recentNginx.serverNames)) ? recentNginx.serverNames : [];
       const covered = names.some((n) => coversDomain(n, pubDomain));

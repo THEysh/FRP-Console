@@ -185,6 +185,9 @@ function healthTip(h) {
     /* 404 时说「通（但返回 404）」比说「不通」准确：TCP/TLS/HTTP 都成功了。 */
     h.pathMissing ? '公网：通，但返回 404' : label('公网', h.layers.public),
   ];
+  /* 靠浏览器网络栈复验通过的，标一下来源：本机 node 直连是被重置的，
+   * 用户看到「通」才知道不是靠 HTTP 412 之类的宽松判定蒙过去的。 */
+  if (h.layers.public && h.layers.public.via === 'browser') parts[parts.length - 1] = '公网：通（浏览器网络栈复验）';
   const hint = h.layers.public && h.layers.public.hint;
   return hintsText(parts.join(' · '), hint);
 }
