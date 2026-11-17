@@ -95,6 +95,7 @@ const ICON_PATHS = {
   trash: '<path d="M4 7h16M9 7V5h6v2M6.5 7l.8 12h9.4l.8-12M10 10.5v5M14 10.5v5"/>',
   edit: '<path d="M4 20h4l10.5-10.5a2.2 2.2 0 0 0-3-3L5 17z"/><path d="m13.5 5.5 3 3"/>',
   check: '<path d="m5 12.5 4.5 4.5L19 6.5"/>',
+  save: '<path d="M5 4.5h10.5L19 8v11.5H5z"/><path d="M8.5 4.5v5h6v-5"/><path d="M8.5 13h7v6.5h-7z"/>',
   alert: '<path d="M12 3.5 21 19H3z"/><path d="M12 9.5v4M12 16.2v.3"/>',
   x: '<path d="m6 6 12 12M18 6 6 18"/>',
   download: '<path d="M12 4v11"/><path d="m7.5 10.5 4.5 4.5 4.5-4.5"/><path d="M4 19h16"/>',
@@ -1396,10 +1397,15 @@ function frpsPane() {
     <div id="frps-pane" class="advanced-pane ${S.server.mode === 'frps' ? '' : 'hidden'}">
       <div class="adv-head">
         <span class="field-hint">服务器端 frps.toml。直接编辑完整 TOML，保存前会校验语法并备份。</span>
-        <div class="page-actions">
-          <button class="btn ghost" type="button" data-act="server.advanced.reload">${icon('download')}<span>重新读取</span></button>
-          <button class="btn" type="button" data-act="server.save">${icon('check')}<span>仅保存</span></button>
-          <button class="btn primary" type="button" data-act="server.save.restart">${icon('restart')}<span>保存并重启 frps</span></button>
+        <div class="page-actions adv-actions">
+          <div class="btn-cluster">
+            <button class="btn ghost" type="button" data-act="server.advanced.reload">${icon('download')}<span>重新读取</span></button>
+          </div>
+          <span class="btn-sep" aria-hidden="true"></span>
+          <div class="btn-cluster">
+            <button class="btn subtle" type="button" data-act="server.save">${icon('check')}<span>仅保存</span></button>
+            <button class="btn primary" type="button" data-act="server.save.restart">${icon('restart')}<span>保存并重启 frps</span></button>
+          </div>
         </div>
       </div>
       <textarea class="textarea server-config" id="server-config" spellcheck="false" placeholder="frps 配置内容">${esc(S.server.config)}</textarea>
@@ -1411,11 +1417,16 @@ function frpcPane() {
     <div id="frpc-pane" class="advanced-pane ${S.server.mode === 'frpc' ? '' : 'hidden'}">
       <div class="adv-head">
         <span class="field-hint">本机 frpc.toml。直接编辑完整 TOML，校验语法通过后才能保存；写前自动备份。</span>
-        <div class="page-actions">
-          <button class="btn ghost" type="button" data-act="server.frpc.verify">${icon('check')}<span>校验语法</span></button>
-          <button class="btn ghost" type="button" data-act="server.frpc.reload">${icon('download')}<span>重新读取</span></button>
-          <button class="btn" type="button" data-act="server.frpc.save">${icon('check')}<span>仅保存</span></button>
-          <button class="btn primary" type="button" data-act="server.frpc.save.restart">${icon('restart')}<span>保存并重启 frpc</span></button>
+        <div class="page-actions adv-actions">
+          <div class="btn-cluster">
+            <button class="btn ghost" type="button" data-act="server.frpc.reload">${icon('download')}<span>重新读取</span></button>
+            <button class="btn ghost" type="button" data-act="server.frpc.verify">${icon('check')}<span>校验语法</span></button>
+          </div>
+          <span class="btn-sep" aria-hidden="true"></span>
+          <div class="btn-cluster">
+            <button class="btn subtle" type="button" data-act="server.frpc.save">${icon('save')}<span>仅保存</span></button>
+            <button class="btn primary" type="button" data-act="server.frpc.save.restart">${icon('restart')}<span>保存并重启 frpc</span></button>
+          </div>
         </div>
       </div>
       <div class="note" id="frpc-verify-result" hidden></div>
