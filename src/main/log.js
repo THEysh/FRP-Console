@@ -7,8 +7,11 @@ const { logLevelOf, parseTimestamp } = require('./util');
 /* 控制台每 3 秒查一次 /api/status，frpc 就以 info 级别把每次请求和响应各写一行。
  * 实测隧道跑 31 秒 42 行日志里有 36 行是这种东西（86%），
  * 600 行的缓冲只够存 9 分钟，真正的报错转眼被冲走。
- * 这类“自己轮询出来的”行在日志页里没有任何信息量，直接不收集。 */
-const ADMIN_POLL_NOISE = /\[client\/admin_api\.go:\d+\]\s*Http (?:request|response) \[\/api\/status\]/i;
+ * 这类“自己轮询出来的”行在日志页里没有任何信息量，直接不收集。
+ *
+ * 注意 frp 0.61 的措辞是 `api request/response [/api/status]`（早先版本是
+ * `Http request/response …`），只匹配旧写法会让噪声全部漏进来 —— 两种都要认。 */
+const ADMIN_POLL_NOISE = /\[client\/admin_api\.go:\d+\]\s*(?:Http\s+|api\s+)(?:request|response)\s+\[\/api\/status\]/i;
 
 function parseLine(raw, id) {
   const text = raw.replace(/\r$/, '');
