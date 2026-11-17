@@ -264,37 +264,112 @@ class AcmeManager {
 
   /* ---------------- 查询 ---------------- */
 
-  list() {
+  /* 把服务器上已有的证书（宝塔 / certbot / 别的工具签的）导入本机库。
+   * 只落本机文件，不动服务器；导入后的元数据带 imported 标记，便于 UI 标来源。 */
+  importCertificate({ domain, certPem, keyPem, source = 'server', serverHost = '', remoteCertPath = '', remoteKeyPath = '' }) {
+    const primary = String(domain || '').trim().toLowerCase();
+    if (!primary) return { ok: false, error: '缺少域名' };
+    if (!certPem || !keyPem) return { ok: false, error: '证书或私钥内容为空' };
+    let info = null;
+    try {
+      info = acme.crypto.readCertificateInfo(certPem);
+    } catch (e) {
+      return { ok: false, error: `证书无法解析：${(e && e.message) || e}` };
+    }
+    const domains = (Array.isArray(info.domains) && info.domains.length ? info.domains : [primary])
+      .map((d) => String(d || '').trim().toLowerCase())
+      .filter(Boolean);
+    const folder = certFolder(primary);
+    const dir = path.join(this.certsDir, folder);
+    ensureDir(dir);
+    const chainPems = acme.crypto.splitPemChain(certPem);
+    const leaf = chainPems[0] || '';
+    const chain = chainPems.slice(1).join('\n');
+    fs.writeFileSync(path.join(dir, 'fullchain.pem'), certPem.replace(/\s*$/, '') + '\n', 'utf8');
+    fs.writeFileSync(path.join(dir, 'cert.pem'), leaf + '\n', 'utf8');
+    if (chain) fs.writeFileSync(path.join(dir, 'chain.pem'), chain + '\n', 'utf8');
+    fs.writeFileSync(path.join(dir, 'key.pem'), keyPem.replace(/\s*$/, '') + '\n', 'utf8');
+    const metaPath = path.join(dir, 'metadata.json');
+    const prev = readJson(metaPath, null) || {};
+    writeJsonAtomic(metaPath, {
+      ...prev,
+      domains,
+      email: prev.email || '',
+      notBefore: info.notBefore ? info.notBefore.toISOString() : null,
+      notAfter: info.notAfter ? info.notAfter.toISOString() : null,
+      issuedAt: prev.issuedAt || Date.now(),
+      imported: {
+        from: String(source || 'server'),
+        serverHost: String(serverHost || ''),
+        remoteCertPath: String(remoteCertPath || ''),
+        remoteKeyPath: String(remoteKeyPath || ''),
+        at: Date.now(),
+      },
+      // 导入的证书「服务器上本来就有」，不需要再部署；保留 nginx 记录以体现来源
+      nginx: prev.nginx || (serverHost
+        ? { ok: true, serverNames: [primary], serverHost: String(serverHost), imported: true, at: Date.now() }
+        : null),
+    });
+    return {
+      ok: true,
+      domain: primary,
+      domains,
+      folder,
+      notAfter: info.notAfter ? info.notAfter.toISOString() : null,
+      daysLeft: daysLeft(info.notAfter),
+      crtPath: path.join(dir, 'fullchain.pem'),
+      keyPath: path.join(dir, 'key.pem'),
+      certPath: path.join(dir, 'cert.pem'),
+    };
+  }
+
+  /* extraDirs：额外只读扫描的证书目录（例如安装版的 %LOCALAPPDATA%\frp-console\certs），
+   * 让源码版也能看到安装版签/导入的证书，不用复制文件。 */
+  list({ extraDirs = [] } = {}) {
     ensureDir(this.certsDir);
     const result = [];
-    try {
-      for (const entry of fs.readdirSync(this.certsDir, { withFileTypes: true })) {
-        if (!entry.isDirectory()) continue;
-        // 旧版本曾把 STAGING 假证书放到 `<域名>.staging` 目录，这里直接跳过，不再显示。
-        if (entry.name.endsWith('.staging')) continue;
-        const meta = readJson(path.join(this.certsDir, entry.name, 'metadata.json'), null);
-        if (!meta || !Array.isArray(meta.domains) || !meta.domains.length) continue;
-        const dir = path.join(this.certsDir, entry.name);
-        const fullchainPath = path.join(dir, 'fullchain.pem');
-        const keyPath = path.join(dir, 'key.pem');
-        const certPath = path.join(dir, 'cert.pem');
-        result.push({
-          folder: entry.name,
-          domain: meta.domains[0],
-          domains: meta.domains,
-          email: meta.email || '',
-          notBefore: meta.notBefore || null,
-          notAfter: meta.notAfter || null,
-          daysLeft: daysLeft(meta.notAfter),
-          issuedAt: meta.issuedAt || 0,
-          exists: fs.existsSync(fullchainPath) && fs.existsSync(keyPath),
-          crtPath: fullchainPath,
-          keyPath,
-          certPath,
-          nginx: meta.nginx || null,
-        });
-      }
-    } catch { /* ignore */ }
+    const seen = new Set();
+    const collect = (baseDir, origin) => {
+      try {
+        for (const entry of fs.readdirSync(baseDir, { withFileTypes: true })) {
+          if (!entry.isDirectory()) continue;
+          // 旧版本曾把 STAGING 假证书放到 `<域名>.staging` 目录，这里直接跳过，不再显示。
+          if (entry.name.endsWith('.staging')) continue;
+          if (seen.has(entry.name)) continue;
+          const dir = path.join(baseDir, entry.name);
+          const meta = readJson(path.join(dir, 'metadata.json'), null);
+          if (!meta || !Array.isArray(meta.domains) || !meta.domains.length) continue;
+          const fullchainPath = path.join(dir, 'fullchain.pem');
+          const keyPath = path.join(dir, 'key.pem');
+          const certPath = path.join(dir, 'cert.pem');
+          seen.add(entry.name);
+          result.push({
+            folder: entry.name,
+            origin,
+            domain: meta.domains[0],
+            domains: meta.domains,
+            email: meta.email || '',
+            notBefore: meta.notBefore || null,
+            notAfter: meta.notAfter || null,
+            daysLeft: daysLeft(meta.notAfter),
+            issuedAt: meta.issuedAt || 0,
+            exists: fs.existsSync(fullchainPath) && fs.existsSync(keyPath),
+            crtPath: fullchainPath,
+            keyPath,
+            certPath,
+            nginx: meta.nginx || null,
+            imported: meta.imported || null,
+          });
+        }
+      } catch { /* ignore */ }
+    };
+    collect(this.certsDir, 'local');
+    for (const extra of extraDirs || []) {
+      const dir = String(extra || '').trim();
+      if (!dir || path.resolve(dir) === path.resolve(this.certsDir)) continue;
+      if (!fs.existsSync(dir)) continue;
+      collect(dir, 'install');
+    }
     result.sort((a, b) => (b.issuedAt || 0) - (a.issuedAt || 0));
     return result;
   }

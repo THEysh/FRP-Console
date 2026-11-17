@@ -155,6 +155,28 @@ let lastNginxState = null;
 /* 服务器证书扫描结果缓存（按 host 记，60 秒内不重复 SSH 扫盘）。 */
 let serverCertScanCache = { at: 0, host: '', certs: [], truncated: false };
 
+/* 额外只读扫描的证书目录：安装版的 certs 目录 + 用户自定义目录。
+ * 让源码版（独立 userData）也能看到安装版签/导入的证书，不必复制文件。 */
+function extraCertDirs() {
+  const dirs = new Set();
+  const candidates = [];
+  if (process.env.LOCALAPPDATA) candidates.push(path.join(process.env.LOCALAPPDATA, 'frp-console', 'certs'));
+  if (process.env.APPDATA) candidates.push(path.join(process.env.APPDATA, 'frp-console', 'certs'));
+  for (const c of candidates) {
+    try {
+      if (fs.existsSync(c)) dirs.add(path.resolve(c));
+    } catch { /* ignore */ }
+  }
+  for (const d of (settings && Array.isArray(settings.certDirs) ? settings.certDirs : [])) {
+    const dir = String(d || '').trim();
+    if (!dir) continue;
+    try {
+      if (fs.existsSync(dir)) dirs.add(path.resolve(dir));
+    } catch { /* ignore */ }
+  }
+  return [...dirs];
+}
+
 // 服务器 allowPorts（frps 对 remotePort 的白名单），未连服务器时为 []。
 function serverAllowPorts() {
   return (serverConfig.summary && serverConfig.summary.allowPorts) || [];
@@ -1675,10 +1697,16 @@ function registerIpc() {
       'adminPort', 'adminUser', 'adminPassword', 'autoReload', 'pollIntervalMs', 'closeToTray',
       'startMinimized', 'launchTunnelOnStart', 'serviceAutoDetect', 'logBuffer', 'confirmStopService',
       'stripProxyEnv', 'launchAtLogin', 'vhostHttpPort', 'vhostHttpsPort',
-      'acmeEmail', 'dnsProvider',
+      'acmeEmail', 'dnsProvider', 'certDirs',
     ];
     const clean = {};
     for (const key of allowed) if (patch && Object.prototype.hasOwnProperty.call(patch, key)) clean[key] = patch[key];
+    if (clean.certDirs !== undefined) {
+      clean.certDirs = (Array.isArray(clean.certDirs) ? clean.certDirs : [])
+        .map((d) => String(d || '').trim())
+        .filter(Boolean)
+        .slice(0, 8);
+    }
     // 开机自启要真的写进系统，写不进去就别保存，免得界面显示“已开启”但重启无效。
     if (clean.launchAtLogin !== undefined) {
       const result = applyLaunchAtLogin(!!clean.launchAtLogin);
@@ -3373,7 +3401,7 @@ function registerIpc() {
 
   /* ---- HTTPS 证书（Let's Encrypt / DNS-01）---- */
 
-  ipcMain.handle('cert:list', async () => ok({ certs: acmeManager.list() }));
+  ipcMain.handle('cert:list', async () => ok({ certs: acmeManager.list({ extraDirs: extraCertDirs() }) }));
 
   ipcMain.handle('cert:issue', async (event, payload = {}) => {
     try {
@@ -3445,6 +3473,33 @@ function registerIpc() {
     if (!result.ok) return fail(result.error);
     pushState();
     return ok({ removed: true });
+  });
+
+  /* 把服务器上已有的证书（宝塔 / certbot）导入本机库，之后就能统一查看/续期/部署。 */
+  ipcMain.handle('cert:import', async (event, payload = {}) => {
+    try {
+      if (!serverSession.connected) return fail('尚未连接服务器');
+      const certPath = String((payload && payload.certPath) || '').trim();
+      const keyPath = String((payload && payload.keyPath) || '').trim();
+      const domain = String((payload && payload.domain) || '').trim();
+      if (!certPath) return fail('缺少证书路径');
+      const read = await serverSession.readRemoteCert({ certPath, keyPath });
+      if (!read.ok) return fail(read.error);
+      const res = acmeManager.importCertificate({
+        domain,
+        certPem: read.certPem,
+        keyPem: read.keyPem,
+        source: 'server',
+        serverHost: serverSession.host,
+        remoteCertPath: certPath,
+        remoteKeyPath: keyPath,
+      });
+      if (!res.ok) return fail(res.error);
+      pushState();
+      return ok(res);
+    } catch (e) {
+      return fail(String((e && e.message) || e));
+    }
   });
 
   /* 服务器上已有的证书盘点（只读）：nginx 引用的 + 宝塔 vhost/cert + letsencrypt/live + /etc/nginx/ssl。

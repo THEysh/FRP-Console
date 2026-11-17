@@ -3371,6 +3371,8 @@ function certRow(c) {
         <div class="cert-title">
           <strong>${esc(c.domain)}</strong>
           ${c.domain.startsWith('*.') ? '<span class="badge">通配符</span>' : ''}
+          ${c.origin === 'install' ? '<span class="badge" title="来自安装版的证书目录（只读扫描）">安装版</span>' : ''}
+          ${c.imported ? `<span class="badge" title="从服务器 ${esc(c.imported.serverHost || '')} 导入">导入自 ${esc(c.imported.serverHost || '服务器')}</span>` : ''}
           ${deployedBadge}
         </div>
         <div class="cert-meta mono">
@@ -3432,7 +3434,7 @@ async function loadServerCerts({ force = false } = {}) {
   if (S.view === 'certs') renderCerts(true);
 }
 
-function serverCertRow(c) {
+function serverCertRow(c, { hasLocal = false } = {}) {
   const tone = c.daysLeft === null || c.daysLeft === undefined ? 'amber' : certExpiryTone(c.daysLeft);
   const src = CERT_SOURCE_LABEL[c.source] || c.source || '未知';
   const names = (Array.isArray(c.altNames) && c.altNames.length ? c.altNames : [c.domain]).filter(Boolean);
@@ -3444,6 +3446,7 @@ function serverCertRow(c) {
         <div class="cert-title">
           <strong>${esc(c.domain || c.certPath)}</strong>
           <span class="badge">${esc(src)}</span>
+          <span class="badge amber" title="这张证书在服务器上，本机库里还没有">仅服务器</span>
           ${String(c.domain || '').startsWith('*.') ? '<span class="badge">通配符</span>' : ''}
         </div>
         <div class="cert-meta mono">
@@ -3456,32 +3459,73 @@ function serverCertRow(c) {
           ${c.keyPath ? `<div>私钥 <code>${esc(c.keyPath)}</code> <button class="icon-btn" type="button" data-act="copy" data-text="${esc(c.keyPath)}" title="复制路径">${icon('copy')}</button></div>` : ''}
         </div>
       </div>
+      <div class="cert-actions">
+        <button class="btn small" type="button" data-act="cert.import" data-domain="${esc(c.domain || '')}" data-cert-path="${esc(c.certPath)}" data-key-path="${esc(c.keyPath || '')}" title="把这张证书复制进本机库，之后可以统一查看/续期/部署" ${c.keyPath ? '' : 'disabled'}>${icon('down')}<span>导入到本机</span></button>
+        <button class="btn small" type="button" data-act="cert.reissue" data-domain="${esc(c.domain || '')}" title="用本机的 ACME 渠道重新签一张同域名证书（需要已配置 DNS Token）">${icon('reload')}<span>用 ACME 重签</span></button>
+        ${hasLocal ? '<span class="badge">本机已有</span>' : ''}
+      </div>
     </div>`;
 }
 
-function serverCertsMarkup() {
-  const st = S.certs.server || {};
-  const host = st.host || (S.server.connected ? String(S.server.host || '') : '');
-  const sub = !S.server.connected
-    ? '连上服务器后，这里会列出它上面已有的证书（nginx / 宝塔 / Let\'s Encrypt）。只读扫描，不会改动任何文件。'
-    : `${host ? `${esc(host)} 上` : '服务器上'}找到 ${st.certs.length} 张证书${st.scannedAt ? ` · ${new Date(st.scannedAt).toLocaleTimeString('zh-CN')} 扫描` : ''}`;
-  const head = `
-        <div class="section-head">
-          <div class="section-title"><strong>服务器上的证书</strong><span>${sub}</span></div>
-          <div class="page-actions">
-            <button class="btn small" type="button" data-act="certs.server.scan" ${st.loading ? 'disabled' : ''}>${icon('reload')}<span>${st.loading ? '扫描中…' : '重新扫描'}</span></button>
+/* 域名分组键：把 a.b.com / *.b.com 归到同一组 b.com；com.cn 这类二级后缀多留一段。 */
+function certGroupKey(domain) {
+  const d = String(domain || '').replace(/^\*\./, '').toLowerCase();
+  const parts = d.split('.').filter(Boolean);
+  if (parts.length <= 2) return parts.join('.');
+  const two = parts.slice(-2).join('.');
+  const multi = /^(com|net|org|gov|edu)\.(cn|hk|tw|jp|uk|us)$/.test(two);
+  return multi ? parts.slice(-3).join('.') : two;
+}
+
+/* 证书总览：本机库 + 服务器上的证书，按父域名分组展示（有通配符时组标题写成 *.theysh.cn）。 */
+function certOverviewHtml() {
+  const local = S.certs.list || [];
+  const srvSt = S.certs.server || {};
+  const srv = srvSt.certs || [];
+  const localDomains = new Set(local.map((c) => String((c && c.domain) || '').toLowerCase()));
+  const srvOnly = srv.filter((s) => !localDomains.has(String((s && s.domain) || '').toLowerCase()));
+
+  const groups = new Map();
+  const push = (key, entry) => {
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(entry);
+  };
+  for (const c of local) push(certGroupKey(c.domain), { kind: 'local', item: c });
+  for (const s of srvOnly) push(certGroupKey(s.domain), { kind: 'server', item: s });
+
+  const scanLine = !S.server.connected
+    ? `<div class="field-hint" style="padding:0 16px 10px">还没连服务器：连上后会自动扫一遍它上面的证书（宝塔 / certbot / nginx），只读不改。</div>`
+    : srvSt.error
+      ? `<div class="note warn" style="margin:0 16px 10px">${icon('alert')}<div>${esc(srvSt.error)}</div></div>`
+      : srvSt.loading && !srvSt.loaded
+        ? `<div class="field-hint" style="padding:0 16px 10px">正在扫描 ${esc(S.server.host || '服务器')} 上的证书…</div>`
+        : `<div class="field-hint" style="padding:0 16px 10px">${esc(S.server.host || '服务器')} 上找到 ${srv.length} 张证书${srvSt.scannedAt ? ` · ${new Date(srvSt.scannedAt).toLocaleTimeString('zh-CN')} 扫描` : ''}${srvOnly.length ? `，其中 ${srvOnly.length} 张本机还没有` : ''}${srvSt.truncated ? ' · 证书较多，只显示前 ' + srv.length + ' 张' : ''}</div>`;
+
+  if (!local.length && !srvOnly.length) {
+    return `${scanLine}<div class="empty"><span class="spinner"></span><h3>还没有证书</h3><p>照上面向导「签发证书」一步签发第一张；已经有证书的话，连上服务器会在这里列出来，点「导入到本机」即可纳入管理。</p></div>`;
+  }
+
+  const blocks = [...groups.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([key, items]) => {
+      const hasWildcard = items.some((e) => String((e.item && e.item.domain) || '').startsWith('*.'));
+      const title = hasWildcard ? `*.${key}` : key;
+      const localCount = items.filter((e) => e.kind === 'local').length;
+      const srvCount = items.length - localCount;
+      const counts = [localCount ? `本机 ${localCount}` : '', srvCount ? `服务器独有 ${srvCount}` : ''].filter(Boolean).join(' · ');
+      const rows = items.map((e) => (e.kind === 'local' ? certRow(e.item) : serverCertRow(e.item))).join('');
+      return `
+        <div class="cert-group">
+          <div class="cert-group-head">
+            <strong>${esc(title)}</strong>
+            <span class="cert-group-count">${esc(counts)}</span>
           </div>
+          <div class="cert-list">${rows}</div>
         </div>`;
-  if (!S.server.connected) return head;
-  if (st.error) return `${head}<div class="note warn" style="margin:0 16px 12px">${icon('alert')}<div>${esc(st.error)}</div></div>`;
-  if (st.loading && !st.loaded) {
-    return `${head}<div class="empty"><span class="spinner"></span><h3>正在扫描服务器证书</h3><p>读 nginx 配置、宝塔证书目录，再用 openssl 看每张证书的域名与到期日。</p></div>`;
-  }
-  if (!st.certs.length) {
-    return `${head}<div class="empty"><h3>这台服务器上没有找到证书</h3><p>看过的位置：nginx 的 <code>ssl_certificate</code>、<code>/www/server/panel/vhost/cert/*</code>、<code>/etc/letsencrypt/live/*</code>、<code>/etc/nginx/ssl/*</code>。用上面的向导签一张，签完「部署到 nginx」即可。</p></div>`;
-  }
-  const trunc = st.truncated ? `<div class="field-hint" style="padding:0 16px 12px">证书较多，只显示了前 ${st.certs.length} 张。</div>` : '';
-  return `${head}<div class="cert-list">${st.certs.map(serverCertRow).join('')}</div>${trunc}`;
+    })
+    .join('');
+
+  return `${scanLine}${blocks}`;
 }
 
 /* ---------------- DNS 记录面板（v1.2.58） ----------------
@@ -3826,19 +3870,14 @@ function renderCerts(force = false) {
 
       <section class="card section">
         <div class="section-head">
-          <div class="section-title"><strong>已签发证书</strong><span>${coveredDomains.length ? `已覆盖域名：${esc(coveredText)} · ` : ''}保存在本机 userData\\certs\\ 下；「部署到 nginx」会把证书上传到服务器终止 TLS。</span></div>
+          <div class="section-title"><strong>证书总览</strong><span>${coveredDomains.length ? `已覆盖域名：${esc(coveredText)} · ` : ''}按父域名分组；本机证书存在 userData\\certs，服务器上的证书（宝塔 / certbot / nginx）只读扫描后可一键导入。</span></div>
           <div class="page-actions">
             ${serverCtx}
+            ${S.server.connected ? `<button class="btn small" type="button" data-act="certs.server.scan" ${S.certs.server.loading ? 'disabled' : ''}>${icon('reload')}<span>${S.certs.server.loading ? '扫描中…' : '扫描服务器'}</span></button>` : ''}
             <button class="btn small" type="button" data-act="certs.refresh">${icon('reload')}<span>刷新</span></button>
           </div>
         </div>
-        ${certs.length
-          ? `<div class="cert-list">${certs.map(certRow).join('')}</div>`
-          : `<div class="empty"><span class="spinner"></span><h3>还没有证书</h3><p>照上面向导「签发证书」一步签发第一张。签发后连上服务器即可「部署到 nginx」，让域名走 80/443。</p></div>`}
-      </section>
-
-      <section class="card section">
-        ${serverCertsMarkup()}
+        ${certOverviewHtml()}
       </section>
     </div>`;
 
@@ -4944,6 +4983,41 @@ async function handleAction(act, dataset, btn) {
         const st = S.certs.server;
         if (st.error) toast('error', '扫描失败', st.error);
         else toast('ok', '扫描完成', `服务器上有 ${st.certs.length} 张证书`);
+        break;
+      }
+      case 'cert.import': {
+        const domain = dataset.domain || '';
+        const certPath = dataset.certPath || '';
+        const keyPath = dataset.keyPath || '';
+        if (!certPath) { toast('warn', '缺少证书路径', '重新扫描服务器后再试'); break; }
+        const okImport = await confirmDialog({
+          title: `把 ${domain || certPath} 导入本机？`,
+          body: `会把服务器上的证书与私钥复制到本机证书库（userData\\certs）。不改动服务器上的任何文件。\n\n证书：${certPath}\n私钥：${keyPath || '（无）'}`,
+          confirmText: '导入',
+        });
+        if (!okImport) break;
+        const res = await withBusy(btn, () => FRP.certImport({ domain, certPath, keyPath }));
+        if (!res || !res.ok) { toast('error', '导入失败', (res && res.error) || '未知错误'); break; }
+        toast('ok', '已导入到本机', `${res.data.domain} · ${(res.data.domains || []).join(', ')}`);
+        // 重新拉列表并强制重画：只靠 loadCerts 内部的重画在某些时序下（弹窗关闭后）会被跳过
+        try { await loadCerts({ silent: true }); } catch { /* ignore */ }
+        if (S.view === 'certs') renderCerts(true);
+        break;
+      }
+      case 'cert.reissue': {
+        const domain = dataset.domain || '';
+        if (!domain) break;
+        const okIssue = await confirmDialog({
+          title: `用 ACME 重新签发 ${domain}？`,
+          body: `会用本机已配置的 DNS 验证渠道（Cloudflare Token）走 Let's Encrypt DNS-01 重新签一张 ${domain} 的证书，并保存到本机证书库。如果这张证书是宝塔/certbot 在用的，签完还需要点「部署到 nginx」才会替换线上证书。`,
+          confirmText: '签发',
+        });
+        if (!okIssue) break;
+        const res = await withBusy(btn, () => FRP.certIssue({ domains: [domain] }));
+        if (!res || !res.ok) { toast('error', '签发失败', (res && res.error) || '未知错误'); break; }
+        toast('ok', '签发成功', `${res.data.domain} · 剩余 ${res.data.daysLeft} 天`);
+        try { await loadCerts({ silent: true }); } catch { /* ignore */ }
+        if (S.view === 'certs') renderCerts(true);
         break;
       }
       case 'dw.check':

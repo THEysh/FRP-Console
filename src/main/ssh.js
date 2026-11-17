@@ -1452,6 +1452,32 @@ class ServerSession {
     return out;
   }
 
+  /* 读取服务器上某个证书/私钥文件的内容（base64 传输，避免编码问题）。
+   * 用于「导入到本机」：宝塔/certbot 签的证书也能纳入本机统一管理。 */
+  async readRemoteCert({ certPath, keyPath }) {
+    if (!this.connected) return { ok: false, error: '尚未连接服务器' };
+    const sudo = await this.detectSudo();
+    const prefix = sudo.ok ? sudo.prefix : '';
+    const readOne = async (p) => {
+      const res = await this.exec(`${prefix}base64 -w0 ${shellQuote(p)} 2>/dev/null || ${prefix}base64 ${shellQuote(p)} 2>/dev/null`, 15000);
+      const b64 = String((res && res.stdout) || '').replace(/\s+/g, '');
+      if (!b64) return { ok: false, error: (res && (res.stderr || res.error)) || '文件为空或不可读（可能权限不足）' };
+      try {
+        return { ok: true, text: Buffer.from(b64, 'base64').toString('utf8') };
+      } catch (e) {
+        return { ok: false, error: String((e && e.message) || e) };
+      }
+    };
+    const cert = await readOne(certPath);
+    if (!cert.ok) return { ok: false, error: `读取证书失败：${cert.error}` };
+    let key = { ok: true, text: '' };
+    if (keyPath) {
+      key = await readOne(keyPath);
+      if (!key.ok) return { ok: false, error: `读取私钥失败：${key.error}` };
+    }
+    return { ok: true, certPem: cert.text, keyPem: key.text };
+  }
+
   /* nginx server_name：多个域名空格分隔，通配符 `*.x` 原样传给 nginx。 */
   nginxServerName(domains) {    const names = (Array.isArray(domains) ? domains : [domains]).map((d) => String(d || '').trim()).filter(Boolean);
     return names.length ? names.join(' ') : 'localhost';
