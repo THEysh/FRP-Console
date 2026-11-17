@@ -142,14 +142,23 @@ function httpProbe(url, timeout = 6000, extraHeaders = null, tlsOptions = null) 
             /* frps 在没有匹配到任何代理时会返回自己的 404 页面。
              * 那种页面看着“HTTP 通了”，其实隧道根本没转发，必须算失败。 */
             const frpsMiss = status === 404 && /<?!?DOCTYPE html/i.test(body) && /<title>Not Found<\/title>/i.test(body);
+            /* 云厂商的备案拦截页：阿里云在 80/8080 上对「未在其备案的域名」直接返回
+             * 403 + 备案提示页（Server: Beaver，标题 Non-compliance ICP Filing）。
+             * 这种响应看着是 HTTP 200/403 的“正常网页”，其实请求根本没到 frps，
+             * 以前会被当成「公网可达」——假绿。 */
+            const serverHeader = String(res.headers['server'] || '');
+            const icpBlocked = status === 403 && (/Non-compliance ICP Filing/i.test(body) || /beaver/i.test(serverHeader));
             done({
-              ok: status > 0 && status < 500 && !frpsMiss,
+              ok: status > 0 && status < 500 && !frpsMiss && !icpBlocked,
               status,
               ms: Date.now() - started,
               title: titleMatch ? titleMatch[1].replace(/\s+/g, ' ').trim().slice(0, 120) : '',
               finalUrl: url,
               contentType: String(res.headers['content-type'] || ''),
-              error: frpsMiss ? 'frps 上没有匹配到该域名（代理未注册或域名不一致）' : null,
+              blocked: icpBlocked ? 'icp' : null,
+              error: frpsMiss
+                ? 'frps 上没有匹配到该域名（代理未注册或域名不一致）'
+                : (icpBlocked ? '域名未备案，被云厂商在 HTTP 端口上拦截（返回的是备案提示页）' : null),
             });
           });
         },

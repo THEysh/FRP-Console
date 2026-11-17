@@ -1533,6 +1533,14 @@ function nginxCardMarkup() {
     setupLabel = '安装 nginx 并配置';
   }
   const certMissing = n.certMissing;
+  /* 1.2.60 起 detectNginx 会带回 serverNames（数组）与 certs：把「这台服务器的
+   * frp-console.conf 里到底配了哪些域名」直接摊开，用户一眼能看出自己的域名
+   * 在不在里面（以前只笼统显示「反代已就绪」，域名没配也不知道）。 */
+  const namesText = Array.isArray(n.serverNames) ? n.serverNames.join('、') : String(n.serverNames || '');
+  const certsText = Array.isArray(n.certs) ? n.certs.join('、') : String(n.certs || '');
+  const configuredNote = (n.proxyConfigured && namesText && !n.ok)
+    ? `<div class="note" style="margin:0 16px 12px">${icon('globe')}<div><strong>nginx 已配置的域名</strong><br>${esc(namesText)}${certsText ? `<br><span class="field-hint mono">${esc(certsText)}</span>` : ''}<br>你的域名不在这个列表里时，https 访问会落到默认站点（证书不匹配、浏览器会告警）。</div></div>`
+    : '';
   return `
     <section class="card">
       <div class="card-head">
@@ -1547,8 +1555,9 @@ function nginxCardMarkup() {
       ${certMissing
         ? `<div class="note warn" style="margin:0 16px 12px">${icon('alert')}<div><strong>还没有可用证书</strong><br>反代需要一张证书来终止 HTTPS。请先到「HTTPS 证书」页签发一张，再回来点「一键配置反代」。</div></div>`
         : ''}
+      ${configuredNote}
       ${n.ok
-        ? `<div class="note" style="margin:0 16px 12px">${icon('check')}<div><strong>反代已就绪</strong><br>${esc(n.serverNames || '')} → nginx 80/443 → frps HTTP vhost（${esc(String(n.frpsHttpPort || ''))}）。现在用 <code>https://你的域名</code> 就能访问，不带端口。</div></div>`
+        ? `<div class="note" style="margin:0 16px 12px">${icon('check')}<div><strong>反代已就绪</strong><br>${esc(namesText || '你的域名')} → nginx 80/443 → frps HTTP vhost（${esc(String(n.frpsHttpPort || ''))}）。现在用 <code>https://你的域名</code> 就能访问，不带端口。</div></div>`
         : ''}
     </section>`;
 }

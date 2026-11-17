@@ -1285,7 +1285,29 @@ class ServerSession {
     const p80 = listeners.filter((l) => l.port === 80);
     const p443 = listeners.filter((l) => l.port === 443);
     const confInfo = await this.detectNginxConfDir();
-    const proxyConf = await this.exec(`[ -f ${shellQuote(`${confInfo.dir}/frp-console.conf`)} ] && echo yes || true`, 6000);
+    const confPath = `${confInfo.dir}/frp-console.conf`;
+    const proxyConf = await this.exec(`[ -f ${shellQuote(confPath)} ] && echo yes || true`, 6000);
+    const proxyConfigured = firstLine(proxyConf.stdout) === 'yes';
+    /* 我们的反代配置文件里到底写了哪些域名：健康检查要据此区分
+     * 「nginx 压根没为这个域名配 443」和「frps 上没有这个路由」——
+     * 前者报成后者会把用户引向排查错方向（1.2.60）。 */
+    let serverNames = [];
+    let certs = [];
+    if (proxyConfigured) {
+      const conf = await this.exec(`cat ${shellQuote(confPath)} 2>/dev/null || true`, 8000);
+      const text = String(conf.stdout || '');
+      for (const line of text.split('\n')) {
+        const nameMatch = line.match(/^\s*server_name\s+([^;]+);/);
+        if (nameMatch) {
+          for (const name of nameMatch[1].split(/\s+/)) {
+            const v = name.trim().toLowerCase();
+            if (v) serverNames.push(v);
+          }
+        }
+        const certMatch = line.match(/^\s*ssl_certificate\s+([^;]+);/);
+        if (certMatch) certs.push(certMatch[1].trim());
+      }
+    }
     return {
       installed,
       version,
@@ -1301,7 +1323,9 @@ class ServerSession {
       port443Conflict: p443.some((l) => l.process && !/nginx/i.test(l.process)),
       confDir: confInfo.dir,
       managedBy: confInfo.managedBy,
-      proxyConfigured: firstLine(proxyConf.stdout) === 'yes',
+      proxyConfigured,
+      serverNames: Array.from(new Set(serverNames)),
+      certs: Array.from(new Set(certs)),
     };
   }
 

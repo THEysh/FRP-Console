@@ -1448,7 +1448,35 @@ async function checkProxyHealth(p, ctx) {
     }
   }
   if (!pub.ok) {
-    return [p.name, { ok: false, reason: '公网不可达', ms: (local.ms || 0) + (server.ms || 0) + (layers.public.ms || 0), error: pub.error || null, layers, at }];
+    /* 「公网不可达」太笼统，会把三种完全不同的故障说成同一件事：
+     *   ① 云厂商备案拦截（80/8080 上返回备案提示页，请求根本没到 frps）
+     *   ② nginx 上没有这个域名的 443（证书没部署，请求落到默认站点）
+     *   ③ frps 上确实没有这个路由（frpc 刚断/正在重连，或域名写错）
+     * 分开说，用户才知道下一步该点哪里。 */
+    let reason = '公网不可达';
+    let error = pub.error || null;
+    let hint = '';
+    const pubDomain = (type === 'http' || type === 'https') ? configModule.firstDomainOf(p) : '';
+    if (pub.blocked === 'icp') {
+      reason = '公网端口被云厂商备案拦截';
+      hint = '这个域名没有在服务器所属云厂商备案，HTTP 端口（80/8080）上的请求会被直接换成备案提示页。要么完成备案，要么改成走 443：在「HTTPS 证书」页把该域名部署到 nginx，然后用 https://域名 访问。';
+    } else if (pubDomain && /frps 上没有匹配到该域名/.test(String(pub.error || ''))) {
+      const ng = (lastNginxState && lastNginxState.serverHost === serverSession.host
+        && Date.now() - lastNginxState.at < 120000) ? lastNginxState : null;
+      const names = (ng && Array.isArray(ng.serverNames)) ? ng.serverNames : [];
+      const covered = names.some((n) => coversDomain(n, pubDomain));
+      if (vhostOpts.nginxProxyEnabled && names.length && !covered) {
+        reason = 'nginx 上没有这个域名';
+        error = `nginx 的 frp-console.conf 里没有为 ${pubDomain} 配置 443（当前只配了 ${names.join('、')}），请求落到了默认站点，再被 frps 拒掉`;
+        hint = '在「HTTPS 证书」页把覆盖该域名的证书「部署到 nginx」，它会补上对应的 server 块与证书';
+      } else {
+        reason = '服务器上没有这个域名的路由';
+        error = `${pub.error}：frpc 与 frps 的连接可能刚断开或正在重连，也可能代理里写的域名和访问的域名不一致`;
+        hint = '先确认隧道是否在线（frpc 是否登录成功）；如果刚好是断开后的几秒内，下一轮检查会自动恢复';
+      }
+    }
+    layers.public.hint = hint;
+    return [p.name, { ok: false, reason, ms: (local.ms || 0) + (server.ms || 0) + (layers.public.ms || 0), error, layers, at }];
   }
   return [p.name, {
     ok: true,
