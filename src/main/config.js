@@ -176,6 +176,15 @@ function validate(model, options = {}) {
       push('error', `proxies[${index}].name`, '代理名称不能为空');
     } else {
       if (/\s|[[\]]/.test(proxy.name)) push('error', `proxies[${index}].name`, `代理名称「${proxy.name}」不能包含空格或方括号`);
+      /* frpc 的 admin 接口把整份配置文本塞进 HTML 模板（/api/reload 等），名称里出现 < 会让
+       * html/template 直接报错、返回 400 —— 表现是「配置保存了但热重载永远失败」，
+       * 而且同一份配置里其它代理也一起不生效。所以在写入前就拦住，而不是等 frpc 报 Go 原文。 */
+      if (/[<>]/.test(proxy.name)) {
+        push('error', `proxies[${index}].name`, `代理名称「${proxy.name}」不能包含尖括号 < >：frpc 的管理接口用 HTML 模板渲染配置，这类名称会让热重载被拒绝（HTTP 400），保存后隧道里的代理不会更新`);
+      }
+      if (proxy.name.length > 64) {
+        push('warn', `proxies[${index}].name`, `代理名称「${proxy.name.slice(0, 12)}…」有 ${proxy.name.length} 个字符，列表里会换行显示，建议缩短到 64 个字符以内`);
+      }
       if (names.has(proxy.name)) push('error', `proxies[${index}].name`, `代理名称「${proxy.name}」与「${names.get(proxy.name)}」重复`);
       else names.set(proxy.name, label);
     }

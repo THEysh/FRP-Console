@@ -66,7 +66,7 @@ if (process.platform === 'win32') app.setAppUserModelId('cn.ysh.frp-console');
 
 const settingsModule = require('./settings');
 const configModule = require('./config');
-const { FrpcManager } = require('./frpc');
+const { FrpcManager, reloadFailureText } = require('./frpc');
 const { LogFollower } = require('./log');
 const service = require('./service');
 const netport = require('./netport');
@@ -121,6 +121,8 @@ let model = null;
 let configError = null;
 let configHash = '';
 let configStamp = { mtimeMs: 0, size: 0 };
+/* 配置文件被外部删掉/移走时只提醒一次，别每 3 秒刷一遍通知 */
+let configMissingNotified = false;
 let serviceCache = { installed: false, state: 'unknown', name: '' };
 let healthCache = new Map();
 let healthBusy = false;
@@ -1396,7 +1398,7 @@ async function applyAndMaybeReload(nextModel, { reload = true, restartRecommende
   if (reload && manager && manager.apiOk) {
     reloadResult = await manager.reload();
     if (!reloadResult.ok) {
-      return { ok: false, error: `配置已保存，但热重载失败：${reloadResult.error}`, saved: true };
+      return { ok: false, error: `配置已保存，但热重载被 frpc 拒绝：${reloadFailureText(reloadResult.error, model.proxies)}`, saved: true };
     }
   }
   await manager.refresh().catch(() => {});
@@ -1862,8 +1864,18 @@ async function checkExternalConfig() {
   try {
     st = fs.statSync(paths.configPath);
   } catch {
+    /* 文件不在了（被删/被移走/盘符掉线）。以前这里直接 return，界面继续显示最后一次读到的
+     * 配置、一句话都不说，用户以为一切正常，实际改文件也不会生效（下次保存又把旧内容写回去）。
+     * 现在给一次明确提示，并且等文件回来后再清掉。 */
+    if (configHash && !configMissingNotified) {
+      configMissingNotified = true;
+      configError = `配置文件不在了：${paths.configPath}（被外部删除或移动）。界面显示的是最后一次读到的内容，下次保存会重新写回这个路径。`;
+      pushState();
+      send('notify', { kind: 'warn', title: '配置文件不见了', message: paths.configPath });
+    }
     return;
   }
+  configMissingNotified = false;
   if (st.mtimeMs === configStamp.mtimeMs && st.size === configStamp.size) return;
   let text;
   try {

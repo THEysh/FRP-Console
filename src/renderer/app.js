@@ -562,7 +562,7 @@ function renderOverview(force = false) {
       const link = p.openUrl || p.publicAddress;
       const dotColor = online ? 'var(--green)' : (failed && p.health.pathMissing) ? 'var(--amber)' : failed ? 'var(--red)' : 'var(--amber)';
       const dotTip = online ? '三层连通' : failed ? (p.health.reason || '链路异常') : '正在检测连通性';
-      const canOpen = !!link && ['http', 'https', 'tcp', 'tcpmux'].includes(p.type);
+      const canOpen = !!openableLink(link) && ['http', 'https', 'tcp', 'tcpmux'].includes(p.type);
       return `
         <div class="addr-row">
           <span class="ar-dot" title="${esc(dotTip)}" style="background:${dotColor}"></span>
@@ -828,6 +828,14 @@ function renderProxies(force = false) {
   }
 }
 
+/* 通配符域名（*.x.com）只是给 frps 做匹配用的，浏览器打不开这种地址——
+ * 别给「打开」按钮，否则点了必然白屏/报错。 */
+function openableLink(link) {
+  const text = String(link || '');
+  if (!text || text.includes('*')) return '';
+  return text;
+}
+
 function proxyRowHtml(p) {
   const failed = p.health && !p.health.ok;
   /* 路径 404：隧道与端口都通，只是路径不对 —— 用橙色，别和「断链」混成一片红。 */
@@ -868,7 +876,7 @@ function proxyRowHtml(p) {
     <tr>
       <td>
         <div class="name-cell">
-          <strong>${esc(p.name)}</strong>
+          <strong title="${esc(p.name)}">${esc(p.name)}</strong>
           <small><span class="badge ${esc(p.type)}" style="font-size:9.5px;padding:1px 6px">${esc(TYPE_LABEL[p.type] || p.type)}</span></small>
         </div>
       </td>
@@ -884,8 +892,8 @@ function proxyRowHtml(p) {
         <div class="trow-actions">
           <button class="icon-btn" type="button" data-act="proxy.test-local" data-name="${esc(p.name)}" data-port="${esc(p.localPort)}" title="测试本机端口">${icon('activity')}</button>
           ${link ? `<button class="icon-btn" type="button" data-act="copy" data-text="${esc(link)}" title="复制公网地址">${icon('copy')}</button>` : ''}
-          ${link && ['http', 'https', 'tcp', 'tcpmux'].includes(p.type)
-            ? `<button class="icon-btn" type="button" data-act="open" data-url="${esc(link)}" title="打开公网地址">${icon('external')}</button>` : ''}
+          ${openableLink(link) && ['http', 'https', 'tcp', 'tcpmux'].includes(p.type)
+            ? `<button class="icon-btn" type="button" data-act="open" data-url="${esc(openableLink(link))}" title="打开公网地址">${icon('external')}</button>` : ''}
           <button class="icon-btn" type="button" data-act="proxy.edit" data-name="${esc(p.name)}" title="编辑">${icon('edit')}</button>
           <button class="icon-btn danger" type="button" data-act="proxy.delete" data-name="${esc(p.name)}" title="删除">${icon('trash')}</button>
         </div>

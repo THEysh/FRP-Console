@@ -60,6 +60,23 @@ function startFailureText(text, adminPort) {
   return raw;
 }
 
+/* /api/reload 用 GET 拿配置文本再塞进 HTML 模板渲染。配置文本里一旦出现 <（典型来源是代理名），
+ * html/template 会抛 "ends in a non-text context" / 'in attribute name' 之类的错误并返回 400，
+ * 前台只看到「配置已保存，但热重载失败：HTTP 400 html/template:frp: ...」——既看不出跟名字有关，
+ * 也不知道该怎么救。这里把人话补上，并点名是哪几条代理的名字有问题。 */
+function reloadFailureText(text, proxies) {
+  const raw = String(text || '').trim();
+  if (!/html\/template/i.test(raw)) return raw;
+  const list = Array.isArray(proxies) ? proxies : [];
+  const bad = list.filter((p) => p && /[<>]/.test(String(p.name || ''))).map((p) => `「${p.name}」`);
+  const who = bad.length
+    ? `代理名 ${bad.slice(0, 3).join('、')}${bad.length > 3 ? ` 等 ${bad.length} 条` : ''} 里含有尖括号 < >`
+    : '配置里有代理名含尖括号 < >';
+  return `${who}。frpc 的管理接口用 HTML 模板渲染配置，含尖括号的名称会被它拒绝（HTTP 400），`
+    + '所以这份配置没生效——把名字里的 < > 去掉（改名）后重试，隧道里的代理才会跟着更新。'
+    + `（frpc 原文：${raw.slice(0, 180)}）`;
+}
+
 class FrpcManager extends EventEmitter {
   constructor(ctx) {
     super();
@@ -516,4 +533,4 @@ class FrpcManager extends EventEmitter {
   }
 }
 
-module.exports = { FrpcManager };
+module.exports = { FrpcManager, reloadFailureText, startFailureText, adminPortBusyText };
