@@ -88,9 +88,14 @@ function summary(data) {
     webPassword: web.password || '',
     vhostHTTPPort: Number(source.vhostHTTPPort) || 0,
     vhostHTTPSPort: Number(source.vhostHTTPSPort) || 0,
+    /* 以下三个是「可选监听端口」：没配就没有对应监听，绝不能当成需要放行的端口，
+     * 否则防火墙清单里会出现一个永远「没程序监听」的假告警。 */
+    kcpBindPort: Number(source.kcpBindPort) || 0,
+    quicBindPort: Number(source.quicBindPort) || 0,
+    tcpmuxHTTPConnectPort: Number(source.tcpmuxHTTPConnectPort) || 0,
     allowPorts: Array.isArray(source.allowPorts) ? source.allowPorts : [],
     allowPortsText: allowPortsToText(source.allowPorts),
-    extraKeys: Object.keys(source).filter((key) => !['bindAddr', 'bindPort', 'auth', 'webServer', 'dashboard', 'vhostHTTPPort', 'vhostHTTPSPort', 'allowPorts'].includes(key)),
+    extraKeys: Object.keys(source).filter((key) => !['bindAddr', 'bindPort', 'auth', 'webServer', 'dashboard', 'vhostHTTPPort', 'vhostHTTPSPort', 'allowPorts', 'kcpBindPort', 'quicBindPort', 'tcpmuxHTTPConnectPort'].includes(key)),
   };
 }
 

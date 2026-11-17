@@ -8,10 +8,18 @@ const { stringify: tomlStringify } = require('smol-toml');
 function friendlyError(err) {
   const message = String((err && err.message) || err || '');
   if (/authentication methods failed|authentication failure/i.test(message)) return '用户名或密码错误';
-  if (/cannot connect|ECONNREFUSED/i.test(message)) return 'SSH 端口无法连接，请检查 IP 与端口';
-  if (/connection lost before handshake|handshake/i.test(message)) return '连接在握手前被断开，该端口可能不是 SSH 服务或被防火墙拦截';
-  if (/ETIMEDOUT|timed out|timeout/i.test(message)) return '连接超时，请检查网络与防火墙';
-  if (/ENOTFOUND|EAI_AGAIN/i.test(message)) return '找不到该主机，请检查 IP';
+  /* 连接层的三种失败要能区分「端口没开」「被防火墙丢包」「被中间设备掐断」，
+   * 否则用户只能看到一句笼统的“无法连接”，不知道该去云控制台还是改 sshd。 */
+  if (/ECONNREFUSED|cannot connect/i.test(message)) {
+    return 'SSH 端口拒绝连接：对方主机在线，但这个端口没有 sshd 在听（SSH 端口填错，或 sshd 没启动）';
+  }
+  if (/connection lost before handshake|handshake/i.test(message)) {
+    return '连接在握手前被断开：该端口可能不是 SSH 服务，或被防火墙/堡垒机拦截（云厂商安全组代答就是这种表现）';
+  }
+  if (/ETIMEDOUT|timed out|timeout/i.test(message)) {
+    return 'SSH 连接超时：端口不可达，多半是云安全组/防火墙没放行这个端口，或本机 VPN/代理拦了出站';
+  }
+  if (/ENOTFOUND|EAI_AGAIN/i.test(message)) return '找不到该主机，请检查 IP 或本机 DNS';
   if (/Permission denied/i.test(message)) return '权限不足，请使用有权限的账户';
   return message || '连接失败';
 }
@@ -888,11 +896,43 @@ class ServerSession {
     if (!parsed.ok) return [];
     const s = frpsSummary(parsed.data);
     const ports = [];
-    if (s.bindPort) { ports.push({ port: s.bindPort, proto: 'tcp', label: 'bindPort' }); ports.push({ port: s.bindPort, proto: 'udp', label: 'bindPort' }); }
+    if (s.bindPort) ports.push({ port: s.bindPort, proto: 'tcp', label: 'bindPort' });
+    /* bindPort 的 UDP 只有配了 kcp / quic 才真的在监听（wss/websocket、tcp 传输都不占 UDP）。
+     * 无条件加一条 udp 会让端口矩阵得出「没有程序在这个端口监听」的假告警。 */
+    if (s.bindPort && (s.kcpBindPort || s.quicBindPort)) ports.push({ port: s.bindPort, proto: 'udp', label: 'bindPort(UDP)' });
     if (s.webPort && s.webPort !== s.bindPort) ports.push({ port: s.webPort, proto: 'tcp', label: 'Dashboard' });
     if (s.vhostHTTPPort) ports.push({ port: s.vhostHTTPPort, proto: 'tcp', label: 'vhostHTTPPort' });
     if (s.vhostHTTPSPort) ports.push({ port: s.vhostHTTPSPort, proto: 'tcp', label: 'vhostHTTPSPort' });
+    if (s.tcpmuxHTTPConnectPort) ports.push({ port: s.tcpmuxHTTPConnectPort, proto: 'tcp', label: 'tcpmuxHTTPConnectPort' });
     return ports;
+  }
+
+  /* 读出服务器上正在监听的 TCP / UDP 端口集合。
+   * 判定「端口被拦」时必须先分清「程序没监听」和「防火墙拦了」——
+   * 这一步提供的就是 S1（监听）信号。 */
+  async readListenPorts() {
+    const cmd = [
+      'echo @@TCP',
+      "(ss -lnt 2>/dev/null || netstat -lnt 2>/dev/null) | awk '{print $4}'",
+      'echo @@UDP',
+      "(ss -lun 2>/dev/null || netstat -lun 2>/dev/null) | awk '{print $4}'",
+    ].join('; ');
+    const out = { tcp: new Set(), udp: new Set() };
+    const result = await this.exec(cmd, 12000);
+    const text = String((result && result.stdout) || '');
+    let bucket = null;
+    for (const raw of text.split(/\r?\n/)) {
+      const line = raw.trim();
+      if (line === '@@TCP') { bucket = out.tcp; continue; }
+      if (line === '@@UDP') { bucket = out.udp; continue; }
+      if (!bucket || !line) continue;
+      // ss 里是 0.0.0.0:7000 / [::]:7000 / 127.0.0.1%lo:4096；netstat 里是 0.0.0.0:7000
+      const m = /[:.](\d{1,5})$/.exec(line);
+      if (!m) continue;
+      const port = Number(m[1]);
+      if (Number.isInteger(port) && port > 0 && port <= 65535) bucket.add(port);
+    }
+    return out;
   }
 
   // 解析 `ss -lntp` / `netstat -ltnp`，取每条监听端口的进程名与 PID（PID 用于 kill 占用者）。

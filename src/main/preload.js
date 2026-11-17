@@ -100,6 +100,7 @@ contextBridge.exposeInMainWorld('FRP', {
   serverFirewallInstall: () => invoke('server:firewall-install'),
   serverFirewallOpenPorts: (payload) => invoke('server:firewall-open-ports', payload),
   serverFirewallClose: (payload) => invoke('server:firewall-close', payload),
+  serverProbePort: (payload) => invoke('server:probe-port', payload),
   // SSH 交互式终端：打开/关闭走 invoke；按键与尺寸调整是高频小消息，走 send。
   shellOpen: (payload) => invoke('server:shell-open', payload),
   shellInput: (text) => ipcRenderer.send('server:shell-input', { text }),

@@ -78,6 +78,19 @@ const updateModule = require('./update');
 const { AcmeManager, coversDomain, readCertCoverage } = require('./acme');
 const { CloudflareDns } = require('./dns');
 const { execFileP, tcpCheck, httpProbe, hashText, randomToken, formatDuration } = require('./util');
+const { probePort, probeUdp, sshConnectHint, outboundHint } = require('./portprobe');
+const { parseRuleSpec, judgePortRow, buildPortMatrix, summarizeMatrix, buildRuleTexts } = require('./portmatrix');
+
+/* 出站失败（证书签发 / DNS API / 下载 frps / 检查更新）补一句本机网络排查方向。
+ * 这类请求都是从本机往 443 连，跟服务器防火墙无关，混在一起说会把用户引到错的方向。 */
+function withOutboundHint(message, what) {
+  const text = String(message || '');
+  if (!text) return text;
+  if (/timeout|timed out|ECONNREFUSED|ECONNRESET|ENOTFOUND|EAI_AGAIN|socket hang up|network|fetch failed|UNABLE_TO_VERIFY|self.signed|SELF_SIGNED/i.test(text)) {
+    return `${text}\n\n${outboundHint(what)}`;
+  }
+  return text;
+}
 
 const assetsDir = path.join(__dirname, '..', '..', 'assets');
 const preloadPath = path.join(__dirname, 'preload.js');
@@ -135,6 +148,8 @@ function currentDnsProvider() {
 const serverSession = new ServerSession();
 let serverConfig = { path: '', content: '', summary: null, error: '' };
 let sessionServerId = '';
+/* 最近一次 nginx 检测结果（服务器页进来就会拉一次），端口矩阵用它补 80/443 的「谁在监听」信号。 */
+let lastNginxState = null;
 
 // 服务器 allowPorts（frps 对 remotePort 的白名单），未连服务器时为 []。
 function serverAllowPorts() {
@@ -1365,7 +1380,16 @@ async function checkProxyHealth(p, ctx) {
   }
   layers.local = { ok: !!local.ok, ms: local.ms || 0, error: local.error || null, skipped: !!local.skipped };
   if (!local.ok) {
-    return [p.name, { ok: false, reason: '本地服务不通', ms: local.ms || 0, error: local.error || null, layers, at }];
+    /* 区分「本地服务没起」和「本机防火墙拦了」：只有绑定到非回环地址时才可能是后者。
+     * 127.0.0.1 上的连接不经过 Windows 防火墙，绑定局域网 IP 才会被入站规则拦。 */
+    const localHost = String(p.localIP || '127.0.0.1');
+    const loopback = /^(127\.|::1$|localhost$)/i.test(localHost);
+    const refused = /ECONNREFUSED/i.test(String(local.error || ''));
+    const reason = (!loopback && refused) ? '本地服务不通（可能被本机防火墙拦）' : '本地服务不通';
+    layers.local.hint = (!loopback && refused)
+      ? `绑定的是 ${localHost}（非回环地址），Windows 防火墙可能拦了入站连接；可先把 localIP 改成 127.0.0.1 验证`
+      : '';
+    return [p.name, { ok: false, reason, ms: local.ms || 0, error: local.error || null, layers, at }];
   }
 
   // 第 2 层：本地 frpc 已连上远程服务器，且该代理已在服务端注册（frpc 状态 running）。
@@ -2494,7 +2518,7 @@ function registerIpc() {
           activeServerId: settings.activeServerId === profile.id ? (rest[0] ? rest[0].id : '') : settings.activeServerId,
         });
       }
-      return fail(result.error, { state: serverState() });
+      return fail(sshConnectHint(result.error), { state: serverState() });
     }
     profile = upsertServerProfile({ ...profile, host, port, username }, { activate: true });
     if (payload.remember) {
@@ -2580,7 +2604,7 @@ function registerIpc() {
       const binary = await frpsBinary.ensure(arch, {
         onProgress: ({ text, percent }) => sendProgress({ stage: 'download', text, percent }),
       });
-      if (!binary.ok) return fail(binary.error);
+      if (!binary.ok) return fail(withOutboundHint(binary.error, '下载 frps 二进制'));
       localBinary = binary.path;
     }
     const configPath = serverSession.configPath || '/etc/frp/frps.toml';
@@ -2660,6 +2684,9 @@ function registerIpc() {
     if (!serverSession.connected) return fail('尚未连接服务器');
     try {
       const det = await serverSession.detectNginx();
+      // 缓存最近一次 nginx 检测：端口矩阵要用 80/443 是否在监听、是否被非 nginx 占用，
+      // 又不想为它多跑一轮 SSH（服务器页进来就会先拉一次 nginx 状态）。
+      lastNginxState = { ...det, at: Date.now(), serverHost: serverSession.host };
       // 同步 nginx 反代状态：frp-console.conf 是否存在，决定 http/https 代理的公网地址要不要带端口。
       // 状态属于「这台服务器」，写进对应档案。
       setProfileNginxProxy(profileForSession(serverSession).id, det.proxyConfigured);
@@ -2744,7 +2771,9 @@ function registerIpc() {
     const out = [];
     const seen = new Set();
     for (const p of model.proxies || []) {
-      if (!p.remotePort || !['tcp', 'udp', 'tcpmux'].includes(p.type)) continue;
+      /* tcpmux 不吃 remotePort（frpc 收到会报 unknown field remotePort），它的入口是
+       * frps 的 tcpmuxHTTPConnectPort —— 由 configPorts() 那条线负责，这里排除掉。 */
+      if (!p.remotePort || !['tcp', 'udp'].includes(p.type)) continue;
       const proto = p.type === 'udp' ? 'udp' : 'tcp';
       const key = `${proto}:${p.remotePort}`;
       if (seen.has(key)) continue;
@@ -2760,32 +2789,85 @@ function registerIpc() {
       const det = await serverSession.detectFirewall();
       const cfgPorts = serverConfig.summary ? serverSession.configPorts(serverConfig.content) : [];
       const proxyPorts = proxyRemotePorts();
-      const allowed = await serverSession.readFirewallAllowed();
-      // 对每个 tcp 端口实测可达性（从本机连服务器端口）。用于区分两种「规则未放行」：
-      // ① 规则没写但实测通 —— 通常是云平台防火墙/安全组（阿里云轻量、腾讯云等）在服务器外放行，
-      //    服务器内 ufw 看到的是「未放行」，但实际不拦；② 规则没写且实测被拦 —— 才真的需要放行。
-      const reachMap = new Map();
-      const tcpPorts = [...cfgPorts, ...proxyPorts].filter((p) => p.proto === 'tcp' && p.port);
-      await Promise.all(tcpPorts.map(async (p) => {
-        const key = `tcp:${p.port}`;
-        if (reachMap.has(key)) return;
+      /* 系统端口也要参与判定：SSH 是管理通道，nginx 80/443 是方案 Y 的公网入口。
+       * 以前这两类完全不在清单里，用户根本看不到「443 有没有被放行」。 */
+      const sysPorts = [];
+      if (serverSession.port) sysPorts.push({ port: Number(serverSession.port), proto: 'tcp', label: 'SSH' });
+      /* nginx 的 80/443 是方案 Y 的公网入口，必须进清单。缓存缺失/过期就现查一次：
+       * 否则用户刚打开服务器页时拿到的矩阵里根本没有 443（这正是他们踩的那个坑）。 */
+      let ng = (lastNginxState && lastNginxState.serverHost === serverSession.host && Date.now() - lastNginxState.at < 60000)
+        ? lastNginxState
+        : null;
+      if (!ng) {
         try {
-          const r = await tcpCheck(serverSession.host, Number(p.port), 2000);
-          reachMap.set(key, !!r.ok);
-        } catch { reachMap.set(key, null); }
+          ng = { ...(await serverSession.detectNginx()), at: Date.now(), serverHost: serverSession.host };
+          lastNginxState = ng;
+        } catch { ng = null; }
+      }
+      if (ng && ng.installed) {
+        sysPorts.push({ port: 443, proto: 'tcp', label: 'nginx' });
+        sysPorts.push({ port: 80, proto: 'tcp', label: 'nginx' });
+      }
+      const [allowed, listenPorts] = await Promise.all([
+        serverSession.readFirewallAllowed(),
+        serverSession.readListenPorts().catch(() => null),
+      ]);
+      // S3：从本机实测（TCP 全部实测；UDP 无握手，只在矩阵里按规则给「很可能被拦」）。
+      const reachMap = new Map();
+      const tcpTargets = [...new Map([...cfgPorts, ...proxyPorts, ...sysPorts]
+        .filter((p) => p.proto === 'tcp' && p.port)
+        .map((p) => [Number(p.port), p])).values()];
+      await Promise.all(tcpTargets.map(async (p) => {
+        const r = await probePort({ host: serverSession.host, port: Number(p.port), timeout: 2000 });
+        reachMap.set(`tcp:${p.port}`, r.ok === true);
       }));
-      const markReachable = (list) => list.map((p) => {
-        if (p.proto !== 'tcp') return p;
-        const v = reachMap.get(`tcp:${p.port}`);
-        return v === undefined ? p : { ...p, reachable: v };
+      const withReach = (list) => (list || []).map((p) => (p.proto === 'tcp'
+        ? { ...p, reachable: reachMap.has(`tcp:${p.port}`) ? reachMap.get(`tcp:${p.port}`) : null }
+        : p));
+      const frpsWithReach = withReach(cfgPorts);
+      const proxyWithReach = withReach(proxyPorts);
+      const sysWithReach = withReach(sysPorts);
+      /* 本机隧道是不是正连着这台服务器：决定了代理端口「没在监听」是故障还是正常。 */
+      const tunnelActive = !!(model && model.serverAddr && serverSession.host
+        && String(model.serverAddr).toLowerCase() === String(serverSession.host).toLowerCase()
+        && manager && manager.snapshot().connected);
+      const rows = buildPortMatrix({
+        cfgPorts: frpsWithReach,
+        proxyPorts: proxyWithReach,
+        sysPorts: sysWithReach,
+        allowed,
+        fwActive: !!det.active,
+        listenPorts,
+        tunnelActive,
       });
       return ok({
         ...det,
-        ports: [...markReachable(cfgPorts), ...markReachable(proxyPorts)],
-        frpsPorts: markReachable(cfgPorts),
-        proxyPorts: markReachable(proxyPorts),
+        ports: [...frpsWithReach, ...proxyWithReach],
+        frpsPorts: frpsWithReach,
+        proxyPorts: proxyWithReach,
+        sysPorts: sysWithReach,
+        sshPort: Number(serverSession.port) || 0,
         allowed,
+        matrix: rows,
+        conclusion: summarizeMatrix(rows),
+        ruleTexts: buildRuleTexts(cfgPorts, proxyPorts, sysPorts, serverSession.port),
       });
+    } catch (e) {
+      return fail(String((e && e.message) || e));
+    }
+  });
+
+  /* 单端口探测（前端在「打开面板」「复制规则前校验」等场景直接问一句）。 */
+  ipcMain.handle('server:probe-port', async (_event, payload = {}) => {
+    const host = String(payload.host || serverSession.host || '').trim();
+    const port = Number(payload.port);
+    const proto = String(payload.proto || 'tcp').toLowerCase() === 'udp' ? 'udp' : 'tcp';
+    if (!host || !port) return fail('缺少主机或端口');
+    try {
+      const r = proto === 'udp'
+        ? await probeUdp({ host, port, timeout: 1200 })
+        : await probePort({ host, port, timeout: Number(payload.timeout) || 2000 });
+      return ok({ host, port, proto, ...r });
     } catch (e) {
       return fail(String((e && e.message) || e));
     }
@@ -2967,7 +3049,26 @@ function registerIpc() {
       const ssPart = (/@@SS([\s\S]*?)(?:@@|$)/.exec(body) || [])[1] || '';
       const listenLine = ssPart.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)[0] || '';
       if (listenLine) {
-        return ok({ layer, ok: true, ms: Date.now() - startedAt, detail: `服务器本机已在 ${bindPort} 上监听（${listenLine.replace(/\s+/g, ' ').slice(0, 90)}）` });
+        /* 「本机在监听」只说明 frps 起来了，不代表外面连得上：云安全组、网络 ACL、
+         * 运营商封端口都在这之后才生效。补一次从本机的实测，才能回答用户真正关心的问题。 */
+        const reach = await probePort({ host: serverSession.host, port: bindPort, timeout: 3000 });
+        if (epoch !== sessionEpoch) return staleFail();
+        if (reach.ok) {
+          return ok({
+            layer,
+            ok: true,
+            ms: Date.now() - startedAt,
+            detail: `服务器本机在 ${bindPort} 上监听，公网实测可达（${reach.ms} ms）`,
+          });
+        }
+        return ok({
+          layer,
+          ok: false,
+          ms: Date.now() - startedAt,
+          reason: '公网连不上这个端口',
+          detail: `服务器本机确实在 ${bindPort} 监听（${listenLine.replace(/\s+/g, ' ').slice(0, 60)}），但从本机连不上（${reach.error || reach.kind}）。`
+            + '本机防火墙放不放行都管不到这一层——多半是云厂商安全组/防火墙没放行（阿里云轻量：控制台 → 防火墙；ECS：安全组入方向），也可能是运营商/网络 ACL 封了端口。',
+        });
       }
       return ok({
         layer,
@@ -3224,7 +3325,7 @@ function registerIpc() {
       };
       sendProgress({ label: '开始签发证书…', percent: 0 });
       const result = await acmeManager.issue({ domains, email, dns: provider.dns, onProgress: sendProgress });
-      if (!result.ok) return fail(result.error);
+      if (!result.ok) return fail(withOutboundHint(result.error, '证书签发'));
       // 证书签发后，自动上传到服务器 nginx 终止 TLS（方案 Y）。
       sendProgress({ label: '部署到服务器 nginx（上传证书 + 重载）…', percent: 95 });
       const nginx = await syncCertToServerNginx(result);
@@ -3232,7 +3333,7 @@ function registerIpc() {
       pushState();
       return ok({ ...result, nginx });
     } catch (e) {
-      return fail(String((e && e.message) || e));
+      return fail(withOutboundHint(String((e && e.message) || e), '证书签发'));
     }
   });
 
@@ -3249,7 +3350,7 @@ function registerIpc() {
       };
       sendProgress({ label: '开始续期…', percent: 0 });
       const result = await acmeManager.renew(domain, { email, dns: provider.dns, onProgress: sendProgress });
-      if (!result.ok) return fail(result.error);
+      if (!result.ok) return fail(withOutboundHint(result.error, '证书续期'));
       // 证书续期后，同样自动同步到 nginx。
       sendProgress({ label: '部署到服务器 nginx（上传证书 + 重载）…', percent: 95 });
       const nginx = await syncCertToServerNginx(result);
@@ -3257,7 +3358,7 @@ function registerIpc() {
       pushState();
       return ok({ ...result, nginx });
     } catch (e) {
-      return fail(String((e && e.message) || e));
+      return fail(withOutboundHint(String((e && e.message) || e), '证书续期'));
     }
   });
 

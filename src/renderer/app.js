@@ -1564,11 +1564,12 @@ function fwSpecRange(spec) {
 
 function firewallCardMarkup() {
   const f = S.server.firewall || {};
+  const title = '端口与连通';
   if (!f || f.loading) {
-    return `<section class="card"><div class="card-head"><div class="ch-icon">${icon('shield')}</div><div class="grow"><h3>服务器防火墙</h3><p>检测服务器防火墙，确保 frps 端口放行、客户端能连上。</p></div></div><div class="field-hint" style="padding:0 16px 12px">检测中…</div></section>`;
+    return `<section class="card"><div class="card-head"><div class="ch-icon">${icon('shield')}</div><div class="grow"><h3>${title}</h3><p>检测每个端口的「监听 / 规则 / 实测」，定位到底拦在哪一层。</p></div></div><div class="field-hint" style="padding:0 16px 12px">检测中…</div></section>`;
   }
   if (f.error) {
-    return `<section class="card"><div class="card-head"><div class="ch-icon">${icon('shield')}</div><div class="grow"><h3>服务器防火墙</h3><p>检测服务器防火墙，确保 frps 端口放行、客户端能连上。</p></div></div><div class="note warn" style="margin:0 16px 12px">${icon('alert')}<div>${esc(f.error)}</div></div></section>`;
+    return `<section class="card"><div class="card-head"><div class="ch-icon">${icon('shield')}</div><div class="grow"><h3>${title}</h3><p>检测每个端口的「监听 / 规则 / 实测」，定位到底拦在哪一层。</p></div></div><div class="note warn" style="margin:0 16px 12px">${icon('alert')}<div>${esc(f.error)}</div></div></section>`;
   }
   const managerLabel = { ufw: 'ufw', firewalld: 'firewalld', iptables: 'iptables', none: '无防火墙' }[f.manager] || esc(f.manager || '未知');
   const frpsPorts = Array.isArray(f.frpsPorts) && f.frpsPorts.length ? f.frpsPorts : (Array.isArray(f.ports) ? f.ports : []);
@@ -1594,13 +1595,6 @@ function firewallCardMarkup() {
     }
     return `<span class="tag bad">${esc(p.label)} ${p.port}/${p.proto} 未放行</span>`;
   };
-  const uncoveredCount = [...frpsPorts, ...proxyPorts].filter((p) => {
-    if (!f.active) return false; // 防火墙未启用不拦截，不算「未放行」
-    if (covered(p.port, p.proto)) return false; // 规则已覆盖
-    // 规则未覆盖：tcp 只有「实测被拦」才算真正需要放行；实测可达（云平台放行）不算。
-    if (p.proto === 'tcp') return p.reachable !== true;
-    return true; // udp 无法实测，保守算「未放行」
-  }).length;
   const statusBadge = f.active
     ? '<span class="badge amber"><span class="bdot"></span>已启用</span>'
     : '<span class="badge green"><span class="bdot"></span>未启用</span>';
@@ -1609,20 +1603,75 @@ function firewallCardMarkup() {
   const mainBtn = f.manager === 'none'
     ? `<button class="btn primary" type="button" data-act="server.firewall.install" ${busy}>${S.server.firewallBusy ? '<span class="spinner-sm"></span>' : icon('shield')}<span>${S.server.firewallBusy ? '安装中…' : '安装并启用防火墙'}</span></button>`
     : `<button class="btn primary" type="button" data-act="server.firewall.open" ${busy}>${S.server.firewallBusy ? '<span class="spinner-sm"></span>' : icon('shield')}<span>${S.server.firewallBusy ? '放行中…' : '放行 frps 与代理端口'}</span></button>`;
+
+  /* ---- 矩阵：监听 / 规则 / 实测 三信号 + 结论（v1.2.56） ---- */
+  const rows = Array.isArray(f.matrix) ? f.matrix : [];
+  const conclusion = f.conclusion || null;
+  const cell = (state, proto) => {
+    if (proto === 'udp' && state === 'reach') return '<span class="pm pm-warn">疑似</span>';
+    if (state === 'yes') return '<span class="pm pm-ok">✓</span>';
+    if (state === 'no') return '<span class="pm pm-bad">✗</span>';
+    return '<span class="pm pm-muted">—</span>';
+  };
+  const tri = (v) => (v === true ? 'yes' : (v === false ? 'no' : 'unknown'));
+  const rowAction = (r) => {
+    if (r.action === 'open') {
+      /* 行内「放行」只放行这一条端口（系统端口如 nginx 443 不在 frps/代理清单里，
+       * 以前点它执行的是「放行 frps 与代理端口」，等于什么都没做）。 */
+      return `<button class="btn tiny" type="button" data-act="server.firewall.openone" data-port="${r.port}" data-proto="${esc(r.proto)}" ${busy}>放行</button>`;
+    }
+    if (r.action === 'cloud') return `<button class="btn tiny" type="button" data-act="server.ports.copy">复制规则</button>`;
+    if (r.action === 'service') return `<button class="btn tiny" type="button" data-act="server.firewall.refresh">重新检测</button>`;
+    return '';
+  };
+  const GROUP_LABEL = { frps: 'frps 端口', proxy: '代理映射端口', system: '系统端口（SSH / nginx）' };
+  const groupOrder = ['frps', 'proxy', 'system'];
+  const matrixHtml = rows.length ? `
+      <div class="port-matrix-wrap">
+        <table class="port-matrix">
+          <thead><tr><th>用途</th><th>端口</th><th>监听</th><th>规则</th><th>实测</th><th>结论</th><th></th></tr></thead>
+          <tbody>
+            ${groupOrder.map((g) => {
+              const list = rows.filter((r) => r.group === g);
+              if (!list.length) return '';
+              return `<tr class="pm-group"><td colspan="7">${GROUP_LABEL[g] || g}</td></tr>`
+                + list.map((r) => `
+                  <tr>
+                    <td class="pm-label">${esc(r.label || '')}</td>
+                    <td class="mono">${r.port}/${esc(r.proto)}</td>
+                    <td>${r.listen === false && r.proto === 'tcp' ? cell('no') : cell(tri(r.listen))}</td>
+                    <td>${f.active ? cell(r.rule ? 'yes' : 'no') : '<span class="pm pm-muted">—</span>'}</td>
+                    <td>${r.proto === 'udp' ? cell('reach', 'udp') : cell(tri(r.reachable))}</td>
+                    <td class="pm-text pm-${esc(r.tone || 'ok')}">${esc(r.text || '')}</td>
+                    <td class="pm-act">${rowAction(r)}</td>
+                  </tr>`).join('');
+            }).join('')}
+          </tbody>
+        </table>
+      </div>` : '';
+  const conclusionHtml = conclusion ? `
+      <div class="note ${conclusion.level === 'ok' ? '' : 'warn'}" style="margin:0 16px 10px">
+        ${icon(conclusion.level === 'ok' ? 'check' : 'alert')}
+        <div><b>${esc(conclusion.text)}</b>${conclusion.total ? `（共 ${conclusion.total} 个端口，${conclusion.ok} 个正常）` : ''}</div>
+      </div>` : '';
+
   return `
     <section class="card">
       <div class="card-head">
         <div class="ch-icon">${icon('shield')}</div>
-        <div class="grow"><h3>服务器防火墙（${managerLabel}）</h3><p>${esc(f.statusText || '')}</p></div>
+        <div class="grow"><h3>${title}（${managerLabel}）</h3><p>${esc(f.statusText || '')}</p></div>
         <div class="page-actions">
           ${statusBadge}
           <button class="btn" type="button" data-act="server.firewall.refresh">${icon('reload')}<span>重新检测</span></button>
           ${mainBtn}
         </div>
       </div>
+      ${conclusionHtml}
+      ${matrixHtml || `
       ${frpsPorts.length ? `<div style="padding:0 16px 6px"><div class="field-hint" style="padding:0 0 6px">frps 端口放行状态：</div><div style="display:flex; flex-wrap:wrap; gap:6px;">${frpsPorts.map(coverTag).join('')}</div></div>` : ''}
       ${proxyPorts.length ? `<div style="padding:0 16px 6px"><div class="field-hint" style="padding:0 0 6px">代理映射端口放行状态：</div><div style="display:flex; flex-wrap:wrap; gap:6px;">${proxyPorts.map(coverTag).join('')}</div></div>` : ''}
-      ${uncoveredCount ? `<div class="note warn" style="margin:0 16px 10px">${icon('alert')}<div>有 ${uncoveredCount} 个 frps / 代理端口还没被放行——点右上「放行 frps 与代理端口」一键补齐，或在下方手动放行。</div></div>` : ''}
+      `}
+      ${f.active ? `<div class="field-hint" style="padding:0 16px 10px">「监听」= 服务器上有没有程序在这个端口监听；「规则」= 服务器内 ${managerLabel} 有没有放行；「实测」= 从本机能不能连上。三者交叉才能定位拦住的是本机防火墙还是云安全组。</div>` : ''}
       ${allowedRules.length ? `
       <div style="padding:0 16px 8px">
         <div class="field-hint" style="padding:0 0 6px">已放行规则（${allowedRules.length} 条，当前实际规则，勾选后可删除）：</div>
@@ -1635,6 +1684,22 @@ function firewallCardMarkup() {
       ${notes
         ? `<div class="note warn" style="margin:0 16px 12px">${icon('alert')}<div>${esc(notes.join('；'))}</div></div>`
         : ''}
+      <div class="cloud-hint">
+        <div class="cloud-hint-head">${icon('alert')}<b>本机防火墙放行 ≠ 公网可访问</b></div>
+        <p>云服务器（阿里云 / 腾讯云 / 华为云等）在机器之外还有一层「云防火墙 / 安全组」，服务器里的 ${managerLabel} 管不到它。
+        判定方法：<b>本机在监听</b> + <b>本机防火墙已放行</b> + <b>上面「实测」不通</b> → 拦截点在云平台层。</p>
+        <ul>
+          <li>阿里云 ECS：控制台 → 实例 → 安全组 → 配置规则 → 入方向 → 手动添加</li>
+          <li>阿里云轻量应用服务器：控制台 → 服务器详情 → 防火墙 → 添加规则</li>
+          <li>腾讯云 CVM：控制台 → 安全组 → 入站规则 → 添加规则</li>
+          <li>华为云 ECS：控制台 → 安全组 → 入方向规则 → 添加规则</li>
+        </ul>
+        <p class="cloud-hint-warn">图省事可先放行 <b>1–65535 TCP + UDP</b>，但那等于把全部端口暴露到公网，只建议在自用/测试服务器上这么做；长期请按上面的端口清单精确放行。</p>
+        <div class="page-actions" style="padding-top:4px">
+          <button class="btn" type="button" data-act="server.ports.copy">${icon('copy')}<span>复制全部端口规则</span></button>
+          <button class="btn" type="button" data-act="server.ports.copywide">${icon('copy')}<span>复制 1-65535 全放行</span></button>
+        </div>
+      </div>
       ${f.manager !== 'none'
         ? `
       <div class="field-hint" style="padding:0 16px 6px">手动放行端口：</div>
@@ -4020,6 +4085,46 @@ async function handleAction(act, dataset, btn) {
       case 'server.firewall.refresh':
         await withBusy(btn, () => loadServerFirewall(false));
         break;
+      case 'server.firewall.openone': {
+        const port = Number(dataset.port);
+        const proto = dataset.proto === 'udp' ? 'udp' : 'tcp';
+        if (!port) break;
+        if (S.server.firewallBusy) break;
+        S.server.firewallBusy = true;
+        renderServer(true);
+        try {
+          const res = await FRP.serverFirewallOpenPorts({ text: String(port), proto });
+          await loadServerFirewall(true);
+          if (res && res.ok) {
+            toast('success', `已放行 ${port}/${proto}`, '正在复检……');
+            await loadServerFirewall(true);
+          } else {
+            toast('error', `放行 ${port}/${proto} 失败`, (res && res.error) || '未知错误');
+          }
+        } finally {
+          S.server.firewallBusy = false;
+          renderServer(true);
+        }
+        break;
+      }
+      case 'server.ports.copy': {
+        const texts = (S.server.firewall && S.server.firewall.ruleTexts) || null;
+        if (!texts || !texts.exact) {
+          toast('warn', '还没有检测结果', '先点「重新检测」，拿到端口清单再复制');
+          break;
+        }
+        await FRP.copy(texts.exact);
+        toast('success', '已复制端口规则清单', '粘到云控制台的「安全组 / 防火墙 → 入方向」里逐条添加');
+        break;
+      }
+      case 'server.ports.copywide': {
+        const texts = (S.server.firewall && S.server.firewall.ruleTexts) || null;
+        const wide = (texts && texts.wide)
+          || '入方向（允许）：\nTCP  1-65535  0.0.0.0/0  允许\nUDP  1-65535  0.0.0.0/0  允许';
+        await FRP.copy(wide);
+        toast('warn', '已复制「1-65535 全放行」', '这只适合自用/测试服务器：等于把全部端口暴露到公网，用完记得按清单收紧');
+        break;
+      }
       case 'server.firewall.open': {
         if (S.server.firewallBusy) break;
         S.server.firewallBusy = true;
@@ -4281,6 +4386,16 @@ async function handleAction(act, dataset, btn) {
           toast('error', '未配置 Dashboard 或缺少服务器地址');
           break;
         }
+        /* 打开之前先探一次：面板端口被云安全组拦着时，浏览器只会给一个空白页/超时，
+         * 用户根本猜不到原因。这里直接告诉他拦在哪一层。 */
+        try {
+          const probe = await FRP.serverProbePort({ host, port: Number(summary.webPort), proto: 'tcp', timeout: 2000 });
+          const data = (probe && probe.data) || null;
+          if (probe && probe.ok && data && data.ok === false) {
+            toast('error', `面板端口 ${summary.webPort} 从本机连不上`, '如果 SSH 正常但面板打不开，多半是云安全组没放行这个端口；也可能是 frps 没监听它。');
+            break;
+          }
+        } catch { /* 探测失败不阻塞打开 */ }
         FRP.openUrl(`http://${host}:${summary.webPort}/`);
         break;
       }
