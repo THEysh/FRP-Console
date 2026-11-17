@@ -1601,7 +1601,7 @@ class ServerSession {
       }
       moved.push(key);
     }
-    /* 一证一目錄的情况（/etc/nginx/ssl/<域名>/）顺手把空目录也清掉。 */
+    /* 一证一目录的情况（/etc/nginx/ssl/<域名>/）顺手把空目录也清掉。 */
     const dir = posixDirname(cert);
     if (dir !== '/etc/nginx' && dir !== '/www/server/panel/vhost/cert') {
       await this.exec(`${prefix}rmdir ${shellQuote(dir)} 2>/dev/null || true`, 6000);
