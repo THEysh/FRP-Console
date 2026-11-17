@@ -74,7 +74,6 @@ const S = {
     installProgress: null,
     error: '',
   },
-  backups: { list: [], dir: '', loaded: false, loading: false, busy: false },
 };
 
 /* ----------------------------- 图标 ------------------------------ */
@@ -4337,45 +4336,6 @@ function renderCerts(force = false) {
 
 /* ----------------------------- 设置 ------------------------------ */
 
-async function loadBackups(force = false) {
-  if (S.backups.loading) return;
-  if (!force && S.backups.loaded) return;
-  S.backups.loading = true;
-  const res = await FRP.configBackups();
-  S.backups.loading = false;
-  if (res && res.ok) {
-    S.backups.list = res.data && res.data.backups || [];
-    S.backups.dir = (res.data && res.data.dir) || '';
-    S.backups.loaded = true;
-  }
-  if (S.view === 'settings') renderSettings(true);
-}
-
-function backupRowHtml(b, i) {
-  const d = new Date(b.mtime);
-  const when = Number.isNaN(d.getTime()) ? '' : d.toLocaleString('zh-CN', { hour12: false });
-  const kb = (b.size / 1024).toFixed(1);
-  return `<div class="backup-row">
-    <div class="grow">
-      <div class="backup-name mono">${esc(b.file)}</div>
-      <div class="backup-meta">${esc(when)} · ${kb} KB</div>
-    </div>
-    <button class="btn small" type="button" data-act="backups.restore" data-file="${esc(b.file)}" data-idx="${i}">${icon('reload')}<span>还原</span></button>
-  </div>`;
-}
-
-function renderBackups() {
-  const b = S.backups;
-  if (!b.loaded && !b.loading) loadBackups(true);
-  if (b.loading && !b.list.length) {
-    return `<div class="backup-list"><div class="muted">正在读取备份…</div></div>`;
-  }
-  if (!b.list.length) {
-    return `<div class="backup-list"><div class="muted">还没有备份。每次保存 <code>frpc.toml</code> 且内容有变化时，会自动在配置目录下的 <code>frp-console-backups</code> 里留一份（最多 10 份）。</div></div>`;
-  }
-  return `<div class="backup-list">${b.list.slice(0, 8).map((x, i) => backupRowHtml(x, i)).join('')}</div>`;
-}
-
 function renderSettings(force = false) {
   if (!force && S.lastKeys.settings === 'rendered') return;
   S.lastKeys.settings = 'rendered';
@@ -4393,7 +4353,7 @@ function renderSettings(force = false) {
       <div class="page-head">
         <div class="page-title">
           <h1>设置</h1>
-          <p>本机程序行为、可执行文件路径、系统集成与版本更新。服务器地址、端口与 Token 全部在「服务器」页管理。</p>
+          <p>本机程序行为、可执行文件路径与版本更新。服务器地址、端口与 Token 全部在「服务器」页管理。</p>
         </div>
       </div>
 
@@ -4425,17 +4385,6 @@ function renderSettings(force = false) {
 
         <section class="card section">
           <div class="section-head">
-            <div class="section-title"><strong>配置备份</strong><span>每次保存 <code>frpc.toml</code> 且内容有变化时自动备份，最多保留 10 份。</span></div>
-            <div class="section-actions">
-              <button class="btn small" type="button" data-act="backups.refresh">${icon('reload')}<span>刷新</span></button>
-              <button class="btn small" type="button" data-act="backups.reveal">${icon('folder')}<span>打开备份目录</span></button>
-            </div>
-          </div>
-          ${renderBackups()}
-        </section>
-
-        <section class="card section">
-          <div class="section-head">
             <div class="section-title"><strong>托盘与退出</strong><span>控制台是常驻托盘的应用：关窗口只是收起来，退出要显式点。</span></div>
             <div class="section-actions">
               <button class="btn small" type="button" data-act="app.tray.hide">${icon('box')}<span>收进托盘</span></button>
@@ -4459,14 +4408,6 @@ function renderSettings(force = false) {
               ? '托盘对象已创建，但系统没有给它分配屏幕位置（可能只被折叠进「^ 显示隐藏的图标」，先点 ^ 看看）。<br>如果 ^ 里也没有，多半是<strong>程序所在目录被安全软件/管控策略保护</strong>，系统拒绝为该目录下的程序注册托盘图标——把程序安装或移动到默认目录（C 盘的「应用程序」目录）再打开即可。此时关闭窗口会<strong>直接退出程序</strong>，不会藏起来。'
               : '托盘图标没能创建（assets 下的 tray-*.png 缺失或被拦截）。此时关闭窗口会<strong>直接退出程序</strong>，不会藏起来，避免窗口消失后叫不回来。'}</div></div>`}
           </div>
-        </section>
-
-        <section class="card section">
-          <div class="section-head">
-            <div class="section-title"><strong>系统集成</strong><span>生成带 --no-sandbox 的桌面与开始菜单快捷方式。</span></div>
-            <button class="btn" type="button" data-act="app.shortcut">${icon('box')}<span>创建快捷方式</span></button>
-          </div>
-          <div class="note">${icon('shield')}<div>本机直接双击 exe 会因 Chromium 沙箱初始化失败而没有窗口（退出码 3），必须由命令行带 <code>--no-sandbox</code>。这里生成的快捷方式已经带上该参数，完成后从桌面或开始菜单双击即可，不用再经过 <code>.cmd</code>。</div></div>
         </section>
 
         <section class="card section">
@@ -5301,46 +5242,8 @@ async function handleAction(act, dataset, btn) {
       case 'settings.reveal':
         FRP.revealPath('config');
         break;
-      case 'backups.refresh':
-        S.backups.loaded = false;
-        await loadBackups(true);
-        break;
-      case 'backups.reveal':
-        FRP.revealPath('config');
-        break;
-      case 'backups.restore': {
-        const file = dataset.file || '';
-        if (!file) break;
-        const okRestore = await confirmDialog({
-          title: '还原这份备份？',
-          body: `会用 <code>${esc(file)}</code> 覆盖当前 <code>frpc.toml</code>（当前配置会先再备份一份）。`,
-          confirmText: '还原',
-          danger: true,
-        });
-        if (!okRestore) break;
-        await withBusy(btn, async () => {
-          const res = await FRP.configRestoreBackup(file);
-          if (res && res.ok) {
-            toast('success', '已还原配置', res.data && res.data.restoredFrom ? `来自 ${res.data.restoredFrom}` : '');
-            S.backups.loaded = false;
-            await loadBackups(true);
-            renderSettings(true);
-          } else toastResult(res);
-        });
-        break;
-      }
       case 'reveal.log':
         FRP.revealPath('log');
-        break;
-      case 'app.shortcut':
-        await withBusy(btn, async () => {
-          const res = await FRP.createShortcut();
-          if (res && res.ok) {
-            const data = res.data || {};
-            const n = (data.created || []).length;
-            toast('success', '快捷方式已创建', n ? `已写入 ${n} 处（桌面${n > 1 ? ' / 开始菜单' : ''}），之后直接双击启动即可` : '');
-          } else toastResult(res);
-        });
         break;
       case 'app.tray.hide': {
         // 走窗口控制，效果和点标题栏的“最小化到托盘”一致

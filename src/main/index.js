@@ -2228,28 +2228,6 @@ function registerIpc() {
     return ok({ revealed: true });
   });
 
-  ipcMain.handle('config:backups', async () => {
-    if (!paths.configPath) return fail('配置路径尚未设置');
-    const result = configModule.listBackups(paths.configPath);
-    if (!result.ok) return fail(result.error);
-    return ok({ backups: result.backups, dir: result.dir });
-  });
-
-  ipcMain.handle('config:restore-backup', async (event, incoming) => {
-    if (!paths.configPath) return fail('配置路径尚未设置');
-    const file = String((incoming && incoming.file) || '').trim();
-    if (!file) return fail('请指定要还原的备份');
-    const restored = configModule.restoreBackup(paths.configPath, file);
-    if (!restored.ok) return fail(restored.error);
-    // 还原后重新从磁盘载入，并视情况热重载隧道。
-    loadConfigFromDisk();
-    pushState();
-    if (manager.apiOk && model) {
-      applyAndMaybeReload(model, { restartRecommended: true }).catch(() => {});
-    }
-    return ok({ restoredFrom: restored.restoredFrom });
-  });
-
   ipcMain.handle('config:save', async (event, incoming) => {
     if (!model) return fail('配置尚未载入');
     const clean = configModule.normalize({
@@ -4492,41 +4470,6 @@ async function syncCertToServerNginx(cert) {
   ipcMain.handle('app:notification', async (event, payload) => {
     notify((payload && payload.kind) || 'info', (payload && payload.title) || 'FRP 控制台', (payload && payload.message) || '');
     return ok({ shown: true });
-  });
-
-  // 生成带 --no-sandbox 的桌面 / 开始菜单快捷方式。
-  // 本机 Chromium 沙箱初始化会失败（退出码 3），快捷方式必须带上该参数，
-  // 否则双击等于没有反应；安装器环境受限时也可以从这里兜底。
-  ipcMain.handle('app:create-shortcut', async () => {
-    const exe = process.execPath;
-    const name = 'FRP 控制台';
-    const targets = [
-      path.join(app.getPath('desktop'), `${name}.lnk`),
-      path.join(app.getPath('appData'), 'Microsoft', 'Windows', 'Start Menu', 'Programs', `${name}.lnk`),
-    ];
-    const created = [];
-    const failed = [];
-    for (const lnk of targets) {
-      try {
-        fs.mkdirSync(path.dirname(lnk), { recursive: true });
-        const written = shell.writeShortcutLink(lnk, 'create', {
-          target: exe,
-          args: '--no-sandbox',
-          cwd: path.dirname(exe),
-          icon: exe,
-          iconIndex: 0,
-          description: 'FRP 内网穿透控制台：代理管理、端口扫描、frps 远程管理',
-        });
-        if (written) created.push(lnk);
-        else failed.push(lnk);
-      } catch (e) {
-        failed.push(`${lnk}（${e.message}）`);
-      }
-    }
-    if (!created.length) {
-      return fail('创建快捷方式失败：当前会话不允许写入桌面，可手动在 exe 上右键「发送到 → 桌面快捷方式」，并在属性里补 --no-sandbox');
-    }
-    return ok({ created, failed });
   });
 }
 

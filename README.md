@@ -490,6 +490,11 @@ node tools/cdp-shot.cjs .proxy-row out.png # 按选择器截单个元素
 
 ## 更新日志
 
+### 1.2.80
+
+- **设置页去掉「配置备份」卡片**：配置文件本来就是可以直接打开编辑的纯文本，专门做一份可视化的备份列表反而多一处要维护、要理解的东西。设置页那张卡片（列出历史备份、还原、刷新、打开备份目录）连同背后的 `config:backups`、`config:restore-backup` 两个接口一并删掉。保存时**写盘前仍会静默留一份快照**（`frp-console-backups/` 里最多 10 份）——这层只是防止"一次保存把手改的内容冲掉"，不再对外暴露任何入口。
+- **设置页去掉「系统集成」卡片**：那张「创建快捷方式」的卡片是早期为了绕开 Chromium 沙箱（双击 exe 没窗口、退出码 3）临时加的，属于开发者自己的排障手段，正式安装包已经由安装器建好快捷方式，普通用户不需要看到它。卡片与 `app:create-shortcut` 接口一起删除；仍然需要命令行启动的场合，`npm run dev:nosandbox` 或手动给快捷方式补 `--no-sandbox` 即可。
+
 ### 1.2.79
 
 - **顶层字段类型写错时不再"看着正常、一启动就崩"**：`frpc.toml` 里 `proxies` 写成字符串（`proxies = "oops"`）、`auth`/`log`/`webServer` 写成非表时，frpc 用 Go 严格反序列化会拒绝整份配置；控制台以前把这几个字段当"没有"，代理列表一片空白、看着一切正常，点启动才蹦出 `cannot unmarshal string into Go value of type v1.ClientConfig`。现在解析时就把类型不符的地方记下来，校验里直接报「proxies 的类型不对：应该是数组（每段用 [[proxies]] 开头），当前是字符串（frpc 会拒绝整份配置）」。

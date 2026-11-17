@@ -51,8 +51,6 @@ contextBridge.exposeInMainWorld('FRP', {
   configRaw: () => invoke('config:raw'),
   configVerifyRaw: (content) => invoke('config:verify-raw', { content }),
   configSaveRaw: (content, restart) => invoke('config:save-raw', { content, restart }),
-  configBackups: () => invoke('config:backups'),
-  configRestoreBackup: (file) => invoke('config:restore-backup', { file }),
   saveProxy: (mode, originalName, proxy) => invoke('proxy:save', { mode, originalName, proxy }),
   deleteProxy: (name) => invoke('proxy:delete', name),
   suggestPort: (type) => invoke('proxy:suggest-port', type),
@@ -134,7 +132,6 @@ contextBridge.exposeInMainWorld('FRP', {
   quit: () => invoke('app:quit'),
   trayState: () => invoke('app:tray-state'),
   notify: (kind, title, message) => invoke('app:notification', { kind, title, message }),
-  createShortcut: () => invoke('app:create-shortcut'),
   // 自动更新：状态在主进程，渲染层只做展示与触发
   updateState: () => invoke('update:state'),
   checkUpdate: () => invoke('update:check'),
