@@ -1950,6 +1950,8 @@ const shellState = {
   resizeObs: null,   // 容器尺寸监听
   open: false,       // 后端 shell 是否在跑
   opening: false,    // 正在打开（防连点）
+  ctxMenu: null,     // 右键菜单 DOM
+  ctxSelection: '',  // 打开菜单那一刻的选区（点菜单会让 xterm 选区失效）
 };
 
 function terminalCardMarkup() {
@@ -2004,9 +2006,81 @@ function disposeShellTerm(notifyClosed) {
   if (st.resizeObs) { try { st.resizeObs.disconnect(); } catch { /* ignore */ } st.resizeObs = null; }
   if (st.term) { try { st.term.dispose(); } catch { /* ignore */ } st.term = null; }
   st.fit = null;
+  closeShellContextMenu();
   if (window.__shellTerm) window.__shellTerm = null;
   if (notifyClosed) FRP.shellClose().catch(() => {});
 }
+
+/* 终端右键菜单：只做三件最常用的事（复制 / 粘贴 / 清屏）。
+ * 菜单挂在 document.body 上，避免被 .term-shell 的 overflow 裁掉；
+ * 点外面 / 按 Esc / 滚轮 / 窗口失焦都会关掉它。 */
+const SHELL_CTX_ITEMS = [
+  { id: 'copy', label: '复制' },
+  { id: 'paste', label: '粘贴' },
+  { id: 'clear', label: '清屏' },
+];
+
+function closeShellContextMenu() {
+  const menu = shellState.ctxMenu;
+  if (menu && menu.parentNode) menu.parentNode.removeChild(menu);
+  shellState.ctxMenu = null;
+}
+
+function openShellContextMenu(x, y) {
+  const st = shellState;
+  if (!st.term) return;
+  closeShellContextMenu();
+  // 打开时先记住选区：点菜单可能让 xterm 的选区失效，复制时用这份快照兜底。
+  const selection = String((st.term.getSelection && st.term.getSelection()) || '');
+  const menu = document.createElement('div');
+  menu.className = 'ctx-menu';
+  menu.innerHTML = SHELL_CTX_ITEMS.map((it) => {
+    const disabled = it.id === 'copy' && !selection;
+    return `<button class="ctx-item${disabled ? ' disabled' : ''}" type="button" data-ctx="${it.id}"${disabled ? ' disabled' : ''}>${it.label}</button>`;
+  }).join('');
+  document.body.appendChild(menu);
+  const rect = menu.getBoundingClientRect();
+  menu.style.left = `${Math.max(8, Math.min(x, window.innerWidth - rect.width - 8))}px`;
+  menu.style.top = `${Math.max(8, Math.min(y, window.innerHeight - rect.height - 8))}px`;
+  st.ctxMenu = menu;
+  st.ctxSelection = selection;
+
+  menu.addEventListener('mousedown', (ev) => ev.stopPropagation());
+  menu.addEventListener('click', async (ev) => {
+    const btn = ev.target && ev.target.closest ? ev.target.closest('[data-ctx]') : null;
+    if (!btn || btn.disabled) return;
+    const action = btn.dataset.ctx;
+    const term = shellState.term;
+    closeShellContextMenu();
+    if (!term) return;
+    if (action === 'copy') {
+      const text = selection || String((term.getSelection && term.getSelection()) || '');
+      if (text) FRP.copy(text).catch(() => {});
+    } else if (action === 'paste') {
+      const res = await FRP.clipboardRead().catch(() => null);
+      const text = res && res.ok && res.data && res.data.text;
+      if (text) term.paste(text);
+    } else if (action === 'clear') {
+      // 先本地清屏（立刻见效），再发一个 ^L（Ctrl+L）让 bash/zsh 重画提示符。
+      // 只写 ESC[2J 会把提示符一起擦掉、屏幕上只剩光标，看着像终端挂了。
+      term.write('\x1b[2J\x1b[H');
+      FRP.shellInput('\x0c');
+    }
+    term.focus();
+  });
+}
+
+document.addEventListener('mousedown', (e) => {
+  if (!shellState.ctxMenu) return;
+  if (e.target && e.target.closest && e.target.closest('.ctx-menu')) return;
+  closeShellContextMenu();
+}, true);
+document.addEventListener('keydown', (e) => {
+  if (shellState.ctxMenu && e.key === 'Escape') closeShellContextMenu();
+}, true);
+window.addEventListener('blur', () => closeShellContextMenu());
+window.addEventListener('resize', () => closeShellContextMenu());
+document.addEventListener('wheel', () => closeShellContextMenu(), { passive: true });
 
 async function openShellTerm() {
   const st = shellState;
@@ -2041,6 +2115,15 @@ async function openShellTerm() {
     if (!host) throw new Error('终端容器未创建');
     term.open(host);
     try { fit.fit(); } catch { /* ignore */ }
+    /* 右键菜单：xterm 默认把右键交给浏览器（会弹出 Chromium 的“检查/另存为”）。
+     * 监听挂在 term.element 上——重渲染时 xterm 元素会被“搬家”，监听跟着走。 */
+    if (term.element) {
+      term.element.addEventListener('contextmenu', (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        openShellContextMenu(ev.clientX, ev.clientY);
+      });
+    }
     const cols = Math.max(2, Math.min(500, term.cols || 100));
     const rows = Math.max(2, Math.min(200, term.rows || 30));
 

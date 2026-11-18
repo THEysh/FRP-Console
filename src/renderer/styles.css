@@ -1520,3 +1520,32 @@ label .icon-btn svg { width: 13px; height: 13px; }
   border-top: 1px solid var(--line);
   background: var(--bg-soft, rgba(0,0,0,.02));
 }
+
+/* ---------------- 终端右键菜单（复制 / 粘贴 / 清屏） ---------------- */
+.ctx-menu {
+  position: fixed;
+  z-index: 95;
+  min-width: 116px;
+  padding: 5px;
+  border-radius: 10px;
+  background: #151b26;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+}
+.ctx-menu .ctx-item {
+  display: block;
+  width: 100%;
+  padding: 7px 12px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-1, #e9eef7);
+  font-size: 12.5px;
+  line-height: 1.2;
+  text-align: left;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.ctx-menu .ctx-item:hover { background: rgba(90, 209, 255, 0.14); }
+.ctx-menu .ctx-item.disabled,
+.ctx-menu .ctx-item:disabled { opacity: 0.42; cursor: default; background: transparent; }
