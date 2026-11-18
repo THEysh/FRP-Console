@@ -60,8 +60,6 @@ contextBridge.exposeInMainWorld('FRP', {
   stopTunnel: () => invoke('tunnel:stop'),
   restartTunnel: () => invoke('tunnel:restart'),
   reloadTunnel: () => invoke('tunnel:reload'),
-  serviceControl: (action, value) => invoke('service:control', { action, value }),
-  enableAdmin: () => invoke('admin:enable'),
   scanListeners: () => invoke('listen:scan'),
   certList: () => invoke('cert:list'),
   certIssue: (payload) => invoke('cert:issue', payload),
@@ -129,8 +127,6 @@ contextBridge.exposeInMainWorld('FRP', {
   clipboardRead: () => invoke('clipboard:read'),
   openUrl: (url) => invoke('shell:open', url),
   windowControl: (action) => invoke('window:control', action),
-  quit: () => invoke('app:quit'),
-  trayState: () => invoke('app:tray-state'),
   notify: (kind, title, message) => invoke('app:notification', { kind, title, message }),
   // 自动更新：状态在主进程，渲染层只做展示与触发
   updateState: () => invoke('update:state'),

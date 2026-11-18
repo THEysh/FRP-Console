@@ -4344,9 +4344,7 @@ function renderSettings(force = false) {
   const settings = state.settings || {};
   const paths = state.paths || {};
   const app = state.app || {};
-  const service = state.service || {};
   const log = config.log || {};
-  const admin = config.webServer || null;
 
   $('#view').innerHTML = `
     <div class="view">
@@ -4385,33 +4383,6 @@ function renderSettings(force = false) {
 
         <section class="card section">
           <div class="section-head">
-            <div class="section-title"><strong>托盘与退出</strong><span>控制台是常驻托盘的应用：关窗口只是收起来，退出要显式点。</span></div>
-            <div class="section-actions">
-              <button class="btn small" type="button" data-act="app.tray.hide">${icon('box')}<span>收进托盘</span></button>
-              <button class="btn small danger" type="button" data-act="app.quit">${icon('power')}<span>完全退出</span></button>
-            </div>
-          </div>
-          <div class="stack" style="gap:10px">
-            <div class="path-row">
-              <div class="path-display grow">
-                <span class="p-label">托盘图标</span>
-                <span class="p-value mono">${S.app && S.app.tray ? '已创建，右键可退出' : S.app && S.app.trayCreated ? '已创建，但系统没显示图标' : '未创建'}</span>
-                <span class="tag ${S.app && S.app.tray ? 'ok' : 'bad'}">${S.app && S.app.tray ? '可用' : '不可用'}</span>
-              </div>
-            </div>
-            <div class="field-hint">
-              关闭窗口（X）${settings.closeToTray !== false ? '会收进托盘，隧道继续跑' : '会直接退出程序'}；
-              「完全退出」会先停掉控制台自己拉起的 frpc，再结束进程。
-              系统服务模式的隧道不受影响——那是单独的常驻服务。
-            </div>
-            ${S.app && S.app.tray ? '' : `<div class="note warn">${icon('alert')}<div>${S.app && S.app.trayCreated
-              ? '托盘对象已创建，但系统没有给它分配屏幕位置（可能只被折叠进「^ 显示隐藏的图标」，先点 ^ 看看）。<br>如果 ^ 里也没有，多半是<strong>程序所在目录被安全软件/管控策略保护</strong>，系统拒绝为该目录下的程序注册托盘图标——把程序安装或移动到默认目录（C 盘的「应用程序」目录）再打开即可。此时关闭窗口会<strong>直接退出程序</strong>，不会藏起来。'
-              : '托盘图标没能创建（assets 下的 tray-*.png 缺失或被拦截）。此时关闭窗口会<strong>直接退出程序</strong>，不会藏起来，避免窗口消失后叫不回来。'}</div></div>`}
-          </div>
-        </section>
-
-        <section class="card section">
-          <div class="section-head">
             <div class="section-title"><strong>运行模式与行为</strong><span>决定控制台如何启动 frpc 以及界面行为。</span></div>
             <button class="btn primary" type="button" data-act="settings.save.behavior">${icon('check')}<span>保存行为设置</span></button>
           </div>
@@ -4419,13 +4390,12 @@ function renderSettings(force = false) {
             <div class="field">
               <label>运行模式</label>
               <select class="select" name="runMode">
-                <option value="auto" ${settings.runMode === 'auto' ? 'selected' : ''}>自动（优先使用 Windows 服务）</option>
-                <option value="service" ${settings.runMode === 'service' ? 'selected' : ''}>Windows 服务</option>
+                <option value="auto" ${settings.runMode !== 'managed' ? 'selected' : ''}>自动（本机有 frpc 系统服务就用它，否则由控制台托管）</option>
                 <option value="managed" ${settings.runMode === 'managed' ? 'selected' : ''}>应用托管进程</option>
               </select>
               <div class="field-hint">${settings.runMode === 'managed'
                 ? '托管模式下隧道是控制台的子进程：控制台退出即断开，不建议用于无人值守。'
-                : '服务模式可开机自启；托管模式由控制台直接拉起 frpc.exe。'}</div>
+                : '「自动」会先看本机是否已把 frpc 装成系统服务（那种能开机自启、不依赖控制台）；没有就由控制台直接拉起 frpc.exe。'}</div>
             </div>
             <div class="field">
               <label>状态刷新间隔（毫秒）</label>
@@ -4452,74 +4422,13 @@ function renderSettings(force = false) {
                 ${switchRow('启动时自动启动隧道', '控制台启动后立即建立 frpc 连接', 'launchTunnelOnStart', !!settings.launchTunnelOnStart)}
                 ${switchRow('开机自动启动', '登录 Windows 后自动运行控制台（写当前用户的启动项，不需要管理员权限）', 'launchAtLogin', !!settings.launchAtLogin)}
                 ${app.launchAtLoginBlocked ? `<div class="note warn" style="margin:2px 0 10px">${icon('alert')}<div>启动项已被系统「任务管理器 → 启动」禁用，重启后不会运行。要恢复请到那里把「FRP 控制台」设为「已启用」；或者换个办法：把快捷方式放进 <code>shell:startup</code>。</div></div>` : ''}
-                ${settings.launchAtLogin && settings.runMode === 'managed' ? `<div class="note warn" style="margin:2px 0 10px">${icon('alert')}<div>当前是「应用托管进程」模式：开机只会自动打开控制台，隧道要等控制台把 frpc 拉起来才算通；控制台一退隧道就断。要“开机即通”，请改用 Windows 服务模式。</div></div>` : ''}
+                ${settings.launchAtLogin && settings.runMode === 'managed' ? `<div class="note warn" style="margin:2px 0 10px">${icon('alert')}<div>当前是「应用托管进程」模式：开机只会自动打开控制台，隧道要等控制台把 frpc 拉起来才算通；控制台一退隧道就断。</div></div>` : ''}
                 ${switchRow('以最小化状态启动', '仅显示托盘图标', 'startMinimized', !!settings.startMinimized)}
                 ${switchRow('停止/重启服务前确认', '需要管理员权限时弹出 UAC 提示', 'confirmStopService', settings.confirmStopService !== false)}
                 ${switchRow('不继承系统代理', '启动 frpc 时摘掉 HTTP_PROXY 等变量。系统开着代理时，frp 会把 TCP 握手交给代理，常见是被网关挡回 502（对系统服务模式无效）', 'stripProxyEnv', settings.stripProxyEnv !== false)}
               </div>
             </div>
           </form>
-        </section>
-
-        <section class="card section">
-          <div class="section-head">
-            <div class="section-title"><strong>客户端管理 API</strong><span>用于状态查询与配置热重载，仅监听本机。</span></div>
-            <button class="btn primary" type="button" data-act="admin.enable">${icon('shield')}<span>${admin ? '校验 / 修复' : '启用管理 API'}</span></button>
-          </div>
-          ${admin
-            ? `<div class="note">${icon('shield')}<div>已启用：<span class="mono">${esc(admin.addr || '127.0.0.1')}:${esc(admin.port)}</span> · 用户 <span class="mono">${esc(admin.user || '-')}</span><br>该管理接口会写回 frpc.toml，启用/修改后需要一次服务重启。</div></div>`
-            : `<div class="note warn">${icon('alert')}<div>未检测到 <span class="mono">webServer</span> 配置。启用后控制台可以读取代理在线状态并热重载配置。</div></div>`}
-          <div class="field-hint" style="margin-top:10px">当前连接：${state.runtime && state.runtime.connected ? '管理 API 可用' : `不可用${state.runtime && state.runtime.apiError ? `（${esc(state.runtime.apiError)}）` : ''}`}</div>
-          <form class="form-grid" id="form-admin" style="margin-top:12px" autocomplete="off" onsubmit="return false">
-            <div class="field">
-              <label>端口</label>
-              <input class="input" name="adminPort" type="number" min="1" max="65535" value="${esc(settings.adminPort || 7400)}" />
-              <div class="field-hint">仅监听 127.0.0.1。改成别的端口时，控制台会同步改写 frpc.toml 并重启隧道。</div>
-            </div>
-            <div class="field">
-              <label>用户名 / 密码</label>
-              <div style="display:flex;gap:6px">
-                <input class="input" name="adminUser" type="text" value="${esc(settings.adminUser || 'admin')}" style="flex:1" />
-                <input class="input" name="adminPassword" type="text" value="${esc(settings.adminPassword || '')}" style="flex:2" />
-              </div>
-              <div class="field-hint">口令会一起写进 frpc.toml 的 <span class="mono">webServer</span>。默认口令等于没有保护：任何本机进程都能用它读到自己配置里的 auth.token。</div>
-            </div>
-            <div class="field">
-              <label>frps 的 HTTP / HTTPS 端口</label>
-              <div style="display:flex;gap:6px">
-                <input class="input" name="vhostHttpPort" type="number" min="1" max="65535" value="${esc(settings.vhostHttpPort || 80)}" style="flex:1" />
-                <input class="input" name="vhostHttpsPort" type="number" min="1" max="65535" value="${esc(settings.vhostHttpsPort || 443)}" style="flex:1" />
-              </div>
-              <div class="field-hint">frps 的 vhostHTTPPort / vhostHTTPSPort。用来拼 http 代理的公网地址和做连通性检查；不是 80/443 时必须填对，否则会误报“公网不可达”。</div>
-            </div>
-            <div class="field" style="align-self:end">
-              <button class="btn primary" type="button" data-act="admin.save">${icon('check')}<span>保存并写入配置</span></button>
-            </div>
-          </form>
-        </section>
-
-        <section class="card section">
-          <div class="section-head">
-            <div class="section-title"><strong>Windows 服务</strong><span>frpc 以系统服务方式运行，开机自启。</span></div>
-            <div class="page-actions">
-              <button class="btn small" type="button" data-act="service.control" data-op="start" ${!service.installed || service.state === 'running' ? 'disabled' : ''}>${icon('play')}<span>启动</span></button>
-              <button class="btn small" type="button" data-act="service.control" data-op="stop" ${service.state !== 'running' ? 'disabled' : ''}>${icon('stop')}<span>停止</span></button>
-              <button class="btn small" type="button" data-act="service.control" data-op="restart" ${!service.installed ? 'disabled' : ''}>${icon('restart')}<span>重启</span></button>
-            </div>
-          </div>
-          <div class="service-box">
-            <div class="sb-state">
-              <span class="sb-name">${esc(service.name || settings.serviceName || 'frpc')}</span>
-              <span class="sb-desc">${esc(service.installed ? `${serviceStateText(service.state)}${service.pid ? ` · PID ${service.pid}` : ''}` : '未检测到该服务')}</span>
-            </div>
-            <select class="select" data-act="service.autostart" ${!service.installed ? 'disabled' : ''} style="max-width:150px">
-              <option value="auto" ${service.startType === 'auto' ? 'selected' : ''}>开机自启</option>
-              <option value="demand" ${service.startType === 'demand' ? 'selected' : ''}>手动启动</option>
-              <option value="disabled" ${service.startType === 'disabled' ? 'selected' : ''}>禁用</option>
-            </select>
-          </div>
-          <div class="field-hint" style="margin-top:10px">${esc(service.binaryPath || '')}</div>
-          ${app.elevated ? '' : `<div class="note warn" style="margin-top:10px">${icon('alert')}<div>当前不是管理员权限。启动/停止服务会触发 UAC 提权确认。</div></div>`}
         </section>
 
         <section class="card section">
@@ -5245,93 +5154,9 @@ async function handleAction(act, dataset, btn) {
       case 'reveal.log':
         FRP.revealPath('log');
         break;
-      case 'app.tray.hide': {
-        // 走窗口控制，效果和点标题栏的“最小化到托盘”一致
-        const res = await FRP.windowControl('hide');
-        if (res && res.ok) toast('info', '已收进托盘', '右键托盘图标可以显示界面或完全退出');
-        else toastResult(res);
-        break;
-      }
-      case 'app.quit': {
-        const okQuit = await confirmDialog({
-          title: '完全退出 FRP 控制台',
-          body: '会先停掉控制台自己拉起的 frpc，再结束进程。<br>系统服务模式的隧道不受影响。',
-          confirmText: '退出',
-          danger: true,
-        });
-        if (okQuit) await FRP.quit();
-        break;
-      }
       case 'settings.save.behavior':
         await saveBehavior(btn);
         break;
-      case 'admin.save': {
-        const form = $('#form-admin');
-        if (!form) break;
-        const val = (name) => {
-          const el = form.querySelector(`[name="${name}"]`);
-          return el ? el.value : '';
-        };
-        const patch = {
-          adminPort: Number(val('adminPort')) || 7400,
-          adminUser: String(val('adminUser') || '').trim() || 'admin',
-          adminPassword: String(val('adminPassword') || ''),
-          vhostHttpPort: Number(val('vhostHttpPort')) || 80,
-          vhostHttpsPort: Number(val('vhostHttpsPort')) || 443,
-        };
-        await withBusy(btn, async () => {
-          let res;
-          try {
-            res = await FRP.saveSettings(patch);
-          } catch (e) {
-            toast('error', '保存失败', (e && e.message) || String(e));
-            return;
-          }
-          if (!res || !res.ok) {
-            toastResult(res);
-            return;
-          }
-          if (res.data && res.data.state) S.state = res.data.state;
-          // 端口/口令落到 frpc.toml 的 webServer 里，否则控制台与 frpc 对不上
-          let ensured;
-          try {
-            ensured = await FRP.enableAdmin();
-          } catch (e) {
-            toast('error', '写入配置失败', (e && e.message) || String(e));
-            return;
-          }
-          if (ensured && ensured.ok && ensured.data && ensured.data.state) S.state = ensured.data.state;
-          S.lastKeys.settings = '';
-          if (ensured && ensured.ok) toast('success', '管理 API 配置已更新', 'frpc.toml 里的 webServer 已同步；隧道正在跑时会自动重启一次');
-          else toastResult(ensured);
-          renderSettings(true);
-        });
-        break;
-      }
-      case 'admin.enable': {
-        await withBusy(btn, async () => {
-          const res = await FRP.enableAdmin();
-          if (res && res.ok) {
-            if (res.data && res.data.state) S.state = res.data.state;
-            toast('success', res.data && res.data.changed ? '管理 API 已启用' : '管理 API 正常', res.data && res.data.changed ? '如隧道已在运行，可能需要重启一次服务' : '');
-            S.lastKeys.settings = '';
-            renderSettings(true);
-          } else toastResult(res);
-        });
-        break;
-      }
-      case 'service.control': {
-        await withBusy(btn, async () => {
-          const res = await FRP.serviceControl(dataset.op);
-          if (res && res.ok) {
-            if (res.data && res.data.state) S.state = res.data.state;
-            toast('success', `服务已${ { start: '启动', stop: '停止', restart: '重启' }[dataset.op] || '操作'}`);
-          } else toastResult(res);
-          S.lastKeys.settings = '';
-          if (S.view === 'settings') renderSettings(true); else if (S.view === 'overview') renderOverview(true);
-        });
-        break;
-      }
       case 'toggle': {
         const target = btn.classList.toggle('on');
         btn.setAttribute('aria-pressed', String(target));

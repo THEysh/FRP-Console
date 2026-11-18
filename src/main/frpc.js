@@ -44,7 +44,7 @@ function spawnErrorText(error, frpcPath) {
 function adminPortBusyText(port) {
   const p = Number(port) || 7400;
   return `管理端口 ${p} 已被占用：本机还有另一个 frpc 在用它（另一份配置、另一个控制台实例，或手工开的 frpc）。`
-    + `到「设置」里换一个管理端口（例如 ${p + 12}）再启动，或者先关掉占用它的那个 frpc。`;
+    + '自动换端口也没成功（连着试了 30 个），先把占用它的那个 frpc 关掉再启动。';
 }
 
 function startFailureText(text, adminPort) {
@@ -55,7 +55,7 @@ function startFailureText(text, adminPort) {
     || /address already in use/i.test(raw);
   if (bindConflict) {
     if (new RegExp(`[:.]${port}\\b`).test(raw)) return `${adminPortBusyText(port)}（frpc 原文：${raw}）`;
-    return `frpc 启动失败：要监听的端口已被占用（${raw}）。如果占用的是管理端口，到「设置」里换一个；如果是代理端口，换一个公网端口。`;
+    return `frpc 启动失败：要监听的端口已被占用（${raw}）。如果占用的是管理端口，关掉占用它的那个 frpc 再启动；如果是代理端口，换一个公网端口。`;
   }
   return raw;
 }

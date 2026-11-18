@@ -2004,11 +2004,39 @@ function tunnelPrerequisiteError() {
   return '';
 }
 
+/* 管理端口被别的 frpc 占着时，spawn 出去只会 bind 失败（Go 原文还很难懂），
+ * 而设置页里那个"改管理端口"的入口已经撤掉了 —— 所以这里自动挪到下一个空闲端口，
+ * 并同步写回 frpc.toml 的 webServer.port 与 settings.adminPort，让隧道照常起来。
+ * 返回一句给用户看的说明（没挪则返回空串）。 */
+async function ensureAdminPortUsable() {
+  if (!model) return '';
+  // 自家 frpc 正在跑（或本进程已经握有 API）时不要动端口，否则会把好好的隧道踢掉。
+  if (manager.apiOk || manager.isChildAlive) return '';
+  const taken = async (port) => tcpCheck('127.0.0.1', port, 400).then((r) => !!(r && r.ok)).catch(() => true);
+  if (!(await taken(settings.adminPort))) return '';
+  const from = Number(settings.adminPort) || 7400;
+  let picked = 0;
+  for (let port = from + 1; port <= Math.min(65535, from + 30); port += 1) {
+    // eslint-disable-next-line no-await-in-loop
+    if (!(await taken(port))) { picked = port; break; }
+  }
+  if (!picked) return '';
+  settings = settingsModule.save({ adminPort: picked });
+  configModule.ensureAdmin(model, settings);
+  const saved = persistModel(model, { reload: false });
+  if (!saved.ok) {
+    settings = settingsModule.save({ adminPort: from });
+    return '';
+  }
+  pushState();
+  notify('warn', '管理端口被占用，已自动换端口', `本机 ${from} 被另一个 frpc 占着（另一份配置、另一个控制台实例或手工开的 frpc），这次改用 ${picked}，已写进 frpc.toml。`);
+  return `管理端口 ${from} 被占用，已自动改用 ${picked}`;
+}
+
 /* 插件代理（https2http / https2https）引用的证书文件在本机不存在时，frpc 会拒绝加载
  * 整份配置 —— 表现为「一条都连不上」，报错却是英文的证书读取失败。
  * 启动前先扫一遍，把「哪条代理缺哪个文件」用中文说清楚（1.2.72）。 */
-function pluginCertProblems() {
-  const out = [];
+function pluginCertProblems() {  const out = [];
   for (const proxy of (model && model.proxies) || []) {
     const plugin = proxy && proxy.plugin;
     if (!plugin || !plugin.type) continue;
@@ -2519,6 +2547,7 @@ function registerIpc() {
      * 所以启动前就说清楚是哪几条、缺哪个文件，别等 frpc 报一段英文。 */
     const certProblem = pluginCertProblemError();
     if (certProblem) return fail(certProblem, { state: buildState() });
+    const adminNote = await ensureAdminPortUsable();
     await refreshService({ detect: true });
     const result = await manager.start({ runMode: settings.runMode });
     await manager.refresh().catch(() => {});
@@ -2526,7 +2555,7 @@ function registerIpc() {
     scheduleHealth(1500);
     pushState();
     if (!result.ok) return fail(result.error, { state: buildState() });
-    return ok({ state: buildState(), mode: result.mode });
+    return ok({ state: buildState(), mode: result.mode, adminNote: adminNote || '' });
   });
 
   ipcMain.handle('tunnel:stop', async () => {
@@ -2564,48 +2593,6 @@ function registerIpc() {
     pushState();
     if (!result.ok) return fail(result.error, { state: buildState() });
     return ok({ state: buildState(), status: result.status });
-  });
-
-  ipcMain.handle('service:control', async (event, payload) => {
-    const action = payload && payload.action;
-    const name = settings.serviceName;
-    let result = { ok: true };
-    if (action === 'start') result = await service.startService(name);
-    else if (action === 'stop') result = await service.stopService(name);
-    else if (action === 'restart') result = await service.restartService(name);
-    else if (action === 'autostart') result = await service.setStartType(name, payload.value === 'auto' ? 'auto' : payload.value === 'disabled' ? 'disabled' : 'demand');
-    else return fail('未知的服务操作');
-    await refreshService({ detect: false });
-    await manager.refresh().catch(() => {});
-    pushState();
-    if (!result.ok) return fail(result.error || '操作失败', { state: buildState(), service: serviceCache });
-    return ok({ state: buildState(), service: serviceCache });
-  });
-
-  ipcMain.handle('admin:enable', async () => {
-    if (!model) return fail('配置尚未载入');
-    const changed = configModule.ensureAdmin(model, settings);
-    if (!changed && manager.apiOk) return ok({ state: buildState(), changed: false });
-    const saved = persistModel(model, { reload: false });
-    if (!saved.ok) return saved;
-    const wasRunning = manager.apiOk || (serviceCache.installed && serviceCache.state === 'running');
-    if (wasRunning) {
-      suppressExitUntil = Date.now() + 20000;
-      if (manager.isChildAlive) {
-        const r = await manager.restart({ runMode: 'managed' });
-        if (!r.ok) return fail(r.error || '重启失败', { state: buildState() });
-      } else if (serviceCache.installed) {
-        const r = await service.restartService(settings.serviceName);
-        if (!r.ok) return fail(r.error || '重启服务失败', { state: buildState() });
-        await manager.waitForApi(20000);
-      } else {
-        const r = await manager.restart({ runMode: settings.runMode });
-        if (!r.ok) return fail(r.error || '重启失败', { state: buildState() });
-      }
-    }
-    await manager.refresh().catch(() => {});
-    pushState();
-    return ok({ state: buildState(), changed: true, restartRecommended: !wasRunning ? false : true });
   });
 
   ipcMain.handle('listen:scan', async () => {
@@ -4465,26 +4452,6 @@ async function syncCertToServerNginx(cert) {
     refreshTray();
     return ok({ maximized: win.isMaximized(), visible: win.isVisible() });
   });
-
-  ipcMain.handle('app:quit', async () => {
-    // 不在这里直接 app.quit()：统一交给 quitApp，保证托管隧道先停干净。
-    quitApp({ source: 'renderer' });
-    return ok({ quitting: true });
-  });
-
-  // 排障用：托盘到底建出来没有、窗口是显示还是收起来了、退出流程走到哪一步。
-  // 设置页会把它显示出来，也方便自动化测试断言。
-  ipcMain.handle('app:tray-state', async () => ok({
-    tray: !!tray,
-    usable: canHideToTray(),
-    bounds: (() => { try { return tray && !tray.isDestroyed() ? tray.getBounds() : null; } catch { return null; } })(),
-    tone: trayToneCache || '',
-    windowVisible: !!(win && !win.isDestroyed() && win.isVisible()),
-    windowDestroyed: !win || win.isDestroyed(),
-    closeToTray: settings ? settings.closeToTray !== false : null,
-    quitting: quitFlowStarted,
-    pid: process.pid,
-  }));
 
   ipcMain.handle('app:notification', async (event, payload) => {
     notify((payload && payload.kind) || 'info', (payload && payload.title) || 'FRP 控制台', (payload && payload.message) || '');
