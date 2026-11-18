@@ -1394,6 +1394,15 @@ class ServerSession {
     } catch { return false; }
   }
 
+  /* 某个端口在本机有没有监听（健康检查定因用，一条命令，不联网）。 */
+  async hasListener(port) {
+    if (!this.connected) return null;
+    const res = await this.exec(`ss -lnt 2>/dev/null | grep -c ":${Number(port)} " || true`, 8000);
+    if (!res || !res.ok) return null;
+    const n = Number(String(res.stdout || '').trim());
+    return Number.isFinite(n) ? n > 0 : null;
+  }
+
   async detectNginx() {
     if (!this.connected) return { installed: false, error: '尚未连接服务器' };
     const which = await this.exec('command -v nginx 2>/dev/null || true', 6000);

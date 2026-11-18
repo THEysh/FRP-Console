@@ -1931,10 +1931,24 @@ async function checkProxyHealth(p, ctx) {
        * 握手在中间被掐掉了。常见于云厂商对未备案域名的 443 拦截——
        * 浏览器有时仍能打开（Chromium 的 ClientHello 被放行），
        * node/schannel 这类客户端直接收到 RST。说成「公网不可达」会让人去查安全组。 */
-      reason = '公网 TLS 握手被中断';
-      error = `${target.kind === 'http' ? target.url : `https://${target.host}/`} 握手阶段收到 ${pub.error}（端口是通的，连接是被中途重置的）`;
-      hint = '先用浏览器打开这个域名确认：如果浏览器能打开、只有本机探测被重置，通常是云厂商按域名在做 TLS 层拦截（未备案最常见），隧道本身没问题；'
-        + '要彻底消除就到云厂商完成备案，或把域名解析到已备案的机器上。';
+      /* 有可能是「服务器上 443 根本没在听」被云厂商边缘 RST 盖住了表象：
+       * 缓存里的 nginx 状态可能过期或还没拉过，这里现场查一次，别让用户白猜备案。 */
+      let port443Free = recentNginx ? recentNginx.port443Free : undefined;
+      if (port443Free === undefined && vhostOpts.nginxProxyEnabled && serverSession && serverSession.connected) {
+        const listening = await serverSession.hasListener(443);
+        if (listening !== null) port443Free = listening === false;
+      }
+      if (vhostOpts.nginxProxyEnabled && port443Free === true) {
+        reason = 'nginx 没有监听 443';
+        error = `探测目标 https://${target.host}/ 在握手阶段收到 ${pub.error}，而服务器上 443 确实没有任何监听（nginx 只配了 80）`;
+        hint = '这条隧道本身是好的，缺的是 443 入口：到「HTTPS 证书」页签发或导入一张覆盖该域名的证书并「部署到 nginx」，它会补上 443 段与证书；'
+          + '补完再点一次检查。若域名未备案，云厂商还会在 443 上重置握手，那就得先备案或换已备案的域名。';
+      } else {
+        reason = '公网 TLS 握手被中断';
+        error = `${target.kind === 'http' ? target.url : `https://${target.host}/`} 握手阶段收到 ${pub.error}（端口是通的，连接是被中途重置的）`;
+        hint = '先用浏览器打开这个域名确认：如果浏览器能打开、只有本机探测被重置，通常是云厂商按域名在做 TLS 层拦截（未备案最常见），隧道本身没问题；'
+          + '要彻底消除就到云厂商完成备案，或把域名解析到已备案的机器上。';
+      }
       const browserErr = layers.public.browserError;
       if (browserErr) hint += `\n浏览器同款网络栈（Chromium）也没能打开：${browserErr}`;
       else if (layers.public.browserUnavailable) hint += '\n（本次没能用浏览器网络栈复核：只在 Electron 主进程里可用。）';

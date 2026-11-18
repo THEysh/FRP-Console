@@ -1436,7 +1436,11 @@ label .icon-btn svg { width: 13px; height: 13px; }
  * 于是右侧「删除」按钮被裁到可视区外（点不到），其它列被压成 41~118px 的窄条。
  * 这里改成固定布局 + 长串折行 + 允许滚动兜底。 */
 .dns-panel { width: min(1040px, calc(100vw - 48px)); }
-.dns-panel .modal-body { padding: 18px 22px 22px; }
+.dns-panel .modal-body { padding: 18px 22px 22px; min-height: 0; }
+/* 关键：.modal-body 是 flex 列容器，子项默认 flex-shrink:1；内容比可视高度高时
+ * 浏览器会把「表格容器」一起压扁（实测 211px → 93px、335px → 147px，甚至只剩表头），
+ * 表面现象就是“表格只有一行、字都看不见”。这里禁止子项收缩，让 body 自己滚动。 */
+.dns-panel .modal-body > * { flex: 0 0 auto; }
 .dns-panel .port-matrix-wrap { margin: 0; max-height: 300px; overflow: auto; }
 .dns-panel .port-matrix { table-layout: fixed; }
 .dns-panel .port-matrix thead th { padding: 7px 10px; }
