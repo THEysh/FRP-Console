@@ -297,6 +297,12 @@ a { color: var(--accent); text-decoration: none; }
 .btn:hover { color: var(--text); background: rgba(148, 163, 184, 0.11); border-color: rgba(148, 163, 184, 0.3); }
 .btn:active { transform: translateY(1px); }
 .btn:focus-visible { box-shadow: 0 0 0 3px rgba(90, 209, 255, 0.18); }
+/* 键盘焦点环兜底：:where() 权重为 0，不会盖掉上面 .btn / .input 的定制样式，
+ * 只给原本完全没有焦点提示的元素（侧栏导航、图标按钮、类型块、开关等）兜一层。 */
+:where(button, a, [tabindex], summary):focus-visible {
+  outline: 2px solid rgba(90, 209, 255, 0.75);
+  outline-offset: 2px;
+}
 .btn[disabled] { opacity: 0.45; pointer-events: none; }
 .btn svg { width: 15px; height: 15px; }
 .btn.primary {
