@@ -28,6 +28,7 @@ if (process.env.ELECTRON_RUN_AS_NODE === '1') {
 const fs = require('node:fs');
 const path = require('node:path');
 const net = require('node:net');
+const { execFileSync } = require('node:child_process');
 const { app, BrowserWindow, ipcMain, dialog, shell, clipboard, Tray, Menu, nativeImage, Notification } = require('electron');
 
 app.setName('frp-console');
@@ -79,7 +80,7 @@ const { AcmeManager, coversDomain, readCertCoverage } = require('./acme');
 const { CloudflareDns } = require('./dns');
 const dnsCheck = require('./dnscheck');
 const browserProbe = require('./netprobe');
-const { execFileP, tcpCheck, httpProbe, hashText, randomToken, formatDuration } = require('./util');
+const { execFileP, powershell, tcpCheck, httpProbe, hashText, randomToken, formatDuration } = require('./util');
 const { probePort, probeUdp, sshConnectHint, outboundHint } = require('./portprobe');
 const { parseRuleSpec, judgePortRow, buildPortMatrix, summarizeMatrix, buildRuleTexts } = require('./portmatrix');
 
@@ -508,38 +509,124 @@ function toggleMainWindow() {
 
 /* ------------------------- 开机自启 ------------------------- */
 /*
- * 用 Electron 的 setLoginItemSettings：Windows 上就是在 HKCU\Software\Microsoft\
- * Windows\CurrentVersion\Run 里写一条记录，不碰系统服务，也不需要管理员权限。
+ * Windows 上就是在 HKCU\Software\Microsoft\Windows\CurrentVersion\Run 里写一条记录，
+ * 不碰系统服务，也不需要管理员权限。实现细节见下面 applyLaunchAtLogin 的注释：
+ * 早期用的是 app.setLoginItemSettings，实测它在本机静默失败（Run 键里什么也没写），
+ * 所以改成自己读写注册表。
  *
- * 三个坑：
+ * 三个坑仍然适用：
  *  1) 开发模式下 process.execPath 是 electron.exe，必须把项目目录作为参数带上，
  *     否则登录后只会打开一个空白的 Electron 窗口。
  *  2) 便携版的 execPath 指向 %TEMP% 里解出来的副本，必须用 PORTABLE_EXECUTABLE_FILE
  *     指回用户双击的那个 exe，否则重启后路径就失效了。
  *  3) 用户在任务管理器里禁用启动项时，Windows 不删 Run 键，而是在
- *     Explorer\StartupApproved\Run 里把状态改成「已禁用」。所以只看 openAtLogin
- *     会得到「已开启」的假象——必须再看 executableWillLaunchAtLogin / launchItems。
+ *     Explorer\StartupApproved\Run 里把状态改成「已禁用」——只看 Run 键会得到
+ *     「已开启」的假象。
  */
-function loginItemOptions(enabled) {
-  const opts = { openAtLogin: !!enabled };
-  if (process.platform !== 'win32') return opts; // macOS/Linux 走各自默认实现
-  if (process.env.PORTABLE_EXECUTABLE_FILE) {
-    opts.path = process.env.PORTABLE_EXECUTABLE_FILE;
-    opts.args = [];
-  } else if (!app.isPackaged) {
-    opts.path = process.execPath;
-    opts.args = [app.getAppPath()];
-  }
-  return opts;
+
+
+/* ---------- 开机自启：Windows 直接读写注册表 ----------
+ * 以前靠 app.setLoginItemSettings：实测（源码运行、打包安装版都试过）它调用之后
+ * HKCU\...\Run 里什么也没写、getLoginItemSettings 一直回 false，界面只能显示
+ * 「系统拒绝了开机启动设置」，开关等于失效。改成自己写注册表：
+ *   1) 写完立刻读回来核对，写没写进去一目了然；
+ *   2) 能识别「任务管理器 → 启动」里被禁用（StartupApproved\Run 首字节 3/7），
+ *      否则界面显示“已开启”、重启却不启动；
+ *   3) 便携版指向用户双击的那个 exe，开发模式指向 electron.exe + 应用目录。
+ * macOS / Linux 仍走 Electron 自带实现。 */
+const RUN_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
+const STARTUP_APPROVED_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run';
+
+function loginItemCommand() {
+  if (process.env.PORTABLE_EXECUTABLE_FILE) return { path: process.env.PORTABLE_EXECUTABLE_FILE, args: [] };
+  if (!app.isPackaged) return { path: process.execPath, args: [app.getAppPath()] };
+  return { path: process.execPath, args: [] };
 }
 
-function sameExe(a, b) {
-  if (!a || !b) return false;
+function loginItemName() {
+  return app.getName() || 'frp-console';
+}
+
+function quoteArg(value) {
+  const text = String(value || '');
+  return /[\s"]/.test(text) ? `"${text.replace(/"/g, '\\"')}"` : text;
+}
+
+function loginItemCommandLine() {
+  const cmd = loginItemCommand();
+  return [quoteArg(cmd.path), ...cmd.args.map(quoteArg)].join(' ');
+}
+
+/* reg query 的值行长这样：  frp-console    REG_SZ    "C:\path\app.exe" "C:\dir" */
+function regQueryValue(key, name) {
   try {
-    return path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();
+    /* stderr 必须自己吞掉：execFileSync 的 stderr 默认继承父进程，
+     * 而 reg 查不到值时一定往 stderr 写「系统找不到指定的注册表项」，
+     * 每次轮询都往控制台刷一行错误，看着像程序坏了。 */
+    const out = execFileSync('reg', ['query', key, '/v', name], { windowsHide: true, encoding: 'utf8', timeout: 8000, stdio: ['ignore', 'pipe', 'pipe'] });
+    const line = out.split(/\r?\n/).find((l) => l.trim().startsWith(name));
+    if (!line) return null;
+    const parts = line.trim().split(/\s{2,}/);
+    return { type: parts[1] || '', data: parts.slice(2).join('  ') };
   } catch {
-    return String(a).toLowerCase() === String(b).toLowerCase();
+    return null;
   }
+}
+
+/* 写注册表走 PowerShell（-EncodedCommand，见 util.powershell），不走 reg.exe：
+ * reg add 的 /d 值里一旦带引号（命令行路径必然带），reg.exe 会报
+ * 「ERROR: Invalid syntax」，实测写不进去。 */
+function psQuote(text) {
+  return `'${String(text === undefined || text === null ? '' : text).replace(/'/g, "''")}'`;
+}
+
+function regPathOf(key) {
+  return String(key).replace(/^(HKCU|HKLM|HKCR|HKU)(?=\\)/i, '$1:');
+}
+
+async function regSetValue(key, name, value, kind = 'String') {
+  const valueExpr = kind === 'Binary' ? '([byte[]](0x02,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00))' : psQuote(value);
+  const script = [
+    "$ErrorActionPreference = 'Stop'",
+    'try {',
+    `  New-ItemProperty -Path ${psQuote(regPathOf(key))} -Name ${psQuote(name)} -Value ${valueExpr} -PropertyType ${kind} -Force | Out-Null`,
+    "  Write-Output 'OK'",
+    '} catch {',
+    "  Write-Output ('FAIL ' + $_.Exception.Message)",
+    '}',
+  ].join('\r\n');
+  const result = await powershell(script, { timeout: 20000 });
+  const out = String(result.stdout || '').trim();
+  // PowerShell 的报错本身带句号，拼进我们的话里会出现「。。」
+  const cleaned = out.replace(/[。.!！]+$/, '');
+  return { ok: out.startsWith('OK'), detail: cleaned || String(result.stderr || '').trim() };
+}
+
+async function regRemoveValue(key, name) {
+  const script = [
+    "$ErrorActionPreference = 'Stop'",
+    'try {',
+    `  Remove-ItemProperty -Path ${psQuote(regPathOf(key))} -Name ${psQuote(name)} -Force -ErrorAction SilentlyContinue`,
+    "  Write-Output 'OK'",
+    '} catch {',
+    "  Write-Output ('FAIL ' + $_.Exception.Message)",
+    '}',
+  ].join('\r\n');
+  const result = await powershell(script, { timeout: 20000 });
+  const out = String(result.stdout || '').trim();
+  // PowerShell 的报错本身带句号，拼进我们的话里会出现「。。」
+  const cleaned = out.replace(/[。.!！]+$/, '');
+  return { ok: out.startsWith('OK'), detail: cleaned || String(result.stderr || '').trim() };
+}
+
+/* StartupApproved\Run 里是 12 字节二进制：首字节 02/06 = 启用，03/07 = 禁用。 */
+function startupApprovedDisabled(name) {
+  const value = regQueryValue(STARTUP_APPROVED_KEY, name);
+  if (!value || !value.data) return false;
+  const first = String(value.data).replace(/[^0-9a-f]/gi, '').slice(0, 2);
+  if (!first) return false;
+  const byte = parseInt(first, 16);
+  return byte === 3 || byte === 7;
 }
 
 /* 返回 { registered, enabled, blocked, error }：
@@ -547,45 +634,77 @@ function sameExe(a, b) {
  *   enabled     重启后真的会启动（没被任务管理器禁用）
  *   blocked     已注册但被禁用——这正是「设置里显示开着、重启却不启动」的原因 */
 function launchAtLoginSnapshot() {
-  const opts = loginItemOptions(true);
-  const query = process.platform === 'win32'
-    ? { ...(opts.path ? { path: opts.path } : {}), ...(opts.args ? { args: opts.args } : {}) }
-    : { path: undefined, args: undefined };
-  let result;
-  try {
-    // Windows 上查询必须带上和写入时相同的 path/args，否则永远查不到那条记录。
-    result = app.getLoginItemSettings(process.platform === 'win32' ? query : {});
-  } catch (e) {
-    return { registered: false, enabled: false, blocked: false, error: String((e && e.message) || e) };
-  }
   if (process.platform !== 'win32') {
+    let result;
+    try {
+      result = app.getLoginItemSettings();
+    } catch (e) {
+      return { registered: false, enabled: false, blocked: false, error: String((e && e.message) || e) };
+    }
     const on = !!result.openAtLogin;
     return { registered: on, enabled: on, blocked: false, error: '' };
   }
-  const registered = !!result.openAtLogin;
-  if (!registered) return { registered: false, enabled: false, blocked: false, error: '' };
-  // launchItems 里带 enabled，是唯一能反映「任务管理器里被禁用」的字段。
-  const items = Array.isArray(result.launchItems) ? result.launchItems : [];
-  const mine = items.find((item) => sameExe(item && item.path, opts.path)) || (items.length === 1 ? items[0] : null);
-  let enabled;
-  if (mine && typeof mine.enabled === 'boolean') enabled = mine.enabled;
-  else if (typeof result.executableWillLaunchAtLogin === 'boolean') enabled = result.executableWillLaunchAtLogin;
-  else enabled = registered;
-  return { registered: true, enabled, blocked: !enabled, error: '' };
+  const name = loginItemName();
+  const value = regQueryValue(RUN_KEY, name);
+  if (!value) return { registered: false, enabled: false, blocked: false, error: '' };
+  const disabled = startupApprovedDisabled(name);
+  return { registered: true, enabled: !disabled, blocked: disabled, error: '' };
 }
 
 function launchAtLoginState() {
   return launchAtLoginSnapshot().enabled;
 }
 
-function applyLaunchAtLogin(enabled) {
-  try {
-    app.setLoginItemSettings(loginItemOptions(enabled));
-  } catch (e) {
-    return { ok: false, error: `写入开机启动项失败：${e.message || e}` };
+async function applyLaunchAtLogin(enabled) {
+  if (process.platform !== 'win32') {
+    try {
+      app.setLoginItemSettings({ openAtLogin: !!enabled });
+    } catch (e) {
+      return { ok: false, error: `写入开机启动项失败：${e.message || e}` };
+    }
+    const on = launchAtLoginSnapshot().enabled;
+    if (on === !!enabled) return { ok: true, actual: on };
+    return {
+      ok: false,
+      actual: on,
+      error: '系统拒绝了开机启动设置（可能被组策略或安全软件拦截），可以改用 shell:startup 文件夹里的快捷方式',
+    };
   }
-  const state = launchAtLoginSnapshot();
-  if (!!enabled && state.blocked) {
+
+  /* 先走 Electron 自带的 setLoginItemSettings（干净、和其它平台一致）。
+   * 它不一定可靠：实测某些受限环境里调用完 Run 键里什么也没写、也不报错，
+   * 所以每次都读回来核对，没生效再自己写注册表兜底。 */
+  const cmd = loginItemCommand();
+  try {
+    app.setLoginItemSettings({ openAtLogin: !!enabled, path: cmd.path, args: cmd.args });
+  } catch {
+    /* 忽略：下面自己写 */
+  }
+  let state = launchAtLoginSnapshot();
+  if (state.enabled === !!enabled) return { ok: true, actual: state.enabled };
+
+  const name = loginItemName();
+  if (!enabled) {
+    const removed = await regRemoveValue(RUN_KEY, name);
+    await regRemoveValue(STARTUP_APPROVED_KEY, name);
+    if (!removed.ok) {
+      return { ok: false, actual: launchAtLoginSnapshot().enabled, error: `删除开机启动项失败：${removed.detail}` };
+    }
+  } else {
+    const written = await regSetValue(RUN_KEY, name, loginItemCommandLine(), 'String');
+    if (!written.ok) {
+      return {
+        ok: false,
+        actual: launchAtLoginSnapshot().enabled,
+        error: `写入开机启动项失败：${written.detail}。可以改用 shell:startup 文件夹里的快捷方式`,
+      };
+    }
+    // 以前被任务管理器禁用过就在 StartupApproved 里留着「已禁用」，这里顺手改回启用。
+    if (startupApprovedDisabled(name)) await regSetValue(STARTUP_APPROVED_KEY, name, '', 'Binary');
+  }
+
+  state = launchAtLoginSnapshot();
+  if (enabled && state.blocked) {
     return {
       ok: false,
       blocked: true,
@@ -594,7 +713,6 @@ function applyLaunchAtLogin(enabled) {
     };
   }
   if (state.enabled !== !!enabled) {
-    // 组策略 / 安全软件拦截时设置会静默失败，别让界面显示成已开启
     return {
       ok: false,
       actual: state.enabled,
@@ -607,7 +725,7 @@ function applyLaunchAtLogin(enabled) {
 /* 启动时对账：设置里开着但系统里没有（重装、移动目录）就补写，
  * 设置里关着但系统里还留着就清掉。
  * 任务管理器里被禁用的，尊重用户的选择：把设置也关掉，不再偷偷加回去。 */
-function syncLaunchAtLogin() {
+async function syncLaunchAtLogin() {
   if (!settings) return;
   const want = settings.launchAtLogin === true;
   const state = launchAtLoginSnapshot();
@@ -617,7 +735,7 @@ function syncLaunchAtLogin() {
     return;
   }
   if (want === state.enabled) return;
-  const result = applyLaunchAtLogin(want);
+  const result = await applyLaunchAtLogin(want);
   if (!result.ok) console.warn('[startup]', result.error);
 }
 
@@ -2122,7 +2240,7 @@ function registerIpc() {
     const allowed = [
       'frpcPath', 'configPath', 'frpsDashboardUrl', 'serviceName', 'runMode',
       'adminPort', 'adminUser', 'adminPassword', 'autoReload', 'pollIntervalMs', 'closeToTray',
-      'startMinimized', 'launchTunnelOnStart', 'serviceAutoDetect', 'logBuffer', 'confirmStopService',
+      'startMinimized', 'launchTunnelOnStart', 'serviceAutoDetect', 'logBuffer',
       'stripProxyEnv', 'launchAtLogin', 'vhostHttpPort', 'vhostHttpsPort',
       'acmeEmail', 'dnsProvider', 'certDirs',
     ];
@@ -2136,7 +2254,7 @@ function registerIpc() {
     }
     // 开机自启要真的写进系统，写不进去就别保存，免得界面显示“已开启”但重启无效。
     if (clean.launchAtLogin !== undefined) {
-      const result = applyLaunchAtLogin(!!clean.launchAtLogin);
+      const result = await applyLaunchAtLogin(!!clean.launchAtLogin);
       if (!result.ok) return fail(result.error);
       clean.launchAtLogin = !!result.actual;
     }
@@ -2178,7 +2296,11 @@ function registerIpc() {
       follower.maxLines = clean.logBuffer;
       if (follower.lines.length > follower.maxLines) follower.lines.splice(0, follower.lines.length - follower.maxLines);
     }
-    if (clean.runMode && !['auto', 'service', 'managed'].includes(clean.runMode)) delete clean.runMode;
+    /* 'service'（Windows 服务模式）已经没有入口了：设置页那张卡删掉了，
+     * 也没有“把 frpc 装成服务”的按钮。老客户端传上来就归一到 auto，
+     * 不让它落到“未检测到 FRP 系统服务”那种死路上。 */
+    if (clean.runMode === 'service') clean.runMode = 'auto';
+    if (clean.runMode && !['auto', 'managed'].includes(clean.runMode)) delete clean.runMode;
     if (clean.configPath !== undefined) {
       const wanted = String(clean.configPath || '').trim();
       /* 填了但文件不存在就直接报错。否则 refreshPaths 会悄悄换回旧路径，
@@ -4928,7 +5050,7 @@ function startApp() {
     createTray();
     createWindow();
     // 系统里的启动项和设置对不上时补一次（重装、移动目录、被任务管理器禁用过）
-    syncLaunchAtLogin();
+    syncLaunchAtLogin().catch(() => {});
     // 更新模块只做“状态持有 + 响应按钮”，不主动联网：检查更新由用户点按钮触发。
     updateModule.init({
       onStatus: (payload) => send('update:status', payload),

@@ -40,7 +40,6 @@ const DEFAULT_SETTINGS = {
   launchTunnelOnStart: false,
   // 登录 Windows 后自动启动控制台（写 HKCU 的 Run 项，不需要管理员权限）。
   launchAtLogin: false,
-  confirmStopService: true,
   logBuffer: 600,
   // 首启生成过模板配置就置 true：用户之后手动删掉它，也不该再冒出来。
   starterConfigCreated: false,
@@ -228,6 +227,10 @@ function load() {
     activeServerId,
     clientServerId,
   };
+  /* Windows 服务模式已经没有入口了（设置页那张卡删了，也没有“装成服务”的按钮），
+   * 但老设置里可能还留着 runMode='service'。留着它会让「启动隧道」每次都先去找
+   * 系统服务、报“未检测到 FRP 系统服务”，看起来像功能坏了 —— 直接归一到 auto。 */
+  if (cached.runMode === 'service') cached.runMode = 'auto';
   delete cached.server;
   legacyHostMemo = String((base.server && base.server.host) || legacyHostMemo || '');
   return cached;

@@ -42,8 +42,16 @@ function powershell(script, options = {}) {
    * execFile 在 Windows 上要把参数拼成一条命令行交给 CreateProcess，
    * 脚本里一旦出现 " { } | $ 这类字符（Get-Process ... ForEach-Object { "$($_.Id)=..." }）
    * 就会被二次解析，表现为“命令失败”且没有任何输出。
-   * Base64(UTF-16LE) 之后命令行里只剩字母数字，彻底没有转义问题。 */
-  const encoded = Buffer.from(String(script || ''), 'utf16le').toString('base64');
+   * Base64(UTF-16LE) 之后命令行里只剩字母数字，彻底没有转义问题。
+   *
+   * 输出编码固定成 UTF-8：PowerShell 默认按控制台代码页（中文系统是 GBK）写 stdout，
+   * 而 execFile 这边按 utf8 解码，中文错误信息会变成一堆问号/乱码——
+   * 报错原文读不出来就没法判断是「没权限」还是「路径不对」。 */
+  const prefix = [
+    '$ProgressPreference = "SilentlyContinue"',
+    'try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }',
+  ].join('\r\n');
+  const encoded = Buffer.from(`${prefix}\r\n${String(script || '')}`, 'utf16le').toString('base64');
   return execFileP(
     'powershell.exe',
     ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded],

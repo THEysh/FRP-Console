@@ -4424,7 +4424,6 @@ function renderSettings(force = false) {
                 ${app.launchAtLoginBlocked ? `<div class="note warn" style="margin:2px 0 10px">${icon('alert')}<div>启动项已被系统「任务管理器 → 启动」禁用，重启后不会运行。要恢复请到那里把「FRP 控制台」设为「已启用」；或者换个办法：把快捷方式放进 <code>shell:startup</code>。</div></div>` : ''}
                 ${settings.launchAtLogin && settings.runMode === 'managed' ? `<div class="note warn" style="margin:2px 0 10px">${icon('alert')}<div>当前是「应用托管进程」模式：开机只会自动打开控制台，隧道要等控制台把 frpc 拉起来才算通；控制台一退隧道就断。</div></div>` : ''}
                 ${switchRow('以最小化状态启动', '仅显示托盘图标', 'startMinimized', !!settings.startMinimized)}
-                ${switchRow('停止/重启服务前确认', '需要管理员权限时弹出 UAC 提示', 'confirmStopService', settings.confirmStopService !== false)}
                 ${switchRow('不继承系统代理', '启动 frpc 时摘掉 HTTP_PROXY 等变量。系统开着代理时，frp 会把 TCP 握手交给代理，常见是被网关挡回 502（对系统服务模式无效）', 'stripProxyEnv', settings.stripProxyEnv !== false)}
               </div>
             </div>
@@ -6277,7 +6276,6 @@ async function saveBehavior(btn) {
     launchTunnelOnStart: isOn('launchTunnelOnStart'),
     launchAtLogin: isOn('launchAtLogin'),
     startMinimized: isOn('startMinimized'),
-    confirmStopService: isOn('confirmStopService'),
     stripProxyEnv: isOn('stripProxyEnv'),
   };
   await withBusy(btn, async () => {

@@ -537,4 +537,4 @@ class FrpcManager extends EventEmitter {
   }
 }
 
-module.exports = { FrpcManager, reloadFailureText, startFailureText, adminPortBusyText };
+module.exports = { FrpcManager, reloadFailureText, startFailureText, adminPortBusyText, childEnv };
