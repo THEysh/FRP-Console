@@ -995,7 +995,7 @@ function logLineHtml(l) {
   return `<div class="log-line ${esc(level)}">
     <span class="lt">${esc(l.time || fmtTime(l.ts))}</span>
     <span class="lv">${esc(lv)}</span>
-    <span class="ltx">${esc(l.text)}</span>
+    <span class="ltx" title="${esc(l.text)}">${esc(l.text)}</span>
   </div>`;
 }
 
@@ -4369,13 +4369,13 @@ function renderSettings(force = false) {
             <div class="path-row">
               <div class="path-display grow">
                 <span class="p-label">frps 面板地址（可选）</span>
-                <span class="p-value mono">${esc(settings.frpsDashboardUrl || (config.serverAddr ? `${config.serverAddr}:7500` : '配置服务器后可用'))}</span>
+                <span class="p-value mono" title="${esc(settings.frpsDashboardUrl || (config.serverAddr ? `${config.serverAddr}:7500` : '配置服务器后可用'))}">${esc(settings.frpsDashboardUrl || (config.serverAddr ? `${config.serverAddr}:7500` : '配置服务器后可用'))}</span>
               </div>
             </div>
             <div class="path-row">
               <div class="path-display grow">
                 <span class="p-label">日志文件</span>
-                <span class="p-value mono">${esc(paths.logPath || '')}</span>
+                <span class="p-value mono" title="${esc(paths.logPath || '')}">${esc(paths.logPath || '')}</span>
                 <span class="tag ${paths.logExists ? 'ok' : 'bad'}">${paths.logExists ? '存在' : '不存在'}</span>
               </div>
               <button class="btn small" type="button" data-act="reveal.log">${icon('folder')}</button>
@@ -6387,6 +6387,20 @@ function bindStaticEvents() {
   });
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape' && S.modalOpen) closeModal();
+    // 弹窗里的表单按回车 = 点主按钮（否则只能去点鼠标，键盘用户会觉得“按了没反应”）。
+    // 排除 textarea（多行输入要换行）、按钮自身（避免二次触发）、危险按钮（防止误确认删除）。
+    if (e.key === 'Enter' && S.modalOpen && !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey) {
+      const el = e.target;
+      const tag = el && el.tagName;
+      const typing = tag === 'INPUT' && !/^(checkbox|radio|button|submit)$/i.test(el.type || '');
+      if (typing) {
+        const primary = document.querySelector('#modal-root .modal .btn.primary');
+        if (primary && !primary.disabled && !/danger/.test(primary.className)) {
+          e.preventDefault();
+          primary.click();
+        }
+      }
+    }
     if ((e.ctrlKey || e.metaKey) && e.key === 'r') {
       e.preventDefault();
       FRP.refresh().then((res) => { if (res && res.ok) { S.state = res.data; updateChrome(); renderCurrent({ force: true }); } }).catch(() => {});

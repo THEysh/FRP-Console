@@ -459,8 +459,15 @@ a { color: var(--accent); text-decoration: none; }
   display: flex; align-items: center; gap: 8px;
   padding: 9px 12px; border-radius: 9px;
   background: rgba(148, 163, 184, 0.06); border: 1px solid rgba(148, 163, 184, 0.12);
+  /* 不要再让 flex 压缩：窗口 1040px 时四步曾被挤到 101px 宽，
+   * 而「本机 frpc 未启动」需要 216px，文字直接盖到右边的箭头和下一步上。
+   * 现在按内容给宽、放不下就换行；真长到离谱时才省略。 */
+  flex: 0 0 auto;
   min-width: 0;
+  max-width: 100%;
 }
+.tunnel-progress .tp-body { overflow: hidden; }
+.tunnel-progress .tp-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tp-dot {
   width: 20px; height: 20px; border-radius: 50%; flex: 0 0 20px;
   display: grid; place-items: center; font-size: 12px; font-weight: 700;
@@ -490,7 +497,10 @@ a { color: var(--accent); text-decoration: none; }
   transform: translateX(-50%);
   background: #1a2130; color: #e2e8f0;
   padding: 7px 10px; border-radius: 7px; font-size: 11px; line-height: 1.5;
-  white-space: nowrap; max-width: 300px; width: max-content;
+  /* 中文说明普遍 40~70 字：nowrap 会让文字溢出这层 300px 的底框（视觉上“飘在框外”），
+   * 这里改成允许换行、按内容收缩但不超过 max-width。 */
+  white-space: normal; word-break: break-word;
+  max-width: min(320px, 76vw); width: max-content;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
   opacity: 0; pointer-events: none; transition: opacity 0.12s ease;
   z-index: 40;
@@ -1009,7 +1019,7 @@ label .icon-btn svg { width: 13px; height: 13px; }
 .detail-row .dr-label { color: var(--text-3); flex: 0 0 92px; }
 .detail-row .dr-value { color: var(--text-2); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .path-display .p-label { font-family: var(--sans); font-size: 10.5px; color: var(--text-3); flex: 0 0 auto; margin-right: 9px; }
-.path-display .p-value { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.path-display .p-value { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* 「关于」卡片里的更新条：一行说明 + 按钮，下载时补一根细进度条 */
 .update-box { margin-top: 14px; }
