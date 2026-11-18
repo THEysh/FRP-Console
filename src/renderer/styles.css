@@ -1429,6 +1429,24 @@ label .icon-btn svg { width: 13px; height: 13px; }
 .pm-text.pm-bad { color: #ef4444; font-weight: 600; }
 .pm-text.pm-warn { color: #f59e0b; }
 .pm-text.pm-ok { color: inherit; font-weight: 400; }
+
+/* ---- DNS 记录面板（v1.2.84）----
+ * 复用 .port-matrix 时踩到的坑：table-layout:auto 下一条 120 字符的 TXT 会把
+ * 「内容」列撑到 864px，表格总宽 1184px，而外层 .port-matrix-wrap 是 overflow:hidden，
+ * 于是右侧「删除」按钮被裁到可视区外（点不到），其它列被压成 41~118px 的窄条。
+ * 这里改成固定布局 + 长串折行 + 允许滚动兜底。 */
+.dns-panel { width: min(1040px, calc(100vw - 48px)); }
+.dns-panel .modal-body { padding: 18px 22px 22px; }
+.dns-panel .port-matrix-wrap { margin: 0; max-height: 300px; overflow: auto; }
+.dns-panel .port-matrix { table-layout: fixed; }
+.dns-panel .port-matrix thead th { padding: 7px 10px; }
+.dns-panel .port-matrix tbody td { padding: 7px 10px; overflow-wrap: anywhere; vertical-align: top; }
+.dns-panel .port-matrix .pm-label { max-width: none; white-space: normal; overflow: visible; text-overflow: clip; }
+.dns-panel .dns-cell-server { margin: 2px 0 0; color: var(--muted, #94a3b8); }
+.dns-panel .dns-cell-records { word-break: break-all; white-space: normal; }
+.dns-panel .dns-cell-name { word-break: break-all; }
+.dns-panel .dns-cell-nowrap { white-space: nowrap; }
+.dns-panel .port-matrix .pm-act { width: auto; text-align: right; white-space: nowrap; }
 .btn.tiny { padding: 2px 8px; font-size: 12px; min-height: 24px; }
 
 .cloud-hint {

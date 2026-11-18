@@ -4027,10 +4027,10 @@ function dnsSourceRow(s) {
     ? `<div class="field-hint" style="margin:2px 0 0;color:var(--red)">可能被本机 DNS 拦截/透明代理污染，结果不可信</div>`
     : '';
   return `<tr>
-      <td class="pm-label">${esc(s.label || s.id)}<div class="field-hint mono" style="margin:0">${esc(s.server || '')}</div>${guard}</td>
-      <td><span class="pm ${tone}">${s.ok ? (s.trusted === false ? '?' : '✓') : '✗'}</span></td>
-      <td class="mono">${body}</td>
-      <td class="mono">${s.ms != null ? `${s.ms} ms` : '—'}</td>
+      <td class="pm-label dns-cell-label">${esc(s.label || s.id)}<div class="field-hint mono dns-cell-server">${esc(s.server || '')}</div>${guard}</td>
+      <td class="dns-cell-mark"><span class="pm ${tone}">${s.ok ? (s.trusted === false ? '?' : '✓') : '✗'}</span></td>
+      <td class="mono dns-cell-records">${body}</td>
+      <td class="mono dns-cell-nowrap">${s.ms != null ? `${s.ms} ms` : '—'}</td>
     </tr>`;
 }
 
@@ -4070,16 +4070,17 @@ function dnsPanelMarkup() {
     ? `<div class="field-hint">还没有配置 Cloudflare Token（下面的「DNS 验证渠道」填一次即可），此时只能看解析结果，无法在程序里增删记录。</div>`
     : cf.error
       ? `<div class="note warn">${icon('alert')}<div><b>读取 Cloudflare 记录失败</b><div>${esc(cf.error)}</div></div></div>`
-      : `<div class="port-matrix-wrap" style="max-height:230px">
-          <table class="port-matrix">
+      : `<div class="port-matrix-wrap" style="max-height:280px">
+          <table class="port-matrix dns-table dns-table-cf">
+            <colgroup><col style="width:9%"><col style="width:26%"><col><col style="width:10%"><col style="width:10%"><col style="width:78px"></colgroup>
             <thead><tr><th>类型</th><th>名称</th><th>内容</th><th>TTL</th><th>代理</th><th></th></tr></thead>
             <tbody>
               ${(cf.records || []).length ? (cf.records || []).map((r) => `<tr>
-                <td class="mono">${esc(r.type)}</td>
-                <td class="mono">${esc(r.name)}</td>
-                <td class="mono">${esc(r.content)}</td>
-                <td class="mono">${r.ttl === 1 ? '自动' : esc(String(r.ttl))}</td>
-                <td>${r.proxied ? '<span class="tag ok">橙云</span>' : '<span class="tag">灰云</span>'}</td>
+                <td class="mono dns-cell-nowrap">${esc(r.type)}</td>
+                <td class="mono dns-cell-name">${esc(r.name)}</td>
+                <td class="mono dns-cell-records">${esc(r.content)}</td>
+                <td class="mono dns-cell-nowrap">${r.ttl === 1 ? '自动' : esc(String(r.ttl))}</td>
+                <td class="dns-cell-nowrap">${r.proxied ? '<span class="tag ok">橙云</span>' : '<span class="tag">灰云</span>'}</td>
                 <td class="pm-act"><button class="btn tiny danger-text" type="button" data-act="dns.del" data-id="${esc(r.id)}" data-type="${esc(r.type)}" data-content="${esc(r.content)}">删除</button></td>
               </tr>`).join('') : '<tr><td colspan="6" class="pm-muted" style="padding:12px 14px">Cloudflare 里还没有这个域名的记录</td></tr>'}
             </tbody>
@@ -4088,7 +4089,7 @@ function dnsPanelMarkup() {
 
   const canProxy = true;
   return `
-    <div class="modal dns-panel" style="width:860px">
+    <div class="modal dns-panel">
       <div class="modal-head">
         <div class="mh-icon" style="color:var(--blue)">${icon('globe')}</div>
         <div class="grow">
@@ -4102,7 +4103,8 @@ function dnsPanelMarkup() {
         ${wildcardNote}
         <div class="field-hint" style="margin:12px 0 6px">解析结果对比（同一个域名，四个来源各自怎么说）</div>
         <div class="port-matrix-wrap">
-          <table class="port-matrix">
+          <table class="port-matrix dns-table dns-table-sources">
+            <colgroup><col style="width:26%"><col style="width:9%"><col><col style="width:13%"></colgroup>
             <thead><tr><th>查询来源</th><th>结果</th><th>记录</th><th>耗时</th></tr></thead>
             <tbody>${sources.length ? sources.map(dnsSourceRow).join('') : '<tr><td colspan="4" class="pm-muted" style="padding:12px 14px">查询中…</td></tr>'}</tbody>
           </table>
