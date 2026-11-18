@@ -4369,7 +4369,8 @@ function renderSettings(force = false) {
             <div class="path-row">
               <div class="path-display grow">
                 <span class="p-label">frps 面板地址（可选）</span>
-                <span class="p-value mono" title="${esc(settings.frpsDashboardUrl || (config.serverAddr ? `${config.serverAddr}:7500` : '配置服务器后可用'))}">${esc(settings.frpsDashboardUrl || (config.serverAddr ? `${config.serverAddr}:7500` : '配置服务器后可用'))}</span>
+                <span class="p-value mono" title="${esc(state.dashboardUrl || (config.serverAddr ? `${config.serverAddr}:7500` : '配置服务器后可用'))}">${esc(state.dashboardUrl || (config.serverAddr ? `${config.serverAddr}:7500` : '配置服务器后可用'))}</span>
+                ${S.server && S.server.connected && S.server.host ? `<span class="tag ok" title="端口来自当前服务器 frps 配置里的 webServer.port">跟随 ${esc(S.server.host)}</span>` : ''}
               </div>
             </div>
             <div class="path-row">

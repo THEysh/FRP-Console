@@ -282,6 +282,30 @@ function setProfileVhostPorts(profileId, vhostHttpPort, vhostHttpsPort) {
   return true;
 }
 
+/* 面板地址里取 host（解析失败就按字符串粗判），用来判断这个地址属于哪台机器。 */
+function hostOfUrl(value) {
+  const text = String(value || '').trim();
+  if (!text) return '';
+  try {
+    const u = new URL(text.includes('://') ? text : 'http://' + text);
+    return String(u.hostname || '').toLowerCase();
+  } catch (e) {
+    const bare = text.includes('://') ? text.slice(text.indexOf('://') + 3) : text;
+    return bare.split('/')[0].split(':')[0].toLowerCase();
+  }
+}
+
+/* 面板地址是「某台服务器的事实」，要跟着服务器走：写进档案，而不是一个全局值用到底。 */
+function setProfileDashboardUrl(profileId, url) {
+  const next = String(url || '').trim();
+  if (!profileId || !next) return false;
+  const list = serverProfiles();
+  const target = list.find((item) => item.id === profileId);
+  if (!target || String(target.dashboardUrl || '') === next) return false;
+  settings = settingsModule.save({ servers: list.map((item) => (item.id === profileId ? { ...item, dashboardUrl: next } : item)) });
+  return true;
+}
+
 /* 当前 SSH 会话对应哪台服务器的档案：按主机名匹配，匹配不上退回当前查看的档案。 */
 function profileForSession(session) {
   const host = String((session && session.host) || '').trim().toLowerCase();
@@ -1477,11 +1501,27 @@ function pathsForState() {
 }
 
 function dashboardUrl() {
-  if (settings.frpsDashboardUrl) return settings.frpsDashboardUrl;
-  if (!model || !model.serverAddr) return '';
-  // 服务器页读到的 frps Dashboard 端口优先（真机常改端口，7500 只是兜底默认）。
+  // 端口的权威来源是 frps 配置（真机常改端口，7500 只是兜底默认）。
   const webPort = (serverConfig.summary && serverConfig.summary.webPort) || 0;
-  return `http://${model.serverAddr}:${webPort || 7500}`;
+  // 主机的权威来源是「现在连着的这台」，没连接时才退回隧道目标地址。
+  // 以前 settings.frpsDashboardUrl 一存到底：连过 A 再换 B，设置页和「打开服务器面板」
+  // 仍然指向 A（用户实际看到的就是这个问题）。
+  const connectedHost = serverSession.connected ? String(serverSession.host || '') : '';
+  const host = connectedHost || String((model && model.serverAddr) || '').trim();
+  const portOf = (value) => Number((String(value || '').match(/:([0-9]{1,5})\b/) || [])[1]) || 0;
+  if (host) {
+    const lower = host.toLowerCase();
+    /* 端口优先级：当前 frps 配置里的 webServer.port > 这台服务器档案记过的
+     * > 全局记过的（只有同机才敢信）> 7500。没连服务器时也能给出对的端口。 */
+    const profile = serverProfiles().find((item) => hostOfUrl(item.dashboardUrl) === lower);
+    const port = webPort
+      || (profile ? portOf(profile.dashboardUrl) : 0)
+      || (hostOfUrl(settings.frpsDashboardUrl) === lower ? portOf(settings.frpsDashboardUrl) : 0)
+      || 7500;
+    return `http://${host}:${port}`;
+  }
+  if (settings.frpsDashboardUrl) return settings.frpsDashboardUrl;
+  return '';
 }
 
 function loadConfigFromDisk({ initial = false } = {}) {
@@ -2819,8 +2859,14 @@ function registerIpc() {
     }
     /* 服务器页已经拿到真实 Dashboard 端口，就把「打开服务器面板」的地址记住，
      * 概览/tray 才不至于重启后还跳回默认的 7500。只在用户没手动设过时自动填。 */
-    if (serverConfig.summary && serverConfig.summary.webPort && serverSession.host && !settings.frpsDashboardUrl) {
-      settings = settingsModule.save({ frpsDashboardUrl: `http://${serverSession.host}:${serverConfig.summary.webPort}` });
+    if (serverConfig.summary && serverConfig.summary.webPort && serverSession.host) {
+      const discovered = `http://${serverSession.host}:${serverConfig.summary.webPort}`;
+      const dashProfile = profileForSession(serverSession);
+      if (dashProfile) setProfileDashboardUrl(dashProfile.id, discovered);
+      // 全局值只当「没连服务器时」的兜底：它属于这台机器才用，属于别人就换成这台的。
+      if (hostOfUrl(settings.frpsDashboardUrl) !== String(serverSession.host || '').toLowerCase()) {
+        settings = settingsModule.save({ frpsDashboardUrl: discovered });
+      }
     }
     /* 服务器页已经拿到真实 vhost 端口，同步到「这台服务器」的档案：否则应用重启后
      * 还没重连服务器页，概览健康检查会拿旧的 vhost 端口去探 http/https 代理，
