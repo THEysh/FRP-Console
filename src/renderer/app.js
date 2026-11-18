@@ -373,6 +373,9 @@ function setView(view, { force = false } = {}) {
     updateChrome();
   }
   renderCurrent({ force: true });
+  /* 一进服务器页就跟主进程对一次连接状态：慢一点也没关系，
+   * 但别让用户对着“未连接”的表单干等（自动连接被竞态吞掉时就是这样）。 */
+  if (view === 'server') syncServerSession().catch(() => {});
   const main = $('#view');
   if (main) {
     main.scrollTop = S.viewScroll[view] || 0;
@@ -1166,6 +1169,7 @@ function applyServerState(data, seq) {
   S.server.clientServerId = data.clientServerId || '';
   S.server.tunnel = data.tunnel || null;
   S.server.sessionServerId = data.sessionServerId || data.serverId || '';
+  S.server.epoch = Number(data.epoch) || 0;
   S.server.client = data.client || null;
   if (data.summary && !S.server.wizardDirty) {
     S.server.wizard = wizardFromSummary(data.summary);
@@ -1200,6 +1204,30 @@ async function loadServerState({ autoConnect = false } = {}) {
     // 只在“第一次打开服务器页”时自动连；绑定变化之类的刷新不打扰已断开的会话。
     if (autoConnect) autoConnectActiveProfile().catch(() => {});
   } else if (res && !res.ok) toastResult(res);
+}
+
+/* 界面上的「连接状态」是主进程 SSH 会话的一个投影，但两边可能短暂不一致：
+ * 比如自动连接成功的那一刻，另一次状态刷新把 serverSeq 抢走了，成功结果被丢弃，
+ * 界面就永远停在「未连接」，用户只能切一次档案才好。
+ * 这里做一次轻量对齐：只要 connected / 会话序号 / 所属档案 与主进程不一致就重新应用。 */
+async function syncServerSession() {
+  if (!S.server.loaded) return;
+  if (S.server.autoConnecting || S.server.switching || S.server.connecting) return;
+  const res = await FRP.serverState().catch(() => null);
+  if (!res || !res.ok || !res.data) return;
+  const d = res.data;
+  const epochChanged = d.epoch !== undefined && Number(d.epoch) !== Number(S.server.epoch || 0);
+  const connChanged = !!d.connected !== !!S.server.connected;
+  const ownerChanged = !!d.connected && (d.sessionServerId || '') !== (S.server.sessionServerId || '');
+  if (!epochChanged && !connChanged && !ownerChanged) return;
+  applyServerState(d, serverSeq());
+  renderServer(true);
+  if (S.server.connected) {
+    loadServerLogs().catch(() => {});
+    loadServerNginx(true).catch(() => {});
+    loadServerNginxHealth({ force: false }).catch(() => {});
+    loadServerFirewall(true).catch(() => {});
+  }
 }
 
 async function loadServerNginx(silent = false) {
@@ -2769,21 +2797,50 @@ async function autoConnectActiveProfile() {
   const active = activeServerProfile();
   if (!active) return;
   if (S.server.connected && S.server.sessionServerId === active.id) return;
-  if (!S.server.savedCredential) return;      // 没存密码就老实走表单
+  if (!S.server.savedCredential) {
+    // 刚启动那一下，主进程可能还没把档案里的密码读出来（savedCredential 是快照），
+    // 这时候如果直接放弃，界面就会一直停在「未连接」，用户只能切一次档案才好。
+    // 档案里明明有密码就再拉一次状态重试一次；真的没存密码才走表单。
+    const p = (S.server.profiles || []).find((x) => x.id === active.id);
+    if (!p || !p.hasPassword) return;
+    if (!S.server.credRetry) {
+      S.server.credRetry = true;
+      setTimeout(() => {
+        S.server.credRetry = false;
+        loadServerState({ autoConnect: true }).catch(() => {});
+      }, 900);
+    }
+    return;
+  }
   if (S.server.autoConnecting) return;
   S.server.autoConnecting = true;
   renderServer(true);
   const seq = serverSeq();
   try {
-    const res = await FRP.serverConnect({
-      host: active.host,
-      port: Number(active.port) || 22,
-      username: active.username || 'root',
-      password: '',
-      remember: true,
-      serverId: active.id,
-    });
-    if (serverSeqStale(seq)) return;
+    let res = null;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      res = await FRP.serverConnect({
+        host: active.host,
+        port: Number(active.port) || 22,
+        username: active.username || 'root',
+        password: '',
+        remember: true,
+        serverId: active.id,
+      });
+      if (res && res.ok) break;
+      // 需要人工介入（密码失效 / 地址与档案不一致）的错误重试也没意义
+      if (res && (res.needsPassword || res.needsDecision)) break;
+      // 开机那几秒 SSH 偶尔会失败一次（网络栈还没起来 / sshd 还在加载），等 1.5 秒再来一遍
+      if (attempt === 0) await new Promise((r) => setTimeout(r, 1500));
+    }
+    if (serverSeqStale(seq)) {
+      /* 连接其实已经成功，但状态序号被别的刷新抢走了（连接过程中主进程会发
+       * server:binding-changed，前端会顺带 refresh 一次），那次刷新的快照可能是在
+       * 连接完成之前取的。直接 return 会让界面停在「无法连接」，后端却已经连上。
+       * 所以这里补一次状态同步，让界面追上真实状态。 */
+      if (res && res.ok) await loadServerState().catch(() => {});
+      return;
+    }
     if (!res || !res.ok) {
       // 保存的密码失效（服务器改过密码）时退回表单，让用户补一次。
       if (res && res.needsPassword) toast('info', '需要手动输入密码', `「${active.name}」保存的密码已不可用`);
@@ -6571,6 +6628,11 @@ async function boot() {
       if (boundId !== undefined && S.server.loaded && boundId !== S.server.clientServerId) {
         loadServerState().catch(() => {});
       }
+      /* 每 3 次刷新（约 9 秒）跟主进程对一次会话状态：
+       * 万一自动连接的结果被竞态吞掉、或主进程那头断开了而界面还停在旧状态，
+       * 这里会自动纠正，用户不必再去切一次服务器档案。 */
+      S.server.syncTick = (S.server.syncTick || 0) + 1;
+      if (S.server.syncTick % 3 === 0) syncServerSession().catch(() => {});
     });
 
     FRP.on('server:binding-changed', () => {
