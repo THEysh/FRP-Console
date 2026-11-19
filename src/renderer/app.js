@@ -6126,7 +6126,19 @@ async function submitProxyForm(form, mode) {
     submit.disabled = true;
     submit.innerHTML = `<span class="spinner-sm"></span><span>保存中…</span>`;
   }
-  const res = await FRP.saveProxy(mode, mode === 'edit' ? S.proxyEdit.originalName : '', input);
+  let res;
+  try {
+    res = await FRP.saveProxy(mode, mode === 'edit' ? S.proxyEdit.originalName : '', input);
+  } catch (error) {
+    /* IPC 直接把异常抛过来时（比如写盘失败、主进程崩溃），
+     * 以前这里会静默 reject：按钮一直转、界面毫无反应。 */
+    if (submit) {
+      submit.disabled = false;
+      submit.innerHTML = `${icon('check')}<span>${mode === 'edit' ? '保存修改' : '创建代理'}</span>`;
+    }
+    showError(String((error && error.message) || error));
+    return;
+  }
   if (!res || !res.ok) {
     if (submit) {
       submit.disabled = false;

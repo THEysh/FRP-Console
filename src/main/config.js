@@ -512,6 +512,20 @@ function configContentKey(text) {
   return String(text || '').replace(STAMP_LINE, '').replace(/\r\n/g, '\n').trim();
 }
 
+/* 写盘失败的统一措辞：把 EPERM/EACCES/EBUSY/ENOSPC 翻译成用户能行动的话。
+ * 只做措辞，不改变「抛异常」还是「返回失败」的语义 —— 由调用方决定。 */
+function explainWriteError(configPath, error) {
+  const code = String((error && error.code) || '');
+  const detail = String((error && error.message) || error);
+  if (code === 'EPERM' || code === 'EACCES') {
+    return `配置文件写入失败：${configPath} 不可写（可能是只读文件，或被其它程序占用）`;
+  }
+  if (code === 'EBUSY') return `配置文件写入失败：${configPath} 正被其它程序占用`;
+  if (code === 'ENOSPC') return '配置文件写入失败：磁盘空间不足';
+  if (code === 'ENOENT') return `配置文件写入失败：目录不存在（${configPath}）`;
+  return `配置文件写入失败：${detail}`;
+}
+
 function writeConfig(configPath, model) {
   const text = serialize(model);
   const previous = fs.existsSync(configPath) ? fs.readFileSync(configPath, 'utf8') : null;
@@ -520,9 +534,15 @@ function writeConfig(configPath, model) {
   }
   const backup = previous !== null ? backupConfig(configPath) : null;
   const tmp = `${configPath}.tmp-${process.pid}`;
-  fs.writeFileSync(tmp, text, 'utf8');
-  fs.renameSync(tmp, configPath);
-  return { changed: true, backup, text };
+  try {
+    fs.writeFileSync(tmp, text, 'utf8');
+    fs.renameSync(tmp, configPath);
+  } catch (error) {
+    /* 临时文件留着只会让人以为写了一半，能删就删 */
+    try { fs.unlinkSync(tmp); } catch {}
+    return { changed: false, backup: null, text: previous, ok: false, error: explainWriteError(configPath, error) };
+  }
+  return { changed: true, backup, text, ok: true };
 }
 
 /* 直接写 frpc.toml 原文（「配置编辑器」用）：保留用户手写的字段与注释，
@@ -535,9 +555,15 @@ function writeRawConfig(configPath, content) {
   }
   const backup = previous !== null ? backupConfig(configPath) : null;
   const tmp = `${configPath}.tmp-${process.pid}`;
-  fs.writeFileSync(tmp, text, 'utf8');
-  fs.renameSync(tmp, configPath);
-  return { changed: true, backup, text };
+  try {
+    fs.writeFileSync(tmp, text, 'utf8');
+    fs.renameSync(tmp, configPath);
+  } catch (error) {
+    /* 临时文件留着只会让人以为写了一半，能删就删 */
+    try { fs.unlinkSync(tmp); } catch {}
+    return { changed: false, backup: null, text: previous, ok: false, error: explainWriteError(configPath, error) };
+  }
+  return { changed: true, backup, text, ok: true };
 }
 
 /* 把管理 API 的监听信息写进 frpc.toml。
@@ -799,6 +825,7 @@ function normalizePlugin(input) {
 }
 
 module.exports = {
+  explainWriteError,
   PROXY_TYPES,
   HOST_TYPES,
   parseConfigText,

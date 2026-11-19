@@ -1598,6 +1598,7 @@ function persistModel(nextModel, { reload = true } = {}) {
     return { ok: false, error: '尚未配置 frpc.toml 路径，请先在设置中选择配置文件' };
   }
   const write = configModule.writeConfig(paths.configPath, nextModel);
+  if (write.ok === false) return { ok: false, error: write.error };
   model = nextModel;
   configError = null;
   configHash = hashText(write.text);
@@ -2585,6 +2586,7 @@ function registerIpc() {
     const verify = await verifyFrpcRaw(content);
     if (!verify.ok) return fail(`配置校验不通过：${verify.error}`, { valid: false });
     const write = configModule.writeRawConfig(paths.configPath, content);
+    if (write.ok === false) return fail(write.error, { valid: true });
     loadConfigFromDisk();
     let restarted = false;
     let reloadError = null;
