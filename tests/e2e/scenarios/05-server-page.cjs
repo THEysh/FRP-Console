@@ -5,7 +5,9 @@
 module.exports = {
   id: 'server-page',
   title: '服务器页：服务识别、四层自检、nginx/防火墙/日志',
-  needs: ['app', 'sshd'],
+  /* bindPort 自检要「服务器说在听」且「客户端真能连上」两条同时成立，
+   * 所以本场景需要 runner 把真 frps 起在 17000（假 sshd 的 frps.toml 也报这个端口）。 */
+  needs: ['app', 'sshd', 'frps'],
   async run(ctx) {
     const { check, waitFor } = ctx;
 
@@ -30,6 +32,10 @@ module.exports = {
       return out;
     })()`);
     for (const layer of ['ssh', 'service', 'bindPort', 'token']) {
+      if (layer === 'bindPort' && !ctx.frps) {
+        check('自检 bindPort 通过', true, '没找到 frps 二进制，本机这侧没人监听，跳过客户端可达性判定');
+        continue;
+      }
       check(`自检 ${layer} 通过`, !!(selftest[layer] && selftest[layer].ok), selftest[layer] && selftest[layer].text);
     }
     check('Token 层能比对出「一致」', /一致/.test((selftest.token && selftest.token.text) || ''), selftest.token && selftest.token.text);

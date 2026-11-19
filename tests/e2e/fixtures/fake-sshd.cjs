@@ -17,6 +17,11 @@ const firewallMode = !!process.argv[7];        // 非空 = 假装装了 ufw 且 
 const listenTcp = (process.argv[8] || '').split(',').map((s) => s.trim()).filter(Boolean);
 /* argv[9]：初始 ufw 规则（逗号分隔，支持 7000/tcp、1:65535/tcp），用来构造 fw-blocked / cloud-blocked 场景。 */
 const seedRules = (process.argv[9] || '').split(',').map((s) => s.trim()).filter(Boolean);
+/* argv[10]：frps 的 bindPort。默认 7000，但 e2e runner 起的真 frps 在 17000，
+ * 两边不一致时「bindPort 自检」就会既说“服务器在听”又连不上——那个检查要的是
+ * 「服务器说在听 + 客户端真能连上」两条同时成立，所以这里必须跟 runner 对齐，
+ * 否则场景就偷偷依赖本机恰好有别的东西占着 7000。 */
+const bindPort = Number(process.argv[10]) || 7000;
 const fwRules = firewallMode
   ? new Set(seedRules.length ? seedRules : ['22/tcp', '7000/tcp', '7000/udp', '28487/tcp', '1:65535/tcp'])
   : new Set();
@@ -77,7 +82,7 @@ function inspectScript() {
     '@@BIN',
     '/usr/local/bin/frps',
     '@@LISTEN',
-    'LISTEN 0 4096 0.0.0.0:7000 0.0.0.0:* users:(("frps",pid=1234,fd=5))',
+    `LISTEN 0 4096 0.0.0.0:${bindPort} 0.0.0.0:* users:(("frps",pid=1234,fd=5))`,
     'LISTEN 0 4096 0.0.0.0:7500 0.0.0.0:* users:(("frps",pid=1234,fd=7))',
     '@@DOCKER',
     '@@CONFIG',
@@ -88,7 +93,7 @@ function inspectScript() {
 
 const JOURNAL = [
   'Nov 13 20:00:01 lab-server frps[1234]: start frps success',
-  'Nov 13 20:00:01 lab-server frps[1234]: frps tcp listen on 0.0.0.0:7000',
+  `Nov 13 20:00:01 lab-server frps[1234]: frps tcp listen on 0.0.0.0:${bindPort}`,
   'Nov 13 20:00:02 lab-server frps[1200]: [lab] login success',
   'Nov 13 20:00:09 lab-server frps[1200]: [lab] start proxy success',
   '',
@@ -102,7 +107,7 @@ const EXEC_START = {
 
 const FRPS_TOML = [
   'bindAddr = "0.0.0.0"',
-  'bindPort = 7000',
+  `bindPort = ${bindPort}`,
   '',
   'auth.method = "token"',
   'auth.token = "' + token + '"',
@@ -123,7 +128,7 @@ const RULES = [
   [/echo @@TCP/, () => [0, ['@@TCP', ...listenTcp.map((p) => `0.0.0.0:${p}`), '@@UDP', ''].join('\n')]],
   // 组合脚本（用例按 @@ 分段解析的那几条）
   [/@@ACTIVE/, () => [0, ['@@ACTIVE', 'active', '@@ENABLED', 'enabled', '@@PROC', '/proc/1234', '@@DOCKER', ''].join('\n')]],
-  [/@@SS/, () => [0, ['@@SS', 'LISTEN 0 4096 0.0.0.0:7000 0.0.0.0:*', ''].join('\n')]],
+  [/@@SS/, () => [0, ['@@SS', `LISTEN 0 4096 0.0.0.0:${bindPort} 0.0.0.0:*`, ''].join('\n')]],
   [/^echo ok/, () => [0, 'ok\n']],
   /* 配置体检（1.2.72 checkNginxHealth）回放：
    * - grep 那条列出所有 ssl_certificate 引用（FAKE_CERT_MISSING 里列的路径当作「文件不存在」）

@@ -110,7 +110,7 @@ async function main() {
   }
   if (needs.has('local')) local = await startLocalServers();
   if (needs.has('sshd')) {
-    sshd = spawn(process.execPath, [path.join(HERE, 'fixtures', 'fake-sshd.cjs'), String(SSH_PORT), 'mixed', 'e2e-server', 'e2e-token-1234567890', '1.26.3', 'fw', '7000,17000', '22/tcp,7000/tcp,17000/tcp'], {
+    sshd = spawn(process.execPath, [path.join(HERE, 'fixtures', 'fake-sshd.cjs'), String(SSH_PORT), 'mixed', 'e2e-server', 'e2e-token-1234567890', '1.26.3', 'fw', '7000,17000', '22/tcp,7000/tcp,17000/tcp', '17000'], {
       cwd: HERE,
       detached: true,
       stdio: 'ignore',
