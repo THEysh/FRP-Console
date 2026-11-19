@@ -170,6 +170,55 @@ function dataDir() {
   return app.getPath('userData');
 }
 
+/* 标量字段的容错收敛。
+ *
+ * 保存路径（index.js 的 settings:save）一直在夹取值，但 **load 从来没有**：
+ * 于是「升级途中断电写坏了半截 JSON」「用户手工编辑过」「老版本允许存进来的怪值」
+ * 会原样进入运行期，最典型的是设置页那个数字输入框显示成 `abc`，
+ * 或者 runMode 既不是 auto 也不是 managed（两个单选都不亮，用户只能猜）。
+ * 这里把每个标量按 DEFAULT_SETTINGS 的类型与文档区间收一遍；
+ * 类型对、值合法的一律原样保留（布尔仍然只有 true/false，不影响 `!== false` 这类判断）。
+ */
+const BOOL_KEYS = [
+  'serviceAutoDetect',
+  'nginxProxyEnabled',
+  'autoReload',
+  'stripProxyEnv',
+  'closeToTray',
+  'startMinimized',
+  'launchTunnelOnStart',
+  'launchAtLogin',
+  'starterConfigCreated',
+];
+const STRING_KEYS = ['frpcPath', 'configPath', 'logPath', 'frpsDashboardUrl', 'serviceName', 'adminUser', 'adminPassword', 'acmeEmail', 'dnsProvider'];
+const PORT_KEYS = ['adminPort', 'vhostHttpPort', 'vhostHttpsPort'];
+
+function sanitizeSettings(input) {
+  const out = { ...input };
+  for (const key of BOOL_KEYS) {
+    if (typeof out[key] !== 'boolean') out[key] = DEFAULT_SETTINGS[key];
+  }
+  for (const key of STRING_KEYS) {
+    if (key === 'logPath' && out[key] === undefined) continue; // logPath 可以不存在（由配置推导）
+    if (typeof out[key] !== 'string') out[key] = DEFAULT_SETTINGS[key] || '';
+  }
+  out.runMode = out.runMode === 'managed' ? 'managed' : 'auto';
+  for (const key of PORT_KEYS) {
+    const n = Math.floor(Number(out[key]));
+    const min = key === 'adminPort' ? 1 : 0; // vhost 端口 0 表示“没填”
+    out[key] = Number.isFinite(n) && n >= min && n <= 65535 ? n : DEFAULT_SETTINGS[key];
+  }
+  const poll = Math.floor(Number(out.pollIntervalMs));
+  out.pollIntervalMs = Number.isFinite(poll) && poll >= 1000 && poll <= 30000 ? poll : DEFAULT_SETTINGS.pollIntervalMs;
+  const buffer = Math.floor(Number(out.logBuffer));
+  out.logBuffer = Number.isFinite(buffer) && buffer >= 100 && buffer <= 2000 ? buffer : DEFAULT_SETTINGS.logBuffer;
+  out.certDirs = Array.isArray(out.certDirs)
+    ? out.certDirs.filter((item) => typeof item === 'string' && item.trim()).slice(0, 8)
+    : [];
+  if (!out.proxyOpenPaths || typeof out.proxyOpenPaths !== 'object' || Array.isArray(out.proxyOpenPaths)) out.proxyOpenPaths = {};
+  return out;
+}
+
 function load() {
   if (cached) return cached;
   const raw = readJson(settingsFile(), {});
@@ -227,10 +276,11 @@ function load() {
     activeServerId,
     clientServerId,
   };
-  /* Windows 服务模式已经没有入口了（设置页那张卡删了，也没有“装成服务”的按钮），
-   * 但老设置里可能还留着 runMode='service'。留着它会让「启动隧道」每次都先去找
-   * 系统服务、报“未检测到 FRP 系统服务”，看起来像功能坏了 —— 直接归一到 auto。 */
-  if (cached.runMode === 'service') cached.runMode = 'auto';
+  /* 标量统一收敛：runMode 只留 auto/managed（老设置的 'service' 在 sanitizeSettings
+   * 里已归一到 auto —— 服务模式入口早删了，留着会让「启动隧道」每次先去找系统服务、
+   * 报“未检测到 FRP 系统服务”），端口/轮询/缓冲按文档区间夹取，类型不对的布尔与
+   * 字符串回到默认值。 */
+  cached = sanitizeSettings(cached);
   delete cached.server;
   legacyHostMemo = String((base.server && base.server.host) || legacyHostMemo || '');
   return cached;
@@ -381,7 +431,7 @@ function clearCloudflareToken() {
 }
 
 function save(patch) {
-  cached = { ...load(), ...(patch || {}) };
+  cached = sanitizeSettings({ ...load(), ...(patch || {}) });
   cached.version = 2;
   cached.servers = normalizeServers(cached.servers);
   delete cached.server;
@@ -518,6 +568,7 @@ module.exports = {
   ensureDir,
   newServerId,
   normalizeServerProfile,
+  sanitizeSettings,
   serverProfileKey,
   mergeDuplicateServers,
   readServerSecret,

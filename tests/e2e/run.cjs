@@ -142,6 +142,31 @@ async function main() {
         (v) => v === true,
         { timeout: 15000, label },
       ),
+    /* 起一个独立实例（自己的数据目录、CDP 端口、单实例端口）。
+     * 迁移类场景必须在**应用启动前**把老数据摆好，所以给了 seed(dir) 回调；
+     * 场景自己负责 finally 里 stop()，否则会占着 CDP 端口影响后面的场景。 */
+    startApp: async ({ seed, cdpOffset = 1 } = {}) => {
+      const dir = fs.mkdtempSync(path.join(dataRoot, 'own-'));
+      if (seed) seed(dir);
+      const cdpPort = CDP_PORT + cdpOffset;
+      const instancePort = INSTANCE_PORT + cdpOffset;
+      const inst = await appHelper.start({ cdpPort, instancePort, dataDir: dir });
+      const ready = await cdp.waitReady(cdpPort, 40);
+      return {
+        dir,
+        cdpPort,
+        ready,
+        eval: (expr) => cdp.evalIn(cdpPort, expr),
+        stop: () => inst.stop(),
+        log: () => {
+          try {
+            return fs.readFileSync(inst.logPath, 'utf8');
+          } catch {
+            return '';
+          }
+        },
+      };
+    },
   };
 
   for (const scenario of scenarios) {
