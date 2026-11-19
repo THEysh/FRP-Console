@@ -99,3 +99,45 @@ test('applyWizard：生成的文本能被 parseConfig 解析回来（自洽）',
   assert.equal(parsed.data.bindPort, 7123);
   assert.equal(parsed.data.auth.token, 'abcdefghijk');
 });
+
+test('Dashboard 密码留空时自动生成，并原样写进配置', () => {
+  const c = require('../../src/main/frpsconfig');
+  const r = c.preview('', {
+    bindPort: 7000,
+    authEnabled: true,
+    token: 'abcdefgh12345678',
+    webEnabled: true,
+    webPort: 4096,
+    webUser: 'admin',
+  });
+  assert.strictEqual(r.ok, true);
+  assert.match(r.generatedPassword, /^[A-Za-z0-9]{20}$/, '应当是一串 20 位随机密码');
+  assert.strictEqual(r.data.webServer.password, r.generatedPassword, '生成的密码必须真的写进配置');
+  assert.ok(
+    r.warnings.some((w) => w.includes(r.generatedPassword)),
+    '提示里也要带上这个密码，否则用户不知道密码是什么',
+  );
+});
+
+test('已经给了 Dashboard 密码时不会被覆盖、也不提示', () => {
+  const c = require('../../src/main/frpsconfig');
+  const r = c.preview('', {
+    bindPort: 7000,
+    authEnabled: true,
+    token: 'abcdefgh12345678',
+    webEnabled: true,
+    webPort: 4096,
+    webUser: 'admin',
+    webPassword: 'my-own-pass',
+  });
+  assert.strictEqual(r.generatedPassword, '');
+  assert.strictEqual(r.data.webServer.password, 'my-own-pass');
+});
+
+test('randomDashboardPassword 每次都不一样，且不含易混字符', () => {
+  const c = require('../../src/main/frpsconfig');
+  const a = c.randomDashboardPassword();
+  const b = c.randomDashboardPassword();
+  assert.notStrictEqual(a, b);
+  assert.match(a, /^[a-km-np-z2-9A-HJ-NP-Z]{20}$/);
+});

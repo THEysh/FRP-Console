@@ -19,6 +19,17 @@ const DEFAULT_FIELDS = {
   allowPortsText: '',
 };
 
+/* Dashboard（frps 面板）默认监听 0.0.0.0:4096，也就是公网可达。
+ * 空密码等于「谁扫到谁能进」——面板里能看到 token、代理列表，还能改配置。
+ * 所以密码留空时自动生成一个，而不是带着空密码上线。 */
+function randomDashboardPassword(length = 20) {
+  const alphabet = 'abcdefghijkmnpqrstuvwxyz23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+  const bytes = require('node:crypto').randomBytes(length);
+  let out = '';
+  for (let i = 0; i < length; i += 1) out += alphabet[bytes[i] % alphabet.length];
+  return out;
+}
+
 function parseConfig(text) {
   try {
     const data = parse(String(text || ''));
@@ -160,7 +171,19 @@ function applyWizard(baseData, fields, { includeMeta = false } = {}) {
   // DEFAULT_FIELDS 的 token 为空、vhost 关闭来重写，把服务器上已配好的 token、
   // vhostHTTPPort / vhostHTTPSPort 悄悄删掉。
   const f = { ...fieldsFromData(baseData), ...(fields || {}) };
+  /* 面板密码留空 = 公网无认证：自动生成一个，并在提示里原样告诉用户。 */
+  let generatedPassword = '';
+  if (f.webEnabled && !String(f.webPassword || '').trim()) {
+    generatedPassword = randomDashboardPassword();
+    f.webPassword = generatedPassword;
+  }
   const check = validateFields(f);
+  if (generatedPassword) {
+    check.warnings = [
+      ...(check.warnings || []),
+      `Dashboard 密码原来是空的，已自动生成：${generatedPassword}（请记下，登录面板时要用）`,
+    ];
+  }
   if (!check.ok) return { ok: false, errors: check.errors, warnings: check.warnings };
 
   const data = structuredClone(baseData && typeof baseData === 'object' ? baseData : {});
@@ -195,7 +218,7 @@ function applyWizard(baseData, fields, { includeMeta = false } = {}) {
   else delete data.allowPorts;
 
   const text = includeMeta ? buildText(data, f, check) : stringify(data);
-  return { ok: true, text, data, warnings: check.warnings };
+  return { ok: true, text, data, warnings: check.warnings, generatedPassword };
 }
 
 function buildText(data, fields, check) {
@@ -254,4 +277,5 @@ module.exports = {
   parseAllowPorts,
   allowPortsToText,
   setTopLevelInt,
+  randomDashboardPassword,
 };

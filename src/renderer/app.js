@@ -3534,8 +3534,26 @@ async function runServerBootstrap(btn) {
     toast('success', 'frps 已初始化并启动', `${via} · ${(res.data && res.data.configPath) || ''}`);
   }
   if (res.data && res.data.appState) S.state = res.data.appState;
+  /* 面板密码留空时后端会自动生成一个：必须让用户看到，否则他登录不进 Dashboard。 */
+  const generatedPw = (res.data && res.data.generatedPassword) || '';
   renderServer(true);
   await loadServerLogs();
+  if (generatedPw) {
+    await confirmDialog({
+      title: '已自动生成 Dashboard 密码',
+      body: [
+        'frps 面板（Dashboard）默认监听 0.0.0.0，也就是公网能访问；密码留空等于谁扫到谁能进。',
+        '',
+        '这次已自动生成一个密码，请记下来（面板用户可以填 admin）：',
+        '',
+        generatedPw,
+        '',
+        '想改成自己的密码：在「配置文件」里改 [webServer] 的 password，保存并重启 frps。',
+      ].join('\n'),
+      confirmText: '我记下了',
+      cancelText: '关闭',
+    });
+  }
 }
 
 async function runServerUninstall(btn) {

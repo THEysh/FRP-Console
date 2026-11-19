@@ -3459,7 +3459,15 @@ function registerIpc() {
       }
     }
     await loadServerSnapshot({ inspect: true });
-    return ok({ ...result, localSync, state: serverState(), appState: buildState() });
+    return ok({
+      ...result,
+      localSync,
+      /* 面板密码留空时我们自动生成了一个：这里带回去让界面提示用户记下。 */
+      generatedPassword: generated.generatedPassword || '',
+      warnings: generated.warnings || [],
+      state: serverState(),
+      appState: buildState(),
+    });
   });
 
   ipcMain.handle('server:bootstrap-cancel', async () => {
