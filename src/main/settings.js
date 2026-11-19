@@ -417,7 +417,11 @@ function candidateDirs(settings) {
   add(bundledFrpcDir());
   add(process.env.PORTABLE_EXECUTABLE_DIR);
   add(path.dirname(process.execPath));
-  add(process.cwd());
+  /* 打包后不再看「当前工作目录」：从资源管理器双击时它等于 exe 目录（上面已加过），
+   * 但从终端/快捷方式启动时它可能是任意目录——那里若躺着别人的 frpc.toml，
+   * 会被当成「我的配置」直接读进来（连带 serverAddr 与 token）。
+   * 开发运行时仍保留，方便 npm start 直接用仓库里的配置。 */
+  if (!app.isPackaged) add(process.cwd());
   try {
     add(app.getAppPath());
     add(path.dirname(app.getAppPath()));
