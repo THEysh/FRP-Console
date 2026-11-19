@@ -21,6 +21,7 @@ const S = {
   proxyQuery: '',
   logLevel: '',
   follow: true,
+  logSource: 'local',   // 'local' = 本机 frpc；'server' = 服务器 frps（1.2.91 起两者都在「实时日志」页）
   modalOpen: false,
   proxyEdit: null,
   update: null,
@@ -1018,9 +1019,62 @@ function filteredLogs() {
   return S.logs.filter((l) => String(l.level || '').toLowerCase() === S.logLevel);
 }
 
+/* 日志来源切换：本机 frpc（文件/进程输出）与服务器 frps（SSH + journalctl）。
+ * 两者都是日志，放在同一页更符合直觉，也省得在服务器页里再开一块。 */
+function logSourceSeg() {
+  const host = S.server.connected ? String(S.server.host || '') : '';
+  return `<div class="seg log-src-seg">
+    <button type="button" data-act="logs.source" data-source="local" class="${S.logSource === 'local' ? 'active' : ''}">本机 frpc</button>
+    <button type="button" data-act="logs.source" data-source="server" class="${S.logSource === 'server' ? 'active' : ''}">服务器 frps${host ? ` · ${esc(host)}` : ''}</button>
+  </div>`;
+}
+
+function renderServerLogsView() {
+  const connected = !!S.server.connected;
+  const host = String(S.server.host || '');
+  const source = S.server.logsSource || 'journalctl -u frps';
+  const parsed = S.server.logs ? parseServerLogs(S.server.logs) : { items: [], stats: { start: '', logins: 0, errors: 0 } };
+  const total = parsed.items.length;
+  $('#view').innerHTML = `
+    <div class="view">
+      <div class="page-head">
+        <div class="page-title">
+          <h1>实时日志</h1>
+          <p>${connected ? `${esc(host)} · ${esc(source)} · 最近 ${total} 行` : '还没有连上服务器：连上之后这里直接读 frps 的日志。'}</p>
+        </div>
+        <div class="page-actions">
+          ${logSourceSeg()}
+          ${connected ? `<button class="btn" type="button" data-act="logs.server.refresh">${icon('reload')}<span>刷新</span></button>` : ''}
+        </div>
+      </div>
+
+      <section class="card log-panel">
+        <div class="log-head">
+          <div class="log-dots"><i></i><i></i><i></i></div>
+          <span class="lh-title" title="${esc(source)}">${esc(connected ? `frps · ${host}` : 'frps 日志')}</span>
+          <div class="lh-right">
+            ${connected ? `<button class="btn ghost small" type="button" data-act="logs.server.errors">${icon('alert')}<span>${S.server.logErrorsOnly ? '显示全部' : '只看错误'}</span></button>
+              <button class="btn ghost small" type="button" data-act="logs.server.expand">${icon('download')}<span>${S.server.logExpanded ? '收起' : '展开全部'}</span></button>` : ''}
+            <span>${connected ? `共 ${total} 行` : '未连接'}</span>
+          </div>
+        </div>
+        ${connected ? serverLogsMarkup() : `<div class="log-empty"><span>还没有连上服务器</span><p class="muted">到「服务器」页连上之后，这里会显示 journalctl -u frps 的内容。</p><div style="margin-top:10px"><button class="btn" type="button" data-act="goto.server">${icon('external')}<span>去服务器页</span></button></div></div>`}
+      </section>
+    </div>`;
+  /* 刚连上（或连上后界面还没跟上）时，这里先把连接状态对齐再拉日志：
+   * 否则用户会看到「还没有连上服务器」，其实主进程那头已经连着。 */
+  if (!connected) { syncServerSession().catch(() => {}); return; }
+  /* 空日志自动拉取：带 3 秒节流，失败过也会再试（不然一个陈旧的 logsError 就能让它永远不重试）。 */
+  if (!S.server.logs && Date.now() - Number(S.server.logsAutoAt || 0) > 3000) {
+    S.server.logsAutoAt = Date.now();
+    loadServerLogs().catch(() => {});
+  }
+}
+
 function renderLogs(force = false) {
   if (!force && S.lastKeys.logs === 'rendered') return;
   S.lastKeys.logs = 'rendered';
+  if (S.logSource === 'server') { renderServerLogsView(); return; }
   const lines = filteredLogs();
   const pathText = (S.state && S.state.paths && S.state.paths.logPath) || '';
   $('#view').innerHTML = `
@@ -1031,6 +1085,7 @@ function renderLogs(force = false) {
           <p>${logsSourceLine()}共缓存 ${S.logs.length} 条。</p>
         </div>
         <div class="page-actions">
+          ${logSourceSeg()}
           <button class="btn" type="button" data-act="logs.export" ${S.logs.length ? '' : 'disabled'}>${icon('download')}<span>导出</span></button>
           <button class="btn" type="button" data-act="logs.clear">${icon('trash')}<span>清空显示</span></button>
           <button class="btn" type="button" data-act="logs.refresh">${icon('reload')}<span>刷新</span></button>
@@ -1153,7 +1208,14 @@ function applyServerState(data, seq) {
   if (!data) return false;
   if (seq !== undefined && serverSeqStale(seq)) return false;
   S.server.loaded = true;
+  const wasConnected = !!S.server.connected;
   S.server.connected = !!data.connected;
+  // 从「断开」变「已连接」（或换了服务器）时，上一次的日志读取错误不该继续挂着。
+  if (S.server.connected && (!wasConnected || S.server.sessionServerId !== (data.sessionServerId || data.serverId || ''))) {
+    S.server.logsError = '';
+    S.server.logs = S.server.logs || '';
+    S.server.logsAutoAt = 0;
+  }
   S.server.host = data.host || S.server.host || '';
   S.server.port = data.port || S.server.port || 22;
   S.server.username = data.username || S.server.username || '';
@@ -1195,7 +1257,7 @@ async function loadServerState({ autoConnect = false } = {}) {
   if (serverSeqStale(seq)) return;
   if (res && res.ok) {
     applyServerState(res.data, seq);
-    renderServer(true);
+    if (S.view === 'server') renderServer(true);
     if (S.server.connected) {
       loadServerNginx(true).catch(() => {});
     loadServerNginxHealth({ force: false }).catch(() => {});
@@ -1221,7 +1283,8 @@ async function syncServerSession() {
   const ownerChanged = !!d.connected && (d.sessionServerId || '') !== (S.server.sessionServerId || '');
   if (!epochChanged && !connChanged && !ownerChanged) return;
   applyServerState(d, serverSeq());
-  renderServer(true);
+  if (S.view === 'server') renderServer(true);
+  if (S.view === 'logs' && S.logSource === 'server') renderLogs(true);
   if (S.server.connected) {
     loadServerLogs().catch(() => {});
     loadServerNginx(true).catch(() => {});
@@ -1319,21 +1382,26 @@ async function loadServerConfig(quiet = false) {
 }
 
 async function loadServerLogs() {
-  if (!S.server.connected) return;
+  if (!S.server.connected || S.server.logsLoading) return;
   const serverId = S.server.sessionServerId;
-  const res = await FRP.serverLogs(250);
-  // 回包时已切到别的服务器：日志不能串台。
-  if (serverId !== S.server.sessionServerId || !S.server.connected) return;
-  if (res && res.ok) {
-    S.server.logs = res.data.content || '';
-    S.server.logsSource = res.data.source || '';
-    S.server.logsError = '';
-  } else if (res && !res.ok) {
-    if (res.stale) return;
-    S.server.logs = '';
-    S.server.logsError = res.error || '读取日志失败';
+  S.server.logsLoading = true;
+  try {
+    const res = await FRP.serverLogs(250);
+    // 回包时已切到别的服务器：日志不能串台。
+    if (serverId !== S.server.sessionServerId || !S.server.connected) return;
+    if (res && res.ok) {
+      S.server.logs = res.data.content || '';
+      S.server.logsSource = res.data.source || '';
+      S.server.logsError = '';
+    } else if (res && !res.ok) {
+      if (res.stale) return;
+      S.server.logs = '';
+      S.server.logsError = res.error || '读取日志失败';
+    }
+  } finally {
+    S.server.logsLoading = false;
+    renderServerLogs();
   }
-  renderServerLogs();
 }
 
 function serverStatusLabel(info) {
@@ -1598,17 +1666,16 @@ function parseServerLogs(text) {
   return { items, stats };
 }
 
-function renderServerLogs() {
-  const box = $('#server-logs');
-  if (!box) return;
+/* frps 日志的内容（结构化）：搬进「实时日志」页后复用同一份渲染。 */
+function serverLogsMarkup() {
   if (!S.server.logs) {
-    box.innerHTML = `<div class="empty small"><h3>暂无日志</h3><p>${esc(S.server.logsError || '启动 frps 或刷新日志后这里会显示结构化内容。')}</p></div>`;
-    return;
+    const hint = S.server.logsError || '服务器上的 frps 启动后，这里会显示它的 journalctl 输出。';
+    return `<div class="log-empty"><span>暂无日志</span><p class="muted">${esc(hint)}</p></div>`;
   }
   const parsed = parseServerLogs(S.server.logs);
   const filtered = S.server.logErrorsOnly ? parsed.items.filter((item) => item.level === 'error') : parsed.items;
   const shown = S.server.logExpanded ? filtered : filtered.slice(-10);
-  box.innerHTML = `
+  return `
     <div class="log-chips">
       <span>${icon('clock')}启动：${esc(parsed.stats.start || '未识别')}</span>
       <span>${icon('link')}客户端连接：${parsed.stats.logins}</span>
@@ -1623,11 +1690,12 @@ function renderServerLogs() {
         </div>`).join('') : '<div class="muted" style="padding:12px">没有匹配的日志</div>'}
     </div>
     <div class="log-foot"><span class="field-hint">共 ${filtered.length} 行${S.server.logErrorsOnly ? '（仅错误）' : ''}${S.server.logExpanded ? '，已展开' : '，默认显示最近 10 行'}</span></div>`;
-  // 过滤/展开开关移到了卡片头，切状态后同步按钮文字。
-  const errBtn = document.querySelector('[data-act="server.logs.errors"] span');
-  if (errBtn) errBtn.textContent = S.server.logErrorsOnly ? '显示全部' : '只看错误';
-  const expBtn = document.querySelector('[data-act="server.logs.expand"] span');
-  if (expBtn) expBtn.textContent = S.server.logExpanded ? '收起' : '展开全部';
+}
+
+/* 服务器页不再内嵌 frps 日志卡片（1.2.91：日志统一到「实时日志」页），
+ * 这里只负责：如果用户正停在日志页的「服务器 frps」来源，就重绘那一页。 */
+function renderServerLogs() {
+  if (S.view === 'logs' && S.logSource === 'server') renderLogs(true);
 }
 
 /* 「其它站点配置」的悬空引用：把那段配置原文摊开给用户看（只读）。
@@ -2352,7 +2420,7 @@ function renderServer(force = false) {
             <button class="btn ${canStart ? 'primary' : ''}" type="button" data-act="server.control" data-op="start" ${canStart ? '' : 'disabled'}>${icon('play')}<span>启动</span></button>
             <button class="btn" type="button" data-act="server.control" data-op="stop" ${canStop ? '' : 'disabled'}>${icon('stop')}<span>停止</span></button>
             <button class="btn" type="button" data-act="server.control" data-op="restart" ${canStop ? '' : 'disabled'}>${icon('restart')}<span>重启</span></button>
-            <button class="btn ghost" type="button" data-act="server.scroll.logs">${icon('terminal')}<span>实时日志</span></button>
+            <button class="btn ghost" type="button" data-act="server.openlogs">${icon('terminal')}<span>frps 日志</span></button>
             ${summary.webPort ? `<button class="btn ghost" type="button" data-act="server.open.dashboard">${icon('external')}<span>打开面板 :${summary.webPort}</span></button>` : ''}
             <button class="btn ghost" type="button" data-act="server.guide">${icon('shield')}<span>排错指南</span></button>
             ${info.frpsInstalled ? `<button class="btn ghost danger-text" type="button" data-act="server.uninstall">${icon('trash')}<span>卸载</span></button>` : ''}
@@ -2407,19 +2475,6 @@ function renderServer(force = false) {
             </div>
           </div>
           <div class="server-proxy-list" id="server-proxies">${serverProxyRows()}</div>
-        </section>
-
-        <section class="card log-card" id="server-log-card">
-          <div class="card-head">
-            <div class="ch-icon">${icon('terminal')}</div>
-            <div class="grow"><h3>frps 日志</h3><p>结构化展示最近 250 行。</p></div>
-            <div class="page-actions">
-              <button class="btn ghost small" type="button" data-act="server.logs.errors">${icon('alert')}<span>${S.server.logErrorsOnly ? '显示全部' : '只看错误'}</span></button>
-              <button class="btn ghost small" type="button" data-act="server.logs.expand">${icon('download')}<span>${S.server.logExpanded ? '收起' : '展开全部'}</span></button>
-              <button class="btn ghost" type="button" data-act="server.logs.refresh">${icon('reload')}<span>刷新</span></button>
-            </div>
-          </div>
-          <div id="server-logs"></div>
         </section>
       </div>
     </div>`;
@@ -5229,21 +5284,38 @@ async function handleAction(act, dataset, btn) {
         await FRP.copy(S.server.configPath || '');
         toast('success', '已复制配置路径', S.server.configPath || '');
         break;
-      case 'server.logs.refresh':
-        await withBusy(btn, async () => { await loadServerLogs(); });
+      case 'server.openlogs':
+      case 'goto.logs.server': {
+        S.logSource = 'server';
+        setView('logs');
+        S.lastKeys.logs = '';
+        renderLogs(true);
+        if (S.server.connected) await loadServerLogs();
         break;
-      case 'server.logs.expand':
-        S.server.logExpanded = !S.server.logExpanded;
-        renderServerLogs();
+      }
+      case 'goto.server':
+        setView('server');
         break;
-      case 'server.logs.errors':
+      case 'logs.source': {
+        const src = btn.dataset.source === 'server' ? 'server' : 'local';
+        if (src === S.logSource) break;
+        S.logSource = src;
+        S.lastKeys.logs = '';
+        renderLogs(true);
+        if (src === 'server' && S.server.connected && !S.server.logs) await loadServerLogs();
+        break;
+      }
+      case 'logs.server.refresh':
+        await loadServerLogs();
+        break;
+      case 'logs.server.errors': {
         S.server.logErrorsOnly = !S.server.logErrorsOnly;
-        renderServerLogs();
+        renderLogs(true);
         break;
-      case 'server.scroll.logs': {
-        const card = $('#server-log-card');
-        if (card) card.scrollIntoView({ behavior: 'smooth', block: 'start' });
-        if (!S.server.logs) await loadServerLogs();
+      }
+      case 'logs.server.expand': {
+        S.server.logExpanded = !S.server.logExpanded;
+        renderLogs(true);
         break;
       }
       case 'server.guide':
