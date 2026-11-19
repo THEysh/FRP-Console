@@ -3262,6 +3262,27 @@ function connectedFormMarkup() {
     </div>`;
 }
 
+/* 主机指纹变了：把「上次 / 现在」两个指纹摊给用户，让他自己决定要不要信任。
+ * 这一步不能自动放行 —— 换机器是正常情况，中间人劫持也是这个表现。 */
+function askTrustHost(info, onTrust) {
+  const body = [
+    `这台机器（${esc(info.host)}:${esc(String(info.port || 22))}）出示的主机密钥和上次记录的不一样。`,
+    '',
+    `上次：${esc(info.previous || '（无记录）')}`,
+    `现在：${esc(info.fingerprint)}`,
+    '',
+    '换系统、重装 SSH、换机器都会导致这个变化；也可能是有人劫持了这台机器的 SSH 端口（中间人）。',
+    '确认是你自己的改动之后再信任，否则先别连。',
+  ].join('\n');
+  confirmDialog({
+    title: '主机密钥变了',
+    body,
+    confirmText: '信任新指纹并连接',
+    danger: true,
+    onConfirm: () => onTrust(),
+  });
+}
+
 async function connectServer(btn, options = undefined) {
   const form = $('#server-form');
   if (!form) return;
@@ -3287,6 +3308,17 @@ async function connectServer(btn, options = undefined) {
       if (res && res.needsDecision === 'host-mismatch') {
         askProfileMismatch(res, (adopt) => {
           connectServer(null, { adoptProfile: adopt }).catch((error) => toast('error', '连接失败', String((error && error.message) || error)));
+        });
+        return;
+      }
+      if (res && res.needsTrustHost) {
+        const info = res.needsTrustHost;
+        askTrustHost(info, async () => {
+          const trusted = await FRP.serverTrustHost({ host: info.host, port: info.port, fingerprint: info.fingerprint });
+          if (!trusted || !trusted.ok) { toastResult(trusted); return; }
+          connectServer(null, { adoptProfile: false }).catch((error) =>
+            toast('error', '连接失败', String((error && error.message) || error)),
+          );
         });
         return;
       }

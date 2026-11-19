@@ -265,7 +265,7 @@ class ServerSession {
     this._connGen = 0;
   }
 
-  async connect({ host, port = 22, username, password, timeout = 15000 }) {
+  async connect({ host, port = 22, username, password, timeout = 15000, onHostKey = null }) {
     this.disconnect();
     const gen = ++this._connGen;
     return new Promise((resolve) => {
@@ -292,6 +292,20 @@ class ServerSession {
       client.on('error', (err) => {
         if (gen !== this._connGen) return;
         this.connected = false;
+        /* 主机密钥不一致时，ssh2 报的是 "Host denied (verification failed)"，
+         * 对用户毫无信息量 —— 换成「与上次记录不一致 + 两个指纹」。 */
+        if (this._hostKeyVerdict && this._hostKeyVerdict.ok === false) {
+          const v = this._hostKeyVerdict;
+          done({
+            ok: false,
+            error:
+              `主机密钥与上次记录的不一致：\n  上次：${v.previous}\n  现在：${v.fingerprint}\n` +
+              '换系统 / 换机器会正常导致这个变化；但也可能是有人劫持了这台机器的 22 端口（中间人）。\n' +
+              '确认无误请在界面上「信任新指纹」，否则不要继续。',
+            needsTrustHost: { host: this.host, port: this.port, fingerprint: v.fingerprint, previous: v.previous },
+          });
+          return;
+        }
         done({ ok: false, error: friendlyError(err) });
       });
       client.on('close', () => {
@@ -307,6 +321,18 @@ class ServerSession {
           password,
           tryKeyboard: true,
           readyTimeout: timeout,
+          /* 主机密钥固定：首次自动信任并记录，之后必须一致（不一致就拒绝连接）。 */
+          hostVerifier: (key) => {
+            if (typeof onHostKey !== 'function') return true;
+            let verdict = null;
+            try {
+              verdict = onHostKey(key);
+            } catch {
+              return true; /* 校验器自身出错不该把用户锁在门外 */
+            }
+            this._hostKeyVerdict = verdict || null;
+            return !!(verdict && verdict.ok !== false);
+          },
           keepaliveInterval: 10000,
           keepaliveCountMax: 3,
         });

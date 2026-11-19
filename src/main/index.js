@@ -72,6 +72,7 @@ const { LogFollower } = require('./log');
 const service = require('./service');
 const netport = require('./netport');
 const { ServerSession } = require('./ssh');
+const { KnownHosts } = require('./knownhosts');
 const frpsConfig = require('./frpsconfig');
 const { TrayPanel } = require('./tray-panel');
 const frpsBinary = require('./frpsBinary');
@@ -151,6 +152,27 @@ function currentDnsProvider() {
   return { ok: false, error: '尚未配置 DNS 验证渠道（当前仅支持 Cloudflare）' };
 }
 const serverSession = new ServerSession();
+
+/* SSH 主机密钥固定表（userData/known-hosts.json）：
+ * 首次自动信任并记录指纹，之后必须一致 —— 本程序要用户交 root 密码，
+ * 22 端口被劫持（ARP 欺骗 / DNS 投毒 / 恶意热点）时这是唯一能拦住的一层。 */
+const knownHosts = new KnownHosts(path.join(settingsModule.dataDir(), 'known-hosts.json'));
+
+function hostKeyGuard(key) {
+  const host = serverSession.host;
+  const port = serverSession.port || 22;
+  const verdict = knownHosts.check(host, port, key);
+  if (verdict.status === 'new') {
+    knownHosts.trust(host, port, verdict.fingerprint);
+    console.log(`[ssh] 首次连接 ${verdict.target}，记录主机指纹 ${verdict.fingerprint}`);
+    return { ...verdict, ok: true };
+  }
+  if (verdict.status === 'changed') {
+    console.warn(`[ssh] ${verdict.target} 主机指纹变了：${verdict.previous} → ${verdict.fingerprint}`);
+    return { ...verdict, ok: false };
+  }
+  return { ...verdict, ok: true };
+}
 let serverConfig = { path: '', content: '', summary: null, error: '' };
 let sessionServerId = '';
 /* 最近一次 nginx 检测结果（服务器页进来就会拉一次），端口矩阵用它补 80/443 的「谁在监听」信号。 */
@@ -2977,6 +2999,26 @@ function registerIpc() {
    * 服务器是会被手动折腾的：停服务、升级二进制、直接改 frps.toml。界面上的
    * 「运行状态」如果一直用连接瞬间的快照，就会出现「自检说 frps 没有运行、
    * 卡片头还写着 running」这种自相矛盾（真机故障注入发现）。 */
+  /* ---- SSH 主机指纹：查看 / 信任新指纹 / 忘记 ---- */
+  ipcMain.handle('server:known-hosts', async () => ok({ hosts: knownHosts.list() }));
+  ipcMain.handle('server:trust-host', async (_event, payload = {}) => {
+    const host = String((payload && payload.host) || '').trim();
+    const port = Number(payload && payload.port) || 22;
+    const fingerprint = String((payload && payload.fingerprint) || '').trim();
+    if (!host) return fail('缺少主机地址');
+    if (!/^SHA256:[A-Za-z0-9+/]+$/.test(fingerprint)) return fail('指纹格式不对（应为 SHA256:…）');
+    knownHosts.trust(host, port, fingerprint);
+    console.log(`[ssh] 用户确认信任 ${host}:${port} 的新指纹 ${fingerprint}`);
+    return ok({ host, port, fingerprint, hosts: knownHosts.list() });
+  });
+  ipcMain.handle('server:forget-host', async (_event, payload = {}) => {
+    const host = String((payload && payload.host) || '').trim();
+    const port = Number(payload && payload.port) || 22;
+    if (!host) return fail('缺少主机地址');
+    knownHosts.forget(host, port);
+    return ok({ host, port, hosts: knownHosts.list() });
+  });
+
   ipcMain.handle('server:recheck', async () => {
     if (!serverSession.connected) return fail('尚未连接服务器');
     const epoch = sessionEpoch;
@@ -3259,7 +3301,7 @@ function registerIpc() {
     // 会话即将变更：让所有在途的读请求结果失效，防止旧档案的数据回写到新页面。
     bumpSessionEpoch();
     const myEpoch = sessionEpoch;
-    const result = await serverSession.connect({ host, port, username, password });
+    const result = await serverSession.connect({ host, port, username, password, onHostKey: hostKeyGuard });
     // SSH 连接期间用户可能删掉了这个档案 / 切到了别的档案：此时必须放弃这次连接，
     // 不能继续 upsert（会偷偷重建一个档案），更不能去读配置回写页面。
     if (sessionEpoch !== myEpoch) {
@@ -3277,6 +3319,10 @@ function registerIpc() {
           servers: rest,
           activeServerId: settings.activeServerId === profile.id ? (rest[0] ? rest[0].id : '') : settings.activeServerId,
         });
+      }
+      /* 主机指纹不一致：把两份指纹原样带给界面，让用户自己确认（不能自动放行）。 */
+      if (result.needsTrustHost) {
+        return fail(result.error, { state: serverState(), needsTrustHost: result.needsTrustHost });
       }
       return fail(sshConnectHint(result.error), { state: serverState() });
     }
@@ -4713,6 +4759,7 @@ async function syncNginxProxyStateInBackground() {
       port: profile.port || 22,
       username: profile.username,
       password: secret,
+      onHostKey: hostKeyGuard,
     });
     if (!conn.ok) return;
     try {
