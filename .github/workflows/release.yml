@@ -54,25 +54,35 @@ jobs:
       # 下载失败必须让流水线红掉——否则打出来的包缺 frpc，用户装完直接不可用。
       - name: 准备内置 frpc.exe
         shell: pwsh
-        env:
-          FRP_DOWNLOAD_MIRROR: ${{ vars.FRP_DOWNLOAD_MIRROR }}
         run: |
-          # 先清掉可能由缓存恢复的半截 vendor/frpc：有它挡着，node 脚本可能判定“已就绪”
-          # 或直接在一个坏目录里解压，而报出来的都是「准备内置 frpc.exe 失败」这一句。
-          Remove-Item -Recurse -Force vendor/frpc -ErrorAction SilentlyContinue
-          Write-Host "仓库自带的压缩包：$(Test-Path vendor/frp-src/frp_0.61.0_windows_amd64.zip)"
-          for ($i = 1; $i -le 4; $i++) {
-            node tools/fetch-frpc.cjs
-            if ($LASTEXITCODE -eq 0 -and (Test-Path vendor/frpc/frpc.exe)) { break }
-            if ($i -lt 4) {
-              Write-Host "::warning::第 $i 次获取 frpc 失败，25 秒后重试"
-              Start-Sleep -Seconds 25
-            }
-          }
-          if (-not (Test-Path vendor/frpc/frpc.exe)) { throw "未拿到 vendor/frpc/frpc.exe，安装包会缺少内置 frpc" }
-          Get-Item vendor/frpc/frpc.exe | Select-Object Name, Length
+          # 这个步骤在 1.2.94/95/96/100/101 反复红过，而 job 日志需要 admin 权限才能读，
+          # 所以这里改成「不依赖任何外部条件」的确定性流程：
+          #   1) 只用仓库自带的压缩包（已提交进 git，不走网络）
+          #   2) 先校验 sha256，不符就报出实际值（.gitattributes 已把 *.zip 标成 binary）
+          #   3) 用 .NET 的 ZipFile 解压，不依赖 Expand-Archive / tar 的行为差异
+          $ErrorActionPreference = 'Stop'
+          $zip = 'vendor/frp-src/frp_0.61.0_windows_amd64.zip'
+          $want = 'ab7ae0633df538b35d0490212eabfd6d3a0051e9e446ae0053c9f63921a8c46e'
+          if (-not (Test-Path $zip)) { throw "仓库里没有 $zip" }
+          $got = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          Write-Host "压缩包 sha256: $got"
+          if ($got -ne $want) { throw "压缩包 sha256 不符：期望 $want，实际 $got" }
 
-      # 下载类失败绝大多数是网络抖动，重试一次基本就过了；两次都失败就把错误原样抛出。
+          if (Test-Path 'vendor/frpc') { Remove-Item -Recurse -Force 'vendor/frpc' }
+          New-Item -ItemType Directory -Force 'vendor/frpc' | Out-Null
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $tmp = Join-Path $env:RUNNER_TEMP 'frp-unzip'
+          if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
+          [System.IO.Compression.ZipFile]::ExtractToDirectory((Resolve-Path $zip).Path, $tmp)
+
+          $exe = Get-ChildItem -Path $tmp -Recurse -Filter 'frpc.exe' | Select-Object -First 1
+          if (-not $exe) { throw '压缩包里没有 frpc.exe' }
+          Copy-Item $exe.FullName 'vendor/frpc/frpc.exe' -Force
+          $info = Get-Item 'vendor/frpc/frpc.exe'
+          Write-Host "已就绪：$($info.Name) $($info.Length) 字节"
+          if ($info.Length -lt 10MB) { throw "frpc.exe 大小异常：$($info.Length) 字节" }
+
       - name: 打包 NSIS 安装包
         shell: pwsh
         env:

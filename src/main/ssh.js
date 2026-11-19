@@ -41,6 +41,13 @@ function posixBasename(p) {
   return i < 0 ? s : s.slice(i + 1);
 }
 
+/* nginx 配置的备份统一放这里，不再往 conf.d 里丢：
+ * nginx 只 include *.conf、不会加载备份，但「引用扫描」得靠白名单跳过它们
+ * （历史上误判过两次），人手还原时也容易挑到旧备份（挑错过一次）。
+ * 只保留最近 NGINX_BACKUP_KEEP 份。 */
+const NGINX_BACKUP_DIR = '/etc/frp-console/nginx-backups';
+const NGINX_BACKUP_KEEP = 10;
+
 /* 备份 / 停用 / 临时文件不参与「证书引用是否还有效」的判断：
  * 它们不会被 nginx 加载，却是我们自己（或用户）生成的副本，会把结论带偏。
  * 1.2.67 删证书时踩过一次（自己的备份挡住删除），1.2.72 体检又踩了一次，所以提成共享常量。 */
@@ -1838,8 +1845,48 @@ class ServerSession {
     return { ok: true, deleted: moved, trash, reloaded: true };
   }
 
+  /* 备份一个 nginx 配置文件到 NGINX_BACKUP_DIR（不再丢进 conf.d）。
+   * 失败时返回 { ok:false }，要不要中止由调用方决定。 */
+  async nginxBackup(file, prefix = '', stamp = '') {
+    const ts = stamp || new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
+    const target = `${NGINX_BACKUP_DIR}/${posixBasename(file)}.${ts}.bak`;
+    const mk = await this.exec(`${prefix}mkdir -p ${shellQuote(NGINX_BACKUP_DIR)}`, 8000);
+    if (!mk.ok) return { ok: false, backup: '', error: (mk.stderr || '').trim() };
+    const cp = await this.exec(`${prefix}cp -p ${shellQuote(file)} ${shellQuote(target)}`, 10000);
+    if (!cp.ok) return { ok: false, backup: '', error: (cp.stderr || '').trim() };
+    await this.pruneNginxBackups(prefix);
+    return { ok: true, backup: target };
+  }
+
+  /* 只留最近 NGINX_BACKUP_KEEP 份备份。 */
+  async pruneNginxBackups(prefix = '') {
+    await this.exec(
+      `${prefix}ls -1t ${shellQuote(NGINX_BACKUP_DIR)}/*.bak 2>/dev/null | tail -n +${NGINX_BACKUP_KEEP + 1} | xargs -r rm -f`,
+      8000,
+    );
+  }
+
+  /* 把以前散落在 nginx 配置目录里的 *.bak-* 搬进备份目录（幂等，失败不影响主流程）。
+   * 真机上曾堆了 13 个：nginx 不会加载它们，但引用扫描要绕开、人手还原时容易挑错。 */
+  async tidyNginxBackups(prefix = '') {
+    const script = [
+      `mkdir -p ${NGINX_BACKUP_DIR}`,
+      'for d in /etc/nginx/conf.d /etc/nginx/sites-available /etc/nginx/sites-enabled /www/server/panel/vhost/nginx; do',
+      '  [ -d "$d" ] || continue',
+      `  find "$d" -maxdepth 1 -type f -name '*.bak-*' -exec mv -f {} ${NGINX_BACKUP_DIR}/ \\; 2>/dev/null || true`,
+      'done',
+      'exit 0',
+    ].join('\n');
+    const b64 = Buffer.from(script, 'utf8').toString('base64');
+    const tmp = '/tmp/frp-console-tidy-backups.sh';
+    await this.exec(`printf %s ${b64} | base64 -d > ${tmp} 2>/dev/null`, 10000);
+    await this.exec(`${prefix}sh ${tmp} >/dev/null 2>&1 || true`, 15000);
+    await this.exec(`rm -f ${tmp} 2>/dev/null || true`, 6000);
+    await this.pruneNginxBackups(prefix);
+  }
+
   /* 把「引用某张证书」的配置改指到另一张证书（换证不换站点）。
-   * 逐个文件：先备份 .bak-frpconsole-<时间戳>，再 sed 替换证书/私钥两行，
+   * 逐个文件：先备份到 NGINX_BACKUP_DIR，再 sed 替换证书/私钥两行，
    * 每改一个文件跑一次 nginx -t，失败立刻把这一个文件还原；全部通过再 reload。
    * 这样最坏情况是「一个都没改」，不会把 nginx 留在起不来的状态。 */
   async replaceCertReference({ fromCert, fromKey, toCert, toKey } = {}) {
@@ -1862,9 +1909,9 @@ class ServerSession {
     const changed = [];
     const backups = [];
     for (const file of files) {
-      const backup = `${file}.bak-frpconsole-${stamp}`;
-      const cp = await this.exec(`${prefix}cp -p ${shellQuote(file)} ${shellQuote(backup)}`, 10000);
-      if (!cp.ok) return { ok: false, error: `备份 ${file} 失败：${(cp.stderr || '').trim() || '权限不足'}` };
+      const bak = await this.nginxBackup(file, prefix, stamp);
+      if (!bak.ok) return { ok: false, error: `备份 ${file} 失败：${bak.error || '权限不足'}` };
+      const backup = bak.backup;
       backups.push({ file, backup });
       let sedExpr = `s|${esc(oldCert)}|${esc(newCert)}|g`;
       if (oldKey && newKey) sedExpr += `; s|${esc(oldKey)}|${esc(newKey)}|g`;
@@ -1945,6 +1992,10 @@ class ServerSession {
       confDir = info.dir;
     }
     const confPath = `${confDir}/frp-console.conf`;
+    /* 顺手把以前散落在 conf.d 里的备份搬走（幂等，失败不影响写入）。
+     * 真机上曾堆到 13 个：不影响 nginx 运行，但引用扫描要绕开它们、
+     * 人手还原时也容易挑到旧备份。 */
+    await this.tidyNginxBackups(prefix).catch(() => {});
     /* 写前校验（1.2.72）：证书文件不在就别写进 nginx。
      * 之前是先写配置再 reload，如果 certDir 里的文件缺失（上传失败、被清理），
      * 就会留下一份「指向不存在证书」的配置——平时看不出，重启 nginx 就整站起不来。 */
@@ -2091,8 +2142,8 @@ class ServerSession {
     if (!sudo.ok) return sudo;
     const prefix = sudo.prefix;
     const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
-    const backup = `${confPath}.bak-frpconsole-${stamp}`;
-    await this.exec(`${prefix}cp -p ${shellQuote(confPath)} ${shellQuote(backup)} 2>/dev/null || true`, 8000);
+    const bak = await this.nginxBackup(confPath, prefix, stamp);
+    const backup = bak.ok ? bak.backup : '';
     const b64 = Buffer.from(stripped.text, 'utf8').toString('base64');
     const tmp = '/tmp/frp-console-nginx.repair.conf';
     await this.exec(`printf %s ${b64} | base64 -d > ${tmp}`, 15000);
@@ -2163,8 +2214,8 @@ class ServerSession {
     if (!sudo.ok) return sudo;
     const prefix = sudo.prefix;
     const stampFile = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
-    const backup = `${target}.bak-frpconsole-${stampFile}`;
-    await this.exec(`${prefix}cp -p ${shellQuote(target)} ${shellQuote(backup)} 2>/dev/null || true`, 8000);
+    const bak = await this.nginxBackup(target, prefix, stampFile);
+    const backup = bak.ok ? bak.backup : '';
     const b64 = Buffer.from(next.join('\n'), 'utf8').toString('base64');
     const tmp = '/tmp/frp-console-nginx.comment.conf';
     await this.exec(`printf %s ${b64} | base64 -d > ${tmp}`, 15000);
@@ -2200,8 +2251,8 @@ class ServerSession {
     if (!sudo.ok) return sudo;
     const prefix = sudo.prefix;
     const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
-    const backup = `${confPath}.bak-frpconsole-${stamp}`;
-    await this.exec(`${prefix}cp -p ${shellQuote(confPath)} ${shellQuote(backup)} 2>/dev/null || true`, 8000);
+    const bak = await this.nginxBackup(confPath, prefix, stamp);
+    const backup = bak.ok ? bak.backup : '';
     const b64 = Buffer.from(stripped.text, 'utf8').toString('base64');
     const tmp = '/tmp/frp-console-nginx.strip.conf';
     await this.exec(`printf %s ${b64} | base64 -d > ${tmp}`, 15000);
