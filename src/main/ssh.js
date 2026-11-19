@@ -1887,7 +1887,9 @@ class ServerSession {
   /* 只留最近 NGINX_BACKUP_KEEP 份备份。 */
   async pruneNginxBackups(prefix = '') {
     await this.exec(
-      `${prefix}ls -1t ${shellQuote(NGINX_BACKUP_DIR)}/*.bak 2>/dev/null | tail -n +${NGINX_BACKUP_KEEP + 1} | xargs -r rm -f`,
+      /* 用 *.bak* 而不是 *.bak：从 conf.d 搬过来的老备份叫「x.conf.bak-frpconsole-<ts>」，
+       * 结尾不是 .bak，用 *.bak 会永远删不掉（真机验过：搬完 12 个、剪枝后还是 12 个）。 */
+      `${prefix}ls -1t ${shellQuote(NGINX_BACKUP_DIR)}/*.bak* 2>/dev/null | tail -n +${NGINX_BACKUP_KEEP + 1} | xargs -r rm -f`,
       8000,
     );
   }
@@ -1899,7 +1901,7 @@ class ServerSession {
       `mkdir -p ${NGINX_BACKUP_DIR}`,
       'for d in /etc/nginx/conf.d /etc/nginx/sites-available /etc/nginx/sites-enabled /www/server/panel/vhost/nginx; do',
       '  [ -d "$d" ] || continue',
-      `  find "$d" -maxdepth 1 -type f -name '*.bak-*' -exec mv -f {} ${NGINX_BACKUP_DIR}/ \\; 2>/dev/null || true`,
+      `  find "$d" -maxdepth 1 -type f -name '*.bak*' -exec mv -f {} ${NGINX_BACKUP_DIR}/ \\; 2>/dev/null || true`,
       'done',
       'exit 0',
     ].join('\n');
