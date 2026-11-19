@@ -1314,6 +1314,16 @@ async function refreshServerInfo(force = false) {
     S.server.info = next;
     /* 只有「状态 / 版本 / 服务名」真的变了才整块重绘，避免把用户正在编辑的 textarea 打断。 */
     const changed = prev.status !== next.status || prev.version !== next.version || prev.serviceName !== next.serviceName;
+    /* 服务器上的 frps.toml 被外部改过：主进程已经重读了配置，这里把新的摘要拉回来，
+     * 否则「配置文件」卡片里还是连接时那份旧内容。 */
+    if (res.data.drifted) {
+      const snap = await FRP.serverState();
+      if (snap && snap.ok && snap.data) {
+        applyServerState(snap.data, serverSeq());
+        if (S.view === 'server') renderServer(true);
+        return;
+      }
+    }
     if (changed && S.view === 'server') renderServer(true);
   } finally {
     S.server.rechecking = false;

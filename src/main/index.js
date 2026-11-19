@@ -156,6 +156,11 @@ const serverSession = new ServerSession();
 /* SSH 主机密钥固定表（userData/known-hosts.json）：
  * 首次自动信任并记录指纹，之后必须一致 —— 本程序要用户交 root 密码，
  * 22 端口被劫持（ARP 欺骗 / DNS 投毒 / 恶意热点）时这是唯一能拦住的一层。 */
+/* 服务器上 frps.toml 的「修改时间:大小」指纹：用来发现外部改动。
+ * 客户端 frpc.toml 有 checkExternalConfig，服务器侧一直没有对应机制 ——
+ * 手工在服务器上改了 bindPort 之类的，界面会一直显示旧值。 */
+let serverConfigStamp = '';
+
 const knownHosts = new KnownHosts(path.join(settingsModule.dataDir(), 'known-hosts.json'));
 
 function hostKeyGuard(key) {
@@ -2892,6 +2897,7 @@ function registerIpc() {
     }
     const configResult = await serverSession.readConfig();
     if (epoch !== sessionEpoch) return { ok: false, stale: true };
+    serverConfigStamp = (await serverSession.fileStamp(serverSession.configPath || configResult.path)) || serverConfigStamp;
     if (configResult.ok) {
       const parsed = frpsConfig.parseConfig(configResult.content);
       serverConfig = {
@@ -3025,7 +3031,28 @@ function registerIpc() {
     const inspected = await serverSession.inspect();
     if (epoch !== sessionEpoch) return staleFail();
     if (!inspected.ok) return fail(inspected.error || '读取服务器信息失败');
-    return ok({ info: serverSession.info || null, epoch: sessionEpoch, configPath: inspected.configPath || '' });
+    /* frps.toml 被外部改过？（改 bindPort、加 allowPorts 之类）
+     * 客户端 frpc.toml 有 checkExternalConfig，服务器侧一直没对应机制，
+     * 结果界面上的配置摘要会一直是连接时那份旧值。 */
+    const stamp = await serverSession.fileStamp(serverSession.configPath || inspected.configPath || '');
+    if (epoch !== sessionEpoch) return staleFail();
+    let drifted = false;
+    if (stamp && serverConfigStamp && stamp !== serverConfigStamp) {
+      const snap = await loadServerSnapshot({ inspect: false });
+      if (epoch !== sessionEpoch) return staleFail();
+      drifted = !!snap.ok;
+      if (drifted) {
+        notify('warn', '服务器上的 frps.toml 被外部修改了', '已重新读取，界面上的端口/允许端口等摘要已更新');
+        pushState();
+      }
+    }
+    return ok({
+      info: serverSession.info || null,
+      epoch: sessionEpoch,
+      configPath: inspected.configPath || '',
+      drifted,
+      stamp: stamp || '',
+    });
   });
 
   /* 手动「整理重复档案」：与启动时的自动迁移同一套逻辑，幂等，随时可按。 */

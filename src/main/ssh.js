@@ -1915,6 +1915,18 @@ class ServerSession {
    * 逐个文件：先备份到 NGINX_BACKUP_DIR，再 sed 替换证书/私钥两行，
    * 每改一个文件跑一次 nginx -t，失败立刻把这一个文件还原；全部通过再 reload。
    * 这样最坏情况是「一个都没改」，不会把 nginx 留在起不来的状态。 */
+  /* 文件的「修改时间:大小」指纹：用来判断服务器上的配置是否被外部改过。
+   * 只做一次 stat，比整份读回来便宜，适合放进 30 秒的巡检节拍里。 */
+  async fileStamp(file) {
+    if (!file) return '';
+    const r = await this.exec(`stat -c '%y|%s' ${shellQuote(file)} 2>/dev/null || echo ''`, 8000);
+    if (!r.ok) return '';
+    const line = String(r.stdout || '').trim().split('\n')[0].trim();
+    /* %y 带纳秒：同一秒内改两次、大小还没变（7000→7001→7000）也能看出来。
+     * 只做长度与冒号的基本校验，格式细节交给两端比对。 */
+    return line.includes(':') && line.length < 120 ? line : '';
+  }
+
   async replaceCertReference({ fromCert, fromKey, toCert, toKey } = {}) {
     if (!this.connected) return { ok: false, error: '尚未连接服务器' };
     const oldCert = String(fromCert || '').trim();
