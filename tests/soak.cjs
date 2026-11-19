@@ -57,6 +57,26 @@ function rssOfPid(pid) {
     })()`);
     if (!up.ok) throw new Error('startTunnel 失败：' + up.err);
 
+    /* 必须确认隧道真的连上了再开始采样：只凭 startTunnel 返回 ok 是不够的
+     * —— frpc 可能起来就退出（管理端口被占、密码错、端口冲突），
+     * 这时长稳会连续 8 分钟测一把“停止状态的空壳”，
+     * 最后却把结论写成「健康检查停摆」，误导排查方向。 */
+    const connected = await (async () => {
+      for (let i = 0; i < 25; i += 1) {
+        const rt = await evalIn('(async () => { const r = await FRP.refresh(); return r.data.runtime; })()');
+        if (rt && rt.connected) return rt;
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+      const rt = await evalIn('(async () => { const r = await FRP.refresh(); return r.data.runtime; })()');
+      return rt;
+    })();
+    if (!connected || !connected.connected) {
+      throw new Error(
+        '隧道没能连上，长稳采样没有意义：' +
+          JSON.stringify({ mode: connected && connected.mode, apiError: connected && connected.apiError, connectError: connected && connected.connectError, lastExit: connected && connected.lastExit }).slice(0, 300),
+      );
+    }
+
     const added = await evalIn(`(async () => {
       for (let i = 1; i <= ${PROXIES}; i++) {
         const res = await FRP.saveProxy('add', '', { name: 'soak-' + i, type: 'tcp', localIP: '127.0.0.1', localPort: ${local.port}, remotePort: ${26100} + i });
@@ -104,7 +124,9 @@ function rssOfPid(pid) {
     console.log(`健康检查推进：${stalled ? '✗ 停摆' : '✓ 正常'}（healthAt ${samples[0].at} → ${samples[samples.length - 1].at}）`);
     console.log(`日志缓冲：${samples[0].logLines} → ${samples[samples.length - 1].logLines} 行（涨 ${logsGrew}）`);
     console.log(`在线代理：${lastS.online} / ${lastS.total}`);
-    const ok = grow <= 40 && !stalled;
+    const neverManaged = samples.every((s) => s.mode !== 'managed');
+    const ok = grow <= 40 && !stalled && !neverManaged;
+    if (neverManaged) console.log('✗ 全程没有进入 managed 模式：采样期间隧道根本没在跑');
     console.log(ok ? '✓ 通过' : '✗ 需要关注');
     fs.writeFileSync(path.join(dataRoot, 'samples.json'), JSON.stringify(samples, null, 2));
     process.exitCode = ok ? 0 : 2;
