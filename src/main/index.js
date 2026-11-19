@@ -1833,8 +1833,20 @@ async function checkProxyHealth(p, ctx) {
   const status = manager.proxyStatus.get(p.name);
   const running = !!status && status.status === 'running';
   if (!running) {
-    layers.tunnel = { ok: false, ms: 0, error: status && status.err ? status.err : '代理尚未在服务端注册' };
-    return [p.name, { ok: false, reason: '隧道未建立', ms: local.ms || 0, error: layers.tunnel.error, layers, at }];
+    const raw = String((status && (status.err || status.status)) || '').trim();
+    layers.tunnel = { ok: false, ms: 0, error: raw || '代理尚未在服务端注册' };
+    /* start error 是 frps 明确拒绝了这个代理，和「还没开始注册」是两件事：
+     * 最常见的原因是域名/端口被别的代理占了（router config conflict）。 */
+    const conflict = /router config conflict|already (?:used|exists)|port .*in use/i.test(raw);
+    const reject = (status && status.status === 'start error') || conflict;
+    const reason = conflict ? '域名或端口与别的代理冲突' : reject ? 'frps 拒绝启动这个代理' : '隧道未建立';
+    const hint = conflict
+      ? '同一个域名只能给一条 http/https/tcpmux 代理；公网端口也不能两条 tcp/udp 代理共用。改掉其中一条即可。'
+      : reject
+        ? '看「实时日志」里这条代理的 start error 行，通常是域名/端口冲突或配置层拒绝。'
+        : '';
+    if (hint) layers.tunnel.hint = hint;
+    return [p.name, { ok: false, reason, ms: local.ms || 0, error: layers.tunnel.error, layers, at }];
   }
   const server = await ctx.serverCheck();
   layers.tunnel = { ok: !!server.ok, ms: server.ms || 0, error: server.error || null };
@@ -4950,7 +4962,13 @@ async function bootstrap() {
       const changed = configModule.ensureAdmin(model, settings);
       if (changed) {
         const saved = persistModel(model, { reload: false });
-        if (!saved.ok) return { ok: false, error: saved.error || '无法写入管理 API 配置' };
+        if (!saved.ok) {
+          /* 校验失败时 persistModel 返回的是 {errors}，没有 error 字段——
+           * 直接兜底成「无法写入管理 API 配置」会把真正原因（域名/端口冲突）吃掉。 */
+          const first = (saved.errors || [])[0];
+          const detail = first ? String(first.message || first) : (saved.error || '无法写入管理 API 配置');
+          return { ok: false, error: `配置有问题，启动前先改掉：${detail}` };
+        }
       }
       return { ok: true, changed };
     },

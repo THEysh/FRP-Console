@@ -5,6 +5,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const config = require('../../src/main/config');
+const { validate } = config;
 
 function model(extra = {}) {
   return config.normalize({
@@ -144,4 +145,45 @@ test('probeTargetFor：访问路径拼进 URL，https 带 SNI，无域名返回 
   assert.equal(tcp.port, 23180);
 
   assert.equal(config.probeTargetFor(m, { type: 'http' }), null);
+});
+
+test('重复的自定义域名会被拦下（同一个域名只能给一条 http/https/tcpmux 代理）', () => {
+  const model = {
+    serverAddr: '127.0.0.1',
+    serverPort: 7000,
+    auth: { method: 'token', token: 'x' },
+    proxies: [
+      { name: 'a', type: 'http', localIP: '127.0.0.1', localPort: 18091, customDomains: ['dup.example.com'] },
+      { name: 'b', type: 'http', localIP: '127.0.0.1', localPort: 18091, customDomains: ['dup.example.com'] },
+    ],
+  };
+  const result = validate(model);
+  assert.ok(result.errors.some((item) => /已经被「a」占用/.test(String(item.message || item))), JSON.stringify(result.errors));
+});
+
+test('重复的子域名会被拦下', () => {
+  const model = {
+    serverAddr: '127.0.0.1',
+    serverPort: 7000,
+    auth: { method: 'token', token: 'x' },
+    proxies: [
+      { name: 'a', type: 'http', localIP: '127.0.0.1', localPort: 18091, subdomain: 'same' },
+      { name: 'b', type: 'http', localIP: '127.0.0.1', localPort: 18091, subdomain: 'same' },
+    ],
+  };
+  const result = validate(model);
+  assert.ok(result.errors.some((item) => /已经被「a」占用/.test(String(item.message || item))), JSON.stringify(result.errors));
+});
+
+test('域名各不相同就不报错', () => {
+  const model = {
+    serverAddr: '127.0.0.1',
+    serverPort: 7000,
+    auth: { method: 'token', token: 'x' },
+    proxies: [
+      { name: 'a', type: 'http', localIP: '127.0.0.1', localPort: 18091, customDomains: ['a.example.com'] },
+      { name: 'b', type: 'http', localIP: '127.0.0.1', localPort: 18091, customDomains: ['b.example.com'] },
+    ],
+  };
+  assert.equal(validate(model).errors.length, 0);
 });

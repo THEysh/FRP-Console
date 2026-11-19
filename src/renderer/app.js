@@ -867,7 +867,9 @@ function proxyRowHtml(p) {
       : '<span class="badge green"><span class="bdot"></span>在线</span>')
     : p.status === 'pending'
       ? '<span class="badge amber"><span class="bdot"></span>同步中</span>'
-      : '<span class="badge muted"><span class="bdot"></span>未同步</span>';
+      : p.status === 'start error'
+        ? `<span class="badge red" title="${esc(tip)}"><span class="bdot"></span>${esc((p.health && p.health.reason) || '启动失败')}</span>`
+        : '<span class="badge muted"><span class="bdot"></span>未同步</span>';
   const health = p.health
     ? (p.health.ok
       ? `<span class="health-hint" title="${esc(tip)}">${icon('check')}三层连通 · ${esc(p.health.ms)}ms</span>`

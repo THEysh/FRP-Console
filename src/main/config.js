@@ -209,6 +209,8 @@ function validate(model, options = {}) {
 
   const names = new Map();
   const remotePorts = new Map();
+  /* 域名归属：同一个域名只能给一条 http/https/tcpmux 代理 */
+  const domainOwners = new Map();
   /* frpc 顶层的 start = [...] 是「只启动列出的这些代理」的白名单（手改配置时常见）。
    * 只要某个代理不在列表里，frpc 根本不会去连它 —— 界面上以前只会显示「隧道未建立」，
    * 用户在本地端口、token、防火墙上查一圈也查不出来。这里提前说清楚。 */
@@ -280,6 +282,22 @@ function validate(model, options = {}) {
       for (const domain of domains) {
         // 带 http:// 或者带端口的域名会让 frpc 启动失败，但报错信息完全看不出是这个原因
         if (!isDomainLike(domain)) push('error', `proxies[${index}].customDomains`, `${label} 的域名「${domain}」不合法：只填域名本身，不要带 http://、端口或路径`);
+        /* 同一个域名只能给一条 http/https/tcpmux 代理用：撞了以后 frps 会给后来者
+         * 返回 router config conflict，界面上只会显示「未同步」，很难看出真实原因。 */
+        const key = domain.toLowerCase();
+        if (domainOwners.has(key)) {
+          push('error', `proxies[${index}].customDomains`, `域名「${domain}」已经被「${domainOwners.get(key)}」占用：同一个域名只能给一条 http/https/tcpmux 代理`);
+        } else {
+          domainOwners.set(key, label);
+        }
+      }
+      if (proxy.subdomain) {
+        const key = `*.${String(proxy.subdomain).toLowerCase()}`;
+        if (domainOwners.has(key)) {
+          push('error', `proxies[${index}].subdomain`, `子域名「${proxy.subdomain}」已经被「${domainOwners.get(key)}」占用`);
+        } else {
+          domainOwners.set(key, label);
+        }
       }
     }
 
