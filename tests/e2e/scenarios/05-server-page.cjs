@@ -47,6 +47,7 @@ module.exports = {
     check('日志来源标注 journalctl', /journalctl/.test(logs.source), logs.source);
 
     /* DOM：卡片顺序与关键块都在（v1.2.65 之后的分区结构）。 */
+    await ctx.waitUi('.nav-item[data-view="server"]', '导航渲染完成');
     const dom = await ctx.eval(`(async () => {
       document.querySelector('.nav-item[data-view="server"]').click();
       await new Promise((r) => setTimeout(r, 500));

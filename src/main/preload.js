@@ -91,7 +91,6 @@ contextBridge.exposeInMainWorld('FRP', {
   serverDisconnect: () => invoke('server:disconnect'),
   serverRefresh: () => invoke('server:refresh'),
   serverReadConfig: () => invoke('server:read-config'),
-  serverPreview: (fields) => invoke('server:preview', { fields }),
   serverBootstrap: (fields, options = {}) => invoke('server:bootstrap', { fields, ...options }),
   serverBootstrapCancel: () => invoke('server:bootstrap-cancel'),
   serverUninstall: (payload) => invoke('server:uninstall', payload),

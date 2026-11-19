@@ -55,12 +55,8 @@ module.exports = {
       check('第二台：nginx 显示未安装（不继承第一台）', nginxB && nginxB.installed === false, JSON.stringify(nginxB).slice(0, 200));
 
       /* DOM 也要跟着变，不能停在上一台的「1.26.3 · 就绪」。
-       * 先等导航渲染出来——单独跑这一个场景时，界面可能还没画完。 */
-      await waitFor(
-        () => ctx.eval('!!document.querySelector(\'.nav-item[data-view="server"]\')'),
-        (v) => v === true,
-        { timeout: 15000, label: '界面渲染完成' },
-      );
+       * 先等导航画出来——单独跑这一个场景时，界面可能还没渲染完。 */
+      await ctx.waitUi('.nav-item[data-view="server"]', '导航渲染完成');
       const domB = await ctx.eval(`(async () => {
         document.querySelector('.nav-item[data-view="server"]').click();
         await new Promise((r) => setTimeout(r, 700));

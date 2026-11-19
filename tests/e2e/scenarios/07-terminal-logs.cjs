@@ -10,6 +10,8 @@ module.exports = {
   async run(ctx) {
     const { check } = ctx;
 
+    await ctx.waitUi('.nav-item[data-view="server"]', '导航渲染完成');
+
     const term = await ctx.eval(`(async () => {
       document.querySelector('.nav-item[data-view="server"]').click();
       await new Promise((r) => setTimeout(r, 400));

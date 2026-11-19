@@ -57,6 +57,7 @@ module.exports = {
     check('公网地址按服务器地址拼', /:23180$/.test(edited.publicAddress || ''), edited.publicAddress);
 
     /* 表单层面：清空名称提交必须留在表单并给内联提示（不能静默关窗）。 */
+    await ctx.waitUi('.nav-item[data-view="server"]', '导航渲染完成');
     const formGuard = await ctx.eval(`(async () => {
       document.querySelector('.nav-item[data-view="proxies"]').click();
       await new Promise((r) => setTimeout(r, 250));

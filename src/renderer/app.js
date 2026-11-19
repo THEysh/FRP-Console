@@ -55,12 +55,8 @@ const S = {
     configError: '',
     mode: 'frps',
     frpcRaw: '',
-    template: 'custom',
     wizard: null,
     wizardDirty: false,
-    previewText: '',
-    previewError: '',
-    previewTimer: null,
     logs: '',
     logsSource: '',
     logsError: '',
@@ -1235,7 +1231,6 @@ function applyServerState(data, seq) {
   S.server.client = data.client || null;
   if (data.summary && !S.server.wizardDirty) {
     S.server.wizard = wizardFromSummary(data.summary);
-    S.server.previewText = '';
   } else if (!data.summary && !S.server.wizard && !S.server.wizardDirty) {
     /* 服务器上还没有 frps.toml：向导直接沿用档案里那把已经自动生成的 Token。
      * 这样「一键初始化」写进服务端的 token 和本机 frpc.toml 的 token 一开始就是
@@ -1246,7 +1241,6 @@ function applyServerState(data, seq) {
       token: (activeProfile && (activeProfile.clientToken || activeProfile.token)) || randomToken(20),
       webPassword: randomToken(14),
     };
-    S.server.previewText = '';
   }
   return true;
 }
@@ -1471,106 +1465,6 @@ function selftestMarkup() {
       ${selftestStepMarkup(steps, 'token', '④', 'Token 一致', '服务端 auth.token 与本机档案里的 Token 是否完全相同')}
     </div>
     <p class="st-foot">服务器就绪 ≠ 隧道可用。真正的「本地 → 隧道 → 公网」三层连通性在概览与代理映射页检查。</p>`;
-}
-
-function wizardField(label, name, value, opts = '') {
-  return `<div class="field"><label>${esc(label)}</label><input class="input" name="${esc(name)}" value="${esc(value)}" ${opts}></div>`;
-}
-
-function wizardToggle(label, name, checked) {
-  return `<label class="check-line"><input type="checkbox" name="${esc(name)}" ${checked ? 'checked' : ''}> ${esc(label)}</label>`;
-}
-
-function wizardPane() {
-  const w = S.server.wizard || wizardDefaults();
-  return `
-    <div id="wizard-pane" class="wizard-pane ${S.server.mode === 'advanced' ? 'hidden' : ''}">
-      <div class="wz-templates">
-        <span class="wz-label">模板</span>
-        ${[
-          ['basic', '基础穿透'],
-          ['auth', '带鉴权'],
-          ['panel', '带鉴权 + Web 面板'],
-          ['https', 'HTTPS 域名'],
-          ['custom', '自定义'],
-        ].map(([key, label]) => `<button class="wz-chip ${S.server.template === key ? 'active' : ''}" type="button" data-act="server.template" data-template="${key}">${label}</button>`).join('')}
-      </div>
-      <div class="wizard-layout">
-        <form id="wizard-form" class="wizard-form" autocomplete="off" onsubmit="return false">
-          <input type="hidden" name="webAddr" value="${esc(w.webAddr || '0.0.0.0')}">
-          <div class="wz-group">
-            <div class="wz-group-title">基础</div>
-            <div class="wz-grid">
-              ${wizardField('bindPort（客户端连接端口）', 'bindPort', w.bindPort, 'type="number" min="1" max="65535"')}
-              <div class="field"><label>绑定地址</label><input class="input" name="bindAddr" value="${esc(w.bindAddr || '0.0.0.0')}" spellcheck="false"></div>
-            </div>
-          </div>
-
-          <div class="wz-group">
-            <div class="wz-group-title">鉴权 ${wizardToggle('启用 token 鉴权', 'authEnabled', w.authEnabled)}</div>
-            <div class="wz-grid wz-auth">
-              <div class="field">
-                <label>auth.token</label>
-                <div class="input-group">
-                  <input class="input" name="token" value="${esc(w.token)}" spellcheck="false" placeholder="客户端必须填写相同 token">
-                  <button class="icon-btn" type="button" data-act="server.gen.token" title="随机生成">${icon('reload')}</button>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div class="wz-group">
-            <div class="wz-group-title">Dashboard ${wizardToggle('启用 Web 面板', 'webEnabled', w.webEnabled)}</div>
-            <div class="wz-grid wz-web">
-              ${wizardField('面板端口', 'webPort', w.webPort, 'type="number" min="1" max="65535"')}
-              ${wizardField('面板用户名', 'webUser', w.webUser, 'spellcheck="false"')}
-              <div class="field span-2">
-                <label>面板密码</label>
-                <div class="input-group">
-                  <input class="input" id="wz-webpass" name="webPassword" type="password" value="${esc(w.webPassword)}" placeholder="面板登录密码">
-                  <button class="icon-btn" type="button" data-act="server.gen.password" title="随机生成">${icon('reload')}</button>
-                  <button class="icon-btn" type="button" data-act="server.eye.web" title="显示 / 隐藏">${icon('eye')}</button>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div class="wz-group">
-            <div class="wz-group-title">域名穿透（可选）</div>
-            <div class="wz-toggles">
-              ${wizardToggle('HTTP（vhostHTTPPort）', 'vhostHTTPEnabled', w.vhostHTTPEnabled)}
-              ${wizardToggle('HTTPS（vhostHTTPSPort）', 'vhostHTTPSEnabled', w.vhostHTTPSEnabled)}
-            </div>
-            <div class="wz-grid">
-              <div class="wz-vhost-http">${wizardField('HTTP 端口', 'vhostHTTPPort', w.vhostHTTPPort, 'type="number" min="1" max="65535"')}</div>
-              <div class="wz-vhost-https">${wizardField('HTTPS 端口', 'vhostHTTPSPort', w.vhostHTTPSPort, 'type="number" min="1" max="65535"')}</div>
-            </div>
-          </div>
-
-          <div class="wz-group">
-            <div class="wz-group-title">允许客户端映射的端口（可选）</div>
-            <div class="field">
-              <input class="input" name="allowPortsText" value="${esc(w.allowPortsText)}" placeholder="例如 2000-3000,3001；留空表示不限制">
-              <span class="field-hint">限制客户端能申请的 remotePort，降低被滥用的风险。</span>
-            </div>
-          </div>
-        </form>
-
-        <div class="wizard-preview-box">
-          <div class="wpb-head">
-            <strong>frps.toml 预览</strong>
-            <button class="btn ghost small" type="button" data-act="server.copy.preview">${icon('copy')}<span>复制</span></button>
-          </div>
-          <pre class="wizard-preview" id="wizard-preview">${esc(S.server.previewText || '正在生成预览…')}</pre>
-          <div class="wpb-foot" id="wizard-preview-msg">${esc(S.server.previewError || '')}</div>
-        </div>
-      </div>
-      <div class="card-actions">
-        <button class="btn" type="button" data-act="server.save">${icon('check')}<span>仅保存</span></button>
-        <button class="btn primary" type="button" data-act="server.save.restart">${icon('restart')}<span>保存并重启</span></button>
-        <span class="field-hint">写入前会在服务器生成 .bak 备份，并优先用 frps verify 校验语法。</span>
-      </div>
-    </div>`;
 }
 
 function frpsPane() {
@@ -2480,12 +2374,10 @@ function renderServer(force = false) {
     </div>`;
 
   renderServerLogs();
-  toggleWizardGroups();
   // 终端会话跨重渲染存活：DOM 被 innerHTML 换掉后把 xterm 搬回新容器。
   remountShellTerm();
   /* 连接表单里的「这台机器已有档案」提示要在渲染后立刻反映当前预填地址。 */
   updateConnectHostNote();
-  if (s.mode === 'wizard' && !s.previewText) schedulePreview(true);
   if (s.connected && !s.logs && !s.logsLoading) {
     s.logsLoading = true;
     loadServerLogs().catch(() => {}).finally(() => { s.logsLoading = false; });
@@ -2822,7 +2714,6 @@ async function saveServerProfileModal(btn) {
     closeModal();
     S.server.wizard = null;
     S.server.wizardDirty = false;
-    S.server.previewText = '';
     S.server.logs = '';
     applyServerState(res.data, seq);
     renderServer(true);
@@ -2906,7 +2797,6 @@ async function autoConnectActiveProfile() {
     S.server.wizardDirty = false;
     S.server.mode = 'frps';
     S.server.frpcRaw = '';
-    S.server.previewText = '';
     S.server.logs = '';
     S.server.logsError = '';
     applyServerState(res.data, seq);
@@ -2948,7 +2838,6 @@ async function selectServerProfile(id) {
     }
     S.server.wizard = null;
     S.server.wizardDirty = false;
-    S.server.previewText = '';
     S.server.logs = '';
     S.server.logsError = '';
     applyServerState(res.data, seq);
@@ -3346,8 +3235,6 @@ async function connectServer(btn, options = undefined) {
     S.server.wizardDirty = false;
     S.server.mode = 'frps';
     S.server.frpcRaw = '';
-    S.server.template = 'custom';
-    S.server.previewText = '';
     S.server.logs = '';
     applyServerState(res.data, seq);
     S.server.nginx = null;      // 旧服务器的 nginx 状态不残留，连接后重新检测
@@ -3368,137 +3255,6 @@ async function connectServer(btn, options = undefined) {
     loadServerNginxHealth({ force: false }).catch(() => {});
     loadServerFirewall(true).catch(() => {});
   });
-}
-
-function readWizardForm() {
-  const form = $('#wizard-form');
-  if (!form) return null;
-  const fields = {};
-  const value = (name) => {
-    const input = form.querySelector(`[name="${name}"]`);
-    return input ? input.value : '';
-  };
-  const checked = (name) => {
-    const input = form.querySelector(`[name="${name}"]`);
-    return !!(input && input.checked);
-  };
-  fields.bindAddr = value('bindAddr').trim() || '0.0.0.0';
-  fields.bindPort = Number(value('bindPort'));
-  fields.authEnabled = checked('authEnabled');
-  fields.token = value('token').trim();
-  fields.webEnabled = checked('webEnabled');
-  fields.webAddr = value('webAddr').trim() || '0.0.0.0';
-  fields.webPort = Number(value('webPort'));
-  fields.webUser = value('webUser').trim();
-  fields.webPassword = value('webPassword');
-  fields.vhostHTTPEnabled = checked('vhostHTTPEnabled');
-  fields.vhostHTTPPort = Number(value('vhostHTTPPort'));
-  fields.vhostHTTPSEnabled = checked('vhostHTTPSEnabled');
-  fields.vhostHTTPSPort = Number(value('vhostHTTPSPort'));
-  fields.allowPortsText = value('allowPortsText').trim();
-  return fields;
-}
-
-function toggleWizardGroups() {
-  const form = $('#wizard-form');
-  if (!form) return;
-  const toggle = (name, selector) => {
-    const input = form.querySelector(`[name="${name}"]`);
-    const box = form.querySelector(selector);
-    if (input && box) box.classList.toggle('off', !input.checked);
-  };
-  toggle('authEnabled', '.wz-auth');
-  toggle('webEnabled', '.wz-web');
-  toggle('vhostHTTPEnabled', '.wz-vhost-http');
-  toggle('vhostHTTPSEnabled', '.wz-vhost-https');
-}
-
-function schedulePreview(immediate = false) {
-  clearTimeout(S.server.previewTimer);
-  const run = async () => {
-    const fields = readWizardForm();
-    if (!fields) return;
-    S.server.wizard = fields;
-    const res = await FRP.serverPreview(fields);
-    const box = $('#wizard-preview');
-    const msg = $('#wizard-preview-msg');
-    if (!box) return;
-    if (res && res.ok) {
-      S.server.previewText = res.data.text || '';
-      S.server.previewError = '';
-      box.textContent = S.server.previewText;
-      if (msg) {
-        msg.textContent = (res.data.warnings || []).join('；');
-        msg.classList.toggle('warn', !!(res.data.warnings || []).length);
-      }
-    } else {
-      S.server.previewText = `// 无法生成：${res ? res.error : '未知错误'}`;
-      S.server.previewError = res ? res.error : '';
-      box.textContent = S.server.previewText;
-      if (msg) {
-        msg.textContent = S.server.previewError;
-        msg.classList.add('bad');
-      }
-    }
-  };
-  if (immediate) run();
-  else S.server.previewTimer = setTimeout(run, 300);
-}
-
-function setWizardValues(fields) {
-  const form = $('#wizard-form');
-  if (!form) return;
-  for (const [name, value] of Object.entries(fields)) {
-    const input = form.querySelector(`[name="${name}"]`);
-    if (!input) continue;
-    if (input.type === 'checkbox') input.checked = !!value;
-    else input.value = value;
-  }
-  toggleWizardGroups();
-}
-
-function applyServerTemplate(template) {
-  const form = $('#wizard-form');
-  if (!form) return;
-  const fields = readWizardForm();
-  if (!fields) return;
-  if (template === 'basic') {
-    fields.authEnabled = false;
-    fields.webEnabled = false;
-    fields.vhostHTTPEnabled = false;
-    fields.vhostHTTPSEnabled = false;
-  } else if (template === 'auth') {
-    fields.authEnabled = true;
-    if (!fields.token) fields.token = randomToken(20);
-    fields.webEnabled = false;
-    fields.vhostHTTPEnabled = false;
-    fields.vhostHTTPSEnabled = false;
-  } else if (template === 'panel') {
-    fields.authEnabled = true;
-    if (!fields.token) fields.token = randomToken(20);
-    fields.webEnabled = true;
-    fields.webPort = 4096;
-    fields.webUser = fields.webUser || 'admin';
-    if (!fields.webPassword) fields.webPassword = randomToken(12);
-    fields.vhostHTTPEnabled = false;
-    fields.vhostHTTPSEnabled = false;
-  } else if (template === 'https') {
-    fields.authEnabled = true;
-    if (!fields.token) fields.token = randomToken(20);
-    fields.webEnabled = true;
-    fields.webPort = fields.webPort || 4096;
-    fields.webUser = fields.webUser || 'admin';
-    if (!fields.webPassword) fields.webPassword = randomToken(12);
-    fields.vhostHTTPEnabled = true;
-    fields.vhostHTTPPort = 80;
-    fields.vhostHTTPSEnabled = true;
-    fields.vhostHTTPSPort = 443;
-  }
-  setWizardValues(fields);
-  S.server.template = template;
-  S.server.wizardDirty = true;
-  document.querySelectorAll('.wz-chip').forEach((chip) => chip.classList.toggle('active', chip.dataset.template === template));
-  schedulePreview();
 }
 
 function setServerMode(mode) {
@@ -5223,35 +4979,6 @@ async function handleAction(act, dataset, btn) {
       case 'server.selftest':
         await runServerSelfTest();
         break;
-      case 'server.gen.token': {
-        const input = $('#wizard-form [name="token"]');
-        if (input) {
-          input.value = randomToken(20);
-          S.server.template = 'custom';
-          S.server.wizardDirty = true;
-          schedulePreview();
-        }
-        break;
-      }
-      case 'server.gen.password': {
-        const input = $('#wz-webpass');
-        if (input) {
-          input.value = randomToken(14);
-          input.type = 'text';
-          S.server.template = 'custom';
-          S.server.wizardDirty = true;
-          schedulePreview();
-        }
-        break;
-      }
-      case 'server.eye.web': {
-        const input = $('#wz-webpass');
-        if (!input) break;
-        const show = input.type === 'password';
-        input.type = show ? 'text' : 'password';
-        btn.innerHTML = icon(show ? 'eyeoff' : 'eye');
-        break;
-      }
       case 'server.mode':
         setServerMode(dataset.mode);
         break;
@@ -5276,17 +5003,6 @@ async function handleAction(act, dataset, btn) {
       case 'server.frpc.save.restart':
         await saveFrpcConfig(true, btn);
         break;
-      case 'server.copy.preview':
-        await FRP.copy(S.server.previewText || '');
-        toast('success', '已复制配置预览');
-        break;
-      case 'server.template': {
-        /* 初始化向导的模板芯片：套用一组默认值（基础/带鉴权/带面板/HTTPS）。
-         * 之前只有 chip 的样式切换、没有处理分支，点下去表单毫无反应。 */
-        const tpl = dataset.template || 'custom';
-        applyServerTemplate(tpl);
-        break;
-      }
       case 'server.openlogs':
       case 'goto.logs.server': {
         S.logSource = 'server';
@@ -6573,12 +6289,6 @@ function bindStaticEvents() {
       if (e.target.name === 'host' || e.target.name === 'port') updateConnectHostNote();
       return;
     }
-    if (!e.target.closest('#wizard-form')) return;
-    S.server.template = 'custom';
-    S.server.wizardDirty = true;
-    document.querySelectorAll('.wz-chip').forEach((chip) => chip.classList.toggle('active', chip.dataset.template === 'custom'));
-    toggleWizardGroups();
-    schedulePreview();
   });
   document.addEventListener('change', (e) => {
     const profileSelect = e.target.closest('#server-profile-select');
@@ -6597,9 +6307,6 @@ function bindStaticEvents() {
       [...document.querySelectorAll('.fw-rule-del')].forEach((c) => { c.checked = ruleAll.checked; });
       return;
     }
-    if (!e.target.closest('#wizard-form')) return;
-    toggleWizardGroups();
-    schedulePreview();
   });
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape' && S.modalOpen) closeModal();

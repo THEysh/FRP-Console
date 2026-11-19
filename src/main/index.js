@@ -3299,12 +3299,6 @@ function registerIpc() {
     return ok({ path: result.path, content: result.content, serverId: sessionServerId, state: serverState() });
   });
 
-  ipcMain.handle('server:preview', async (event, payload = {}) => {
-    const result = frpsConfig.preview(serverConfig.content, payload.fields || {});
-    if (!result.ok) return fail(result.error || (result.errors && result.errors[0]) || '生成配置失败');
-    return ok({ text: result.text, warnings: result.warnings || [] });
-  });
-
   let bootstrapCancelRequested = false;
 
   ipcMain.handle('server:bootstrap', async (event, payload = {}) => {

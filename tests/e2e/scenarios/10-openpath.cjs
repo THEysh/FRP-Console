@@ -54,6 +54,7 @@ module.exports = {
     check('path404 计数回落', Number(ok.counts.path404) === 0, `path404=${ok.counts.path404}`);
 
     /* DOM：复制按钮带的是带路径的地址。 */
+    await ctx.waitUi('.nav-item[data-view="server"]', '导航渲染完成');
     const dom = await ctx.eval(`(async () => {
       document.querySelector('.nav-item[data-view="proxies"]').click();
       await new Promise((r) => setTimeout(r, 500));

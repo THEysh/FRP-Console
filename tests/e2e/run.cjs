@@ -134,6 +134,14 @@ async function main() {
     waitFor,
     sleep,
     reload: () => cdp.reloadPage(CDP_PORT),
+    /* 等某个选择器出现：单独跑某一个场景时界面可能还没画完，
+     * 直接 querySelector(...).click() 会拿到 null。 */
+    waitUi: (selector, label = '界面元素') =>
+      waitFor(
+        () => cdp.evalIn(CDP_PORT, `!!document.querySelector(${JSON.stringify(selector)})`),
+        (v) => v === true,
+        { timeout: 15000, label },
+      ),
   };
 
   for (const scenario of scenarios) {

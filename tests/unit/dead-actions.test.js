@@ -78,11 +78,9 @@ test('handleAction 的 case 都能被点到（含别名共用的写法）', () =
   let d;
   while ((d = dispatchRe.exec(source))) dispatched.add(d[1]);
 
-  /* 已知的「代码在、入口没了」清单：frps 配置的向导界面（wizardPane + 预览 + 随机
-   * Token/口令 + 模板芯片）在 1.2.49 换成双编辑器之后就没有任何地方渲染了，
-   * 这些分支点不到。留在这里是为了记录问题，不是在为它们背书——等确认
-   * 是「恢复向导 tab」还是「删掉这些代码」之后再从这里移除。 */
-  const KNOWN_UNREACHABLE = new Set(['server.template', 'server.gen.token', 'server.gen.password', 'server.copy.preview', 'server.copy.previewText']);
+  /* 1.2.93 把「配置向导」的渲染层整块删掉了（那些按钮本来就点不到），
+   * 所以这里不再需要豁免清单：任何点不到的分支都应该算失败。 */
+  const KNOWN_UNREACHABLE = new Set();
   const dead = runs
     .filter((run) => !run.some((a) => acts.has(a) || dispatched.has(a) || KNOWN_UNREACHABLE.has(a)))
     .map((run) => run.join('|'));

@@ -9,6 +9,8 @@ module.exports = {
   async run(ctx) {
     const { check } = ctx;
 
+    /* 单独跑这个场景时界面可能还没画完，先确认导航在。 */
+    await ctx.waitUi('.nav-item[data-view="server"]', '导航渲染完成');
     const result = await ctx.eval(`(async () => {
       const views = ['overview', 'proxies', 'discovery', 'certs', 'logs', 'server'];
       const out = [];
@@ -32,7 +34,10 @@ module.exports = {
           return false;
         }).slice(0, 5).map((el) => (el.className || el.tagName).toString().slice(0, 40));
 
+        /* 空状态插画是刻意做成 38px 的大图标（.empty-illustration），
+         * 「超大图标」只针对本该 15px 的行内图标，所以插画要排除。 */
         const bigSvgs = [...root.querySelectorAll('svg')].filter((svg) => {
+          if (svg.closest('.empty-illustration, .empty-state')) return false;
           const r = svg.getBoundingClientRect();
           return r.width > 24 || r.height > 24;
         }).map((svg) => ({ cls: (svg.parentElement && svg.parentElement.className || '').toString().slice(0, 30), w: Math.round(svg.getBoundingClientRect().width) }));
