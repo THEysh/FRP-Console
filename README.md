@@ -479,6 +479,27 @@ node tools/cdp-shot.cjs .proxy-row out.png # 按选择器截单个元素
 
 `FRP_INSTANCE_PORT` 让测试实例用独立单实例锁，`PORTABLE_EXECUTABLE_DIR` 让它把设置写到别处；两者缺一，测试实例会被正在运行的正式实例挡掉，或改到你的真实配置。
 
+### 测试
+
+仓库自带三层可回归的测试，不需要外网、不需要真实服务器：
+
+```bash
+npm test               # L0 语法检查 + L1 单元测试 + 机密扫描，约 4 秒，CI 每次推送都跑
+npm run test:e2e       # L2 端到端：起一个真 Electron、真 frpc、真 frps、假 sshd，跑完 12 个场景
+npm run test:e2e -- --only=tunnel        # 只跑名字含 tunnel 的场景
+npm run test:e2e -- --keep               # 保留现场（数据目录与进程），便于排查
+```
+
+| 层 | 内容 | 依赖 |
+| --- | --- | --- |
+| L0 `tools/check-syntax.cjs` | 对 `src/ tools/ tests/` 逐个 `node --check` | 无 |
+| L1 `tests/unit/*.test.js` | 纯函数单测（配置解析与校验、端口矩阵、SSH 输出解析、DNS 判定、证书域名匹配、设置合并…） | 无 |
+| L2 `tests/e2e` | 冷启动、代理增删改与校验、真隧道三层全通、健康检查如实报错、服务器页、证书页与 DNS 面板、SSH 终端与日志、布局体检、20 条代理不截断、访问路径 404、外部改配置热重载、设置边界值 | 本机 electron；frpc 自动从 `vendor/frpc/` 找；frps 可选（缺了对应场景跳过） |
+
+端到端跑批把数据目录放在仓库内的 `.e2e-tmp/run-*`（已 gitignore），可以用 `E2E_DATA_ROOT` 换个位置——**不要放到 `%TEMP%`**，那会让 Electron 建单实例锁失败（`Error code: 5`）直接退不到界面。跑完要清理时删掉 `.e2e-tmp` 即可。
+
+`tools/` 下另有一批早先的 CDP 脚本（`ui-test.cjs`、`ui-flow.cjs`、`cdp-eval.cjs`）用于临场排查，不属于回归集。
+
 ## 安全说明
 
 - SSH 密码与本机 Token 使用 Windows DPAPI 加密后存在用户数据目录，**不会明文落盘**；解密绑定当前 Windows 账户，拷到别的机器上无效。
