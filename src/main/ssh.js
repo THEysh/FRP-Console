@@ -80,6 +80,63 @@ function parseMissingPaths(text) {
 /* 从 nginx 配置文本里摘掉「body 中出现任一 needle」的 server { … } 块。
  * 只按大括号配对切 server 块，块外的注释和空行原样保留；
  * 块没闭合（配置本身就是坏的）就整段留着不动，交由 nginx -t 判定。 */
+/* ---- nginx 配置合并（1.2.98） ----
+ * 以前 writeNginxProxyConfig 每次都「用这一张证书的域名重新生成整份 frp-console.conf」，
+ * 于是给 A 域名部署证书会把 B 域名的 443 站点整块抹掉：B 的请求随即落到默认站点，
+ * 拿到 A 的证书，浏览器报 ERR_TLS_CERT_ALTNAME_INVALID——看起来像「TLS 被中断/没备案」，
+ * 实际是我们自己把它的 vhost 删了。现在改成「按域名替换，其它块原样保留」。 */
+const NGINX_CONF_HEADER = [
+  '# 由 FRP-Console 生成：nginx 在 80/443 终止 TLS，把 frp 域名的流量反代给 frps 的 HTTP vhost。',
+  '# 修改后请执行 nginx -t && systemctl reload nginx。',
+].join('\n');
+
+/* 扫出所有顶层 server 块的 [start, end) 与其 server_name 列表。 */
+function nginxServerBlockSpans(text) {
+  const src = String(text || '');
+  const spans = [];
+  const re = /(^|\n)[ \t]*server[ \t]*\{/g;
+  let m;
+  while ((m = re.exec(src)) !== null) {
+    const braceAt = src.indexOf('{', m.index + m[0].length - 1);
+    if (braceAt < 0) break;
+    let depth = 0;
+    let i = braceAt;
+    for (; i < src.length; i += 1) {
+      if (src[i] === '{') depth += 1;
+      else if (src[i] === '}') {
+        depth -= 1;
+        if (depth === 0) { i += 1; break; }
+      }
+    }
+    const chunk = src.slice(m.index, i);
+    const names = [];
+    const nameRe = /^[ \t]*server_name[ \t]+([^;]+);/gm;
+    let nm;
+    while ((nm = nameRe.exec(chunk)) !== null) {
+      for (const one of nm[1].trim().split(/\s+/)) if (one) names.push(one.toLowerCase());
+    }
+    spans.push({ start: m.index, end: i, names });
+    re.lastIndex = i;
+  }
+  return spans;
+}
+
+/* 摘掉 server_name 命中 domains 的块，再把新块追加到末尾；其它内容（别的域名、
+ * 手写的 upstream、注释）原样保留。 */
+function mergeNginxConf(existing, { domains = [], blocks = [], header = NGINX_CONF_HEADER } = {}) {
+  const wanted = domains.map((d) => String(d || '').trim().toLowerCase()).filter(Boolean);
+  let body = String(existing || '');
+  const spans = nginxServerBlockSpans(body);
+  for (const span of [...spans].reverse()) {
+    if (span.names.some((n) => wanted.includes(n))) body = body.slice(0, span.start) + body.slice(span.end);
+  }
+  let head = body.replace(/\n{3,}/g, '\n\n').trim();
+  if (!head) head = header;
+  else if (!/# 由 FRP-Console 生成/.test(head)) head = `${header}\n\n${head}`;
+  const tail = blocks.filter(Boolean).join('\n\n');
+  return `${head}\n\n${tail}\n`.replace(/\n{3,}/g, '\n\n');
+}
+
 function removeServerBlocks(text, needles) {
   const list = (needles || []).filter(Boolean);
   const lines = String(text || '').split('\n');
@@ -1918,13 +1975,7 @@ class ServerSession {
         '    }',
       ]
       : [];
-    const conf = [
-      '# 由 FRP-Console 生成：nginx 在 80/443 终止 TLS，把 frp 域名的流量反代给 frps 的 HTTP vhost。',
-      '# 修改后请执行 nginx -t && systemctl reload nginx。',
-      'server {',
-      '    listen 80;',
-      `    server_name ${serverNames};`,
-      ...redirectLines,
+    const proxyLines = [
       '    location / {',
       `        proxy_pass http://127.0.0.1:${frpsHttpPort};`,
       '        proxy_set_header Host $host;',
@@ -1932,31 +1983,30 @@ class ServerSession {
       '        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;',
       '        proxy_set_header X-Forwarded-Proto $scheme;',
       '    }',
-      '}',
-      '',
+    ];
+    const block80 = ['server {', '    listen 80;', `    server_name ${serverNames};`, ...redirectLines, ...proxyLines, '}'].join('\n');
+    const block443 = [
       'server {',
       '    listen 443 ssl;',
       `    server_name ${serverNames};`,
       `    ssl_certificate ${certDir}/fullchain.pem;`,
       `    ssl_certificate_key ${certDir}/key.pem;`,
       ...redirectLines,
-      '    location / {',
-      `        proxy_pass http://127.0.0.1:${frpsHttpPort};`,
-      '        proxy_set_header Host $host;',
-      '        proxy_set_header X-Real-IP $remote_addr;',
-      '        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;',
-      '        proxy_set_header X-Forwarded-Proto $scheme;',
-      '    }',
+      ...proxyLines,
       '}',
-      '',
     ].join('\n');
+    /* 与已有配置合并：只替换「server_name 命中本次域名」的块，别把同一台机器上
+     * 其它域名的 80/443 站点顶掉（1.2.98 之前正是那样，导致别的域名拿到错证书）。 */
+    const current = await this.exec(`cat ${shellQuote(confPath)} 2>/dev/null || true`, 10000);
+    const domains = String(serverNames || '').split(/\s+/).filter(Boolean);
+    const conf = mergeNginxConf(String(current.stdout || ''), { domains, blocks: [block80, block443] });
     const b64 = Buffer.from(conf, 'utf8').toString('base64');
     const tmp = '/tmp/frp-console-nginx.conf';
     await this.exec(`printf %s ${b64} | base64 -d > ${tmp}`, 15000);
     const install = await this.exec(`${prefix}install -m 644 ${tmp} ${shellQuote(confPath)}`, 10000);
     await this.exec(`rm -f ${tmp} 2>/dev/null || true`, 6000);
     if (!install.ok) return { ok: false, error: `写入 nginx 配置失败：${(install.stderr || install.stdout || '权限不足').trim()}` };
-    return { ok: true, confPath, content: conf };
+    return { ok: true, confPath, content: conf, mergedDomains: domains };
   }
 
   /* 配置体检（1.2.72）：nginx -t 能不能过 + 所有 ssl_certificate(_key) 指向的文件还在不在。
@@ -2475,4 +2525,4 @@ function parsePortInput(text) {
   return { ok: true, ranges };
 }
 
-module.exports = { ServerSession, parseServiceUnits, rankServiceUnits, parsePortInput, removeServerBlocks, ufwAllowsPort, parseCertRefs, parseMissingPaths };
+module.exports = { ServerSession, parseServiceUnits, rankServiceUnits, parsePortInput, removeServerBlocks, ufwAllowsPort, parseCertRefs, parseMissingPaths, mergeNginxConf, nginxServerBlockSpans };

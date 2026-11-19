@@ -1983,6 +1983,28 @@ async function checkProxyHealth(p, ctx) {
         error = `探测目标 https://${target.host}/ 在握手阶段收到 ${pub.error}，而服务器上 443 确实没有任何监听（nginx 只配了 80）`;
         hint = '这条隧道本身是好的，缺的是 443 入口：到「HTTPS 证书」页签发或导入一张覆盖该域名的证书并「部署到 nginx」，它会补上 443 段与证书；'
           + '补完再点一次检查。若域名未备案，云厂商还会在 443 上重置握手，那就得先备案或换已备案的域名。';
+      } else if (/altname|not in the cert|CERT_ALTNAME_INVALID|certificate has expired|CERT_HAS_EXPIRED|self[- ]signed|DEPTH_ZERO_SELF_SIGNED/i.test(String(pub.error || ''))) {
+        /* 证书层面失败（1.2.98）：443 握手是通的，但服务端出示的证书没覆盖这个域名。
+         * 最常见的原因是 nginx 上只有「别的域名」的 443 站点——请求落到默认站点，
+         * 拿到的是那个站点的证书，客户端校验 altname 时直接断。
+         * 这类错误以前被归到「TLS 握手被中断」并提示去备案，方向完全错了：
+         * 用户要的是「给这个域名补一个 443 站点/证书」。 */
+        const shown = (String(pub.error || '').match(/DNS:([^"'\s,]+)/g) || [])
+          .map((s) => s.slice(4))
+          .filter(Boolean)
+          .slice(0, 3);
+        const expired = /expired|CERT_HAS_EXPIRED/i.test(String(pub.error || ''));
+        const selfSigned = /self[- ]signed|DEPTH_ZERO_SELF_SIGNED/i.test(String(pub.error || ''));
+        reason = expired ? '证书已过期' : selfSigned ? '证书是自签的（不被信任）' : '证书与域名不匹配';
+        error = `${target.kind === 'http' ? target.url : `https://${target.host}/`} 握手成功，但服务端出示的证书`
+          + (shown.length ? `只覆盖 ${shown.join(' / ')}` : '不覆盖这个域名')
+          + (expired ? '（已过期）' : '')
+          + `：${String(pub.error || '').slice(0, 200)}`;
+        hint = '这是 nginx 上的站点/证书没对上，不是备案也不是隧道：'
+          + '到「HTTPS 证书」页给这个域名签发或导入一张覆盖它的证书，再点「部署到 nginx」——'
+          + '它会在 443 上补一个属于这个域名的 server 块（同一台机器上别的域名不会被顶掉）。'
+          + (shown.length ? `
+现在 443 上返回的是 ${shown.join(' / ')} 的证书，说明请求落到了默认站点。` : '');
       } else {
         reason = '公网 TLS 握手被中断';
         error = `${target.kind === 'http' ? target.url : `https://${target.host}/`} 握手阶段收到 ${pub.error}（端口是通的，连接是被中途重置的）`;
