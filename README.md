@@ -488,6 +488,7 @@ npm test               # L0 语法检查 + L1 单元测试 + 机密扫描，约 
 npm run test:e2e       # L2 端到端：起一个真 Electron、真 frpc、真 frps、假 sshd，跑完 12 个场景
 npm run test:e2e -- --only=tunnel        # 只跑名字含 tunnel 的场景
 npm run test:e2e -- --keep               # 保留现场（数据目录与进程），便于排查
+node tests/soak.cjs 10                  # 长稳抽查：隧道 + 20 条代理跑 10 分钟，看内存/健康检查/日志缓冲趋势
 ```
 
 | 层 | 内容 | 依赖 |
