@@ -126,18 +126,25 @@ function findFrpc(dir) {
   ].filter(Boolean);
 
   let lastError = null;
-  /* 每个地址最多试 5 次（3/6/12/24 秒退避）。CI 上偶发的 502/超时会让整次发版失败，
-   * v1.2.92 与 v1.2.94 都栽在「准备内置 frpc.exe」这一步。 */
   const sha256 = (file) => require('node:crypto').createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+  /* 校验下载结果：大小 + sha256。任何一项不符都当作「这个源不能用」，
+   * 换下一个（也正因为有它，走第三方镜像才是安全的）。 */
+  const verifyZip = () => {
+    const size = fs.statSync(zipPath).size;
+    if (size !== ZIP_SIZE) return { ok: false, error: `大小不对：${size}（应为 ${ZIP_SIZE}）` };
+    const digest = sha256(zipPath);
+    if (digest !== ZIP_SHA256) return { ok: false, error: `sha256 不匹配：${digest}` };
+    return { ok: true };
+  };
+  /* 每个地址最多试 5 次（3/6/9/12 秒退避）。CI 上偶发的 502/超时会让整次发版失败，
+   * v1.2.92 / v1.2.94 / v1.2.95 都栽在「准备内置 frpc.exe」这一步。 */
   outer: for (const url of urls) {
     for (let attempt = 1; attempt <= 5; attempt += 1) {
       try {
         log(`下载 ${url}${attempt > 1 ? `（第 ${attempt} 次尝试）` : ''}`);
         await download(url, zipPath);
-        const size = fs.statSync(zipPath).size;
-        if (size !== ZIP_SIZE) throw new Error(`大小不对：${size}（应为 ${ZIP_SIZE}）`);
-        const digest = sha256(zipPath);
-        if (digest !== ZIP_SHA256) throw new Error(`sha256 不匹配：${digest}`);
+        const verdict = verifyZip();
+        if (!verdict.ok) throw new Error(verdict.error);
         lastError = null;
         break outer;
       } catch (e) {
@@ -150,6 +157,36 @@ function findFrpc(dir) {
         }
         if (attempt < 5) await new Promise((r) => setTimeout(r, Math.min(24, attempt * 3) * 1000));
       }
+    }
+  }
+
+  /* 兜底：node 的 https 在 CI 上失败过很多次，但 runner 上的 curl 走的是另一套
+   * 连接栈和重试逻辑，成功率明显更高。curl 拿到的文件同样要过 sha256。 */
+  if (lastError) {
+    log('node 下载全部失败，改用系统 curl 再试一轮');
+    for (const url of urls) {
+      for (const bin of ['curl.exe', 'curl']) {
+        try {
+          log(`curl 下载 ${url}`);
+          execFileSync(bin, ['-fsSL', '--retry', '3', '--retry-delay', '3', '--max-time', '300', '-o', zipPath, url], {
+            stdio: ['ignore', 'ignore', 'pipe'],
+            timeout: 360000,
+          });
+          const verdict = verifyZip();
+          if (!verdict.ok) throw new Error(verdict.error);
+          lastError = null;
+          break;
+        } catch (e) {
+          lastError = e;
+          log(`curl 失败（${bin}）：${String((e && e.message) || e).slice(0, 200)}`);
+          try {
+            fs.rmSync(zipPath, { force: true });
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+      if (!lastError) break;
     }
   }
   if (lastError) {
