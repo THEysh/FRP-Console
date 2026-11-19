@@ -804,6 +804,8 @@ a { color: var(--accent); text-decoration: none; }
 }
 .note.warn { border-color: rgba(255, 195, 92, .2); background: rgba(255, 195, 92, .07); color: #ffe2ae; }
 .note.error { border-color: rgba(255, 118, 118, .2); background: rgba(255, 118, 118, .07); color: #ffc3c3; }
+/* 比 error 更重的红：安全类提示（面板裸奔等） */
+.note.bad { border-color: rgba(255, 96, 96, .38); background: rgba(255, 96, 96, .12); color: #ffd0d0; }
 .note svg { width: 15px; height: 15px; flex: 0 0 15px; margin-top: 1px; }
 
 /* ---------------- 空状态 ---------------- */

@@ -2346,6 +2346,31 @@ function renderServer(force = false) {
     return { key, label: '未知', sub: info.bootText || '无法判断', cls: 'muted' };
   })();
 
+  /* Dashboard 的暴露面：frp 在面板没密码时压根不校验身份，
+   * 而 addr = 0.0.0.0 就等于把它摆到公网上（能看到 token、改配置、重启 frps）。 */
+  const dashRisk = (() => {
+    if (!summary.webPort) return null;
+    const addr = String(summary.webAddr || '');
+    const exposed = addr === '0.0.0.0' || addr === '::' || addr === '[::]' || addr === '';
+    if (!exposed) return null;
+    const len = String(summary.webPassword || '').length;
+    if (len === 0) {
+      return {
+        cls: 'bad',
+        title: `frps 面板对公网开放，而且没有密码（:${summary.webPort}）`,
+        detail: `webServer.addr 是 ${addr}，frp 在面板没设口令时不校验身份——谁都能打开 :${summary.webPort} 看到 auth.token、改配置并重启 frps。去 frps.toml 的 [webServer] 里加一句 password，或把 addr 改成 127.0.0.1。`,
+      };
+    }
+    if (len < 10) {
+      return {
+        cls: 'warn',
+        title: `frps 面板对公网开放，口令偏短（:${summary.webPort}）`,
+        detail: `webServer.addr 是 ${addr}，当前口令 ${len} 位。公网上的面板建议 16 位以上随机口令；只想自己看的话，把 addr 改成 127.0.0.1，用 SSH 隧道访问更安全。`,
+      };
+    }
+    return null;
+  })();
+
   $('#view').innerHTML = `
     <div class="view server-view">
       <div class="page-head">
@@ -2397,6 +2422,8 @@ function renderServer(force = false) {
         ${metricCard('鉴权 Token', summary.authEnabled ? '已设置' : '未启用', summary.authEnabled ? '客户端需一致' : '不校验 token', !summary.authEnabled ? 'warn' : '')}
         ${metricCard('开机自启', boot.label, boot.sub, boot.cls)}
       </section>
+
+      ${dashRisk ? `<div class="note ${dashRisk.cls}">${icon('alert')}<div><strong>${esc(dashRisk.title)}</strong><br>${esc(dashRisk.detail)}</div></div>` : ''}
 
       <section class="card selftest-card" id="selftest-panel">${selftestMarkup()}</section>
 

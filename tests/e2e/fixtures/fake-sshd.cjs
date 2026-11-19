@@ -112,10 +112,18 @@ const FRPS_TOML = [
   'auth.method = "token"',
   'auth.token = "' + token + '"',
   '',
-  'webServer.addr = "127.0.0.1"',
-  'webServer.port = 7500',
-  'webServer.user = "admin"',
-  'webServer.password = "labpass"',
+  /* 用 FAKE_FRPS_WEB="addr:port:user:password" 造「面板暴露」这类场景 */
+  ...(() => {
+    const raw = process.env.FAKE_FRPS_WEB;
+    if (!raw) return ['webServer.addr = "127.0.0.1"', 'webServer.port = 7500', 'webServer.user = "admin"', 'webServer.password = "labpass"'];
+    const [addr, port, user, ...rest] = raw.split(':');
+    return [
+      `webServer.addr = "${addr}"`,
+      `webServer.port = ${Number(port) || 7500}`,
+      `webServer.user = "${user || 'admin'}"`,
+      `webServer.password = "${rest.join(':')}"`,
+    ];
+  })(),
   '',
 ].join('\n');
 
