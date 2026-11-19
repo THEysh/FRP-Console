@@ -36,6 +36,11 @@ jobs:
       - name: 安装依赖
         run: npm ci --no-audit --no-fund
 
+      # 发版闸门：语法检查 + 单元测试 + 机密检查，任何一项红掉都不继续打包。
+      # 打包出坏包用户装完直接不可用，而带进真实密码会随公开仓库与安装包一起发出去。
+      - name: 静态检查与单元测试
+        run: npm run test
+
       # 安装包要内置 frpc.exe（extraResources 从 vendor/frpc 取）。这里显式下载并校验，
       # 而不是靠 npm script：CI 跑的是 npx electron-builder，不会经过 dist 脚本。
       # 下载失败必须让流水线红掉——否则打出来的包缺 frpc，用户装完直接不可用。

@@ -1,0 +1,40 @@
+name: test
+
+# 每次推 main / 提 PR 都跑一遍「不接触真实机器」的那几层：
+#   L0 静态（node --check 全量）
+#   L1 单元（纯函数：配置解析、端口矩阵、DNS 判定、证书规则、档案合并…）
+#   L0 机密（仓库里不能出现真实密码 / token / 私钥）
+# 目标是让「改坏一个纯函数」「顺手粘了服务器密码」在合并前就红掉，
+# 而不是等打包发版之后由用户发现。真机 / GUI 层见 测试计划-v1.2.91.md 的 L2–L5。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # 单测直接 require 源码模块，需要它们依赖的第三方包（smol-toml / acme-client / ssh2）。
+      - name: 安装依赖
+        run: npm ci --no-audit --no-fund
+
+      - name: 静态检查（node --check）
+        run: npm run lint:syntax
+
+      - name: 单元测试
+        run: npm run test:unit
+
+      - name: 机密泄漏检查
+        run: npm run test:secrets

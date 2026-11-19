@@ -24,6 +24,10 @@
     "windows"
   ],
   "scripts": {
+    "lint:syntax": "node tools/check-syntax.cjs",
+    "test:unit": "node tools/run-unit.cjs",
+    "test:secrets": "node tools/check-secrets.cjs",
+    "test": "npm run lint:syntax && npm run test:unit && npm run test:secrets",
     "start": "node tools/dev.cjs",
     "dev": "node tools/dev.cjs",
     "dev:raw": "electron .",
