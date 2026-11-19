@@ -77,6 +77,15 @@ function rssOfPid(pid) {
       );
     }
 
+    /* 清掉上一轮可能留下的 soak-* 代理（同一个配置文件被反复用时会撞名） */
+    const cleaned = await evalIn(`(async () => {
+      const r = await FRP.refresh();
+      const stale = (r.data.proxies || []).filter((x) => /^soak-/.test(x.name)).map((x) => x.name);
+      for (const name of stale) await FRP.deleteProxy(name);
+      return stale.length;
+    })()`);
+    if (cleaned) console.log('清掉了上一轮的 ' + cleaned + ' 条 soak 代理');
+
     const added = await evalIn(`(async () => {
       for (let i = 1; i <= ${PROXIES}; i++) {
         const res = await FRP.saveProxy('add', '', { name: 'soak-' + i, type: 'tcp', localIP: '127.0.0.1', localPort: ${local.port}, remotePort: ${26100} + i });

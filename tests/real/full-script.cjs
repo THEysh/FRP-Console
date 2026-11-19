@@ -60,7 +60,7 @@ const httpGet = (options, timeout = 8000) =>
       return { ok: r.ok, err: String(r.error || '').slice(0, 120), trust: !!(r.needsTrustHost) };
     })()`);
     connected = conn.ok === true;
-    step('连上广州服务器', connected, conn.err || (conn.trust ? '需要信任指纹' : ''));
+    step(`连上服务器 ${HOST}`, connected, conn.err || (conn.trust ? '需要信任指纹' : ''));
     if (!connected) throw new Error('连不上服务器，后续无法进行');
 
     /* ② 四层自检 */
