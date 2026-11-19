@@ -254,6 +254,22 @@ function ensureDir(dir) {
   }
 }
 
+/* 进程环境里实际存在的代理变量（大小写都算），用于在设置页说明「不继承系统代理」这个开关
+ * 现在到底有没有意义——Windows 的「系统代理」只写注册表，不会设置这些变量，
+ * 所以大多数机器上它本来就不起作用，界面上应该讲明白，而不是让用户对着一个哑开关猜。
+ * 注意：这些变量只影响「应用托管进程」模式下拉起的 frpc。 */
+const PROXY_ENV_NAMES = ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'FTP_PROXY', 'NO_PROXY'];
+function proxyEnvKeys(env = process.env) {
+  const found = [];
+  for (const base of PROXY_ENV_NAMES) {
+    for (const key of [base, base.toLowerCase()]) {
+      const v = env && env[key];
+      if (typeof v === 'string' && v.trim()) found.push(key);
+    }
+  }
+  return found;
+}
+
 module.exports = {
   execFileP,
   powershell,
@@ -267,4 +283,5 @@ module.exports = {
   parseTimestamp,
   logLevelOf,
   ensureDir,
+  proxyEnvKeys,
 };

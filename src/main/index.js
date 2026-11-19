@@ -80,7 +80,7 @@ const { AcmeManager, coversDomain, readCertCoverage } = require('./acme');
 const { CloudflareDns } = require('./dns');
 const dnsCheck = require('./dnscheck');
 const browserProbe = require('./netprobe');
-const { execFileP, powershell, tcpCheck, httpProbe, hashText, randomToken, formatDuration } = require('./util');
+const { execFileP, powershell, tcpCheck, httpProbe, hashText, randomToken, formatDuration, proxyEnvKeys } = require('./util');
 const { probePort, probeUdp, sshConnectHint, outboundHint } = require('./portprobe');
 const { parseRuleSpec, judgePortRow, buildPortMatrix, summarizeMatrix, buildRuleTexts } = require('./portmatrix');
 
@@ -1358,7 +1358,7 @@ function pruneOpenPaths() {
 function buildState() {
   if (!manager) {
     return {
-      app: { version: app.getVersion(), frpcVersion, elevated },
+      app: { version: app.getVersion(), frpcVersion, elevated, proxyEnvKeys: proxyEnvKeys() },
       settings: settingsForState(),
       paths: pathsForState(),
       config: null,
@@ -1412,6 +1412,8 @@ function buildState() {
       elevated,
       platform: process.platform,
       arch: process.arch,
+      /* 设置页用它说明「不继承系统代理」现在有没有意义（Windows 的「系统代理」不写这些变量）。 */
+      proxyEnvKeys: proxyEnvKeys(),
       uptime: runtime.since ? Date.now() - runtime.since : 0,
       uptimeLabel: runtime.since ? formatDuration(Date.now() - runtime.since) : '',
       // 设置页据此提示“关闭窗口会不会真退出”
