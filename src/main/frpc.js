@@ -91,6 +91,11 @@ class FrpcManager extends EventEmitter {
     this.apiError = null;
     this.apiData = null;
     this.stopping = false;
+    /* start() 单飞：界面上的「启动隧道」是普通按钮，慢机器上双击很容易，
+     * 两次 start 都会通过「管理端口还空着」的判断，于是各 spawn 一个 frpc 抢
+     * 同一个 admin 端口，输的那个退出时又把管理器的 child 指针清掉 ——
+     * 隧道明明还活着，界面却显示已停止。用同一个 promise 兜住并发调用。 */
+    this.startPromise = null;
     this.proxyStatus = new Map();
     this.serviceState = { installed: false, state: 'unknown' };
     this.connectedAt = null;
@@ -306,7 +311,15 @@ class FrpcManager extends EventEmitter {
     return this.ctx.ensureAdminConfig();
   }
 
-  async start({ runMode = 'auto' } = {}) {
+  async start(options = {}) {
+    if (this.startPromise) return this.startPromise;
+    this.startPromise = this._start(options).finally(() => {
+      this.startPromise = null;
+    });
+    return this.startPromise;
+  }
+
+  async _start({ runMode = 'auto' } = {}) {
     if (this.apiOk) {
       // 端口被别人的 frpc 占着：既不能接管，也不能假装已经启动成功
       if (this.ownership === 'foreign') {
@@ -337,6 +350,16 @@ class FrpcManager extends EventEmitter {
   }
 
   async stop({ runMode = 'auto' } = {}) {
+    /* 「点了启动马上又点停止」：spawn 可能还在路上，child 尚未赋值。
+     * 先等启动落地再停，否则这里会以“没有子进程”直接返回 ok，
+     * 而几百毫秒后 frpc 才真正起来 —— 用户看到的是「停了又自己活了」。 */
+    if (this.startPromise) {
+      try {
+        await this.startPromise;
+      } catch {
+        /* 启动失败也没关系，下面按当前状态收尾 */
+      }
+    }
     const service = this.serviceState || {};
     if (this.isChildAlive) {
       return this.stopManaged();

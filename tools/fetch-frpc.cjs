@@ -20,6 +20,15 @@ const FRP_VERSION = '0.61.0';
 const ZIP_NAME = `frp_${FRP_VERSION}_windows_amd64.zip`;
 const MIRROR = (process.env.FRP_DOWNLOAD_MIRROR || '').trim();
 const URL_PRIMARY = `https://github.com/fatedier/frp/releases/download/v${FRP_VERSION}/${ZIP_NAME}`;
+/* 固定校验和：锁定我们发布的 frpc.exe 到底来自哪份官方压缩包。
+ * 有了它，走第三方镜像也是安全的（内容不对就换下一个源，绝不落盘），
+ * 同时也能挡住「下载被截断但 HTTP 200」这类更隐蔽的坏包。 */
+const ZIP_SHA256 = 'ab7ae0633df538b35d0490212eabfd6d3a0051e9e446ae0053c9f63921a8c46e';
+const ZIP_SIZE = 12893922;
+/* GitHub 的 release 资产走 objects.githubusercontent.com，偶发 502/超时；
+ * v1.2.92、v1.2.94 两次发版都栽在「准备内置 frpc.exe」这一步。
+ * 因此除了官方地址，再带几个公共镜像 —— 全部按上面的 sha256 校验。 */
+const MIRROR_PREFIXES = ['https://ghfast.top/', 'https://ghproxy.net/', 'https://gh-proxy.com/'];
 
 const root = path.join(__dirname, '..');
 const outDir = path.join(root, 'vendor', 'frpc');
@@ -110,25 +119,38 @@ function findFrpc(dir) {
 
   const work = fs.mkdtempSync(path.join(os.tmpdir(), 'frpc-fetch-'));
   const zipPath = path.join(work, ZIP_NAME);
-  const urls = [URL_PRIMARY, MIRROR ? `${MIRROR.replace(/\/$/, '')}/${URL_PRIMARY}` : ''].filter(Boolean);
+  const urls = [
+    URL_PRIMARY,
+    MIRROR ? `${MIRROR.replace(/\/$/, '')}/${URL_PRIMARY}` : '',
+    ...MIRROR_PREFIXES.map((prefix) => `${prefix}${URL_PRIMARY}`),
+  ].filter(Boolean);
 
   let lastError = null;
-  /* 每个地址重试 3 次（1s/3s 退避）：CI 上偶发的 502/超时会让整次发版失败，
-   * v1.2.92 就因此栽在「准备内置 frpc.exe」这一步，重跑一次就好了。 */
-  for (const url of urls) {
-    for (let attempt = 1; attempt <= 3; attempt += 1) {
+  /* 每个地址最多试 5 次（3/6/12/24 秒退避）。CI 上偶发的 502/超时会让整次发版失败，
+   * v1.2.92 与 v1.2.94 都栽在「准备内置 frpc.exe」这一步。 */
+  const sha256 = (file) => require('node:crypto').createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+  outer: for (const url of urls) {
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
       try {
-        log(`下载 ${url}${attempt > 1 ? `（第 ${attempt} 次重试）` : ''}`);
+        log(`下载 ${url}${attempt > 1 ? `（第 ${attempt} 次尝试）` : ''}`);
         await download(url, zipPath);
+        const size = fs.statSync(zipPath).size;
+        if (size !== ZIP_SIZE) throw new Error(`大小不对：${size}（应为 ${ZIP_SIZE}）`);
+        const digest = sha256(zipPath);
+        if (digest !== ZIP_SHA256) throw new Error(`sha256 不匹配：${digest}`);
         lastError = null;
-        break;
+        break outer;
       } catch (e) {
         lastError = e;
         log(`失败：${e.message}`);
-        if (attempt < 3) await new Promise((r) => setTimeout(r, attempt * 2000));
+        try {
+          fs.rmSync(zipPath, { force: true });
+        } catch {
+          /* 删不掉也不影响下一个源覆盖写 */
+        }
+        if (attempt < 5) await new Promise((r) => setTimeout(r, Math.min(24, attempt * 3) * 1000));
       }
     }
-    if (!lastError) break;
   }
   if (lastError) {
     // 失败时给出可操作的手工放置办法，和 README 的说明一致
@@ -139,6 +161,7 @@ function findFrpc(dir) {
     );
   }
 
+  log(`校验通过（sha256 ${ZIP_SHA256.slice(0, 12)}…，${(ZIP_SIZE / 1024 / 1024).toFixed(1)} MB）`);
   log('解压…');
   const unpacked = path.join(work, 'unpacked');
   extract(zipPath, unpacked);
@@ -147,7 +170,10 @@ function findFrpc(dir) {
 
   fs.mkdirSync(outDir, { recursive: true });
   fs.copyFileSync(found, outFile);
-  log(`完成：${path.relative(root, outFile)}（${(fs.statSync(outFile).size / 1024 / 1024).toFixed(1)} MB）`);
+  /* 解压出来的 exe 也验一遍大小（压缩包对、解出来的文件被截断这种事也发生过）。 */
+  const exeSize = fs.statSync(outFile).size;
+  if (exeSize < 10 * 1024 * 1024) throw new Error(`解压出的 frpc.exe 大小异常：${exeSize} 字节`);
+  log(`完成：${path.relative(root, outFile)}（${(exeSize / 1024 / 1024).toFixed(1)} MB）`);
 
   try {
     fs.rmSync(work, { recursive: true, force: true });

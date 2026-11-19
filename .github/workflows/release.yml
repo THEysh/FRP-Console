@@ -33,6 +33,14 @@ jobs:
           key: eb-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
           restore-keys: eb-${{ runner.os }}-
 
+      # 内置 frpc.exe 每版都一样（0.61.0），缓存下来就没必要每次去 GitHub 下载：
+      # v1.2.92 / v1.2.94 两次发版都是栽在下载这一步的偶发 502 上。
+      - name: 缓存内置 frpc
+        uses: actions/cache@v4
+        with:
+          path: vendor/frpc
+          key: frpc-0.61.0-windows-amd64
+
       - name: 安装依赖
         run: npm ci --no-audit --no-fund
 
@@ -49,12 +57,12 @@ jobs:
         env:
           FRP_DOWNLOAD_MIRROR: ${{ vars.FRP_DOWNLOAD_MIRROR }}
         run: |
-          for ($i = 1; $i -le 3; $i++) {
+          for ($i = 1; $i -le 4; $i++) {
             node tools/fetch-frpc.cjs
             if ($LASTEXITCODE -eq 0 -and (Test-Path vendor/frpc/frpc.exe)) { break }
-            if ($i -lt 3) {
-              Write-Host "::warning::第 $i 次获取 frpc 失败，20 秒后重试"
-              Start-Sleep -Seconds 20
+            if ($i -lt 4) {
+              Write-Host "::warning::第 $i 次获取 frpc 失败，25 秒后重试"
+              Start-Sleep -Seconds 25
             }
           }
           if (-not (Test-Path vendor/frpc/frpc.exe)) { throw "未拿到 vendor/frpc/frpc.exe，安装包会缺少内置 frpc" }
