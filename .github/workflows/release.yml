@@ -57,6 +57,10 @@ jobs:
         env:
           FRP_DOWNLOAD_MIRROR: ${{ vars.FRP_DOWNLOAD_MIRROR }}
         run: |
+          # 先清掉可能由缓存恢复的半截 vendor/frpc：有它挡着，node 脚本可能判定“已就绪”
+          # 或直接在一个坏目录里解压，而报出来的都是「准备内置 frpc.exe 失败」这一句。
+          Remove-Item -Recurse -Force vendor/frpc -ErrorAction SilentlyContinue
+          Write-Host "仓库自带的压缩包：$(Test-Path vendor/frp-src/frp_0.61.0_windows_amd64.zip)"
           for ($i = 1; $i -le 4; $i++) {
             node tools/fetch-frpc.cjs
             if ($LASTEXITCODE -eq 0 -and (Test-Path vendor/frpc/frpc.exe)) { break }
