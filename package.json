@@ -28,7 +28,7 @@
     "test:unit": "node tools/run-unit.cjs",
     "test:secrets": "node tools/check-secrets.cjs",
     "test:e2e": "node tests/e2e/run.cjs",
-  "test": "npm run lint:syntax && npm run test:unit && npm run test:secrets",
+    "test": "npm run lint:syntax && npm run test:unit && npm run test:secrets",
     "start": "node tools/dev.cjs",
     "dev": "node tools/dev.cjs",
     "dev:raw": "electron .",
@@ -36,7 +36,8 @@
     "dist:portable": "node tools/fetch-frpc.cjs && electron-builder --win portable --x64 && node tools/after-build.cjs",
     "dist:dir": "node tools/fetch-frpc.cjs && electron-builder --win dir --x64 && node tools/after-build.cjs",
     "fetch:frpc": "node tools/fetch-frpc.cjs",
-    "tray-icons": "node tools/make-tray-icons.cjs"
+    "tray-icons": "node tools/make-tray-icons.cjs",
+    "test:real": "node tests/real/full-script.cjs"
   },
   "dependencies": {
     "@xterm/addon-fit": "^0.11.0",
