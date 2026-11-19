@@ -3972,7 +3972,11 @@ function registerIpc() {
       if (unitActive === 'active' || pid || dockerUp) {
         const where = unitActive === 'active' ? `${unit}.service 正在运行` : dockerUp ? `容器 ${dockerParts[0]} 正在运行` : `frps 进程运行中（PID ${pid || '—'}）`;
         const boot = unitEnabled === 'enabled' ? '，已设为开机自启' : '';
-        return ok({ layer, ok: true, ms: Date.now() - startedAt, detail: `${where}${boot}` });
+        /* 进程在跑不等于装好了：二进制被移走时它还能撑到下次重启。 */
+        const info = serverSession.info || {};
+        const gone = info.binaryExists === false;
+        const warn = gone ? `；但可执行文件 ${info.installedPath || 'frps'} 已不存在，重启 frps 或重启机器后会起不来` : '';
+        return ok({ layer, ok: true, warn: gone, ms: Date.now() - startedAt, detail: `${where}${boot}${warn}` });
       }
       return ok({
         layer,

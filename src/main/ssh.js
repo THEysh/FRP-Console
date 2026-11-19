@@ -570,6 +570,14 @@ class ServerSession {
     const installedPath = lines('BIN')[0] || binaryPath || '';
     const arch = normalizeArch(text('ARCH'));
 
+    /* 文件在不在：只有绝对路径才值得多跑一趟 test -x。
+     * 二进制被移走（升级半途、手工清理）时进程往往还在跑，光看 unit 会误判成"装好了"。 */
+    let binaryExists = null;
+    if (/^\//.test(installedPath)) {
+      const chk = await this.exec(`test -x ${shellQuote(installedPath)} && echo yes || echo no`, 8000);
+      binaryExists = firstLine(chk.stdout) === 'yes';
+    }
+
     let version = '';
     let versionSource = '';
     const direct = await this.exec('(command -v frps >/dev/null 2>&1 && frps -v 2>/dev/null) || true', 8000);
@@ -660,7 +668,8 @@ class ServerSession {
       versionSource,
       arch,
       installedPath,
-      frpsInstalled: !!(installedPath || (docker && docker.name)),
+      binaryExists,
+      frpsInstalled: !!((installedPath && binaryExists !== false) || (docker && docker.name)),
       listeners: lines('LISTEN').join('\n'),
       ports: lines('LISTEN').filter((line) => /frps|:7000|:4096/.test(line)).slice(0, 8).join('\n'),
       configPath,
