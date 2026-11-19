@@ -373,6 +373,14 @@ function setView(view, { force = false } = {}) {
   /* 一进服务器页就跟主进程对一次连接状态：慢一点也没关系，
    * 但别让用户对着“未连接”的表单干等（自动连接被竞态吞掉时就是这样）。 */
   if (view === 'server') syncServerSession().catch(() => {});
+  /* 进页面就把服务器侧的三份状态拉齐。以前 nginx / 防火墙 / 体检只在
+   * 「连接表单点连接」这一条路径上加载，从托盘、自动连接、脚本进来的会话
+   * 会看到「检测中…」「端口与连通（未知）」——数据就在服务器上，界面却说自己不知道。 */
+  if (view === 'server' && S.server.connected) {
+    if (!S.server.nginxReady) loadServerNginx(true).catch(() => {});
+    if (!S.server.firewallReady) loadServerFirewall(true).catch(() => {});
+    if (!S.server.nginxHealth) loadServerNginxHealth({ force: false }).catch(() => {});
+  }
   const main = $('#view');
   if (main) {
     main.scrollTop = S.viewScroll[view] || 0;
@@ -1272,6 +1280,7 @@ async function syncServerSession() {
   const res = await FRP.serverState().catch(() => null);
   if (!res || !res.ok || !res.data) return;
   const d = res.data;
+  refreshServerInfo().catch(() => {});
   const epochChanged = d.epoch !== undefined && Number(d.epoch) !== Number(S.server.epoch || 0);
   const connChanged = !!d.connected !== !!S.server.connected;
   const ownerChanged = !!d.connected && (d.sessionServerId || '') !== (S.server.sessionServerId || '');
@@ -1287,11 +1296,41 @@ async function syncServerSession() {
   }
 }
 
+/* 服务器信息（hostname / OS / frps 状态与版本）以前只在「连上那一刻」抓过一次，
+ * 之后 frps 被停掉、被升级、frps.toml 被手改，卡片都还拿旧快照说话——真机故障注入时
+ * 出现过「自检写 frps 没有运行、运行状态卡还绿着 running」。这里按 30 秒节流重新抓。 */
+async function refreshServerInfo(force = false) {
+  if (!S.server.connected || S.server.rechecking) return;
+  const now = Date.now();
+  if (!force && now - (S.server.infoAt || 0) < 30000) return;
+  S.server.rechecking = true;
+  try {
+    const res = await FRP.serverRecheck();
+    if (!res || !res.ok || !res.data) return;
+    const next = res.data.info || null;
+    if (!next) return;
+    const prev = S.server.info || {};
+    S.server.infoAt = Date.now();
+    S.server.info = next;
+    /* 只有「状态 / 版本 / 服务名」真的变了才整块重绘，避免把用户正在编辑的 textarea 打断。 */
+    const changed = prev.status !== next.status || prev.version !== next.version || prev.serviceName !== next.serviceName;
+    if (changed && S.view === 'server') renderServer(true);
+  } finally {
+    S.server.rechecking = false;
+  }
+}
+
 async function loadServerNginx(silent = false) {
   if (!S.server.connected) return;
   if (!silent) S.server.nginx = { ...(S.server.nginx || {}), loading: true };
   if (S.view === 'server') renderServer(true);
-  const res = await FRP.serverNginxState();
+  let res = null;
+  try {
+    res = await FRP.serverNginxState();
+  } catch (e) {
+    res = { ok: false, error: '读取 nginx 状态失败：' + String((e && e.message) || e) };
+  }
+  S.server.nginxReady = true;
   if (res && res.ok) {
     S.server.nginx = { ...(S.server.nginx || {}), ...res.data, loading: false };
   } else {
@@ -1323,6 +1362,7 @@ async function loadServerFirewall(silent = false) {
   if (!silent) S.server.firewall = { ...(S.server.firewall || {}), loading: true };
   if (S.view === 'server') renderServer(true);
   const res = await FRP.serverFirewallState();
+  S.server.firewallReady = true;
   if (res && res.ok) {
     S.server.firewall = { ...(S.server.firewall || {}), ...res.data, loading: false };
   } else {
@@ -1673,7 +1713,7 @@ function nginxCardMarkup() {
   /* 状态还没拉回来时不能断言「未安装」——以前 `!n` 对空对象恒为假，
    * 结果卡片直接落到 installed=false 分支，写着「服务器还没装 nginx」，
    * 用户看到的第一眼就是假结论（连接成功的头几百毫秒就是这样）。 */
-  if (!S.server.nginx || n.loading) {
+  if (!S.server.nginx) {
     return `<section class="card"><div class="card-head"><div class="ch-icon">${icon('globe')}</div><div class="grow"><h3>HTTPS 域名反代（nginx）</h3><p>检测服务器 nginx，让域名走 80/443、不用带端口。</p></div></div><div class="field-hint" style="padding:0 16px 12px">检测中…</div></section>`;
   }
   if (n.error) {
@@ -1689,6 +1729,10 @@ function nginxCardMarkup() {
   const certsList = Array.isArray(n.certs) ? n.certs : (n.certs ? [n.certs] : []);
   const hasTls = certsList.length > 0;
   const httpsListening = !n.port443Free;
+  /* 体检结论（nginx -t / 悬空证书引用）优先于「就绪」判据：配置都过不了 nginx -t，
+   * 头上还挂绿「就绪」，就等于跟下面的红字自相矛盾（真机故障注入复现）。 */
+  const healthState = S.server.nginxHealth || null;
+  const healthIssue = !!(healthState && (healthState.testOk === false || Number(healthState.missingCount || 0) > 0));
   let statusBadge;
   let detail;
   let setupLabel;
@@ -1716,6 +1760,12 @@ function nginxCardMarkup() {
     detail = '服务器还没装 nginx。一键配置会自动安装并写好反代规则。';
     setupLabel = '安装 nginx 并配置';
   }
+  if (healthIssue && installed && !conflict) {
+    statusBadge = '<span class="badge red"><span class="bdot"></span>' + (n.version ? esc(n.version) : 'nginx') + ' · 配置异常</span>';
+    detail = healthState.testOk === false
+      ? 'nginx 当前这份配置过不了 nginx -t：现在还能访问是因为旧进程还在跑，一旦 reload 或重启就会整站起不来。'
+      : '配置里有引用不存在的证书文件，reload / 重启 nginx 会失败。详见下方配置体检。';
+  }
   const certMissing = n.certMissing;
   /* 1.2.60 起 detectNginx 会带回 serverNames（数组）与 certs：把「这台服务器的
    * frp-console.conf 里到底配了哪些域名」直接摊开，用户一眼能看出自己的域名
@@ -1724,7 +1774,9 @@ function nginxCardMarkup() {
   const certsText = certsList.join('、');
   /* `n.ok` 服务端从来没给过（nginx:state 只回 detectNginx 的字段），
    * 所以「反代已就绪」这条提示一直是死代码。改成按「配置在 + 有证书」自己算。 */
-  const ready = !!(n.proxyConfigured && hasTls);
+  /* 体检结论优先：nginx -t 失败或引用了不存在的证书时，卡片头不能再挂绿「就绪」——
+   * 那会和下方的红字直接打架（真机复现：上头「1.22.1 · 就绪」，下头「nginx -t 失败…」。 */
+  const ready = !!(n.proxyConfigured && hasTls) && !healthIssue;
   const configuredNote = (n.proxyConfigured && namesText && !ready)
     ? `<div class="note" style="margin:0 16px 12px">${icon('globe')}<div><strong>nginx 已配置的域名</strong><br>${esc(namesText)}${certsText ? `<br><span class="field-hint mono">${esc(certsText)}</span>` : ''}<br>你的域名不在这个列表里时，https 访问会落到默认站点（证书不匹配、浏览器会告警）。</div></div>`
     : '';
@@ -1763,7 +1815,7 @@ function fwSpecRange(spec) {
 function firewallCardMarkup() {
   const f = S.server.firewall || {};
   const title = '端口与连通';
-  if (!f || f.loading) {
+  if (!f) {
     return `<section class="card"><div class="card-head"><div class="ch-icon">${icon('shield')}</div><div class="grow"><h3>${title}</h3><p>检测每个端口的「监听 / 规则 / 实测」，定位到底拦在哪一层。</p></div></div><div class="field-hint" style="padding:0 16px 12px">检测中…</div></section>`;
   }
   if (f.error) {
@@ -2382,6 +2434,22 @@ function renderServer(force = false) {
     s.logsLoading = true;
     loadServerLogs().catch(() => {}).finally(() => { s.logsLoading = false; });
   }
+  /* nginx / 防火墙 / 配置体检：从 IPC 连上服务器时（自动连接、恢复会话、脚本）不会走
+   * connectServer 分支，这三份状态就没人拉，卡片永久停在「检测中…」/「（未知）」。
+   * 渲染时发现是空的就补拉一次，用单独的 in-flight 标记防止重入。 */
+  if (s.connected) {
+    if (!s.nginxReady && !s.nginxLoading) {
+      s.nginxLoading = true;
+      loadServerNginx(true).catch(() => {}).finally(() => { s.nginxLoading = false; });
+    }
+    if (!s.firewallReady && !s.firewallLoading) {
+      s.firewallLoading = true;
+      loadServerFirewall(true).catch(() => {}).finally(() => { s.firewallLoading = false; });
+    }
+    if (!s.nginxHealth && !s.nginxHealthBusy) {
+      loadServerNginxHealth({ force: false }).catch(() => {});
+    }
+  }
 }
 
 function bootstrapCardMarkup(info, s) {
@@ -2801,10 +2869,12 @@ async function autoConnectActiveProfile() {
     S.server.logsError = '';
     applyServerState(res.data, seq);
     S.server.nginx = null;      // 旧服务器的 nginx 状态不残留，连接后重新检测
+    S.server.nginxReady = false;
     S.server.selftest = null;   // 旧服务器的就绪检查结果不残留
     S.server.nginxHealth = null; // 体检结果同理（1.2.73）
     S.server.confView = null;
     S.server.firewall = null;   // 旧服务器的防火墙状态不残留
+    S.server.firewallReady = false;
     S.certs.server = { loaded: false, loading: false, certs: [], host: '', scannedAt: 0, truncated: false, error: '' }; // 换服务器后证书列表要重扫
   } catch (e) {
     toast('error', '自动连接失败', String((e && e.message) || e));
@@ -3238,10 +3308,12 @@ async function connectServer(btn, options = undefined) {
     S.server.logs = '';
     applyServerState(res.data, seq);
     S.server.nginx = null;      // 旧服务器的 nginx 状态不残留，连接后重新检测
+    S.server.nginxReady = false;
     S.server.selftest = null;   // 旧服务器的就绪检查结果不残留
     S.server.nginxHealth = null; // 体检结果同理（1.2.73）
     S.server.confView = null;
     S.server.firewall = null;   // 旧服务器的防火墙状态不残留
+    S.server.firewallReady = false;
     S.certs.server = { loaded: false, loading: false, certs: [], host: '', scannedAt: 0, truncated: false, error: '' }; // 换服务器后证书列表要重扫
     renderServer(true);
     openShellTerm().catch(() => {});   // SSH 终端默认打开
@@ -3526,6 +3598,7 @@ async function runServerSelfTest() {
   }
   S.server.selftest.busy = false;
   S.server.selftest.conclusion = failure || SELFTEST_OK;
+  refreshServerInfo(true).catch(() => {});
   renderSelfTest();
   if (failure) {
     toast('error', '服务器还没准备好', failure);
@@ -6415,6 +6488,11 @@ async function boot() {
       if (S.server.syncTick % 3 === 0) syncServerSession().catch(() => {});
     });
 
+    /* 主进程连上/断开 SSH 后主动推一条：走 IPC、自动连接、托盘进来的会话，
+     * 不用等「会话同步」节拍（最多 9 秒）也不会停在连接表单上。 */
+    FRP.on('server:session-changed', () => {
+      loadServerState().catch(() => {});
+    });
     FRP.on('server:binding-changed', () => {
       if (S.server.loaded) loadServerState().catch(() => {});
     });
@@ -6471,3 +6549,4 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 })();
+

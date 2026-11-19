@@ -2973,6 +2973,19 @@ function registerIpc() {
 
   ipcMain.handle('server:state', async () => ok(serverState()));
 
+  /* 重新抓一次服务器信息（hostname / OS / frps 状态与版本 / 配置路径）。
+   * 服务器是会被手动折腾的：停服务、升级二进制、直接改 frps.toml。界面上的
+   * 「运行状态」如果一直用连接瞬间的快照，就会出现「自检说 frps 没有运行、
+   * 卡片头还写着 running」这种自相矛盾（真机故障注入发现）。 */
+  ipcMain.handle('server:recheck', async () => {
+    if (!serverSession.connected) return fail('尚未连接服务器');
+    const epoch = sessionEpoch;
+    const inspected = await serverSession.inspect();
+    if (epoch !== sessionEpoch) return staleFail();
+    if (!inspected.ok) return fail(inspected.error || '读取服务器信息失败');
+    return ok({ info: serverSession.info || null, epoch: sessionEpoch, configPath: inspected.configPath || '' });
+  });
+
   /* 手动「整理重复档案」：与启动时的自动迁移同一套逻辑，幂等，随时可按。 */
   ipcMain.handle('server:profiles-dedupe', async () => {
     const result = dedupeServerProfiles();
@@ -3291,6 +3304,7 @@ function registerIpc() {
       serverConfig = { path: '', content: '', summary: null, error: '' };
       return fail('连接期间服务器档案已变更，本次连接已取消', { stale: true, state: serverState() });
     }
+    send('server:session-changed', { connected: true, host: serverSession.host || host });
     return ok({
       ...serverState(),
       adoptProfile: changed && payload.adoptProfile === true,
@@ -3303,6 +3317,7 @@ function registerIpc() {
     sessionServerId = '';
     serverConfig = { path: '', content: '', summary: null, error: '' };
     bumpSessionEpoch();
+    send('server:session-changed', { connected: false });
     return ok(serverState());
   });
 

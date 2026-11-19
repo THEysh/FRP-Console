@@ -80,6 +80,7 @@ contextBridge.exposeInMainWorld('FRP', {
   dnsDelRecord: (payload) => invoke('dns:del-record', payload),
   dnsVerify: (payload) => invoke('dns:verify', payload),
   serverState: () => invoke('server:state'),
+  serverRecheck: () => invoke('server:recheck'),
   serverSelect: (id) => invoke('server:select', { id }),
   serverProfileSave: (payload) => invoke('server:profile-save', payload),
   serverProfileDelete: (id, force) => invoke('server:profile-delete', { id, force }),
