@@ -5280,10 +5280,13 @@ async function handleAction(act, dataset, btn) {
         await FRP.copy(S.server.previewText || '');
         toast('success', '已复制配置预览');
         break;
-      case 'server.copy.path':
-        await FRP.copy(S.server.configPath || '');
-        toast('success', '已复制配置路径', S.server.configPath || '');
+      case 'server.template': {
+        /* 初始化向导的模板芯片：套用一组默认值（基础/带鉴权/带面板/HTTPS）。
+         * 之前只有 chip 的样式切换、没有处理分支，点下去表单毫无反应。 */
+        const tpl = dataset.template || 'custom';
+        applyServerTemplate(tpl);
         break;
+      }
       case 'server.openlogs':
       case 'goto.logs.server': {
         S.logSource = 'server';
