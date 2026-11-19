@@ -4378,8 +4378,6 @@ function renderSettings(force = false) {
                 ${app.launchAtLoginBlocked ? `<div class="note warn" style="margin:2px 0 10px">${icon('alert')}<div>启动项已被系统「任务管理器 → 启动」禁用，重启后不会运行。要恢复请到那里把「FRP 控制台」设为「已启用」；或者换个办法：把快捷方式放进 <code>shell:startup</code>。</div></div>` : ''}
                 ${settings.launchAtLogin && settings.runMode === 'managed' ? `<div class="note warn" style="margin:2px 0 10px">${icon('alert')}<div>当前是「应用托管进程」模式：开机只会自动打开控制台，隧道要等控制台把 frpc 拉起来才算通；控制台一退隧道就断。</div></div>` : ''}
                 ${switchRow('以最小化状态启动', '仅显示托盘图标', 'startMinimized', !!settings.startMinimized)}
-                ${switchRow('不继承系统代理', '启动 frpc 时摘掉 HTTP_PROXY / HTTPS_PROXY / ALL_PROXY 等变量。代理软件把这些变量设进环境后，frpc 会把到 frps 的 TCP 握手交给 HTTP 代理，常见现象是被网关挡回 502，看着像“连不上服务器”。只对「应用托管进程」模式下拉起的 frpc 生效；Windows 的「系统代理」开关只写注册表、不设这些变量，所以那种代理本来就不影响 frpc。', 'stripProxyEnv', settings.stripProxyEnv !== false)}
-                ${proxyEnvHint(settings)}
               </div>
             </div>
           </form>
@@ -4420,47 +4418,6 @@ function switchRow(label, desc, field, on) {
     <div class="sr-text"><strong>${esc(label)}</strong><span>${esc(desc)}</span></div>
     <button class="switch ${on ? 'on' : ''}" type="button" data-act="toggle" data-field="${esc(field)}" aria-pressed="${on}"></button>
   </div>`;
-}
-
-/* 「不继承系统代理」现在的实际状态：把进程环境里有没有这些变量直接写出来，
- * 免得用户对着一个哑开关猜——Windows 的「系统代理」根本不写这些变量。
- * 注意行为开关是「改了要点保存」的表单控件（case 'toggle' 只翻转外观），
- * 所以这里读**开关当前状态**，并在还没保存时明确说出来。 */
-function proxyEnvKeysNow() {
-  return (S.state && S.state.app && Array.isArray(S.state.app.proxyEnvKeys)) ? S.state.app.proxyEnvKeys : [];
-}
-
-function proxyEnvHintHtml() {
-  const keys = proxyEnvKeysNow();
-  const btn = document.querySelector('.switch[data-field="stripProxyEnv"]');
-  const strip = btn ? btn.classList.contains('on') : ((S.state && S.state.settings && S.state.settings.stripProxyEnv) !== false);
-  const saved = (S.state && S.state.settings && S.state.settings.stripProxyEnv) !== false;
-  const dirty = strip !== saved ? '（改完点「保存行为设置」生效）' : '';
-  if (!keys.length) {
-    return '<div class="field-hint" data-proxy-hint>当前进程环境里没有 HTTP_PROXY 等变量：这个开关在你的机器上暂时不起作用，保持默认（开启）即可。</div>';
-  }
-  const list = keys.slice(0, 3).join('、');
-  if (strip) {
-    return `<div class="field-hint ok" data-proxy-hint>检测到 ${esc(list)}：启动 frpc 时会摘掉，隧道走直连。${dirty}</div>`;
-  }
-  return `<div class="field-hint warn" data-proxy-hint>检测到 ${esc(list)}，但开关是关的：frpc 会继承它，隧道可能连不上（502/连接被拒）。${dirty}</div>`;
-}
-
-function proxyEnvHint() {
-  return proxyEnvHintHtml();
-}
-
-/* 就地换掉那条提示（开关刚被点击时用，不重绘整个设置页） */
-function refreshProxyEnvHint() {
-  const el = document.querySelector('[data-proxy-hint]');
-  if (!el) return;
-  const tmp = document.createElement('div');
-  tmp.innerHTML = proxyEnvHintHtml();
-  const next = tmp.firstElementChild;
-  if (next) {
-    el.className = next.className;
-    el.innerHTML = next.innerHTML;
-  }
 }
 
 function isOn(field) {
@@ -5135,9 +5092,6 @@ async function handleAction(act, dataset, btn) {
       case 'toggle': {
         const target = btn.classList.toggle('on');
         btn.setAttribute('aria-pressed', String(target));
-        /* 行为开关要按「保存行为设置」才落盘，所以提示得跟着开关的即时状态走，
-         * 否则用户刚点完看到的还是保存前那句话。 */
-        refreshProxyEnvHint();
         break;
       }
       case 'proxyform.suggest': {
@@ -6255,7 +6209,6 @@ async function saveBehavior(btn) {
     launchTunnelOnStart: isOn('launchTunnelOnStart'),
     launchAtLogin: isOn('launchAtLogin'),
     startMinimized: isOn('startMinimized'),
-    stripProxyEnv: isOn('stripProxyEnv'),
   };
   await withBusy(btn, async () => {
     const level = form.querySelector('[name="logLevel"]').value;
@@ -6268,8 +6221,6 @@ async function saveBehavior(btn) {
       return;
     }
     if (res.data && res.data.state) S.state = res.data.state;
-    /* 状态更新后立刻重算「不继承系统代理」那条提示：否则它还挂着「改完点保存生效」。 */
-    refreshProxyEnvHint();
     /* 日志级别 / loginFailExit 落在 frpc.toml 里，同一个按钮一起写掉，
      * 免得用户改完日志级别还要再找一次“保存配置在哪”。 */
     const cfg = await saveClientLogOptions(level, loginFailExit);

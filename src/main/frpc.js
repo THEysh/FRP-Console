@@ -16,8 +16,15 @@ const PROXY_ENV_KEYS = [
   'http_proxy', 'https_proxy', 'all_proxy', 'ftp_proxy', 'no_proxy',
 ];
 
+/* 默认永远摘掉。理由：Windows 的「系统代理」只写注册表、不会设置这些变量，
+ * 所以摘掉它并不会影响那种代理；而一旦环境里真有变量，frpc 就会把到 frps 的
+ * TCP 握手交给 HTTP 代理，绝大多数代理只转发 HTTP(S)，直接被挡回 502，
+ * 表现成「连不上服务器但端口和 Token 都正常」——这是最难查的一类故障。
+ * 需要让 frpc 走代理的场景（比如 frps 只能经代理访问）留两个逃生口：
+ * 环境变量 FRP_CONSOLE_KEEP_PROXY=1，或配置项 stripProxyEnv:false。 */
 function childEnv(settings) {
-  const inherit = !settings || settings.stripProxyEnv === false;
+  const override = String(process.env.FRP_CONSOLE_KEEP_PROXY || '').trim() === '1';
+  const inherit = override || (settings && settings.stripProxyEnv === false);
   if (inherit) return process.env;
   const env = { ...process.env };
   for (const key of PROXY_ENV_KEYS) delete env[key];

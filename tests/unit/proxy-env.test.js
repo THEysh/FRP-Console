@@ -28,32 +28,55 @@ test('同名的两个大小写只报存在的那几个', () => {
   assert.deepEqual(proxyEnvKeys({ HTTP_PROXY: 'a', http_proxy: 'b' }).sort(), ['HTTP_PROXY', 'http_proxy']);
 });
 
-test('childEnv：默认（stripProxyEnv 未设/为真）摘掉代理变量，且不动别的变量', () => {
-  const saved = { ...process.env };
-  process.env.HTTP_PROXY = 'http://127.0.0.1:10808';
-  process.env.ALL_PROXY = 'socks5://127.0.0.1:1080';
-  process.env.FRP_TEST_KEEP = 'keep-me';
+/* 1.2.100 起：不再让用户选，默认永远摘掉 —— Windows 的「系统代理」只写注册表、
+ * 不设 HTTP_PROXY，所以摘掉它不影响那种代理；而环境里一旦真有变量，frpc 会把到 frps
+ * 的 TCP 握手交给 HTTP 代理，被挡回 502，表现成「连不上服务器」。
+ * 逃生口两个：配置项 stripProxyEnv:false，或环境变量 FRP_CONSOLE_KEEP_PROXY=1。 */
+function withEnv(vars, fn) {
+  const saved = {};
+  for (const k of Object.keys(vars)) {
+    saved[k] = process.env[k];
+    if (vars[k] === undefined) delete process.env[k];
+    else process.env[k] = vars[k];
+  }
   try {
-    const env = childEnv({});
-    assert.equal(env.HTTP_PROXY, undefined);
-    assert.equal(env.ALL_PROXY, undefined);
-    assert.equal(env.FRP_TEST_KEEP, 'keep-me');
+    return fn();
+  } finally {
+    for (const k of Object.keys(saved)) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+  }
+}
+
+test('childEnv：默认就摘掉代理变量（settings 缺失也一样），且不动别的变量', () => {
+  withEnv({ HTTP_PROXY: 'http://127.0.0.1:10808', ALL_PROXY: 'socks5://127.0.0.1:1080', FRP_TEST_KEEP: 'keep-me', FRP_CONSOLE_KEEP_PROXY: undefined }, () => {
+    for (const settings of [undefined, {}, { stripProxyEnv: true }]) {
+      const env = childEnv(settings);
+      assert.equal(env.HTTP_PROXY, undefined, '应摘掉 HTTP_PROXY');
+      assert.equal(env.ALL_PROXY, undefined, '应摘掉 ALL_PROXY');
+      assert.equal(env.FRP_TEST_KEEP, 'keep-me', '别的变量要原样保留');
+    }
     /* 不能改到 process.env 本身，否则同进程里别的子进程也被牵连 */
     assert.equal(process.env.HTTP_PROXY, 'http://127.0.0.1:10808');
-  } finally {
-    delete process.env.HTTP_PROXY;
-    delete process.env.ALL_PROXY;
-    delete process.env.FRP_TEST_KEEP;
-    for (const k of Object.keys(saved)) if (!(k in process.env)) process.env[k] = saved[k];
-  }
+  });
 });
 
-test('childEnv：显式关掉开关时原样继承（用户就想让 frpc 走代理）', () => {
-  process.env.HTTPS_PROXY = 'http://127.0.0.1:10808';
-  try {
-    const env = childEnv({ stripProxyEnv: false });
-    assert.equal(env.HTTPS_PROXY, 'http://127.0.0.1:10808');
-  } finally {
-    delete process.env.HTTPS_PROXY;
-  }
+test('childEnv：老配置显式写了 stripProxyEnv:false 时继续尊重（升级不突变）', () => {
+  withEnv({ HTTPS_PROXY: 'http://127.0.0.1:10808', FRP_CONSOLE_KEEP_PROXY: undefined }, () => {
+    assert.equal(childEnv({ stripProxyEnv: false }).HTTPS_PROXY, 'http://127.0.0.1:10808');
+  });
+});
+
+test('childEnv：环境变量 FRP_CONSOLE_KEEP_PROXY=1 是逃生口（frps 只能经代理访问时用）', () => {
+  withEnv({ HTTPS_PROXY: 'http://127.0.0.1:10808', FRP_CONSOLE_KEEP_PROXY: '1' }, () => {
+    assert.equal(childEnv({ stripProxyEnv: true }).HTTPS_PROXY, 'http://127.0.0.1:10808');
+    assert.equal(childEnv({}).HTTPS_PROXY, 'http://127.0.0.1:10808');
+  });
+});
+
+test('childEnv：逃生口只认 "1"，别的值仍然照常摘掉', () => {
+  withEnv({ HTTPS_PROXY: 'http://127.0.0.1:10808', FRP_CONSOLE_KEEP_PROXY: 'true' }, () => {
+    assert.equal(childEnv({}).HTTPS_PROXY, undefined);
+  });
 });
