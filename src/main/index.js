@@ -2655,7 +2655,11 @@ function registerIpc() {
         if (!openPath) {
           return {
             ok: false,
-            error: `访问路径「${rawOpenPath}」不合法：只填路径部分，不能包含空格、引号、分号、换行等字符（例如 /panel/）`,
+            error:
+              `访问路径「${rawOpenPath}」不合法。规则：只填路径部分（以 / 开头），` +
+              '只用 URL 安全字符（字母 数字 - . _ ~ / % ! $ & \' ( ) * + , = : @ ?）；' +
+              '不能有空格、引号、分号、反斜杠、换行，也不能出现 ..；' +
+              '中文请用百分号编码（「/中文/」写成 /%E4%B8%AD%E6%96%87/，例如 /panel/）',
             validation,
           };
         }
