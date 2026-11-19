@@ -33,6 +33,14 @@ const MIRROR_PREFIXES = ['https://ghfast.top/', 'https://ghproxy.net/', 'https:/
 const root = path.join(__dirname, '..');
 const outDir = path.join(root, 'vendor', 'frpc');
 const outFile = path.join(outDir, 'frpc.exe');
+/* 仓库里自带一份官方压缩包（12.3 MB），打包时优先用它。
+ *
+ * 为什么不只靠下载：1.2.92 / 1.2.94 / 1.2.95 / 1.2.96 四次发版都卡在
+ * 「准备内置 frpc.exe」这一步 —— GitHub 的 release 资产下载在 CI 上反复 502/超时，
+ * 重试、镜像、curl 兜底都没能稳定解决。发版不该依赖对端的可用性，
+ * 而 12 MB 的一次性体积换「永不失败」是划算的（安装包本身 88 MB）。
+ * 没有这份 zip 时才走网络下载（下面那段保留着，仍带 sha256 校验）。 */
+const BUNDLED_ZIP = path.join(root, 'vendor', 'frp-src', ZIP_NAME);
 const force = process.argv.includes('--force');
 
 function exists(file) {
@@ -111,6 +119,28 @@ function findFrpc(dir) {
   return '';
 }
 
+/* 解压 + 安装到 vendor/frpc/frpc.exe。两条来源（仓库自带 zip / 网络下载）都走这里，
+ * 保证「压缩包对、解出来的文件被截断」这类问题只在一处处理。 */
+function unpackAndInstall(work, zipPath) {
+  log('解压…');
+  const unpacked = path.join(work, 'unpacked');
+  extract(zipPath, unpacked);
+  const found = findFrpc(unpacked);
+  if (!found) throw new Error(`压缩包里没找到 frpc.exe：${unpacked}`);
+
+  fs.mkdirSync(outDir, { recursive: true });
+  fs.copyFileSync(found, outFile);
+  const exeSize = fs.statSync(outFile).size;
+  if (exeSize < 10 * 1024 * 1024) throw new Error(`解压出的 frpc.exe 大小异常：${exeSize} 字节`);
+  log(`完成：${path.relative(root, outFile)}（${(exeSize / 1024 / 1024).toFixed(1)} MB）`);
+
+  try {
+    fs.rmSync(work, { recursive: true, force: true });
+  } catch {
+    /* 临时目录清不掉不影响结果 */
+  }
+}
+
 (async () => {
   if (exists(outFile) && !force) {
     log(`已存在，跳过：${path.relative(root, outFile)}（${(fs.statSync(outFile).size / 1024 / 1024).toFixed(1)} MB）`);
@@ -119,6 +149,19 @@ function findFrpc(dir) {
 
   const work = fs.mkdtempSync(path.join(os.tmpdir(), 'frpc-fetch-'));
   const zipPath = path.join(work, ZIP_NAME);
+
+  /* 仓库自带压缩包优先：校验 sha256 后直接用，不碰网络。 */
+  if (fs.existsSync(BUNDLED_ZIP)) {
+    const digest = require('node:crypto').createHash('sha256').update(fs.readFileSync(BUNDLED_ZIP)).digest('hex');
+    if (digest !== ZIP_SHA256) {
+      throw new Error(`仓库自带的 ${path.relative(root, BUNDLED_ZIP)} 校验失败（${digest}），请重新放置官方压缩包`);
+    }
+    log(`使用仓库自带压缩包：${path.relative(root, BUNDLED_ZIP)}（sha256 校验通过）`);
+    fs.copyFileSync(BUNDLED_ZIP, zipPath);
+    unpackAndInstall(work, zipPath);
+    return;
+  }
+
   const urls = [
     URL_PRIMARY,
     MIRROR ? `${MIRROR.replace(/\/$/, '')}/${URL_PRIMARY}` : '',
@@ -199,24 +242,7 @@ function findFrpc(dir) {
   }
 
   log(`校验通过（sha256 ${ZIP_SHA256.slice(0, 12)}…，${(ZIP_SIZE / 1024 / 1024).toFixed(1)} MB）`);
-  log('解压…');
-  const unpacked = path.join(work, 'unpacked');
-  extract(zipPath, unpacked);
-  const found = findFrpc(unpacked);
-  if (!found) throw new Error(`压缩包里没找到 frpc.exe：${unpacked}`);
-
-  fs.mkdirSync(outDir, { recursive: true });
-  fs.copyFileSync(found, outFile);
-  /* 解压出来的 exe 也验一遍大小（压缩包对、解出来的文件被截断这种事也发生过）。 */
-  const exeSize = fs.statSync(outFile).size;
-  if (exeSize < 10 * 1024 * 1024) throw new Error(`解压出的 frpc.exe 大小异常：${exeSize} 字节`);
-  log(`完成：${path.relative(root, outFile)}（${(exeSize / 1024 / 1024).toFixed(1)} MB）`);
-
-  try {
-    fs.rmSync(work, { recursive: true, force: true });
-  } catch {
-    /* 临时目录清不掉不影响结果 */
-  }
+  unpackAndInstall(work, zipPath);
 })().catch((error) => {
   console.error(`[frpc] ${error.message}`);
   process.exit(1);
