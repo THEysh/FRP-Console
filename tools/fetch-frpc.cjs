@@ -113,16 +113,22 @@ function findFrpc(dir) {
   const urls = [URL_PRIMARY, MIRROR ? `${MIRROR.replace(/\/$/, '')}/${URL_PRIMARY}` : ''].filter(Boolean);
 
   let lastError = null;
+  /* 每个地址重试 3 次（1s/3s 退避）：CI 上偶发的 502/超时会让整次发版失败，
+   * v1.2.92 就因此栽在「准备内置 frpc.exe」这一步，重跑一次就好了。 */
   for (const url of urls) {
-    try {
-      log(`下载 ${url}`);
-      await download(url, zipPath);
-      lastError = null;
-      break;
-    } catch (e) {
-      lastError = e;
-      log(`失败：${e.message}`);
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      try {
+        log(`下载 ${url}${attempt > 1 ? `（第 ${attempt} 次重试）` : ''}`);
+        await download(url, zipPath);
+        lastError = null;
+        break;
+      } catch (e) {
+        lastError = e;
+        log(`失败：${e.message}`);
+        if (attempt < 3) await new Promise((r) => setTimeout(r, attempt * 2000));
+      }
     }
+    if (!lastError) break;
   }
   if (lastError) {
     // 失败时给出可操作的手工放置办法，和 README 的说明一致
