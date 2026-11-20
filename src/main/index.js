@@ -2415,7 +2415,15 @@ function registerIpc() {
       return await saveSettingsPatch(patch);
     } catch (e) {
       // 渲染层对 IPC 抛错是“静默”的（只 await 不 catch），所以这里必须自己兜住
-      return fail(`保存设置失败：${(e && e.message) || e}`);
+      const code = String((e && e.code) || '');
+      const reason = code === 'EPERM' || code === 'EACCES'
+        ? '设置文件不可写（可能被设成只读，或被安全软件占用）'
+        : code === 'EBUSY'
+          ? '设置文件正被其它程序占用'
+          : code === 'ENOSPC'
+            ? '磁盘空间不足'
+            : (e && e.message) || String(e);
+      return fail(`保存设置失败：${reason}`);
     }
   });
 
