@@ -814,7 +814,8 @@ class ServerSession {
       result = await this.exec(`${prefix}cp -p ${shellQuote(configPath)} ${shellQuote(backup)}`, 10000);
       if (!result.ok) return { ok: false, error: `备份原配置失败：${(result.stderr || '未知错误').trim()}`, steps };
     }
-    result = await this.exec(`${prefix}install -m 644 ${tmpConfig} ${shellQuote(configPath)}`, 10000);
+    /* frps.toml 里有 auth.token 和面板口令，不能让同机其他用户读到。 */
+    result = await this.exec(`${prefix}install -m 600 ${tmpConfig} ${shellQuote(configPath)}`, 10000);
     await this.exec(`rm -f ${tmpConfig} 2>/dev/null || true`, 6000);
     if (!result.ok) return { ok: false, error: `写入配置失败：${(result.stderr || '权限不足').trim()}`, steps };
     this.configPath = configPath;
@@ -2499,6 +2500,10 @@ class ServerSession {
 
     const moveResult = await this.exec(`cp ${remoteTmp} ${shellQuote(this.configPath)}`, 10000);
     await this.exec(`rm -f ${remoteTmp} 2>/dev/null || true`, 6000);
+    /* 配置里有 auth.token / 面板口令：正式文件与备份都收紧到 600，备份只留最近 10 份。 */
+    await this.exec(`chmod 600 ${shellQuote(this.configPath)} ${shellQuote(backup)} 2>/dev/null || true`, 8000);
+    await this.exec(`ls -1t ${shellQuote(this.configPath)}.bak-* 2>/dev/null | tail -n +11 | xargs -r rm -f`, 8000);
+    await this.exec(`ls -1 ${shellQuote(this.configPath)}.bak-* 2>/dev/null | xargs -r chmod 600`, 8000);
     if (!moveResult.ok) {
       const why = (moveResult.stderr || '未知错误').trim();
       return { ok: false, error: `写入失败：${why}${explainFsError(why)}` };

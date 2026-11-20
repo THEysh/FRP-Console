@@ -193,6 +193,9 @@ const BOOL_KEYS = [
 const STRING_KEYS = ['frpcPath', 'configPath', 'logPath', 'frpsDashboardUrl', 'serviceName', 'adminUser', 'adminPassword', 'acmeEmail', 'dnsProvider'];
 const PORT_KEYS = ['adminPort', 'vhostHttpPort', 'vhostHttpsPort'];
 
+/* 已经删掉的功能留下的字段（1.2.38 去掉 STAGING、1.2.83 去掉「停止服务前确认」）。 */
+const OBSOLETE_KEYS = ['acmeStaging', 'confirmStopService'];
+
 function sanitizeSettings(input) {
   const out = { ...input };
   for (const key of BOOL_KEYS) {
@@ -216,6 +219,7 @@ function sanitizeSettings(input) {
     ? out.certDirs.filter((item) => typeof item === 'string' && item.trim()).slice(0, 8)
     : [];
   if (!out.proxyOpenPaths || typeof out.proxyOpenPaths !== 'object' || Array.isArray(out.proxyOpenPaths)) out.proxyOpenPaths = {};
+  for (const key of OBSOLETE_KEYS) delete out[key];
   return out;
 }
 
@@ -569,6 +573,7 @@ module.exports = {
   newServerId,
   normalizeServerProfile,
   sanitizeSettings,
+  OBSOLETE_KEYS,
   serverProfileKey,
   mergeDuplicateServers,
   readServerSecret,
