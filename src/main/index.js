@@ -1365,6 +1365,24 @@ function dropProxyOpenPath(name) {
   settings = settingsModule.save({ proxyOpenPaths: map });
 }
 
+/* 外部改配置时（手改 frpc.toml、用别的工具删掉代理），settings 里的访问路径记录
+ * 不会跟着消失；等哪天新建一条同名代理，就会「凭空」继承一个用户从没设过的路径
+ * —— 界面上突然出现「复制/打开」跳到某个 /panel/，很难解释。每次成功读到配置后
+ * 对一遍名字表，把已经不存在的清掉。 */
+function pruneProxyOpenPaths() {
+  const map = { ...((settings && settings.proxyOpenPaths) || {}) };
+  const names = new Set(((model && model.proxies) || []).map((p) => p.name));
+  let changed = false;
+  for (const key of Object.keys(map)) {
+    if (!names.has(key)) {
+      delete map[key];
+      changed = true;
+    }
+  }
+  if (changed) settings = settingsModule.save({ proxyOpenPaths: map });
+  return changed;
+}
+
 /* frpc.toml 顶层的 start = [...] 是「只启动列出的这些代理」的白名单。
  * 控制台自己增删代理时要同步它，否则「界面上新建了、隧道里却没有这条」会让人
  * 以为是端口或 token 的问题。只动这一个名字，其它条目原样保留；
@@ -1614,6 +1632,7 @@ function loadConfigFromDisk({ initial = false } = {}) {
     const st = fs.statSync(paths.configPath);
     configStamp = { mtimeMs: st.mtimeMs, size: st.size };
     configError = null;
+    pruneProxyOpenPaths();
     updateLogFile();
     return true;
   } catch (e) {
