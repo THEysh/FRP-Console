@@ -22,6 +22,8 @@ const seedRules = (process.argv[9] || '').split(',').map((s) => s.trim()).filter
  * 「服务器说在听 + 客户端真能连上」两条同时成立，所以这里必须跟 runner 对齐，
  * 否则场景就偷偷依赖本机恰好有别的东西占着 7000。 */
 const bindPort = Number(process.argv[10]) || 7000;
+/* argv[11]：frps -v 回什么版本号（用来验证「服务器 frps 与本机 frpc 版本不一致」的提示）。 */
+const frpsVersion = process.argv[11] || '0.61.0';
 const fwRules = firewallMode
   ? new Set(seedRules.length ? seedRules : ['22/tcp', '7000/tcp', '7000/udp', '28487/tcp', '1:65535/tcp'])
   : new Set();
@@ -234,7 +236,7 @@ const RULES = [
   }],
   [/-f '?\/etc\/frp\/frps\.toml'?/, () => [0, 'yes\n']],
   // 「command -v frps && frps -v」这条要排在 command -v 前面，否则会被当成“只查路径”
-  [/frps['" ]*(-v|verify)/, () => (mode === 'empty' ? [1, ''] : [0, '0.61.0\n'])],
+  [/frps['" ]*(-v|verify)/, () => (mode === 'empty' ? [1, ''] : [0, `${frpsVersion}\n`])],
   [/command -v frps/, () => (mode === 'empty' ? [1, ''] : [0, '/usr/local/bin/frps\n'])],
   [/test -f /, () => [0, 'yes\n']],
   [/\[ -d \/run\/systemd\/system \]/, () => (mode === 'nosystemd' ? [1, ''] : [0, 'yes\n'])],

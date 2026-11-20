@@ -1476,6 +1476,30 @@ function serverStatusSource(info) {
   return '';
 }
 
+/* 服务器 frps 与本机 frpc 的版本关系：frp 要求主版本一致；次版本不同一般能连，但服务器不认的字段会被忽略。 */
+function versionParts(text) {
+  const m = /(\d+)\.(\d+)\.(\d+)/.exec(String(text || ''));
+  return m ? { major: Number(m[1]), minor: Number(m[2]), patch: Number(m[3]) } : null;
+}
+
+function versionMismatchMarkup(info) {
+  const serverVer = info && info.version && info.version !== 'unknown' ? String(info.version).trim() : '';
+  const clientVer = (S.state && S.state.app && S.state.app.frpcVersion) || '';
+  if (!serverVer || !clientVer) return '';
+  const sv = versionParts(serverVer);
+  const cv = versionParts(clientVer);
+  if (!sv || !cv) return '';
+  /* frp 目前全是 0.x，主版本恒为 0，兼容性其实由次版本决定：0.52 与 0.61 差 9 个次版本。 */
+  const farApart = Math.abs(sv.minor - cv.minor) >= 2;
+  if (sv.major !== cv.major || farApart) {
+    return `<div class="note bad">${icon('alert')}<div><strong>服务器 frps ${esc(serverVer)} 与本机 frpc ${esc(clientVer)} 主版本不一致</strong><br>frp 要求客户端与服务端主版本相同，这条隧道很可能连不上（或者连上了也用不了）。在服务器上换成同版本 frps，或用「从零初始化」重装。</div></div>`;
+  }
+  if (sv.minor !== cv.minor) {
+    return `<div class="note warn">${icon('alert')}<div><strong>服务器 frps ${esc(serverVer)} 与本机 frpc ${esc(clientVer)} 次版本不同</strong><br>通常还能连，但服务器不认的新字段会被忽略或让 frpc 报错；遇到莫名其妙的问题时先把两边版本对齐。</div></div>`;
+  }
+  return '';
+}
+
 function metricCard(label, value, sub = '', cls = '') {
   return `<div class="srv-metric ${cls}"><span>${esc(label)}</span><strong>${esc(value)}</strong>${sub ? `<small>${esc(sub)}</small>` : ''}</div>`;
 }
@@ -2421,6 +2445,8 @@ function renderServer(force = false) {
           </div>
         </div>
       </section>
+
+      ${versionMismatchMarkup(info)}
 
       ${needsBootstrap ? bootstrapCardMarkup(info, s) : ''}
 
