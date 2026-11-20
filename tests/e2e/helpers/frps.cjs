@@ -51,7 +51,7 @@ function waitPort(port, host = '127.0.0.1', timeoutMs = 15000) {
   });
 }
 
-async function startFrps({ dir, bindPort = 17000, dashPort = 17500, token = 'e2e-token-1234567890' }) {
+async function startFrps({ dir, bindPort = 17000, dashPort = 17500, token = 'e2e-token-1234567890', vhostHttpPort, vhostHttpsPort }) {
   const bin = findFrps();
   if (!bin) return null;
   fs.mkdirSync(dir, { recursive: true });
@@ -64,7 +64,12 @@ async function startFrps({ dir, bindPort = 17000, dashPort = 17500, token = 'e2e
        * 表现出来的却是「端口没监听」，很难第一时间想到是配置顺序。 */
       'bindAddr = "127.0.0.1"',
       `bindPort = ${bindPort}`,
-      `vhostHTTPPort = ${bindPort + 1000}`,
+      `vhostHTTPPort = ${vhostHttpPort || bindPort + 1000}`,
+      /* 没有 vhostHTTPSPort 时 frps 会拒绝 https 代理（type [https] not supported…），
+       * 「同一域名 http+https」这类用例就没法测，所以这里一并开上。 */
+      /* 两台 frps 的端口只差 1 时，+1000/+1001 会互相撞（vhostHTTP 撞上另一台的 vhostHTTPS），
+       * 所以 https 用 +2000，并且允许调用方显式指定。 */
+      `vhostHTTPSPort = ${vhostHttpsPort || bindPort + 2000}`,
       '',
       '[auth]',
       'method = "token"',

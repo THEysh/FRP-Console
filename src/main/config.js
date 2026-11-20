@@ -320,19 +320,21 @@ function validate(model, options = {}) {
             push('error', `proxies[${index}].customDomains`, `${label} 的域名太长（${shaped.length} 字符，域名最长 253）：${shaped.slice(0, 40)}…`);
           }
         }
-        /* 同一个域名只能给一条 http/https/tcpmux 代理用：撞了以后 frps 会给后来者
-         * 返回 router config conflict，界面上只会显示「未同步」，很难看出真实原因。 */
-        const key = domain.toLowerCase();
+        /* 同一个域名在**同一种类型**里只能给一条代理用：撞了以后 frps 会给后来者
+         * 返回 router config conflict，界面上只会显示「未同步」，很难看出真实原因。
+         * 但 http 与 https 走的是两个不同的 vhost 端口（vhostHTTPPort / vhostHTTPSPort），
+         * 「同一站点同时开 http 和 https」是很常见的配置，不能当成冲突拦掉。 */
+        const key = `${proxy.type}:${domain.toLowerCase()}`;
         if (domainOwners.has(key)) {
-          push('error', `proxies[${index}].customDomains`, `域名「${domain}」已经被「${domainOwners.get(key)}」占用：同一个域名只能给一条 http/https/tcpmux 代理`);
+          push('error', `proxies[${index}].customDomains`, `域名「${domain}」已经被「${domainOwners.get(key)}」占用：同一种类型的代理（http/https/tcpmux）里，一个域名只能用一次（http 与 https 走不同端口，可以各配一条）`);
         } else {
           domainOwners.set(key, label);
         }
       }
       if (proxy.subdomain) {
-        const key = `*.${String(proxy.subdomain).toLowerCase()}`;
+        const key = `${proxy.type}:*.${String(proxy.subdomain).toLowerCase()}`;
         if (domainOwners.has(key)) {
-          push('error', `proxies[${index}].subdomain`, `子域名「${proxy.subdomain}」已经被「${domainOwners.get(key)}」占用`);
+          push('error', `proxies[${index}].subdomain`, `子域名「${proxy.subdomain}」已经被「${domainOwners.get(key)}」占用（同一类型内不能重复）`);
         } else {
           domainOwners.set(key, label);
         }

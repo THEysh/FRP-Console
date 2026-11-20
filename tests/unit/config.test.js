@@ -161,6 +161,34 @@ test('重复的自定义域名会被拦下（同一个域名只能给一条 http
   assert.ok(result.errors.some((item) => /已经被「a」占用/.test(String(item.message || item))), JSON.stringify(result.errors));
 });
 
+test('同一个域名同时配 http 和 https 不算冲突（走不同的 vhost 端口）', () => {
+  const model = {
+    serverAddr: '127.0.0.1',
+    serverPort: 7000,
+    auth: { method: 'token', token: 'x' },
+    proxies: [
+      { name: 'site-http', type: 'http', localIP: '127.0.0.1', localPort: 18091, customDomains: ['site.example.com'] },
+      { name: 'site-https', type: 'https', localIP: '127.0.0.1', localPort: 18091, customDomains: ['site.example.com'] },
+    ],
+  };
+  const result = validate(model);
+  assert.strictEqual(result.errors.filter((item) => /已经被/.test(String(item.message || item))).length, 0, JSON.stringify(result.errors));
+});
+
+test('https 之间同域名仍然算冲突', () => {
+  const model = {
+    serverAddr: '127.0.0.1',
+    serverPort: 7000,
+    auth: { method: 'token', token: 'x' },
+    proxies: [
+      { name: 'a', type: 'https', localIP: '127.0.0.1', localPort: 18091, customDomains: ['dup2.example.com'] },
+      { name: 'b', type: 'https', localIP: '127.0.0.1', localPort: 18091, customDomains: ['dup2.example.com'] },
+    ],
+  };
+  const result = validate(model);
+  assert.ok(result.errors.some((item) => /已经被「a」占用/.test(String(item.message || item))), JSON.stringify(result.errors));
+});
+
 test('重复的子域名会被拦下', () => {
   const model = {
     serverAddr: '127.0.0.1',
