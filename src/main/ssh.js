@@ -2533,6 +2533,9 @@ class ServerSession {
   async control(action) {
     if (!this.connected) return { ok: false, error: '尚未连接服务器' };
     if (!['start', 'stop', 'restart'].includes(action)) return { ok: false, error: '未知操作' };
+    /* info 是连上那一刻的快照：服务器上 unit 被删/被 mask 之后还拿着旧值，
+     * 会走错分支（例如明明没有 unit 了，还去 systemctl start，得到一句英文 not found）。 */
+    await this.inspect().catch(() => null);
     const info = this.info || {};
     const actionText = { start: '启动', stop: '停止', restart: '重启' }[action];
     const before = { status: info.status, service: info.serviceName, docker: info.docker && info.docker.name };
@@ -2551,7 +2554,7 @@ class ServerSession {
     if (info.hasUnit && info.serviceName) {
       const result = await this.sudoSystemctl(action, info.serviceName);
       if (!result.ok) {
-        return { ok: false, error: `${actionText}失败：${(result.stderr || result.stdout || '请确认当前账户有 systemctl 权限').trim()}` };
+        return { ok: false, error: `${actionText}失败：${explainServiceError((result.stderr || result.stdout || '请确认当前账户有 systemctl 权限').trim(), info.serviceName || 'frps')}` };
       }
       const after = await this.inspect();
       const afterInfo = after.info || null;
@@ -2586,7 +2589,7 @@ class ServerSession {
       if (!result.ok) {
         result = await this.exec(`nohup ${shellQuote(bin)} -c ${shellQuote(config)} >> /var/log/frps.log 2>&1 < /dev/null & echo started`, 10000);
       }
-      if (!result.ok) return { ok: false, error: `启动失败：${(result.stderr || result.stdout || '请确认 frps 路径与配置').trim()}` };
+      if (!result.ok) return { ok: false, error: `启动失败：${explainServiceError((result.stderr || result.stdout || '请确认 frps 路径与配置').trim(), 'frps')}` };
       await new Promise((r) => setTimeout(r, 1200));
       const after = await this.inspect();
       const afterInfo = after.info || null;
@@ -2688,6 +2691,22 @@ function parsePortInput(text) {
  * root 遇到 "Operation not permitted" 基本只有三种原因：文件被 chattr +i 冻结、
  * 分区只读挂载、SELinux/AppArmor 拦了——所以要把这几条出路写出来。
  */
+/* systemctl 的报错也是英文原话，翻译成能动手的提示。 */
+function explainServiceError(text, unit = 'frps') {
+  const raw = String(text || '').trim();
+  if (/Unit\s+\S+\s+(?:not found|could not be found)/i.test(raw) || /could not be found/i.test(raw)) {
+    return `${raw}（这台服务器上没有 ${unit}.service 服务单元：用「从零初始化」重装 frps，或先手工把 systemd 服务建回来）`;
+  }
+  if (/is masked/i.test(raw)) return `${raw}（服务被 mask 了：${'systemctl unmask ' + unit} 之后再启动）`;
+  if (/Start request repeated too quickly|start request repeated/i.test(raw)) {
+    return `${raw}（systemd 因为反复启动失败而暂停了：先 systemctl reset-failed ${unit}，再看 journalctl -u ${unit} 找原因）`;
+  }
+  if (/Job for .* failed because the control process exited with error code/i.test(raw)) {
+    return `${raw}（frps 进程启动后立刻退出了：看 journalctl -u ${unit} -n 30 或 /var/log/frps.log）`;
+  }
+  return raw;
+}
+
 function explainFsError(text) {
   const raw = String(text || '');
   if (/Operation not permitted/i.test(raw)) {
@@ -2700,4 +2719,5 @@ function explainFsError(text) {
   return '';
 }
 module.exports = {
-  explainFsError, ServerSession, parseServiceUnits, rankServiceUnits, parsePortInput, removeServerBlocks, ufwAllowsPort, parseCertRefs, parseMissingPaths, mergeNginxConf, nginxServerBlockSpans };
+  explainFsError,
+  explainServiceError, ServerSession, parseServiceUnits, rankServiceUnits, parsePortInput, removeServerBlocks, ufwAllowsPort, parseCertRefs, parseMissingPaths, mergeNginxConf, nginxServerBlockSpans };

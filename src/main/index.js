@@ -4068,6 +4068,7 @@ function registerIpc() {
         `echo @@ENABLED; systemctl is-enabled -- ${unit} 2>/dev/null || true`,
         "echo @@PROC; for d in /proc/[0-9]*; do [ \"$(cat $d/comm 2>/dev/null)\" = frps ] && echo \"$d\"; done | head -n 1",
         "echo @@DOCKER; docker ps --format '{{.Names}}\\t{{.Status}}' 2>/dev/null | grep -i frp | head -n 1",
+        `echo @@UNIT; systemctl cat ${unit} >/dev/null 2>&1 && echo yes || echo no`,
       ].join('; ');
       const result = await serverSession.exec(script, 12000);
       if (epoch !== sessionEpoch) return staleFail();
@@ -4106,12 +4107,19 @@ function registerIpc() {
             : '';
         return ok({ layer, ok: true, warn: gone || broken || notEnabled, ms: Date.now() - startedAt, detail: `${where}${boot}${warn}` });
       }
+      /* unit 文件被删掉（卸载残留、手工清理）时，光说「没有运行」会让用户去 start，
+       * 但 systemctl 只会回 "Unit frps.service not found."。这里直接改口。 */
+      const unitExists = pick('UNIT') !== 'no';
       return ok({
         layer,
         ok: false,
         ms: Date.now() - startedAt,
-        reason: 'frps 没有运行',
-        detail: unitActive === 'failed' ? `${unit}.service 处于 failed，展开实时日志看原因` : `没有找到运行的 frps（${unit}.service 未激活，也没有 frps 进程或容器）`,
+        reason: unitExists ? 'frps 没有运行' : 'frps 服务不存在',
+        detail: unitExists
+          ? unitActive === 'failed'
+            ? `${unit}.service 处于 failed，展开实时日志看原因`
+            : `没有找到运行的 frps（${unit}.service 未激活，也没有 frps 进程或容器）`
+          : `这台服务器上没有 ${unit}.service（服务单元被删或从没建过）：用「从零初始化」重装 frps，或手工把 systemd 服务建回来`,
       });
     }
 

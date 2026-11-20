@@ -512,6 +512,11 @@ node tests/soak.cjs 10                  # 长稳抽查：隧道 + 20 条代理�
 
 ## 更新日志
 
+### 1.2.127
+
+- **frps 服务单元被删掉时说得清楚**：把服务器上的 `/etc/systemd/system/frps.service` 删掉后，就绪检查以前只说「frps 没有运行」（让人以为点一下启动就行），点启动则得到一句英文 `Failed to start frps.service: Unit frps.service not found.`。现在自检直接说「frps 服务不存在：这台服务器上没有 frps.service（服务单元被删或从没建过）→ 用『从零初始化』重装，或手工把 systemd 服务建回来」，启动失败的报错也会附带同一句指引。
+- 同类翻译：`is masked` → 提示 `systemctl unmask`；`start request repeated too quickly` → 提示先 `systemctl reset-failed` 再看 `journalctl`；控制进程非零退出 → 指到日志。
+
 ### 1.2.126
 
 - **root 也写不了的时候，报错变成能动手的提示**：配置文件被 `chattr +i` 冻结、分区只读挂载、SELinux 拦截、磁盘满这几种情况下，以前界面上只有 `install: cannot remove ...: Operation not permitted` 或 `cp: cannot create regular file ...` 这种原话——用 root 的人看到「operation not permitted」只会更困惑。现在会补充「root 也被拒绝了：文件可能被设成不可修改——用 lsattr 看有没有 i 属性，chattr -i 去掉；也可能是分区只读挂载或 SELinux/AppArmor 拦截」，磁盘满/权限不足/打开文件数上限也各有对应说明。
