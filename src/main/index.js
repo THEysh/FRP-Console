@@ -1909,7 +1909,7 @@ async function checkProxyHealth(p, ctx) {
     const reject = (status && status.status === 'start error') || conflict;
     const reason = conflict ? '域名或端口与别的代理冲突'
       : hitsServerPort ? `公网端口 ${p.remotePort} 就是 frps 的监听端口`
-        : portUnavailable ? '公网端口在 frps 上用不了'
+        : portUnavailable ? `公网端口 ${p.remotePort} 在 frps 上用不了`
           : reject ? 'frps 拒绝启动这个代理'
             : '隧道未建立';
     const hint = conflict
@@ -1917,7 +1917,7 @@ async function checkProxyHealth(p, ctx) {
       : hitsServerPort
         ? `这个端口是 frpc 连 frps 用的（服务器端口 ${p.remotePort} / bindPort），frps 自己占着，换个别的公网端口。`
         : portUnavailable
-          ? 'frps 说这个端口它用不了：可能被服务器上别的程序占着，也可能被别的客户端先注册了。到服务器页跑一次「检查端口」就能看清。'
+          ? `frps 说 ${p.remotePort} 它用不了：可能被服务器上别的程序占着，也可能被别的客户端先注册了。到服务器页跑一次「检查端口」就能看清。`
           : reject
             ? '看「实时日志」里这条代理的 start error 行，通常是域名/端口冲突或配置层拒绝。'
             : '';
