@@ -312,6 +312,11 @@ function validate(model, options = {}) {
       if (!domains.length && !proxy.subdomain) {
         push('error', `proxies[${index}].customDomains`, `${label} 需要至少一个自定义域名或 subdomain`);
       }
+      /* 两条都填时 frp 仍然要求服务器开启 subdomain：只要 subdomain 非空，
+       * frps 没配 subDomainHost 就会回 "subdomain is not supported"。 */
+      if (domains.length && proxy.subdomain) {
+        push('warn', `proxies[${index}].subdomain`, `${label} 同时填了自定义域名和 subdomain：frp 仍会按 subdomain 注册，服务器没配 subDomainHost 时这条代理起不来。只想用完整域名就把 subdomain 清空`);
+      }
       for (const domain of domains) {
         // 带 http:// 或者带端口的域名会让 frpc 启动失败，但报错信息完全看不出是这个原因
         if (!isDomainLike(domain)) {

@@ -190,6 +190,23 @@ test('重复的自定义域名会被拦下（同一个域名只能给一条 http
   assert.ok(result.errors.some((item) => /已经被「a」占用/.test(String(item.message || item))), JSON.stringify(result.errors));
 });
 
+test('subdomain 与自定义域名同时填时给出警告（frp 仍按 subdomain 注册）', () => {
+  const mk = (proxy) => ({
+    serverAddr: '127.0.0.1',
+    serverPort: 7000,
+    auth: { method: 'token', token: 'x' },
+    proxies: [{ name: 'p', type: 'http', localIP: '127.0.0.1', localPort: 18091, ...proxy }],
+  });
+  const both = validate(mk({ subdomain: 'demo', customDomains: ['demo.example.com'] }));
+  assert.ok(both.warnings.some((item) => /subDomainHost/.test(String(item.message || item))), JSON.stringify(both.warnings));
+
+  const domOnly = validate(mk({ customDomains: ['demo.example.com'] }));
+  assert.strictEqual(domOnly.warnings.filter((item) => /subDomainHost/.test(String(item.message || item))).length, 0, JSON.stringify(domOnly.warnings));
+
+  const subOnly = validate(mk({ subdomain: 'demo' }));
+  assert.strictEqual(subOnly.warnings.filter((item) => /subDomainHost/.test(String(item.message || item))).length, 0, JSON.stringify(subOnly.warnings));
+});
+
 test('同一个域名同时配 http 和 https 不算冲突（走不同的 vhost 端口）', () => {
   const model = {
     serverAddr: '127.0.0.1',

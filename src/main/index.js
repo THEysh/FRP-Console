@@ -1947,20 +1947,27 @@ async function checkProxyHealth(p, ctx) {
     const hitsServerPort = portUnavailable && Number(p.remotePort) > 0
       && Number(p.remotePort) === Number(model && model.serverPort);
     const reject = (status && status.status === 'start error') || conflict;
+    /* 服务器没配 subDomainHost 时，frpc 只回一句英文
+     * "subdomain is not supported because this feature is not enabled in server"，
+     * 用户既不知道该改 frps.toml，也不知道「只填 customDomains 也能用」。 */
+    const subdomainUnsupported = /subdomain is not supported/i.test(raw);
     const reason = conflict ? '域名或端口与别的代理冲突'
       : hitsServerPort ? `公网端口 ${p.remotePort} 就是 frps 的监听端口`
         : portUnavailable ? `公网端口 ${p.remotePort} 在 frps 上用不了`
-          : reject ? 'frps 拒绝启动这个代理'
-            : '隧道未建立';
+          : subdomainUnsupported ? '服务器没有开启 subdomain'
+            : reject ? 'frps 拒绝启动这个代理'
+              : '隧道未建立';
     const hint = conflict
       ? '同一个域名只能给一条 http/https/tcpmux 代理；公网端口也不能两条 tcp/udp 代理共用。改掉其中一条即可。'
       : hitsServerPort
         ? `这个端口是 frpc 连 frps 用的（服务器端口 ${p.remotePort} / bindPort），frps 自己占着，换个别的公网端口。`
         : portUnavailable
           ? `frps 说 ${p.remotePort} 它用不了：可能被服务器上别的程序占着，也可能被别的客户端先注册了。到服务器页跑一次「检查端口」就能看清。`
-          : reject
-            ? '看「实时日志」里这条代理的 start error 行，通常是域名/端口冲突或配置层拒绝。'
-            : '';
+          : subdomainUnsupported
+            ? '两条路选一条：①在服务器 frps.toml 里配 subDomainHost（子域名后缀），重启 frps；②不填 subdomain，直接在「自定义域名」里写完整域名（两条都填时 frp 仍要求服务器开启 subdomain）。'
+            : reject
+              ? '看「实时日志」里这条代理的 start error 行，通常是域名/端口冲突或配置层拒绝。'
+              : '';
     if (hint) layers.tunnel.hint = hint;
     return [p.name, { ok: false, reason, ms: local.ms || 0, error: layers.tunnel.error, layers, at }];
   }
