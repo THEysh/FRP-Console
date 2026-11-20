@@ -89,7 +89,8 @@ module.exports = {
     /* ③ 面板 0.0.0.0 + 16 位口令 → 不提示 */
     await withServer(22457, '0.0.0.0:4096:admin:Zx9q2Lm7Pw4tRv8K', async () => {
       const note = await wantNote();
-      check('16 位口令 + 0.0.0.0 → 不提示', note === null, note && note.text);
+      check('16 位口令 + 0.0.0.0 → 仍然提示（公网暴露本身就要说）', !!note && /note warn/.test(note.cls), note && note.text);
+      check('提示说明口令够长但端口对公网开放', !!note && /口令/.test(note.text) && /公网/.test(note.text), note && note.text);
     });
 
     /* ④ 只监听 127.0.0.1（默认）→ 不提示 */

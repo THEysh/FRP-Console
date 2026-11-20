@@ -2372,7 +2372,12 @@ function renderServer(force = false) {
         detail: `webServer.addr 是 ${addr}，当前口令 ${len} 位。公网上的面板建议 16 位以上随机口令；只想自己看的话，把 addr 改成 127.0.0.1，用 SSH 隧道访问更安全。`,
       };
     }
-    return null;
+    /* 口令够长也提醒一句：面板里存着 auth.token，公网上被扫到就是白给一个攻击面。 */
+    return {
+      cls: 'warn',
+      title: `frps 面板对公网开放（:${summary.webPort}）`,
+      detail: `webServer.addr 是 ${addr}，口令 ${len} 位。口令本身够长，但这个端口对整个互联网开放，面板里又能看到 auth.token。不需要外网访问的话，把 addr 改成 127.0.0.1（配合 SSH 隧道）或用云厂商安全组限定来源 IP。`,
+    };
   })();
 
   $('#view').innerHTML = `
