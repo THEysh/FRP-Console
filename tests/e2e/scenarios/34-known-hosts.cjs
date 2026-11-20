@@ -46,6 +46,14 @@ module.exports = {
         })()`);
         check('设置页列出了这台服务器', ui.rows === 1 && /127\.0\.0\.1/.test(ui.text), JSON.stringify(ui));
 
+        /* 1.2.145：卡片里必须给出「怎么自己核对指纹」的命令，否则用户只能无脑点信任。 */
+        const hint = await inst.eval(`(async () => {
+          const box = document.querySelector('#known-hosts-box');
+          const text = box ? box.textContent.replace(/\\s+/g, ' ') : '';
+          return { hasHint: /ssh-keygen -lf/.test(text), text: text.slice(0, 120) };
+        })()`);
+        check('卡片里有核对指纹的方法', hint.hasHint === true, hint.text);
+
         const forgot = await inst.eval(`FRP.serverForgetHost({ host: '127.0.0.1', port: ${port} })`);
         check('删除接口返回成功且列表变空', forgot.ok === true && forgot.data.hosts.length === 0, forgot.error || '');
         const rowsAfter = await inst.eval(`(async () => { const r = await FRP.serverKnownHosts(); return r.data.hosts.length; })()`);

@@ -3368,6 +3368,11 @@ function askTrustHost(info, onTrust) {
     '',
     '换系统、重装 SSH、换机器都会导致这个变化；也可能是有人劫持了这台机器的 SSH 端口（中间人）。',
     '确认是你自己的改动之后再信任，否则先别连。',
+    '',
+    '怎么核对（在你自己能确认身份的地方执行，不要用这个连不上的机器）：',
+    `① 在服务器本机：ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub（或 ssh_host_rsa_key.pub）`,
+    '② 或在另一台已信任它的机器上：ssh-keyscan -t ed25519 <这台机器的地址> | ssh-keygen -lf -',
+    '两条输出都是 SHA256:… 的形式，必须和上面「现在」那一串一字不差。',
   ].join('\n');
   confirmDialog({
     title: '主机密钥变了',
@@ -4537,7 +4542,8 @@ function knownHostsMarkup() {
   if (!hosts.length) {
     return '<div class="field-hint">还没有记录。连过一次服务器之后，这里会出现它的主机指纹；换机器、重装 sshd 或怀疑被劫持时，删掉对应那条再连一次即可重新记录。</div>';
   }
-  return `<div class="known-list">${hosts
+  return `<div class="field-hint" style="margin-bottom:8px">核对方法：在服务器本机跑 <code>ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub</code>（或 <code>ssh_host_rsa_key.pub</code>），输出的 <code>SHA256:…</code> 必须和这里一字不差；对不上就先别连。</div>
+  <div class="known-list">${hosts
     .map(
       (h) => `<div class="known-row">
         <span class="kr-host mono-text">${esc(String(h.host))}:${esc(String(h.port))}</span>
