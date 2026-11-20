@@ -1532,11 +1532,12 @@ function frpsPane() {
           </div>
           <span class="btn-sep" aria-hidden="true"></span>
           <div class="btn-cluster">
-            <button class="btn subtle" type="button" data-act="server.save">${icon('check')}<span>仅保存</span></button>
-            <button class="btn primary" type="button" data-act="server.save.restart">${icon('restart')}<span>保存并重启 frps</span></button>
+            <button class="btn subtle" type="button" data-act="server.save"${S.server.config ? '' : ' disabled'}>${icon('check')}<span>仅保存</span></button>
+            <button class="btn primary" type="button" data-act="server.save.restart"${S.server.config ? '' : ' disabled'}>${icon('restart')}<span>保存并重启 frps</span></button>
           </div>
         </div>
       </div>
+      ${S.server.config ? '' : `<div class="note warn">${icon('alert')}<div>现在读不到服务器上的 frps 配置文件${S.server.configError ? `：${esc(S.server.configError)}` : ''}。为避免把空内容写回去覆盖掉原有文件，保存按钮先置灰；确认路径后点「重新读取」，或到服务器页用「从零初始化」重新生成。</div></div>`}
       <textarea class="textarea server-config" id="server-config" spellcheck="false" placeholder="frps 配置内容">${esc(S.server.config)}</textarea>
     </div>`;
 }

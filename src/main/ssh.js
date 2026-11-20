@@ -1060,7 +1060,18 @@ class ServerSession {
     if (!this.connected) return { ok: false, error: '尚未连接服务器' };
     if (!this.configPath) return { ok: false, error: '未找到 frps 配置文件（支持 /etc/frp/frps.toml 等常见路径）' };
     const result = await this.exec(`cat ${shellQuote(this.configPath)}`, 12000);
-    if (!result.ok) return { ok: false, error: result.stderr || '读取配置文件失败' };
+    if (!result.ok) {
+      const raw = String(result.stderr || '').trim();
+      /* cat 的英文原话（No such file or directory）对用户没有信息量，
+       * 而且「文件没了」和「权限不够」要用完全不同的说法。 */
+      if (/No such file or directory|not found/i.test(raw)) {
+        return { ok: false, error: `服务器上没有这个配置文件：${this.configPath}（可能被删掉或改名了，也可能 frps 用的是别的路径）`, missing: true };
+      }
+      if (/Permission denied/i.test(raw)) {
+        return { ok: false, error: `没有权限读取 ${this.configPath}（当前 SSH 用户读不了这个文件）`, denied: true };
+      }
+      return { ok: false, error: raw || '读取配置文件失败' };
+    }
     return { ok: true, path: this.configPath, content: result.stdout };
   }
 

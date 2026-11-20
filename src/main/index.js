@@ -2994,7 +2994,10 @@ function registerIpc() {
     }
     const configResult = await serverSession.readConfig();
     if (epoch !== sessionEpoch) return { ok: false, stale: true };
-    serverConfigStamp = (await serverSession.fileStamp(serverSession.configPath || configResult.path)) || serverConfigStamp;
+    /* 读不到文件时不要把旧指纹留着：留着的话，「文件被删了」在指纹比对里永远显示成「没变化」，
+     * 界面会一直停在删除前那份摘要上（真机 rm /etc/frp/frps.toml 复现过）。 */
+    const stampNow = await serverSession.fileStamp(serverSession.configPath || configResult.path);
+    serverConfigStamp = stampNow || (configResult.ok ? serverConfigStamp : '');
     if (configResult.ok) {
       const parsed = frpsConfig.parseConfig(configResult.content);
       serverConfig = {
@@ -3134,12 +3137,19 @@ function registerIpc() {
     const stamp = await serverSession.fileStamp(serverSession.configPath || inspected.configPath || '');
     if (epoch !== sessionEpoch) return staleFail();
     let drifted = false;
-    if (stamp && serverConfigStamp && stamp !== serverConfigStamp) {
+    /* 文件之前是有的（serverConfigStamp 非空），现在读不到指纹 = 被删掉或改名了。
+     * 这种情况以前被 `stamp &&` 挡在外面，摘要就一直显示删除前那份。 */
+    const gone = !stamp && !!serverConfigStamp;
+    if (gone || (stamp && serverConfigStamp && stamp !== serverConfigStamp)) {
       const snap = await loadServerSnapshot({ inspect: false });
       if (epoch !== sessionEpoch) return staleFail();
       drifted = !!snap.ok;
       if (drifted) {
-        notify('warn', '服务器上的 frps.toml 被外部修改了', '已重新读取，界面上的端口/允许端口等摘要已更新');
+        notify(
+          'warn',
+          gone ? '服务器上的 frps.toml 不见了' : '服务器上的 frps.toml 被外部修改了',
+          gone ? '可能被删掉或改名了；界面上的配置摘要已清空，确认后可以重新写入或从零初始化' : '已重新读取，界面上的端口/允许端口等摘要已更新',
+        );
         pushState();
       }
     }
@@ -4124,6 +4134,17 @@ function registerIpc() {
     if (layer === 'token') {
       /* 比对对象必须是「这次会话连的那台」的档案。activeServerId 在极端情况下
        * 可能已经指向别的档案（切换中），拿错了会报出莫名其妙的 Token 不一致。 */
+      /* 配置文件根本读不到时（被删、改名、权限不够），summary 是空的；
+       * 那种情况说「服务端未启用鉴权」是错的——服务端多半好好的，是我们没读到它。 */
+      if (!serverConfig || !serverConfig.content) {
+        return ok({
+          layer,
+          ok: false,
+          ms: Date.now() - startedAt,
+          reason: '读不到服务器上的 frps.toml',
+          detail: (serverConfig && serverConfig.error) || '先确认配置文件路径，点「重新读取」再试',
+        });
+      }
       const owner = findServerProfile(sessionServerId) || active;
       const serverToken = String((summary && summary.token) || '');
       const profileToken = String((owner && owner.clientToken) || '');
