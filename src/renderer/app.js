@@ -598,7 +598,7 @@ function renderOverview(force = false) {
   if (state.configVerifyError) issues.push(`<div class="note error">${icon('alert')}<div>${esc(state.configVerifyError)}<br><span style="opacity:.75">隧道仍在用上一次的配置运行；把 frpc.toml 改对后会自动重新载入。</span></div></div>`);
   if (info.foreign) {
     const port = (info.r && info.r.adminPort) || 7400;
-    issues.push(`<div class="note error">${icon('alert')}<div><strong>管理端口 ${esc(port)} 上跑着另一个 frpc</strong><br>它连的服务器或代理名单跟这份配置对不上（多半是另一份配置、另一个控制台实例，或手工开的 frpc）。本配置的隧道没有在跑，这里也不能停它。<br><span style="opacity:.75">到「设置 → 运行模式与行为」换一个管理 API 端口，或先把那个 frpc 关掉。</span></div></div>`);
+    issues.push(`<div class="note error">${icon('alert')}<div><strong>管理端口 ${esc(port)} 上跑着另一个 frpc</strong><br>它连的服务器或代理名单跟这份配置对不上（多半是另一份配置、另一个控制台实例，或手工开的 frpc）。本配置的隧道没有在跑，这里也不能停它。<br><span style="opacity:.75">到「设置 → 运行模式与行为 → 客户端管理 API」换个端口，或先把那个 frpc 关掉。</span></div></div>`);
   }
   if (onlyMissingServer) {
     issues.push(welcomeGuideHtml());
@@ -4549,6 +4549,29 @@ function renderSettings(force = false) {
                 ${switchRow('以最小化状态启动', '仅显示托盘图标', 'startMinimized', !!settings.startMinimized)}
               </div>
             </div>
+            <div class="field span-2">
+              <div class="section-title" style="margin:4px 0 0"><strong>客户端管理 API</strong><span>frpc 只在本机 127.0.0.1 上开的管理接口，控制台用它读状态、做热重载；口令保护的是 <code>/api/config</code>（里面有 frps 的 auth.token）。</span></div>
+            </div>
+            <div class="field">
+              <label>管理端口</label>
+              <input class="input" name="adminPort" type="number" min="1024" max="65535" step="1" value="${esc(String(settings.adminPort || 7400))}" />
+              <div class="field-hint">如果 7400 被别的程序占了，控制台会自动顺延；也可以在这里固定一个</div>
+            </div>
+            <div class="field">
+              <label>管理用户名</label>
+              <input class="input" name="adminUser" type="text" autocomplete="off" value="${esc(settings.adminUser || 'admin')}" />
+              <div class="field-hint">写进 frpc.toml 的 <code>[webServer]</code> 段</div>
+            </div>
+            <div class="field span-2">
+              <label>管理口令</label>
+              <div class="input-group">
+                <input class="input" name="adminPassword" id="in-adminpass" type="password" autocomplete="off" value="${esc(settings.adminPassword || '')}" />
+                <button class="btn small" type="button" data-act="settings.eye.adminpass" title="显示 / 隐藏">${icon('eye')}</button>
+                <button class="btn small" type="button" data-act="settings.gen.adminpass" title="生成 20 位随机口令">${icon('reload')}<span>随机生成</span></button>
+              </div>
+              <div id="adminpass-note">${adminWeakNote(settings)}</div>
+              <div class="field-hint">改完点右上角「保存行为设置」；隧道在跑时会带着新口令重启 frpc</div>
+            </div>
           </form>
         </section>
 
@@ -5255,6 +5278,22 @@ async function handleAction(act, dataset, btn) {
       case 'reveal.log':
         FRP.revealPath('log');
         break;
+      case 'settings.gen.adminpass': {
+        const input = $('#in-adminpass');
+        if (!input) break;
+        input.value = randomAdminPassword();
+        input.type = 'text';
+        const note = $('#adminpass-note');
+        if (note) note.innerHTML = '';
+        toast('success', '已生成 20 位随机口令', '记得点「保存行为设置」才会写进 frpc.toml');
+        break;
+      }
+      case 'settings.eye.adminpass': {
+        const input = $('#in-adminpass');
+        if (!input) break;
+        input.type = input.type === 'password' ? 'text' : 'password';
+        break;
+      }
       case 'settings.save.behavior':
         await saveBehavior(btn);
         break;
@@ -6379,6 +6418,32 @@ async function saveClientLogOptions(level, loginFailExit) {
   return res;
 }
 
+/* 管理 API 口令的强度提示：空 / 老默认 admin / 太短，都值得说一句。 */
+function adminWeakNote(settings) {
+  const pw = String((settings && settings.adminPassword) || '');
+  if (!pw) {
+    return `<div class="note bad">${icon('alert')}<div><strong>当前没有管理口令</strong><br>本机任何进程都能直接读 <code>/api/config</code>，里面带着 frps 的 <code>auth.token</code>。点「随机生成」或自己填一个。</div></div>`;
+  }
+  if (pw === 'admin') {
+    return `<div class="note bad">${icon('alert')}<div><strong>口令还是老版本的默认值 admin</strong><br>知道这个默认值的人（或本机的任何程序）就能读到你的 frps <code>auth.token</code>。换成「随机生成」的 20 位口令。</div></div>`;
+  }
+  if (pw.length < 10) {
+    return `<div class="note warn">${icon('alert')}<div>口令只有 ${pw.length} 位，建议 10 位以上（「随机生成」会给你 20 位）。</div></div>`;
+  }
+  return '';
+}
+
+/* 20 位随机口令：字母表去掉容易看错的 l/o/0/1，和控制台生成 frps 口令时一致。 */
+function randomAdminPassword() {
+  const alphabet = 'abcdefghijkmnpqrstuvwxyz23456789';
+  const buf = new Uint32Array(20);
+  if (globalThis.crypto && globalThis.crypto.getRandomValues) globalThis.crypto.getRandomValues(buf);
+  else for (let i = 0; i < buf.length; i += 1) buf[i] = Math.floor(Math.random() * 4294967296);
+  let out = '';
+  for (let i = 0; i < 20; i += 1) out += alphabet[buf[i] % alphabet.length];
+  return out;
+}
+
 async function saveBehavior(btn) {
   const form = $('#form-behavior');
   if (!form) return;
@@ -6391,6 +6456,20 @@ async function saveBehavior(btn) {
     launchAtLogin: isOn('launchAtLogin'),
     startMinimized: isOn('startMinimized'),
   };
+  const adminPortEl = form.querySelector('[name="adminPort"]');
+  const adminUserEl = form.querySelector('[name="adminUser"]');
+  const adminPassEl = form.querySelector('[name="adminPassword"]');
+  if (adminPortEl) {
+    const port = Number(adminPortEl.value);
+    if (!Number.isInteger(port) || port < 1024 || port > 65535) {
+      toast('error', '管理端口不合法', '填 1024 - 65535 之间的端口');
+      adminPortEl.focus();
+      return;
+    }
+    patch.adminPort = port;
+  }
+  if (adminUserEl) patch.adminUser = String(adminUserEl.value || '').trim() || 'admin';
+  if (adminPassEl) patch.adminPassword = String(adminPassEl.value || '');
   await withBusy(btn, async () => {
     const level = form.querySelector('[name="logLevel"]').value;
     const loginFailExit = isOn('loginFailExit');
@@ -6402,6 +6481,8 @@ async function saveBehavior(btn) {
       return;
     }
     if (res.data && res.data.state) S.state = res.data.state;
+    const adminWarnings = (res.data && Array.isArray(res.data.warnings) ? res.data.warnings : []).filter(Boolean);
+    if (adminWarnings.length) toast('warn', '设置已保存，但有一处没落到配置文件', adminWarnings[0]);
     /* 日志级别 / loginFailExit 落在 frpc.toml 里，同一个按钮一起写掉，
      * 免得用户改完日志级别还要再找一次“保存配置在哪”。 */
     const cfg = await saveClientLogOptions(level, loginFailExit);

@@ -2535,11 +2535,17 @@ function registerIpc() {
     const adminChanged = adminBefore.port !== settings.adminPort
       || adminBefore.user !== settings.adminUser
       || adminBefore.password !== settings.adminPassword;
+    const adminWarnings = [];
     if (adminChanged && model) {
       const changed = configModule.ensureAdmin(model, settings);
       if (changed) {
         const saved = persistModel(model, { reload: false });
-        if (!saved.ok) return fail(`管理 API 配置写入失败：${saved.error || '未知原因'}`);
+        /* 写不进去通常是配置本身还有别的问题（全新安装时 serverAddr 还空着就是最常见的一种）。
+         * 设置已经保存了，为一个跟口令无关的校验错误整次失败只会让人困惑；
+         * 这里如实说明「没写进 frpc.toml」以及补救方式——启动隧道时 ensureAdminConfig 会再写一次。 */
+        if (!saved.ok) {
+          adminWarnings.push(`管理 API 的端口/口令没能立刻写进 frpc.toml：${saved.error || '未知原因'}。等配置修好后保存一次，或下次启动隧道时会再写。`);
+        }
       }
       const snap = manager.snapshot();
       if (snap.running) {
@@ -2550,7 +2556,7 @@ function registerIpc() {
     }
     await manager.refresh().catch(() => {});
     pushState();
-    return ok({ state: buildState(), paths: pathsForState() });
+    return ok({ state: buildState(), paths: pathsForState(), warnings: adminWarnings });
   }
 
   ipcMain.handle('paths:pick', async (event, kind) => {
