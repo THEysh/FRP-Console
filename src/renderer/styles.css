@@ -1524,3 +1524,26 @@ label .icon-btn svg { width: 13px; height: 13px; }
 .log-src-seg button { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* 服务器页「运行监控」区现在只剩「本机映射」一张卡：让它铺满整行，别留半边空白。 */
 .srv-monitor-grid > :only-child { grid-column: 1 / -1; }
+
+/* 设置页「已知服务器指纹」：左边地址、中间指纹（可截断，悬停看全）、右边删除。
+   指纹是 base64，长且不能自动断行，所以给它 flex:1 + 单行省略。 */
+.known-list { display: flex; flex-direction: column; gap: 6px; }
+.known-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(148, 163, 184, 0.06);
+  border: 1px solid rgba(148, 163, 184, 0.12);
+}
+.kr-host { flex: 0 0 auto; font-size: 12.5px; color: var(--text-1); }
+.kr-fp {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 11.5px;
+  color: var(--text-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

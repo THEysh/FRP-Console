@@ -77,5 +77,5 @@ test('打开文件时忽略格式不对的条目（手工改坏也不会误信�
   const file = tempFile();
   fs.writeFileSync(file, JSON.stringify({ v: 1, hosts: { 'a:22': 'SHA256:good', 'b:22': 'md5:xx', 'c:22': 123 } }), 'utf8');
   const kh = new KnownHosts(file);
-  assert.deepStrictEqual(kh.list(), [{ target: 'a:22', fingerprint: 'SHA256:good' }]);
+  assert.deepStrictEqual(kh.list(), [{ target: 'a:22', host: 'a', port: 22, fingerprint: 'SHA256:good' }]);
 });

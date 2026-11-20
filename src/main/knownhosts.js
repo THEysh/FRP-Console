@@ -88,7 +88,13 @@ class KnownHosts {
   }
 
   list() {
-    return Object.entries(this.map).map(([target, fingerprint]) => ({ target, fingerprint }));
+    /* 同时给出 host / port，界面不用自己拆 'host:port'（IPv6 拆起来容易错）。 */
+    return Object.entries(this.map).map(([target, fingerprint]) => {
+      const at = target.lastIndexOf(':');
+      const host = at > 0 ? target.slice(0, at) : target;
+      const port = at > 0 ? Number(target.slice(at + 1)) || 22 : 22;
+      return { target, host, port, fingerprint };
+    });
   }
 }
 

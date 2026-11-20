@@ -25,6 +25,8 @@ const S = {
   modalOpen: false,
   proxyEdit: null,
   update: null,
+  /* 已知服务器指纹（userData/known-hosts.json）：首次连接记录、之后比对，设置页可以查看与删除 */
+  knownHosts: { loaded: false, loading: false, hosts: [], error: '' },
   certs: { list: [], dns: { dnsProvider: '', hasToken: false, acmeEmail: '' }, loaded: false, busy: false, issuing: false, wizard: { domain: '', checking: false, dns: null, setA: false, result: null }, server: { loaded: false, loading: false, certs: [], host: '', scannedAt: 0, truncated: false, error: '' } },
   lastKeys: {},
   viewScroll: {},
@@ -4502,6 +4504,40 @@ function renderCerts(force = false) {
 
 /* ----------------------------- 设置 ------------------------------ */
 
+/* 设置页「已知服务器指纹」区块：把 userData/known-hosts.json 摊开，
+ * 让用户能看到都信任过谁、也能把某台删掉（下次连接会重新记录）。 */
+function knownHostsMarkup() {
+  const k = S.knownHosts || {};
+  if (k.loading && !k.loaded) return '<div class="field-hint">正在读取…</div>';
+  if (k.error) return `<div class="note warn">${icon('alert')}<div>${esc(k.error)}</div></div>`;
+  const hosts = k.hosts || [];
+  if (!hosts.length) {
+    return '<div class="field-hint">还没有记录。连过一次服务器之后，这里会出现它的主机指纹；换机器、重装 sshd 或怀疑被劫持时，删掉对应那条再连一次即可重新记录。</div>';
+  }
+  return `<div class="known-list">${hosts
+    .map(
+      (h) => `<div class="known-row">
+        <span class="kr-host mono-text">${esc(String(h.host))}:${esc(String(h.port))}</span>
+        <span class="kr-fp mono-text" title="${esc(String(h.fingerprint || ''))}">${esc(String(h.fingerprint || ''))}</span>
+        <button class="btn small ghost" type="button" data-act="known.forget" data-host="${esc(String(h.host))}" data-port="${esc(String(h.port))}">${icon('trash')}<span>删除</span></button>
+      </div>`,
+    )
+    .join('')}</div>`;
+}
+
+async function loadKnownHosts(silent = false) {
+  if (!silent) {
+    S.knownHosts = { ...(S.knownHosts || {}), loading: true };
+    const box = $('#known-hosts-box');
+    if (box) box.innerHTML = knownHostsMarkup();
+  }
+  const res = await FRP.serverKnownHosts().catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+  if (res && res.ok) S.knownHosts = { loaded: true, loading: false, hosts: (res.data && res.data.hosts) || [], error: '' };
+  else S.knownHosts = { loaded: true, loading: false, hosts: [], error: (res && res.error) || '读不到已知指纹列表' };
+  const box2 = $('#known-hosts-box');
+  if (box2) box2.innerHTML = knownHostsMarkup();
+}
+
 function renderSettings(force = false) {
   if (!force && S.lastKeys.settings === 'rendered') return;
   S.lastKeys.settings = 'rendered';
@@ -4621,6 +4657,14 @@ function renderSettings(force = false) {
 
         <section class="card section">
           <div class="section-head">
+            <div class="section-title"><strong>已知服务器指纹</strong><span>第一次连接某台服务器时会记下它的 SSH 主机指纹，之后每次连接都比对；对不上就拒绝连接并让你确认。</span></div>
+            <button class="btn small" type="button" data-act="known.refresh">${icon('reload')}<span>刷新</span></button>
+          </div>
+          <div id="known-hosts-box">${knownHostsMarkup()}</div>
+        </section>
+
+        <section class="card section">
+          <div class="section-head">
             <div class="section-title"><strong>关于</strong><span>版本与运行环境。</span></div>
           </div>
           <div class="detail-list">
@@ -4636,6 +4680,8 @@ function renderSettings(force = false) {
     </div>`;
 
   renderUpdateBox();  if (!S.update) refreshUpdateState();
+  /* 指纹列表很短，顺手拉一次；失败也只是那一段显示错误文案 */
+  loadKnownHosts().catch(() => {});
 }
 
 function pathRow(label, value, exists, kind) {
@@ -5314,6 +5360,30 @@ async function handleAction(act, dataset, btn) {
           S.lastKeys.settings = '';
           renderSettings(true);
         } else if (res && !res.ok) toastResult(res);
+        break;
+      }
+      case 'known.refresh': {
+        await loadKnownHosts(true);
+        break;
+      }
+      case 'known.forget': {
+        const host = btn && btn.dataset ? btn.dataset.host : '';
+        const port = Number((btn && btn.dataset && btn.dataset.port) || 22);
+        if (!host) break;
+        const okForget = await confirmDialog({
+          title: `忘掉 ${host}:${port} 的指纹？`,
+          body: '删掉之后，下次连这台服务器会重新记录它出示的指纹——如果现在这台机器的密钥确实换过（重装系统、换 sshd），这么做是对的；如果没换过，先别急着删，那可能是有人在中间冒充它。',
+          confirmText: '删掉',
+          cancelText: '取消',
+          danger: true,
+        });
+        if (!okForget) break;
+        const res = await FRP.serverForgetHost({ host, port }).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+        if (!res || !res.ok) { toast('error', '没删掉', (res && res.error) || ''); break; }
+        S.knownHosts = { loaded: true, loading: false, hosts: (res.data && res.data.hosts) || [], error: '' };
+        const box = $('#known-hosts-box');
+        if (box) box.innerHTML = knownHostsMarkup();
+        toast('ok', `已忘掉 ${host}:${port} 的指纹`);
         break;
       }
       case 'settings.reveal':

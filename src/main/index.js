@@ -173,6 +173,13 @@ function hostKeyGuard(key) {
   if (verdict.status === 'new') {
     knownHosts.trust(host, port, verdict.fingerprint);
     console.log(`[ssh] 首次连接 ${verdict.target}，记录主机指纹 ${verdict.fingerprint}`);
+    /* 首次信任说白了是「这次先信你」：给一条可见的通知，用户才知道有这么一层，
+     * 也知道真出事时该去哪儿对比（设置页「已知服务器指纹」）。 */
+    notify(
+      'info',
+      `首次连接 ${verdict.target}`,
+      `已记下它的主机指纹 ${String(verdict.fingerprint).slice(0, 24)}…，之后每次连接都会比对；对不上会拒绝并让你确认。`,
+    );
     return { ...verdict, ok: true };
   }
   if (verdict.status === 'changed') {
