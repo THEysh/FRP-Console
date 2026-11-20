@@ -295,9 +295,13 @@ function boundVhostPorts() {
   const sessionIsBound = !!(serverSession && serverSession.connected && sessionServerId && bound && sessionServerId === bound.id);
   const srvSummary = (sessionIsBound && serverConfig.summary) || null;
   if (bound) {
+    /* 档案里没记（0）时回落到全局设置：`settings:save` 会把用户在设置页填的值同步进
+     * 绑定档案，但老档案、或刚连上还没同步过的档案这里是空的。直接返回 0 会让探测
+     * 按 80/443 去猜 —— 服务端 vhost 端口不是 80 时，每条 http 代理都会永远
+     * 显示「公网不可达」，明明隧道是通的。 */
     return {
-      vhostHttpPort: (srvSummary && srvSummary.vhostHTTPPort) || Number(bound.vhostHttpPort) || 0,
-      vhostHttpsPort: (srvSummary && srvSummary.vhostHTTPSPort) || Number(bound.vhostHttpsPort) || 0,
+      vhostHttpPort: (srvSummary && srvSummary.vhostHTTPPort) || Number(bound.vhostHttpPort) || Number(settings.vhostHttpPort) || 0,
+      vhostHttpsPort: (srvSummary && srvSummary.vhostHTTPSPort) || Number(bound.vhostHttpsPort) || Number(settings.vhostHttpsPort) || 0,
     };
   }
   return {
@@ -1808,6 +1812,23 @@ function isIpLike(text) {
 async function resolveDomainInfo(domain) {
   const clean = String(domain || '').trim().toLowerCase();
   if (!clean) return { resolved: [], pointsToServer: false, error: '缺少域名', sources: [] };
+  /* customDomains 里可以直接写 IP（frp 按 Host 匹配，浏览器也能用 http://1.2.3.4 访问）。
+   * IP 根本不需要解析，走 DNS 只会得到「查不到 A/AAAA 记录」这种假故障 ——
+   * 之前填 127.0.0.1 的 http 代理会一直红着「域名没有解析」，第三层探测也永远不跑。 */
+  if (isIpLike(clean) || net.isIP(clean)) {
+    return {
+      resolved: [clean],
+      pointsToServer: true,
+      error: '',
+      verdict: 'ok',
+      tone: 'ok',
+      title: '这是 IP，不需要域名解析',
+      detail: '',
+      soaMinTtl: 0,
+      sources: [],
+      checkedAt: Date.now(),
+    };
+  }
   const server = String((model && model.serverAddr) || '').trim().toLowerCase();
   try {
     const info = await dnsCheck.resolveName(clean);
