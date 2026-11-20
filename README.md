@@ -511,6 +511,9 @@ node tests/soak.cjs 10                  # 长稳抽查：隧道 + 20 条代理�
 - frps 初始化会写入 `/etc/frp/frps.toml`、注册系统服务并重启 frps；**若服务器上原有的 frps 正在服务其他隧道，这会短暂中断并替换其配置**，执行前请确认影响范围。
 
 ## 更新日志
+### 1.2.137
+
+- **修：frps 起不来时，报错只会贴 systemd 的 `Failed with result 'exit-code'`**，真正的原因（配置字段类型错、端口被占）就在同一段日志里却被盖掉了。现在优先挑 frps 自己那条报错，并在「配置读不了」时直接告诉你回配置文件改。
 ### 1.2.136
 
 - **修：`frps.service` 被 mask 时，程序会绕过 systemd 偷偷裸起一个 frps 还报「启动成功」**。那个进程不受 systemd 管理（重启机器就没了），还会占着 7000/4096 让后续 `systemctl start` 一直失败。现在：自检直接说「被 mask 了」，点启动会失败并告诉你在服务器上执行 `systemctl unmask frps.service`，不会再裸起进程。

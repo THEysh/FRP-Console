@@ -152,3 +152,26 @@ test('maskedUnitFromUnitFiles：空输出/异常输入不抛错', () => {
   assert.equal(maskedUnitFromUnitFiles(''), '');
   assert.equal(maskedUnitFromUnitFiles(null), '');
 });
+
+const { pickFailureLine } = require('../../src/main/ssh.js');
+
+test('pickFailureLine：优先挑 frps 自己的报错行，而不是 systemd 的 exit-code 噪声', () => {
+  const tail = [
+    "Nov 20 19:16:01 host systemd[1]: frps.service: Main process exited, code=exited, status=1/FAILURE",
+    "Nov 20 19:16:01 host frps[123]: listen tcp 0.0.0.0:4096: bind: address already in use",
+    "Nov 20 19:16:01 host systemd[1]: Failed with result 'exit-code'.",
+  ].join('\n');
+  const line = pickFailureLine(tail);
+  assert.match(line, /frps\[123\]/);
+  assert.match(line, /address already in use/);
+});
+
+test('pickFailureLine：只有 systemd 噪声时退而求其次也要给一行', () => {
+  const line = pickFailureLine("Nov 20 19:16:01 host systemd[1]: Failed with result 'exit-code'.");
+  assert.match(line, /exit-code/);
+});
+
+test('pickFailureLine：空输入返回空串', () => {
+  assert.equal(pickFailureLine(''), '');
+  assert.equal(pickFailureLine(null), '');
+});

@@ -5,6 +5,31 @@ const { Client } = require('ssh2');
 const { parseConfig: frpsParseConfig, summary: frpsSummary } = require('./frpsconfig');
 const { stringify: tomlStringify } = require('smol-toml');
 
+/* 从 journalctl 尾巴里挑最能说明问题的那一行：
+ * systemd 自己只会写 "Failed with result 'exit-code'."，真正的原因在 frps 那一行
+ * （配置解析失败、端口被占、权限不足……）。以前取「最后一条含 error 的行」，
+ * 结果永远拿到 systemd 那句，用户看完还是不知道错在哪。 */
+function pickFailureLine(logTail) {
+  const lines = String(logTail || '')
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  if (!lines.length) return '';
+  const isDaemon = (l) => /\bfrps\[/.test(l);
+  const isCause = (l) => /(unmarshal|invalid|error|cannot|failed to|address already in use|permission denied|no such file|panic)/i.test(l);
+  const isSystemdNoise = (l) => /systemd\[\d+\]:/i.test(l);
+  const daemonCause = lines.filter((l) => isDaemon(l) && isCause(l)).slice(-1)[0];
+  if (daemonCause) return daemonCause;
+  const deamonAny = lines.filter(isDaemon).slice(-1)[0];
+  if (deamonAny) return deamonAny;
+  const anyCause = lines.filter((l) => isCause(l) && !isSystemdNoise(l)).slice(-1)[0];
+  if (anyCause) return anyCause;
+  const causeOnly = lines.filter((l) => isCause(l)).slice(-1)[0];
+  if (causeOnly) return causeOnly;
+  /* 什么关键字都没有时，最后一行总比空着强（至少能看出是 frps 退出了）。 */
+  return lines.slice(-1)[0] || '';
+}
+
 /* systemctl list-unit-files 的输出里，状态为 masked 的那一行就是「被 mask 的单元」。
  * 单独抽出来是为了能单测：这行判断错了，产品会绕过 systemd 裸起进程。 */
 function maskedUnitFromUnitFiles(text) {
@@ -2560,9 +2585,13 @@ class ServerSession {
   explainStartFailure(logTail) {
     const text = String(logTail || '');
     if (!text.trim()) return '';
-    const errLine = text.split(/\r?\n/).map((s) => s.trim()).filter((l) => /error|fail|already in use|cannot|refused/i.test(l)).slice(-1)[0] || '';
+    const errLine = pickFailureLine(text);
     if (/address already in use/i.test(text)) {
       return `${errLine ? `（日志：${errLine}）` : ''}；这个端口已经被别的程序占用了——在服务器上执行 ss -lntp 找出占用者并停掉，或把 frps 的 bindPort 换成空闲端口`;
+    }
+    /* 配置解析失败时，只贴 Go 的原始报错不够，得告诉用户下一步怎么做。 */
+    if (/unmarshal|json: /i.test(text)) {
+      return `${errLine ? `（日志：${errLine}）` : ''}；frps 读不了这份配置（字段类型或写法不对）——在服务器页的「配置文件」里改正后保存，保存前会先跑一遍 frps 自己的校验`;
     }
     return errLine ? `（日志最后一条错误：${errLine}）` : '';
   }
@@ -2773,4 +2802,4 @@ function explainFsError(text) {
 }
 module.exports = {
   explainFsError,
-  explainServiceError, ServerSession, parseServiceUnits, rankServiceUnits, parsePortInput, removeServerBlocks, ufwAllowsPort, parseCertRefs, parseMissingPaths, mergeNginxConf, nginxServerBlockSpans, maskedUnitFromUnitFiles };
+  explainServiceError, ServerSession, parseServiceUnits, rankServiceUnits, parsePortInput, removeServerBlocks, ufwAllowsPort, parseCertRefs, parseMissingPaths, mergeNginxConf, nginxServerBlockSpans, maskedUnitFromUnitFiles, pickFailureLine };
