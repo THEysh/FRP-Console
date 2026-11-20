@@ -2844,16 +2844,27 @@ function registerIpc() {
     return ok({ state: result.state, reloaded: result.reloaded });
   });
 
+  /* 端口建议/随机：找不到时必须说清原因。以前只回 {port:null}，
+   * 界面把 null 写进输入框等于什么都不发生，用户以为按钮坏了。 */
+  const noPortReason = (allowPorts) => {
+    if (allowPorts && allowPorts.length) {
+      return `服务器的 allowPorts（${configModule.formatAllowPorts(allowPorts)}）里已经没有空闲端口了`;
+    }
+    return '10000–64999 之间没找到空闲端口（代理数量太多？）';
+  };
+
   ipcMain.handle('proxy:suggest-port', async (event, type) => {
     if (!model) return ok({ port: 10000 });
     const allowPorts = (serverConfig.summary && serverConfig.summary.allowPorts) || [];
-    return ok({ port: configModule.suggestRemotePort(model, type, { allowPorts }) });
+    const port = configModule.suggestRemotePort(model, type, { allowPorts });
+    return ok(port ? { port } : { port: null, reason: noPortReason(allowPorts) });
   });
 
   ipcMain.handle('proxy:random-port', async (event, type) => {
     if (!model) return ok({ port: 10000 });
     const allowPorts = (serverConfig.summary && serverConfig.summary.allowPorts) || [];
-    return ok({ port: configModule.randomRemotePort(model, type, { allowPorts }) });
+    const port = configModule.randomRemotePort(model, type, { allowPorts });
+    return ok(port ? { port } : { port: null, reason: noPortReason(allowPorts) });
   });
 
   ipcMain.handle('proxy:check-port', async (event, payload) => {

@@ -126,6 +126,18 @@ const FRPS_TOML = [
       `webServer.password = "${rest.join(':')}"`,
     ];
   })(),
+  /* 用 FAKE_ALLOW_PORTS="20000,20001" 造「服务器只允许这几个公网端口」的场景：
+   * frps 的 allowPorts 会限制 frpc 能用哪些 remotePort，端口建议/随机必须尊重它。 */
+  ...(() => {
+    const raw = process.env.FAKE_ALLOW_PORTS;
+    if (!raw) return [];
+    const parts = raw
+      .split(',')
+      .map((s) => Number(s.trim()))
+      .filter((n) => Number.isInteger(n) && n > 0 && n < 65536);
+    if (!parts.length) return [];
+    return ['', 'allowPorts = [' + parts.join(', ') + ']'];
+  })(),
   '',
 ].join('\n');
 

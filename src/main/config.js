@@ -612,7 +612,16 @@ function portInAllowList(port, allowPorts) {
   if (!Array.isArray(allowPorts) || allowPorts.length === 0) return true;
   const n = Number(port);
   return allowPorts.some((entry) => {
-    if (!entry || typeof entry !== 'object') return false;
+    if (entry == null) return false;
+    /* 容错：数字或 "3000-4000" 这种写法也认（TOML 里两种都常见），
+     * 不能因为形状不对就把所有端口判成「不在白名单」。 */
+    if (typeof entry === 'number') return n === entry;
+    if (typeof entry === 'string') {
+      const range = /^(\d+)\s*-\s*(\d+)$/.exec(entry.trim());
+      if (range) return n >= Number(range[1]) && n <= Number(range[2]);
+      return n === Number(entry);
+    }
+    if (typeof entry !== 'object') return false;
     if (entry.single != null) return n === Number(entry.single);
     if (entry.start != null && entry.end != null) return n >= Number(entry.start) && n <= Number(entry.end);
     return false;

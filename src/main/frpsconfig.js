@@ -67,6 +67,23 @@ function parseAllowPorts(text) {
   return { ok: true, value: items };
 }
 
+/* frps 的 allowPorts 在 TOML 里可能写成 [20000, "3000-4000"]，
+ * 读进来要统一成 { single } / { start, end }，否则上层判断一条都匹配不上。 */
+function normalizeAllowPorts(list) {
+  if (!Array.isArray(list)) return [];
+  const out = [];
+  for (const entry of list) {
+    if (entry && typeof entry === 'object') {
+      if (entry.single != null) out.push({ single: Number(entry.single) });
+      else if (entry.start != null && entry.end != null) out.push({ start: Number(entry.start), end: Number(entry.end) });
+      continue;
+    }
+    const parsed = parseAllowPorts(String(entry));
+    if (parsed.ok && Array.isArray(parsed.value)) out.push(...parsed.value);
+  }
+  return out.filter((e) => (e.single >= 1 && e.single <= 65535) || (e.start >= 1 && e.end <= 65535 && e.start <= e.end));
+}
+
 function allowPortsToText(list) {
   if (!Array.isArray(list)) return '';
   return list
@@ -104,7 +121,7 @@ function summary(data) {
     kcpBindPort: Number(source.kcpBindPort) || 0,
     quicBindPort: Number(source.quicBindPort) || 0,
     tcpmuxHTTPConnectPort: Number(source.tcpmuxHTTPConnectPort) || 0,
-    allowPorts: Array.isArray(source.allowPorts) ? source.allowPorts : [],
+    allowPorts: normalizeAllowPorts(source.allowPorts),
     allowPortsText: allowPortsToText(source.allowPorts),
     extraKeys: Object.keys(source).filter((key) => !['bindAddr', 'bindPort', 'auth', 'webServer', 'dashboard', 'vhostHTTPPort', 'vhostHTTPSPort', 'allowPorts', 'kcpBindPort', 'quicBindPort', 'tcpmuxHTTPConnectPort'].includes(key)),
   };
@@ -328,5 +345,6 @@ module.exports = {
   allowPortsToText,
   setTopLevelInt,
   randomDashboardPassword,
+  normalizeAllowPorts,
   rotateWebPassword,
 };

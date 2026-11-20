@@ -5418,9 +5418,13 @@ async function handleAction(act, dataset, btn) {
       }
       case 'proxyform.suggest': {
         const res = await FRP.suggestPort($('#pf-type') ? $('#pf-type').value : 'tcp');
-        if (res && res.ok) {
-          const input = $('#pf-remote');
+        const input = $('#pf-remote');
+        if (res && res.ok && res.data.port) {
           if (input) input.value = res.data.port;
+          const st = $('#pf-remote-status');
+          if (st) { st.textContent = `已填入 ${res.data.port}，建议点「检测」确认可用`; st.className = 'field-hint'; }
+        } else {
+          toast('warn', '没找到可用端口', (res && res.data && res.data.reason) || '');
         }
         break;
       }
@@ -5484,9 +5488,13 @@ async function handleAction(act, dataset, btn) {
       }
       case 'proxyform.random': {
         const res = await FRP.randomPort($('#pf-type') ? $('#pf-type').value : 'tcp');
+        const input = $('#pf-remote');
         if (res && res.ok && res.data.port) {
-          const input = $('#pf-remote');
           if (input) input.value = res.data.port;
+          const st = $('#pf-remote-status');
+          if (st) { st.textContent = `已填入随机端口 ${res.data.port}，建议点「检测」确认可用`; st.className = 'field-hint'; }
+        } else {
+          toast('warn', '没找到可用端口', (res && res.data && res.data.reason) || '');
         }
         break;
       }
@@ -6107,9 +6115,11 @@ async function refreshServerSummarySilently() {
 
 async function suggestRemotePort(type) {
   const res = await FRP.suggestPort(type);
-  if (res && res.ok) {
-    const input = $('#pf-remote');
+  const input = $('#pf-remote');
+  if (res && res.ok && res.data.port) {
     if (input && !input.value) input.value = res.data.port;
+  } else if (res && res.ok && !res.data.port) {
+    toast('warn', '没找到可用端口', res.data.reason || '');
   }
 }
 

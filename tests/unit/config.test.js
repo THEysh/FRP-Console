@@ -220,3 +220,21 @@ test('域名超过 253 字符会被拒（DNS 上限）', () => {
   assert.equal(res.errors.length, 1);
   assert.match(res.errors[0].message, /太长/);
 });
+
+/* 边界：服务器 allowPorts 很小且已用满时，端口建议与随机都必须如实返回 null，
+ * 不能悄悄给一个「反正 frpc 会拒绝」的端口。 */
+test('allowPorts 用满后 suggestRemotePort 返回 null', () => {
+  const model = { serverAddr: '1.2.3.4', serverPort: 7000, proxies: [{ name: 'a', type: 'tcp', remotePort: 20000 }] };
+  assert.equal(config.suggestRemotePort(model, 'tcp', { allowPorts: [{ single: 20000 }] }), null);
+});
+
+test('allowPorts 用满后 randomRemotePort 也返回 null', () => {
+  const model = { serverAddr: '1.2.3.4', serverPort: 7000, proxies: [{ name: 'a', type: 'tcp', remotePort: 20000 }] };
+  assert.equal(config.randomRemotePort(model, 'tcp', { allowPorts: [{ single: 20000 }] }), null);
+});
+
+test('allowPorts 还有空闲时只在白名单里挑', () => {
+  const model = { serverAddr: '1.2.3.4', serverPort: 7000, proxies: [{ name: 'a', type: 'tcp', remotePort: 20000 }] };
+  const port = config.suggestRemotePort(model, 'tcp', { allowPorts: [{ single: 20000 }, { single: 20001 }] });
+  assert.equal(port, 20001);
+});
