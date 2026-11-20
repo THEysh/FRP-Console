@@ -291,7 +291,20 @@ function validate(model, options = {}) {
       }
       for (const domain of domains) {
         // 带 http:// 或者带端口的域名会让 frpc 启动失败，但报错信息完全看不出是这个原因
-        if (!isDomainLike(domain)) push('error', `proxies[${index}].customDomains`, `${label} 的域名「${domain}」不合法：只填域名本身，不要带 http://、端口或路径`);
+        if (!isDomainLike(domain)) {
+          push('error', `proxies[${index}].customDomains`, `${label} 的域名「${domain}」不合法：只填域名本身，不要带 http://、端口或路径`);
+        } else {
+          /* isDomainLike 允许「*」开头的泛域名（frps 确实支持：*.a.com 能匹配 x.a.com），
+           * 但「.a.com」「a..com」「a.com.」这种成不了形的写法它放过了，而 frps 永远匹配不到——
+           * 结果是代理看着 running、公网怎么都 404，排查很久才知道是域名写错。 */
+          const shaped = String(domain || '').trim();
+          if (/^\./.test(shaped) || /\.$/.test(shaped) || /\.\./.test(shaped)) {
+            push('error', `proxies[${index}].customDomains`, `${label} 的域名「${domain}」不成形：不能以点开头或结尾，也不能有连续的点（泛域名请写成 *.example.com）`);
+          } else if (shaped.length > 253) {
+            /* 253 是 DNS 名字的总长上限；更长的域名根本解析不出来，frps 也永远匹配不到。 */
+            push('error', `proxies[${index}].customDomains`, `${label} 的域名太长（${shaped.length} 字符，域名最长 253）：${shaped.slice(0, 40)}…`);
+          }
+        }
         /* 同一个域名只能给一条 http/https/tcpmux 代理用：撞了以后 frps 会给后来者
          * 返回 router config conflict，界面上只会显示「未同步」，很难看出真实原因。 */
         const key = domain.toLowerCase();

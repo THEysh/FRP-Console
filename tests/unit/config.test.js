@@ -187,3 +187,36 @@ test('域名各不相同就不报错', () => {
   };
   assert.equal(validate(model).errors.length, 0);
 });
+
+test('域名不能以点开头/结尾或有连续的点（泛域名仍允许）', () => {
+  const base = (domains) =>
+    config.validate({
+      serverAddr: '1.2.3.4',
+      serverPort: 7000,
+      auth: { method: 'token', token: 't' },
+      proxies: [{ name: 'p1', type: 'http', localIP: '127.0.0.1', localPort: 80, customDomains: domains }],
+    });
+  const bad = ['.a.com', 'a.com.', 'a..com'];
+  for (const d of bad) {
+    const res = base([d]);
+    assert.equal(res.errors.length, 1, `${d} 应被拒`);
+    /* \`a.com.` 会先被 isDomainLike 拦下（另一条文案），这里只要求「一定被拒且有中文说明」 */
+    assert.match(res.errors[0].message, /域名/);
+  }
+  for (const d of ['a.com', '*.a.com', 'sub.a.com']) {
+    const res = base([d]);
+    assert.equal(res.errors.length, 0, `${d} 应被接受，实际：${JSON.stringify(res.errors)}`);
+  }
+});
+
+test('域名超过 253 字符会被拒（DNS 上限）', () => {
+  const long = `${'a'.repeat(250)}.example.com`;
+  const res = config.validate({
+    serverAddr: '1.2.3.4',
+    serverPort: 7000,
+    auth: { method: 'token', token: 't' },
+    proxies: [{ name: 'p1', type: 'http', localIP: '127.0.0.1', localPort: 80, customDomains: [long] }],
+  });
+  assert.equal(res.errors.length, 1);
+  assert.match(res.errors[0].message, /太长/);
+});
