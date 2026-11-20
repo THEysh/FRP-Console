@@ -4329,7 +4329,10 @@ function registerIpc() {
     const epoch = sessionEpoch;
     const result = await serverSession.control(action);
     if (epoch !== sessionEpoch) return staleFail();
-    if (!result.ok) return fail(result.error, { state: serverState() });
+    if (!result.ok) {
+      const refined = frpsConfig.refineStartError(result.error, serverConfig.summary);
+      return fail(refined, { state: serverState() });
+    }
     await loadServerSnapshot({ epoch });
     return ok({ ...result, serverId: sessionServerId, state: serverState() });
   });

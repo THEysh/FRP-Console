@@ -333,6 +333,36 @@ function rotateWebPassword(text, pass) {
   return null;
 }
 
+/* frps 起不来常见原因是「某个端口被占」，但报错只说「这个端口被占用」，
+ * 而 frps 有 4 类端口（bindPort / Dashboard / vhostHTTPPort / vhostHTTPSPort）。
+ * 日志里其实带着具体端口号，这里按当前配置把端口号翻译成「是哪个键」。 */
+function refineStartError(text, summary) {
+  const msg = String(text || '');
+  if (!msg || !/address already in use/i.test(msg)) return msg;
+  /* 只认「报 address already in use 的那一行」里的端口号。
+   * 以前用一条带可选分支的正则去抓，遇到「Nov 20 20:42:34 … listen tcp 0.0.0.0:4096: bind」
+   * 这种行会先咬到时间里的数字，结果把 4096 说成 42 端口。 */
+  const line = String(msg).split(/\r?\n/).find((l) => /address already in use/i.test(l)) || '';
+  const nums = [...line.matchAll(/:([0-9]{2,5})(?=[:\s]|$)/g)].map((m) => Number(m[1]));
+  const configured = [summary && summary.bindPort, summary && summary.webPort, summary && summary.vhostHTTPPort, summary && summary.vhostHTTPSPort]
+    .map(Number).filter(Boolean);
+  const port = nums.find((n) => configured.includes(n)) || nums[0] || 0;
+  const s = summary || {};
+  const table = [
+    ['bindPort', '连接端口（bindPort，客户端连它）'],
+    ['webPort', 'Dashboard 面板端口（webServer.port）'],
+    ['vhostHTTPPort', 'HTTP 域名穿透端口（vhostHTTPPort）'],
+    ['vhostHTTPSPort', 'HTTPS 域名穿透端口（vhostHTTPSPort）'],
+  ];
+  const hit = port ? table.find(([k]) => Number(s[k]) === port) : null;
+  const tail = hit
+    ? `；被占的是 ${port} 端口——它是 frps 的 ${hit[1]}。要么在服务器上停掉占用它的程序（ss -lntp | grep ${port}），要么在「配置文件」里把对应的键改成空闲端口。`
+    : (port ? `；被占的是 ${port} 端口——在服务器上执行 ss -lntp | grep ${port} 看是谁在用，或把对应配置项换成空闲端口。` : '');
+  if (!tail) return msg;
+  /* 原来的尾巴一律说「把 bindPort 换成空闲端口」，对 Dashboard/vhost 端口是错的 */
+  return msg.replace(/；这个端口已经被别的程序占用了[^。]*。?/g, '').replace(/\s*$/, '') + tail;
+}
+
 module.exports = {
   DEFAULT_FIELDS,
   parseConfig,
@@ -347,4 +377,5 @@ module.exports = {
   randomDashboardPassword,
   normalizeAllowPorts,
   rotateWebPassword,
+  refineStartError,
 };

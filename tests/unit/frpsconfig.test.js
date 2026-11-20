@@ -141,3 +141,32 @@ test('randomDashboardPassword 每次都不一样，且不含易混字符', () =>
   assert.notStrictEqual(a, b);
   assert.match(a, /^[a-km-np-z2-9A-HJ-NP-Z]{20}$/);
 });
+
+const { refineStartError } = require('../../src/main/frpsconfig.js');
+
+test('refineStartError：面板端口被占时点明是 webServer.port，而不是让人去改 bindPort', () => {
+  const summary = { bindPort: 7000, webPort: 4096, vhostHTTPPort: 8080 };
+  const raw = "启动后 frps 未运行（已停止）（日志：frps[1]: listen tcp 0.0.0.0:4096: bind: address already in use）；这个端口已经被别的程序占用了——在服务器上执行 ss -lntp 找出占用者并停掉，或把 frps 的 bindPort 换成空闲端口";
+  const out = refineStartError(raw, summary);
+  assert.match(out, /4096/);
+  assert.match(out, /Dashboard 面板端口/);
+  assert.ok(!/把 frps 的 bindPort 换成空闲端口/.test(out), '不该再让人去改 bindPort');
+});
+
+test('refineStartError：连接端口被占时标明是 bindPort', () => {
+  const out = refineStartError('frps[9]: listen tcp 0.0.0.0:7000: bind: address already in use', { bindPort: 7000, webPort: 4096 });
+  assert.match(out, /7000/);
+  assert.match(out, /bindPort/);
+});
+
+test('refineStartError：端口不属于当前配置时仍给端口号，笼统说“对应配置项”', () => {
+  const out = refineStartError('frps[9]: listen tcp 0.0.0.0:9999: bind: address already in use', { bindPort: 7000 });
+  assert.match(out, /9999/);
+  assert.match(out, /对应配置项/);
+});
+
+test('refineStartError：与端口无关的错误原样返回', () => {
+  const raw = '启动后 frps 未运行（异常）（日志：frps[1]: json: cannot unmarshal string into Go struct field ServerConfig.bindPort of type int）';
+  assert.equal(refineStartError(raw, { bindPort: 7000 }), raw);
+  assert.equal(refineStartError('', {}), '');
+});
