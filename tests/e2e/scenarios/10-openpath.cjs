@@ -12,6 +12,16 @@ module.exports = {
     const seeded = await ensureConfig(ctx);
     check('准备：隧道目标指向测试 frps', seeded.ok, seeded.err || '');
 
+    /* 健康检查只在隧道跑着的时候进行，单独跑本场景时必须自己把隧道拉起来，
+     * 否则 health 永远是 null（整条套件里跑时是前一个场景留下的隧道在顶着）。 */
+    const started = await ctx.eval(`(async () => { const r = await FRP.startTunnel(); return { ok: r.ok, err: String(r.error || '').slice(0, 100) }; })()`);
+    check('准备：隧道已启动', started.ok === true, started.err);
+    await waitFor(
+      () => ctx.eval(`(async () => { const r = await FRP.refresh(); return !!(r.data.runtime && r.data.runtime.connected); })()`),
+      (v) => v === true,
+      { timeout: 30000, label: '隧道连上测试 frps' },
+    );
+
     const added = await ctx.eval(`(async () => {
       const res = await FRP.saveProxy('add', '', { name: 'e2e-path', type: 'tcp', localIP: '127.0.0.1', localPort: ${ctx.local.port}, remotePort: 24280, openPath: '/nope/' });
       return { ok: !!(res && res.ok), err: (res && res.error) || '' };
@@ -24,7 +34,9 @@ module.exports = {
         const p = (r.data.proxies || []).find((x) => x.name === 'e2e-path');
         return { health: p && p.health, openPath: p && p.openPath, openUrl: p && p.openUrl, counts: r.data.counts };
       })()`),
-      (s) => s && s.health && s.health.ok === false,
+      /* 只等「失败」会提前被『隧道未建立』满足，于是断言到的是错的那一档。
+       * 必须等到 pathMissing 真的出现。 */
+      (s) => s && s.health && s.health.ok === false && s.health.pathMissing === true,
       { timeout: 45000, label: '错误路径被判定为 404' },
     );
     check('判定失败而不是通过', wrong.health.ok === false, JSON.stringify(wrong.health && wrong.health.reason));

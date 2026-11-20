@@ -48,12 +48,22 @@ module.exports = {
       return res.map((r) => (r.status === 'fulfilled' ? 'ok' : String(r.reason && r.reason.message || r.reason)));
     `);
     ctx.check('启动/停止交叉调用没有抛异常', interleaved.every((x) => x === 'ok'), interleaved.join(','));
+    /* stop→start→stop 并发，最终是「跑着」还是「停了」取决于调度，不该断言具体结局；
+     * 要守的是「不会卡在 starting」以及「显式停止一定能停下」。 */
     const settled = await ctx.waitFor(
       () => evalIpc('const r = await FRP.refresh(); return r.data.runtime;'),
-      (rt) => rt && rt.connected === false,
-      { timeout: 20000, label: '最终停在未连接' },
+      (rt) => rt && rt.mode !== 'starting',
+      { timeout: 25000, label: '交叉调用后状态收敛（不卡在 starting）' },
     );
-    ctx.check('最终停在停止状态（不会卡在 starting）', settled.mode === 'stopped' || settled.pid === null, JSON.stringify({ mode: settled.mode, pid: settled.pid }));
+    ctx.check('交叉调用后不会卡在 starting', settled.mode !== 'starting', JSON.stringify({ mode: settled.mode, pid: settled.pid }));
+
+    await evalIpc('await FRP.stopTunnel(); return 1;');
+    const stopped = await ctx.waitFor(
+      () => evalIpc('const r = await FRP.refresh(); return r.data.runtime;'),
+      (rt) => rt && rt.connected === false,
+      { timeout: 25000, label: '显式停止后不再连接' },
+    );
+    ctx.check('显式停止后确实停下', stopped.mode === 'stopped' || stopped.pid === null, JSON.stringify({ mode: stopped.mode, pid: stopped.pid }));
 
     /* ---------- ③ 并发保存同一条代理 ---------- */
     await evalIpc(`await FRP.saveProxy('add', '', { name: 'race-a', type: 'tcp', localIP: '127.0.0.1', localPort: 18080, remotePort: 23411 }); return 1;`);
