@@ -315,7 +315,14 @@ function boundVhostPorts() {
 function sessionSubDomainHost() {
   const bound = findServerProfile(settings.clientServerId) || activeServerProfile();
   const sessionIsBound = !!(serverSession && serverSession.connected && sessionServerId && bound && sessionServerId === bound.id);
-  return (sessionIsBound && serverConfig.summary && serverConfig.summary.subDomainHost) || '';
+  const fromSession = (serverConfig.summary && serverConfig.summary.subDomainHost) || '';
+  if (sessionIsBound) return fromSession;
+  /* 会话与绑定档案 id 不同、但 host 相同（档案被清理过、手动重连过）时也认：
+   * 后缀是「这台服务器」的事实，host 一致就是同一台。 */
+  const sessionHost = serverSession && serverSession.connected ? String(serverSession.host || '').toLowerCase() : '';
+  const boundHost = bound ? String(bound.host || '').toLowerCase() : '';
+  if (sessionHost && boundHost && sessionHost === boundHost) return fromSession;
+  return '';
 }
 
 /* 把 SSH 会话读到的 vhost 端口写进「这台服务器」的档案，返回是否发生变化。 */function setProfileVhostPorts(profileId, vhostHttpPort, vhostHttpsPort) {
@@ -1481,6 +1488,9 @@ function buildState() {
       openUrl: (() => {
         if (proxy.type === 'udp' || proxy.type === 'sudp' || proxy.type === 'xtcp' || proxy.type === 'stcp') return '';
         if (!publicAddress) return '';
+        /* 「只有 subdomain、还不知道服务器后缀」时 publicAddress 是 `subdomain:demo`——
+         * 这不是地址，补成 http:// 只会给出一个必然打不开的链接。 */
+        if (/^subdomain:/i.test(publicAddress)) return '';
         const base = /^[a-z][a-z0-9+.-]*:\/\//i.test(publicAddress) ? publicAddress : `http://${publicAddress}`;
         return openPath ? `${base.replace(/\/+$/, '')}${openPath}` : base;
       })(),
