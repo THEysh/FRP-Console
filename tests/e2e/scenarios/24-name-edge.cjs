@@ -33,6 +33,22 @@ module.exports = {
       const started = await ctx.eval(`(async () => { const r = await FRP.startTunnel(); return { ok: r.ok, err: String(r.error || '').slice(0, 140) }; })()`);
       ctx.check('隧道能起来（frpc 接受这些名字）', started.ok === true, started.err);
 
+      /* 零宽空格：frpc 能用，但必须给出「不可见字符」的警告（否则列表里认不出）；
+       * 全角空格：属于 \s，直接拒绝。 */
+      const ZW = 'zw\u200bsp';
+      const invisible = await ctx.eval(`(async () => {
+        const r = await FRP.saveProxy('add', '', { name: ${JSON.stringify(ZW)}, type: 'tcp', localIP: '127.0.0.1', localPort: ${local}, remotePort: 46320 });
+        return { ok: r.ok, warnings: ((r.data && r.data.warnings) || []).map((w) => String(w.message || w)) };
+      })()`);
+      if (invisible.ok) created.push(ZW);
+      ctx.check('名字含零宽空格时给出「不可见字符」警告', invisible.ok === true && invisible.warnings.some((w) => /不可见字符/.test(w)), JSON.stringify(invisible).slice(0, 200));
+
+      const wide = await ctx.eval(`(async () => {
+        const r = await FRP.saveProxy('add', '', { name: 'a\u3000b', type: 'tcp', localIP: '127.0.0.1', localPort: ${local}, remotePort: 46321 });
+        return { ok: r.ok, err: String(r.error || '') };
+      })()`);
+      ctx.check('名字含全角空格时被拒绝', wide.ok === false, wide.err.slice(0, 120));
+
       const running = await ctx.waitFor(
         () => ctx.eval(`(async () => { const r = await FRP.refresh(); return (r.data.proxies || []).filter((p) => p.status === 'running').length; })()`),
         (v) => v >= names.length,

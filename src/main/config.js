@@ -239,6 +239,14 @@ function validate(model, options = {}) {
       if (/[<>]/.test(proxy.name)) {
         push('error', `proxies[${index}].name`, `代理名称「${proxy.name}」不能包含尖括号 < >：frpc 的管理接口用 HTML 模板渲染配置，这类名称会让热重载被拒绝（HTTP 400），保存后隧道里的代理不会更新`);
       }
+      /* 零宽空格（U+200B）、BOM、方向标记这类「格式/控制字符」肉眼看不见，也不被 \s 拦住。
+       * 实测 frpc 本身能接受这种名字（代理照样 running），但列表里它和去掉不可见字符后的名字
+       * 长得一模一样，排查时几乎必然认错，所以给一条警告而不是错误。 */
+      if (/[\p{Cc}\p{Cf}]/u.test(proxy.name)) {
+        const shown = proxy.name.replace(/[\p{Cc}\p{Cf}]/gu, '?');
+        const plain = proxy.name.replace(/[\p{Cc}\p{Cf}]/gu, '');
+        push('warn', `proxies[${index}].name`, `代理名称「${shown}」里含不可见字符（零宽空格、BOM、控制符等）：frpc 能用，但在列表里它和「${plain}」长得一模一样，容易认错，建议删掉`);
+      }
       if (proxy.name.length > 64) {
         push('warn', `proxies[${index}].name`, `代理名称「${proxy.name.slice(0, 12)}…」有 ${proxy.name.length} 个字符，列表里会换行显示，建议缩短到 64 个字符以内`);
       }

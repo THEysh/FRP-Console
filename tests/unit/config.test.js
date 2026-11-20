@@ -147,6 +147,35 @@ test('probeTargetFor：访问路径拼进 URL，https 带 SNI，无域名返回 
   assert.equal(config.probeTargetFor(m, { type: 'http' }), null);
 });
 
+test('代理名里的不可见字符（零宽空格 / BOM / 控制符）会被警告', () => {
+  const mk = (name) => ({
+    serverAddr: '127.0.0.1',
+    serverPort: 7000,
+    auth: { method: 'token', token: 'x' },
+    proxies: [{ name, type: 'tcp', localIP: '127.0.0.1', localPort: 18091, remotePort: 24001 }],
+  });
+  for (const bad of ['a\u200bb', '\ufeffa', 'a\u0007b', 'a\u200eb']) {
+    const result = validate(mk(bad));
+    assert.ok(
+      result.warnings.some((item) => /不可见字符/.test(String(item.message || item))),
+      JSON.stringify({ bad, warnings: result.warnings }),
+    );
+    assert.strictEqual(
+      result.errors.filter((item) => /不可见字符/.test(String(item.message || item))).length,
+      0,
+      JSON.stringify({ bad, errors: result.errors }),
+    );
+  }
+  for (const good of ['ab', '中文代理-测试', 'p-🚀', 'a.b/c']) {
+    const result = validate(mk(good));
+    assert.strictEqual(
+      result.warnings.filter((item) => /不可见字符/.test(String(item.message || item))).length,
+      0,
+      JSON.stringify({ good, warnings: result.warnings }),
+    );
+  }
+});
+
 test('重复的自定义域名会被拦下（同一个域名只能给一条 http/https/tcpmux 代理）', () => {
   const model = {
     serverAddr: '127.0.0.1',
