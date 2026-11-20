@@ -3857,7 +3857,7 @@ function certExpiryTone(days) {
   return 'bad';
 }
 
-function certRow(c) {
+function certRow(c, hasToken = false) {
   const tone = certExpiryTone(c.daysLeft);
   const nginxOk = !!(c.nginx && c.nginx.ok);
   const nginxHost = (c.nginx && c.nginx.serverHost) || '';
@@ -3874,6 +3874,9 @@ function certRow(c) {
           ${c.origin === 'install' ? '<span class="badge" title="来自安装版的证书目录（只读扫描）">安装版</span>' : ''}
           ${c.imported ? `<span class="badge" title="从服务器 ${esc(c.imported.serverHost || '')} 导入">导入自 ${esc(c.imported.serverHost || '服务器')}</span>` : ''}
           ${deployedBadge}
+          ${typeof c.daysLeft === 'number' && c.daysLeft <= 30 && !hasToken
+            ? '<span class="badge amber" title="没有配置 DNS 渠道：自动续期不会运行，到期后 https://域名 会打不开">自动续期未开启</span>'
+            : ''}
         </div>
         <div class="cert-meta mono">
           到期 ${c.notAfter ? new Date(c.notAfter).toLocaleString('zh-CN') : '—'}
@@ -4155,7 +4158,7 @@ function certOverviewHtml() {
       const localCount = items.filter((e) => e.kind === 'local').length;
       const srvCount = items.length - localCount;
       const counts = [localCount ? `本机 ${localCount}` : '', srvCount ? `服务器独有 ${srvCount}` : ''].filter(Boolean).join(' · ');
-      const rows = items.map((e) => (e.kind === 'local' ? certRow(e.item) : serverCertRow(e.item))).join('');
+      const rows = items.map((e) => (e.kind === 'local' ? certRow(e.item, !!(S.certs.dns || {}).hasToken) : serverCertRow(e.item))).join('');
       return `
         <div class="cert-group">
           <div class="cert-group-head">
@@ -4495,6 +4498,24 @@ function renderCerts(force = false) {
     ? `<span class="badge">当前服务器 ${esc(serverHost)}</span>`
     : '<span class="badge amber">未连接服务器</span>';
 
+  /* 30 天内到期的那张证书 —— 自动续期只有配了 DNS 渠道才跑得动，没配就得明说。 */
+  const expiring = (certs || [])
+    .filter((c) => c.exists && typeof c.daysLeft === 'number' && c.daysLeft <= 30)
+    .sort((a, b) => a.daysLeft - b.daysLeft);
+  const soonest = expiring[0] || null;
+  const renewBanner = !soonest ? '' : `
+      <section class="card section">
+        <div class="note ${hasToken ? 'warn' : 'bad'}">
+          <strong>${esc(soonest.domain)} 还有 ${soonest.daysLeft} 天到期</strong>
+          <div>${hasToken
+            ? '已配置 DNS 验证渠道：自动续期每 12 小时检查一次，剩余不足 30 天时会自动签新证书（续完记得重新「部署到 nginx」，浏览器才会拿到新证书）。'
+            : '没有配置 DNS 验证渠道，自动续期不会运行 —— 证书到期后 https://域名 会直接打不开。下面的「续期」按钮也要先配好渠道才能用。'}</div>
+          ${hasToken
+            ? ''
+            : `<button class="btn small" type="button" data-act="certs.godns">${icon('key')}<span>去配置 Cloudflare token</span></button>`}
+        </div>
+      </section>`;
+
   $('#view').innerHTML = `
     <div class="view">
       <div class="page-head">
@@ -4503,6 +4524,8 @@ function renderCerts(force = false) {
           <p>给域名上 HTTPS：签证书 → 部署到服务器 → 浏览器就能 <code>https://</code> 访问、不带端口。不配置也能正常使用隧道。</p>
         </div>
       </div>
+
+      ${renewBanner}
 
       <section class="card section">
         <div class="section-head">
@@ -5572,6 +5595,16 @@ async function handleAction(act, dataset, btn) {
           if (crt) crt.value = cert.crtPath;
           if (key) key.value = cert.keyPath;
           toast('success', '已填入证书路径', cert.domain);
+        }
+        break;
+      }
+      case 'certs.godns': {
+        S.certs.wizard = { ...(S.certs.wizard || {}), expanded: true };
+        renderCerts(true);
+        const input = $('#cert-dns-token');
+        if (input) {
+          input.scrollIntoView({ block: 'center' });
+          input.focus();
         }
         break;
       }
