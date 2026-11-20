@@ -58,6 +58,10 @@
 
 内置的 `frpc.exe` 位于 `<安装目录>\resources\frpc\frpc.exe`，**不要手动改它，也不要往里写配置**——安装目录在升级时会被整个替换。「设置 → 可执行文件与路径」里那张路径卡就是它，`frpc.toml` 则固定放在数据目录（`%LOCALAPPDATA%\frp-console\frpc.toml`）。想用自己的 frpc 版本，就在那里手动选一个 exe，选中后以你的为准。
 
+### 1.2.158
+
+- 只填 subdomain 的代理，公网地址会按服务器的 `subDomainHost` 补成完整域名（例如 `demo` → `http://demo.<后缀>:28080`）；还没连服务器、拿不到后缀时显示 `subdomain:demo`，不再拼一个看起来能打开、实际打不开的 `http://demo:28080`。
+
 ### 1.2.157
 
 - 只填 subdomain 而服务器没配 subDomainHost 时，原来只会显示 frps 的英文原话「subdomain is not supported because this feature is not enabled in server」；现在翻成「服务器没有开启 subdomain」，并给出两条出路（配 subDomainHost / 改用完整自定义域名）。

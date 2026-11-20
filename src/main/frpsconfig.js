@@ -120,6 +120,9 @@ function summary(data) {
     webPassword: web.password || '',
     vhostHTTPPort: Number(source.vhostHTTPPort) || 0,
     vhostHTTPSPort: Number(source.vhostHTTPSPort) || 0,
+    /* 配了它，frps 才接受 subdomain 类型的代理；客户端也能用它把「demo」补成
+     * demo.<后缀> 的完整地址（否则界面只能显示一个裸的 demo）。 */
+    subDomainHost: String(source.subDomainHost || '').trim(),
     /* 以下三个是「可选监听端口」：没配就没有对应监听，绝不能当成需要放行的端口，
      * 否则防火墙清单里会出现一个永远「没程序监听」的假告警。 */
     kcpBindPort: Number(source.kcpBindPort) || 0,

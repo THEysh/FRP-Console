@@ -310,8 +310,15 @@ function boundVhostPorts() {
   };
 }
 
-/* 把 SSH 会话读到的 vhost 端口写进「这台服务器」的档案，返回是否发生变化。 */
-function setProfileVhostPorts(profileId, vhostHttpPort, vhostHttpsPort) {
+/* subdomain 的真实后缀只有服务器知道（frps.toml 的 subDomainHost）。
+ * 隧道绑定的就是当前 SSH 会话时直接用它，好把「demo」补成 demo.<后缀>。 */
+function sessionSubDomainHost() {
+  const bound = findServerProfile(settings.clientServerId) || activeServerProfile();
+  const sessionIsBound = !!(serverSession && serverSession.connected && sessionServerId && bound && sessionServerId === bound.id);
+  return (sessionIsBound && serverConfig.summary && serverConfig.summary.subDomainHost) || '';
+}
+
+/* 把 SSH 会话读到的 vhost 端口写进「这台服务器」的档案，返回是否发生变化。 */function setProfileVhostPorts(profileId, vhostHttpPort, vhostHttpsPort) {
   if (!profileId) return false;
   const vh = Number(vhostHttpPort) || 0;
   const vs = Number(vhostHttpsPort) || 0;
@@ -1991,6 +1998,7 @@ async function checkProxyHealth(p, ctx) {
   const vhostOpts = {
     ...settings,
     ...boundVhostPorts(),
+    subDomainHost: sessionSubDomainHost(),
     // settings 里的全局 nginxProxyEnabled 是「最后一次连过的服务器」的事实（兼容字段），
     // 探测必须按隧道绑定档案解析，否则切档案后 http 代理会按错的服务器探测 443。
     nginxProxyEnabled: yModeEnabled(),

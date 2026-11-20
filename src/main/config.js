@@ -711,13 +711,38 @@ function firstDomainOf(proxy) {
   return proxy.subdomain ? String(proxy.subdomain) : '';
 }
 
+/* subdomain 只用「标签」，真实域名要靠服务器的 subDomainHost 补后缀：
+ * 服务器配了 demo.sub.example.com，客户端填的 demo 才能被路由到。
+ * 不知道后缀时返回 ''（由调用方决定怎么显示），不要拼出一个打不开的裸标签地址。 */
+function subdomainHostOf(proxy, options = {}) {
+  const sub = String(proxy.subdomain || '').trim();
+  if (!sub) return '';
+  const suffix = String(options.subDomainHost || '').trim().replace(/^\./, '');
+  return suffix ? `${sub}.${suffix}` : '';
+}
+
+/* 真正用来做 Host/SNI 的域名：优先 customDomains，其次 subdomain + 服务器后缀。 */
+function effectiveDomainOf(proxy, options = {}) {
+  const domains = Array.isArray(proxy.customDomains) ? proxy.customDomains : [];
+  if (domains.length) return String(domains[0]);
+  return subdomainHostOf(proxy, options) || String(proxy.subdomain || '');
+}
+
 function publicAddressFor(model, proxy, options = {}) {
   if (!model.serverAddr) return '';
   if (HOST_TYPES.includes(proxy.type)) {
     return proxy.remotePort ? `${model.serverAddr}:${proxy.remotePort}` : '';
   }
   if (proxy.type === 'http' || proxy.type === 'https') {
-    const domain = firstDomainOf(proxy);
+    const domains = Array.isArray(proxy.customDomains) ? proxy.customDomains : [];
+    /* 只填了 subdomain：必须用服务器的 subDomainHost 补后缀才是一个真地址。
+     * 不知道后缀时不要拼 http://demo:28080 —— 那看起来像个能打开的主机名，
+     * 复制出去必然打不开，反而误导。 */
+    if (!domains.length && proxy.subdomain) {
+      const full = subdomainHostOf(proxy, options);
+      if (!full) return `subdomain:${proxy.subdomain}`;
+    }
+    const domain = effectiveDomainOf(proxy, options);
     if (!domain) return '';
     /* 方案 Y：服务器上已由 nginx 在 443 终止 TLS 并反代到 frps，公网入口
      * 是统一的 https://域名（不带端口）。这里直接返回它，不再拼 frps 的
@@ -769,7 +794,7 @@ function probeTargetFor(model, proxy, options = {}) {
   })();
   const openPathLabel = openPath === '/' ? '' : openPath;
   if (type === 'http' || type === 'https') {
-    const domain = firstDomainOf(proxy);
+    const domain = effectiveDomainOf(proxy, options);
     if (!domain) return null;
     /* 方案 Y：公网入口是 nginx 的 443（终止 TLS 后转 frps vhostHTTPPort），
      * frps 自己的 vhost 端口（8080/8443）只是内网。健康检查必须走真实入口，
@@ -788,7 +813,7 @@ function probeTargetFor(model, proxy, options = {}) {
     }
   }
   if (type === 'http') {
-    const domain = firstDomainOf(proxy);
+    const domain = effectiveDomainOf(proxy, options);
     if (!domain) return null;
     const port = vhostPortOf('http', options);
     return {
@@ -801,7 +826,7 @@ function probeTargetFor(model, proxy, options = {}) {
     };
   }
   if (type === 'https') {
-    const domain = firstDomainOf(proxy);
+    const domain = effectiveDomainOf(proxy, options);
     if (!domain) return null;
     const port = vhostPortOf('https', options);
     return {

@@ -6,6 +6,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const config = require('../../src/main/config');
 const { validate } = config;
+const { probeTargetFor } = config;
 
 function model(extra = {}) {
   return config.normalize({
@@ -188,6 +189,41 @@ test('重复的自定义域名会被拦下（同一个域名只能给一条 http
   };
   const result = validate(model);
   assert.ok(result.errors.some((item) => /已经被「a」占用/.test(String(item.message || item))), JSON.stringify(result.errors));
+});
+
+test('只填 subdomain 时用服务器 subDomainHost 补成完整地址', () => {
+  const model = { serverAddr: '127.0.0.1', serverPort: 7000, auth: { method: 'token', token: 'x' } };
+  const proxy = { name: 's', type: 'http', localIP: '127.0.0.1', localPort: 18080, subdomain: 'demo' };
+
+  const withSuffix = config.publicAddressFor(model, proxy, { vhostHttpPort: 28080, subDomainHost: 'frp.example.com' });
+  assert.strictEqual(withSuffix, 'http://demo.frp.example.com:28080');
+
+  const noSuffix = config.publicAddressFor(model, proxy, { vhostHttpPort: 28080 });
+  assert.strictEqual(noSuffix, 'subdomain:demo');
+
+  const target = probeTargetFor(model, proxy, { vhostHttpPort: 28080, subDomainHost: 'frp.example.com' });
+  assert.strictEqual(target.host, 'demo.frp.example.com');
+  assert.strictEqual(target.url, 'http://127.0.0.1:28080/');
+});
+
+test('https2http 插件代理的探测 URL 也带访问路径，并用 vhostHttpsPort', () => {
+  const model = { serverAddr: '127.0.0.1', serverPort: 7000, auth: { method: 'token', token: 'x' } };
+  const proxy = {
+    name: 'p',
+    type: 'https',
+    localIP: '127.0.0.1',
+    localPort: 18090,
+    customDomains: ['plugin.example.com'],
+    openPath: '/panel/',
+    plugin: { type: 'https2http', localAddr: '127.0.0.1:18090', crtPath: 'C:/c.pem', keyPath: 'C:/k.pem' },
+  };
+  const target = probeTargetFor(model, proxy, { vhostHttpsPort: 28443 });
+  assert.ok(target, '应当给出探测目标');
+  assert.strictEqual(target.kind, 'http');
+  assert.strictEqual(target.url, 'https://127.0.0.1:28443/panel/');
+  assert.strictEqual(target.servername, 'plugin.example.com');
+  assert.strictEqual(target.rejectUnauthorized, false);
+  assert.strictEqual(target.openPath, '/panel/');
 });
 
 test('subdomain 与自定义域名同时填时给出警告（frp 仍按 subdomain 注册）', () => {
