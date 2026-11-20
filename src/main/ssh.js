@@ -1639,7 +1639,10 @@ class ServerSession {
     const c = await this.exec(`${prefix}install -m 644 ${tmpCert} ${shellQuote(dir)}/fullchain.pem`, 10000);
     const k = await this.exec(`${prefix}install -m 600 ${tmpKey} ${shellQuote(dir)}/key.pem`, 10000);
     await this.exec(`rm -f ${tmpCert} ${tmpKey} 2>/dev/null || true`, 6000);
-    if (!c.ok) return { ok: false, error: `上传证书失败：${c.stderr || '未知错误'}` };
+    if (!c.ok) {
+      const why = c.stderr || '未知错误';
+      return { ok: false, error: `上传证书失败：${why}${explainFsError(why)}` };
+    }
     if (!k.ok) return { ok: false, error: `上传私钥失败：${k.stderr || '未知错误'}` };
     return { ok: true, dir };
   }
@@ -2134,7 +2137,10 @@ class ServerSession {
     await this.exec(`printf %s ${b64} | base64 -d > ${tmp}`, 15000);
     const install = await this.exec(`${prefix}install -m 644 ${tmp} ${shellQuote(confPath)}`, 10000);
     await this.exec(`rm -f ${tmp} 2>/dev/null || true`, 6000);
-    if (!install.ok) return { ok: false, error: `写入 nginx 配置失败：${(install.stderr || install.stdout || '权限不足').trim()}` };
+    if (!install.ok) {
+      const why = (install.stderr || install.stdout || '权限不足').trim();
+      return { ok: false, error: `写入 nginx 配置失败：${why}${explainFsError(why)}` };
+    }
     return { ok: true, confPath, content: conf, mergedDomains: domains };
   }
 
@@ -2227,7 +2233,10 @@ class ServerSession {
     await this.exec(`printf %s ${b64} | base64 -d > ${tmp}`, 15000);
     const install = await this.exec(`${prefix}install -m 644 ${tmp} ${shellQuote(confPath)}`, 10000);
     await this.exec(`rm -f ${tmp} 2>/dev/null || true`, 6000);
-    if (!install.ok) return { ok: false, error: `写入 nginx 配置失败：${(install.stderr || install.stdout || '权限不足').trim()}` };
+    if (!install.ok) {
+      const why = (install.stderr || install.stdout || '权限不足').trim();
+      return { ok: false, error: `写入 nginx 配置失败：${why}${explainFsError(why)}` };
+    }
     const test = await this.exec(`${prefix}nginx -t 2>&1`, 15000);
     const testText = `${test.stdout || ''}\n${test.stderr || ''}`.trim();
     if (/\[emerg\]|\[error\]/i.test(testText)) {
@@ -2299,7 +2308,10 @@ class ServerSession {
     await this.exec(`printf %s ${b64} | base64 -d > ${tmp}`, 15000);
     const install = await this.exec(`${prefix}install -m 644 ${tmp} ${shellQuote(target)}`, 10000);
     await this.exec(`rm -f ${tmp} 2>/dev/null || true`, 6000);
-    if (!install.ok) return { ok: false, error: `写入失败：${(install.stderr || install.stdout || '权限不足').trim()}` };
+    if (!install.ok) {
+      const why = (install.stderr || install.stdout || '权限不足').trim();
+      return { ok: false, error: `写入失败：${why}${explainFsError(why)}` };
+    }
     const test = await this.exec(`${prefix}nginx -t 2>&1`, 15000);
     const testText = `${test.stdout || ''}\n${test.stderr || ''}`.trim();
     if (/\[emerg\]|\[error\]/i.test(testText)) {
@@ -2336,7 +2348,10 @@ class ServerSession {
     await this.exec(`printf %s ${b64} | base64 -d > ${tmp}`, 15000);
     const install = await this.exec(`${prefix}install -m 644 ${tmp} ${shellQuote(confPath)}`, 10000);
     await this.exec(`rm -f ${tmp} 2>/dev/null || true`, 6000);
-    if (!install.ok) return { ok: false, changed: false, error: `写入 nginx 配置失败：${(install.stderr || install.stdout || '权限不足').trim()}` };
+    if (!install.ok) {
+      const why = (install.stderr || install.stdout || '权限不足').trim();
+      return { ok: false, changed: false, error: `写入 nginx 配置失败：${why}${explainFsError(why)}` };
+    }
     const test = await this.exec(`${prefix}nginx -t 2>&1`, 15000);
     const testText = `${test.stdout || ''}\n${test.stderr || ''}`;
     if (!test.ok && !/syntax is ok|test is successful/i.test(testText)) {
@@ -2484,7 +2499,10 @@ class ServerSession {
 
     const moveResult = await this.exec(`cp ${remoteTmp} ${shellQuote(this.configPath)}`, 10000);
     await this.exec(`rm -f ${remoteTmp} 2>/dev/null || true`, 6000);
-    if (!moveResult.ok) return { ok: false, error: `写入失败：${moveResult.stderr || '未知错误'}` };
+    if (!moveResult.ok) {
+      const why = (moveResult.stderr || '未知错误').trim();
+      return { ok: false, error: `写入失败：${why}${explainFsError(why)}` };
+    }
 
     let restarted = null;
     let firewall = null;
@@ -2666,4 +2684,20 @@ function parsePortInput(text) {
   return { ok: true, ranges };
 }
 
-module.exports = { ServerSession, parseServiceUnits, rankServiceUnits, parsePortInput, removeServerBlocks, ufwAllowsPort, parseCertRefs, parseMissingPaths, mergeNginxConf, nginxServerBlockSpans };
+/* 把 shell 里的文件系统错误翻译成用户能动手的提示。
+ * root 遇到 "Operation not permitted" 基本只有三种原因：文件被 chattr +i 冻结、
+ * 分区只读挂载、SELinux/AppArmor 拦了——所以要把这几条出路写出来。
+ */
+function explainFsError(text) {
+  const raw = String(text || '');
+  if (/Operation not permitted/i.test(raw)) {
+    return '（root 也被拒绝了：文件可能被设成不可修改——用 lsattr 看有没有 i 属性，chattr -i 去掉；也可能是分区只读挂载或 SELinux/AppArmor 拦截）';
+  }
+  if (/Read-only file system/i.test(raw)) return '（分区是只读挂载：remount 成 rw 之后再试）';
+  if (/No space left on device/i.test(raw)) return '（磁盘满了：清一些空间再试）';
+  if (/Permission denied/i.test(raw)) return '（权限不足：确认用的是 root 或免密 sudo）';
+  if (/Too many open files/i.test(raw)) return '（服务器打开文件数到上限了：调大 fs.file-max 或 nofile）';
+  return '';
+}
+module.exports = {
+  explainFsError, ServerSession, parseServiceUnits, rankServiceUnits, parsePortInput, removeServerBlocks, ufwAllowsPort, parseCertRefs, parseMissingPaths, mergeNginxConf, nginxServerBlockSpans };
