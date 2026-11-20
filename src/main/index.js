@@ -4651,8 +4651,11 @@ async function syncCertToServerNginx(cert) {
   ipcMain.handle('cert:nginx-sync', async (event, payload = {}) => {
     try {
       const domain = String((payload && payload.domain) || '').trim();
-      const cert = domain ? acmeManager.get(domain) : (acmeManager.list()[0] || null);
-      if (!cert) return fail(domain ? `本地没有 ${domain} 的证书` : '本地还没有证书');
+      /* 必须点名是哪张证书：以前域名缺省时会拿 list()[0] 顶上，等于「随便挑一张部署到当前服务器」，
+       * 传参走样（比如把字符串当对象）就会把别的域名传到这台机器上，界面上还显示成功。 */
+      if (!domain) return fail('缺少域名：要部署哪一张证书');
+      const cert = acmeManager.get(domain);
+      if (!cert || !cert.exists) return fail(`本地没有 ${domain} 的证书`);
       const sync = await syncCertToServerNginx(cert);
       if (!sync.ok) return fail(sync.error);
       pushState();
