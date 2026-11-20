@@ -441,4 +441,22 @@ class AcmeManager {
   }
 }
 
-module.exports = { AcmeManager, daysLeft, certFolder, coversDomain, readCertCoverage, dns01Name };
+/* 续期后要不要重新部署到服务器 nginx？
+ * prevNginx：上次部署结果（{ok, serverHost} 或 null）
+ * currentHost：当前 SSH 连着的服务器（未连接时为空串）
+ * 返回 { deploy, reason }：deploy=false 时 reason 是给人看的说明。 */
+function shouldRedeploy(prevNginx, currentHost) {
+  if (!prevNginx || !prevNginx.ok) {
+    return { deploy: false, reason: '' }; // 当初就没部署，别自作主张上传
+  }
+  if (!currentHost) {
+    return { deploy: false, reason: '现在没有连接服务器，新证书留在本机' };
+  }
+  const prevHost = String(prevNginx.serverHost || '');
+  if (prevHost && prevHost !== String(currentHost)) {
+    return { deploy: false, reason: `原来部署在 ${prevHost}，当前连的是 ${currentHost}` };
+  }
+  return { deploy: true, reason: '' };
+}
+
+module.exports = { AcmeManager, daysLeft, certFolder, coversDomain, readCertCoverage, dns01Name, shouldRedeploy };

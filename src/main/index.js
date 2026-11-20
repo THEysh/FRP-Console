@@ -77,7 +77,7 @@ const frpsConfig = require('./frpsconfig');
 const { TrayPanel } = require('./tray-panel');
 const frpsBinary = require('./frpsBinary');
 const updateModule = require('./update');
-const { AcmeManager, coversDomain, readCertCoverage } = require('./acme');
+const { AcmeManager, coversDomain, readCertCoverage, shouldRedeploy } = require('./acme');
 const { CloudflareDns } = require('./dns');
 const dnsCheck = require('./dnscheck');
 const browserProbe = require('./netprobe');
@@ -5131,11 +5131,42 @@ async function autoRenewExpiringCerts() {
   try {
     const provider = currentDnsProvider();
     if (!provider.ok) return; // 没配 DNS 渠道就跳过，静默。
+    /* 续期之前先记住「这些域名当初部署到哪台服务器」——storeCertificate 会重写 metadata，
+     * 续完再读就拿不到上一次的部署记录了。 */
+    const beforeRenew = new Map(acmeManager.list().map((c) => [c.domain, c]));
     const result = await acmeManager.renewIfExpiring({ days: AUTO_RENEW_BEFORE_DAYS, dns: provider.dns });
     if (result.renewed.length) {
       const names = result.renewed.map((c) => `${c.domain}（${c.daysLeft} 天）`).join('、');
       notify('info', '证书已自动续期', names);
-      pushState(); // 刷新证书列表，让到期天数即时更新
+
+      /* 新证书只写在本机 certs/ 里；服务器 nginx 用的还是当初上传的那份副本。
+       * 不重新部署的话，到期那天浏览器照样拿到过期证书 —— 续了等于没续。 */
+      const nowHost = serverSession.connected ? String(serverSession.host || '') : '';
+      const deployed = [];
+      const skipped = [];
+      for (const item of result.renewed) {
+        const prev = beforeRenew.get(item.domain) || null;
+        const decision = shouldRedeploy(prev && prev.nginx, nowHost);
+        if (!decision.deploy) {
+          if (decision.reason) skipped.push(`${item.domain}：${decision.reason}`);
+          continue;
+        }
+        try {
+          const fresh = acmeManager.get(item.domain) || prev;
+          const r = await syncCertToServerNginx(fresh);
+          if (r && r.ok) deployed.push(item.domain);
+          else skipped.push(`${item.domain}：${(r && r.error) || '部署失败'}`);
+        } catch (e) {
+          skipped.push(`${item.domain}：${(e && e.message) || e}`);
+        }
+      }
+      if (deployed.length) {
+        notify('info', '新证书已重新部署到 nginx', `${deployed.join('、')}（已重载 nginx，浏览器再来就是新证书）`);
+      }
+      if (skipped.length) {
+        notify('warn', '证书续了，但没部署到 nginx', `${skipped.join('；')}。服务器上仍是旧证书，到期后 https://域名 会打不开 —— 到「HTTPS 证书」页点「部署到 nginx」。`);
+      }
+      pushState(); // 刷新证书列表，让到期天数与部署徽标即时更新
     }
     if (result.errors.length) {
       const first = result.errors[0];
