@@ -81,7 +81,7 @@ const { AcmeManager, coversDomain, readCertCoverage } = require('./acme');
 const { CloudflareDns } = require('./dns');
 const dnsCheck = require('./dnscheck');
 const browserProbe = require('./netprobe');
-const { execFileP, powershell, tcpCheck, httpProbe, hashText, randomToken, formatDuration, proxyEnvKeys } = require('./util');
+const { execFileP, powershell, tcpCheck, httpProbe, hashText, randomToken, formatDuration, proxyEnvKeys, parseSocketHolder } = require('./util');
 const { probePort, probeUdp, sshConnectHint, outboundHint } = require('./portprobe');
 const { parseRuleSpec, judgePortRow, buildPortMatrix, summarizeMatrix, buildRuleTexts } = require('./portmatrix');
 
@@ -4125,14 +4125,30 @@ function registerIpc() {
 
     if (layer === 'bindPort') {
       if (!bindPort) return ok({ layer, ok: false, ms: Date.now() - startedAt, reason: 'bindPort 未知', detail: '服务器上没有可读的 frps 配置，先在向导里生成一份' });
+      /* 「监听者是不是 frps」要用新鲜事实判断，不能用连上那一刻的快照。 */
+      await serverSession.inspect().catch(() => null);
+      if (epoch !== sessionEpoch) return staleFail();
       const result = await serverSession.exec(
-        `echo @@SS; (ss -lntH 2>/dev/null || ss -lnt 2>/dev/null || netstat -lnt 2>/dev/null) | grep -E '[:.]${bindPort}([[:space:]]|$)' | head -n 3`,
+        `echo @@SS; (ss -lntpH 2>/dev/null || ss -lntp 2>/dev/null || netstat -lntp 2>/dev/null) | grep -E '[:.]${bindPort}([[:space:]]|$)' | head -n 3`,
         12000,
       );
       if (epoch !== sessionEpoch) return staleFail();
       const body = String(result.stdout || '');
       const ssPart = (/@@SS([\s\S]*?)(?:@@|$)/.exec(body) || [])[1] || '';
       const listenLine = ssPart.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)[0] || '';
+      /* 端口在监听 ≠ frps 在监听：别的程序占着同一个端口时 frps 根本起不来，
+       * 但这个自检会看到「有人在听」，再测公网可达就报绿——典型的假绿。 */
+      const holder = parseSocketHolder(listenLine);
+      const frpsAlive = !!(serverSession.info && (serverSession.info.status === 'running' || serverSession.info.processAlive));
+      if (holder && !/frps/i.test(holder.name)) {
+        return ok({
+          layer,
+          ok: false,
+          ms: Date.now() - startedAt,
+          reason: 'bindPort 被别的程序占用',
+          detail: `${bindPort} 上监听的是 ${holder.name}（PID ${holder.pid}），不是 frps。${frpsAlive ? 'frps 进程在反复重启（抢不到端口），' : 'frps 起不来就是因为这个端口被占了：'}先停掉 ${holder.name}，或者在配置里换一个 bindPort。`,
+        });
+      }
       if (listenLine) {
         /* 「本机在监听」只说明 frps 起来了，不代表外面连得上：云安全组、网络 ACL、
          * 运营商封端口都在这之后才生效。补一次从本机的实测，才能回答用户真正关心的问题。 */

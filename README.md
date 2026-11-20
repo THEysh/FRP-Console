@@ -512,6 +512,11 @@ node tests/soak.cjs 10                  # 长稳抽查：隧道 + 20 条代理�
 
 ## 更新日志
 
+### 1.2.128
+
+- **bindPort 被别的程序占着时不再假绿**：把 7000 让给另一个程序（真机上用 python3 占着）后，frps 起不来，但以前的就绪检查会看到「有人在监听」+「公网可达」就报绿，界面上一切正常。现在会核对监听者进程：`7000 上监听的是 python3（PID 4311），不是 frps。frps 起不来就是因为这个端口被占了`。
+- 启动/重启失败时把 frps 自己的日志尾巴带出来，并识别 `address already in use` → 「这个端口已经被别的程序占用了——在服务器上执行 ss -lntp 找出占用者并停掉，或把 frps 的 bindPort 换成空闲端口」。
+
 ### 1.2.127
 
 - **frps 服务单元被删掉时说得清楚**：把服务器上的 `/etc/systemd/system/frps.service` 删掉后，就绪检查以前只说「frps 没有运行」（让人以为点一下启动就行），点启动则得到一句英文 `Failed to start frps.service: Unit frps.service not found.`。现在自检直接说「frps 服务不存在：这台服务器上没有 frps.service（服务单元被删或从没建过）→ 用『从零初始化』重装，或手工把 systemd 服务建回来」，启动失败的报错也会附带同一句指引。

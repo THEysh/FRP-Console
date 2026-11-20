@@ -270,7 +270,16 @@ function proxyEnvKeys(env = process.env) {
   return found;
 }
 
+/* 从 ss/netstat 的一行里取出占用端口的进程名与 PID。
+ * 形如：LISTEN 0 4096 0.0.0.0:7000 0.0.0.0:* users:(("python3",pid=4311,fd=3))
+ * 注意 users: 后面只有两个左括号，别多写。 */
+function parseSocketHolder(line) {
+  const m = /users:\(\("([^"]+)",pid=(\d+)/.exec(String(line || ''));
+  return m ? { name: m[1], pid: m[2] } : null;
+}
+
 module.exports = {
+  parseSocketHolder,
   execFileP,
   powershell,
   tcpCheck,

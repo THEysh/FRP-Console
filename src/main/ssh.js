@@ -2530,6 +2530,17 @@ class ServerSession {
     return { ok: true, backup, restarted, firewall };
   }
 
+  /* 从 frps 的日志尾巴里抽出「为什么没起来」，最常见的是端口被占。 */
+  explainStartFailure(logTail) {
+    const text = String(logTail || '');
+    if (!text.trim()) return '';
+    const errLine = text.split(/\r?\n/).map((s) => s.trim()).filter((l) => /error|fail|already in use|cannot|refused/i.test(l)).slice(-1)[0] || '';
+    if (/address already in use/i.test(text)) {
+      return `${errLine ? `（日志：${errLine}）` : ''}；这个端口已经被别的程序占用了——在服务器上执行 ss -lntp 找出占用者并停掉，或把 frps 的 bindPort 换成空闲端口`;
+    }
+    return errLine ? `（日志最后一条错误：${errLine}）` : '';
+  }
+
   async control(action) {
     if (!this.connected) return { ok: false, error: '尚未连接服务器' };
     if (!['start', 'stop', 'restart'].includes(action)) return { ok: false, error: '未知操作' };
@@ -2559,7 +2570,12 @@ class ServerSession {
       const after = await this.inspect();
       const afterInfo = after.info || null;
       if ((action === 'start' || action === 'restart') && afterInfo && afterInfo.status && afterInfo.status !== 'running') {
-        return { ok: false, error: `${actionText}后 frps 未运行（${afterInfo.statusText}）`, via: 'systemd', service: info.serviceName, before, after: afterInfo };
+        /* 只说「未运行」等于让用户猜：把 frps 自己的日志尾巴带出来，
+         * 并把最常见的「端口被占」翻译成人话。 */
+        const logs = await this.exec(`journalctl -u ${shellQuote(info.serviceName)} -n 25 --no-pager 2>&1 | tail -n 25`, 12000).catch(() => null);
+        const tail = String((logs && (logs.stdout || logs.stderr)) || '').trim();
+        const extra = this.explainStartFailure(tail);
+        return { ok: false, error: `${actionText}后 frps 未运行（${afterInfo.statusText}）${extra}`, via: 'systemd', service: info.serviceName, before, after: afterInfo, logTail: tail.slice(-800) };
       }
       if (action === 'start' || action === 'restart') await this.openFirewallForConfig();
       return { ok: true, via: 'systemd', service: info.serviceName, before, after: afterInfo };
