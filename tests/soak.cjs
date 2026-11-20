@@ -18,6 +18,19 @@ const MINUTES = Number(process.argv[2] || 6);
 const SAMPLE_MS = 30000;
 const PROXIES = 20;
 
+/* 按调试端口反查真正在跑的 Electron 主进程（启动器进程会先退出） */
+function pidOnPort(port) {
+  try {
+    const out = execFileSync('netstat', ['-ano'], { encoding: 'utf8' });
+    const needle = ':' + port + ' ';
+    const line = out.split(String.fromCharCode(10)).find((l) => l.includes(needle) && /LISTEN/i.test(l));
+    if (!line) return 0;
+    return Number(line.trim().split(/\s+/).pop()) || 0;
+  } catch {
+    return 0;
+  }
+}
+
 function rssOfPid(pid) {
   if (!pid) return null;
   /* 先试 tasklist（快），拿不到再退回 PowerShell（某些环境 tasklist 会被安全软件限制） */
@@ -120,7 +133,8 @@ function rssOfPid(pid) {
           mode: s.runtime.mode,
         };
       })()`);
-      const row = { t: i * (SAMPLE_MS / 1000), mainMB: rssOfPid(app.child.pid), ...snap };
+      const livePid = pidOnPort(9359) || app.child.pid;
+      const row = { t: i * (SAMPLE_MS / 1000), mainMB: rssOfPid(livePid), ...snap };
       samples.push(row);
       console.log(`  +${String(row.t).padStart(3)}s  main=${String(row.mainMB).padStart(4)}MB  mode=${row.mode}  proxies=${row.total} online=${row.online} unchecked=${row.unchecked} logs=${row.logLines}`);
     }

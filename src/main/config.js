@@ -1,6 +1,7 @@
 'use strict';
 
 const fs = require('node:fs');
+const net = require('node:net');
 const path = require('node:path');
 const toml = require('smol-toml');
 
@@ -39,6 +40,10 @@ function toInt(value, fallback = null) {
 function isHostLike(value) {
   const text = String(value || '').trim();
   if (!text) return false;
+  /* [::1] 这种带方括号的写法也允许（用户从浏览器地址栏复制来的） */
+  const bare = text.startsWith('[') && text.endsWith(']') ? text.slice(1, -1) : text;
+  /* IPv4 / IPv6 都交给 net.isIP 判定；注意 999.1.1.1 会返回 0，仍要走下面的严格检查 */
+  if (net.isIP(bare)) return true;
   if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(text)) {
     return text.split('.').every((part) => Number(part) <= 255);
   }
@@ -199,7 +204,9 @@ function validate(model, options = {}) {
   if (!model.serverAddr) push('error', 'serverAddr', '服务器地址不能为空');
   else if (/\s/.test(model.serverAddr)) push('error', 'serverAddr', '服务器地址不能包含空格');
   else if (/^[a-z]+:\/\//i.test(model.serverAddr)) push('error', 'serverAddr', '服务器地址只填主机名或 IP，不要带 http:// 前缀');
-  else if (!/^[A-Za-z0-9.-]+$/.test(model.serverAddr)) push('warn', 'serverAddr', '服务器地址看起来不是常见的主机名或 IP');
+  else if (!/^[A-Za-z0-9.:-]+$/.test(model.serverAddr) && !isHostLike(model.serverAddr)) {
+    push('warn', 'serverAddr', '服务器地址看起来不是常见的主机名或 IP');
+  }
   // 顶层字段类型不对（proxies = "oops" 这种）：frpc 会整份拒绝，界面上却像是"没有代理"
   for (const message of (model && model._shapeErrors) || []) push('error', 'config', message);
   if (!Number.isInteger(model.serverPort) || model.serverPort < 1 || model.serverPort > 65535) {
