@@ -232,6 +232,9 @@ const RULES = [
   [/systemctl cat .*frp/, () => [0, `${EXEC_START.frp}\n`]],
   [/systemctl is-active/, () => (mode === 'nosystemd' ? [1, ''] : [0, 'active\n'])],
   [/systemctl is-enabled/, () => [0, 'enabled\n']],
+  /* 被 mask 的单元：systemctl list-units 不会列出来，只有 list-unit-files 里能看到 'masked'。
+   * 用 FAKE_MASKED_UNIT=frps.service 造这个场景（配合 mode=empty，即机器上没有可用的 unit）。 */
+  [/list-unit-files/, () => [0, process.env.FAKE_MASKED_UNIT ? `${process.env.FAKE_MASKED_UNIT} masked\n` : '']],
   [/systemctl daemon-reload|systemctl enable|systemctl restart|systemctl start/, () => [0, '']],
   [/journalctl -u/, () => [0, JOURNAL]],
   // nginx 检测（detectNginx 用）：nginxVersion 非空时假装已装并占 80/443，否则装没装。

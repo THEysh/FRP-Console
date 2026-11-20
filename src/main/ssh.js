@@ -5,6 +5,16 @@ const { Client } = require('ssh2');
 const { parseConfig: frpsParseConfig, summary: frpsSummary } = require('./frpsconfig');
 const { stringify: tomlStringify } = require('smol-toml');
 
+/* systemctl list-unit-files 的输出里，状态为 masked 的那一行就是「被 mask 的单元」。
+ * 单独抽出来是为了能单测：这行判断错了，产品会绕过 systemd 裸起进程。 */
+function maskedUnitFromUnitFiles(text) {
+  for (const line of String(text || '').split(/\r?\n/)) {
+    const parts = line.trim().split(/\s+/);
+    if (parts.length >= 2 && parts[1] === 'masked' && /^frps?[^\s]*\.service$|^frp-.*\.service$/.test(parts[0])) return parts[0];
+  }
+  return '';
+}
+
 function friendlyError(err) {
   const message = String((err && err.message) || err || '');
   if (/authentication methods failed|authentication failure/i.test(message)) return '用户名或密码错误';
@@ -452,6 +462,7 @@ class ServerSession {
     });
   }
 
+
   async sudoSystemctl(action, unit) {
     let result = await this.exec(`systemctl ${action} ${unit}`, 20000);
     if (!result.ok && /Interactive authentication|permission denied|access denied|must be root/i.test(result.stderr || '')) {
@@ -552,6 +563,14 @@ class ServerSession {
         if (argMatch) configPath = validConfigPath(argMatch[1]);
       }
       break;
+    }
+    /* systemctl list-units 不列被 mask 的单元（它们根本没被加载），于是 hasUnit 为 false，
+     * 上层就会走「裸起进程」那条路——结果是 systemd 以为服务没跑、进程却在跑，
+     * 重启机器以后又没了。这里单独把 mask 状态捞出来。 */
+    let maskedUnit = '';
+    if (!serviceName) {
+      const masked = await this.exec("systemctl list-unit-files 'frp*.service' --no-legend 2>/dev/null | head -n 20", 8000);
+      maskedUnit = maskedUnitFromUnitFiles(masked.stdout);
     }
     const hasUnit = !!serviceName;
     if (configPath) {
@@ -657,8 +676,10 @@ class ServerSession {
       os: text('OS'),
       kernel: text('KERNEL'),
       uptime: text('UPTIME'),
-      serviceName: serviceName || 'frps',
+      serviceName: serviceName || (maskedUnit ? maskedUnit.replace(/\.service$/, '') : 'frps'),
       hasUnit,
+      masked: !!maskedUnit,
+      maskedUnit,
       unitActive,
       unitEnabled,
       dockerRestart,
@@ -2601,6 +2622,17 @@ class ServerSession {
       await new Promise((r) => setTimeout(r, 1200));
     }
 
+    if ((action === 'start' || action === 'restart') && info.masked) {
+      /* 裸起一个 frps 只会让 systemd 与它抢端口，重启后还没了；
+       * 用户要的是「把它重新纳入服务管理」，直接说清怎么做。 */
+      return {
+        ok: false,
+        error: `${actionText}失败：${info.maskedUnit || 'frps.service'} 已被 mask（systemd 禁止启动它）。在服务器上执行 \`systemctl unmask ${info.maskedUnit || 'frps'}\` 之后再用服务方式启动；本程序不会绕过 systemd 直接裸起进程，否则会和 systemd 抢端口、重启后也会丢`,
+        via: 'masked',
+        maskedUnit: info.maskedUnit || '',
+      };
+    }
+
     if (action === 'start' || action === 'restart') {
       const bin = info.binaryPath || 'frps';
       const config = this.configPath;
@@ -2741,4 +2773,4 @@ function explainFsError(text) {
 }
 module.exports = {
   explainFsError,
-  explainServiceError, ServerSession, parseServiceUnits, rankServiceUnits, parsePortInput, removeServerBlocks, ufwAllowsPort, parseCertRefs, parseMissingPaths, mergeNginxConf, nginxServerBlockSpans };
+  explainServiceError, ServerSession, parseServiceUnits, rankServiceUnits, parsePortInput, removeServerBlocks, ufwAllowsPort, parseCertRefs, parseMissingPaths, mergeNginxConf, nginxServerBlockSpans, maskedUnitFromUnitFiles };

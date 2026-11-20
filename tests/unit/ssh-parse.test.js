@@ -130,3 +130,25 @@ test('removeServerBlocks：块没闭合时不动（交给 nginx -t 判定）', (
   assert.equal(out.removed, 0);
   assert.equal(out.text, broken);
 });
+
+const { maskedUnitFromUnitFiles } = require('../../src/main/ssh.js');
+
+test('maskedUnitFromUnitFiles：认出被 mask 的 frps 单元', () => {
+  const text = ['frps.service masked', 'frpc.service enabled', 'x-ui.service enabled'].join('\n');
+  assert.equal(maskedUnitFromUnitFiles(text), 'frps.service');
+});
+
+test('maskedUnitFromUnitFiles：没有 mask 的 frps 就返回空', () => {
+  const text = ['frps.service enabled', 'frpc.service enabled'].join('\n');
+  assert.equal(maskedUnitFromUnitFiles(text), '');
+});
+
+test('maskedUnitFromUnitFiles：只认 frp 系列单元，别把 sshd 的 mask 当 frps', () => {
+  const text = ['sshd.service masked', 'cron.service masked'].join('\n');
+  assert.equal(maskedUnitFromUnitFiles(text), '');
+});
+
+test('maskedUnitFromUnitFiles：空输出/异常输入不抛错', () => {
+  assert.equal(maskedUnitFromUnitFiles(''), '');
+  assert.equal(maskedUnitFromUnitFiles(null), '');
+});

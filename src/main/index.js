@@ -4151,6 +4151,18 @@ function registerIpc() {
       /* unit 文件被删掉（卸载残留、手工清理）时，光说「没有运行」会让用户去 start，
        * 但 systemctl 只会回 "Unit frps.service not found."。这里直接改口。 */
       const unitExists = pick('UNIT') !== 'no';
+      /* 被 mask 的单元 systemd 根本不会加载：说「没有运行」会让人去点启动，
+       * 点下去只会得到 "Unit is masked"，所以这里单独说清。 */
+      const maskedUnit = (serverSession.info && serverSession.info.masked && serverSession.info.maskedUnit) || '';
+      if (maskedUnit) {
+        return ok({
+          layer,
+          ok: false,
+          ms: Date.now() - startedAt,
+          reason: `${maskedUnit} 被 mask 了`,
+          detail: `systemd 禁止启动被 mask 的单元：在服务器上执行 \`systemctl unmask ${maskedUnit}\` 之后再启动；也可以用「从零初始化」重写服务单元`,
+        });
+      }
       return ok({
         layer,
         ok: false,
