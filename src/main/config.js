@@ -277,7 +277,7 @@ function validate(model, options = {}) {
         push('error', `proxies[${index}].remotePort`, `${label} 需要 1 - 65535 的公网端口`);
       } else {
         if (proxy.remotePort === model.serverPort) {
-          push('warn', `proxies[${index}].remotePort`, `${label} 的公网端口与服务器端口相同，可能冲突`);
+          push('warn', `proxies[${index}].remotePort`, `${label} 的公网端口与服务器端口（${model.serverPort}）相同——frps 自己占着这个端口，起不来，请换一个公网端口`);
         }
         if (BROWSER_UNSAFE_PORTS.has(proxy.remotePort)) {
           push('warn', `proxies[${index}].remotePort`, `${label} 的公网端口 ${proxy.remotePort} 是浏览器（Chrome/Edge）的禁用端口，浏览器会拒绝访问（ERR_UNSAFE_PORT），建议换一个端口`);

@@ -1890,13 +1890,26 @@ async function checkProxyHealth(p, ctx) {
     /* start error 是 frps 明确拒绝了这个代理，和「还没开始注册」是两件事：
      * 最常见的原因是域名/端口被别的代理占了（router config conflict）。 */
     const conflict = /router config conflict|already (?:used|exists)|port .*in use/i.test(raw);
+    /* frps 对「端口占不到」只回一句 port unavailable（不带端口号），而最常见的一种是
+     * 用户把公网端口填成了 frps 自己的 bindPort——原来的提示完全不指向问题。 */
+    const portUnavailable = /port unavailable/i.test(raw);
+    const hitsServerPort = portUnavailable && Number(p.remotePort) > 0
+      && Number(p.remotePort) === Number(model && model.serverPort);
     const reject = (status && status.status === 'start error') || conflict;
-    const reason = conflict ? '域名或端口与别的代理冲突' : reject ? 'frps 拒绝启动这个代理' : '隧道未建立';
+    const reason = conflict ? '域名或端口与别的代理冲突'
+      : hitsServerPort ? `公网端口 ${p.remotePort} 就是 frps 的监听端口`
+        : portUnavailable ? '公网端口在 frps 上用不了'
+          : reject ? 'frps 拒绝启动这个代理'
+            : '隧道未建立';
     const hint = conflict
       ? '同一个域名只能给一条 http/https/tcpmux 代理；公网端口也不能两条 tcp/udp 代理共用。改掉其中一条即可。'
-      : reject
-        ? '看「实时日志」里这条代理的 start error 行，通常是域名/端口冲突或配置层拒绝。'
-        : '';
+      : hitsServerPort
+        ? `这个端口是 frpc 连 frps 用的（服务器端口 ${p.remotePort} / bindPort），frps 自己占着，换个别的公网端口。`
+        : portUnavailable
+          ? 'frps 说这个端口它用不了：可能被服务器上别的程序占着，也可能被别的客户端先注册了。到服务器页跑一次「检查端口」就能看清。'
+          : reject
+            ? '看「实时日志」里这条代理的 start error 行，通常是域名/端口冲突或配置层拒绝。'
+            : '';
     if (hint) layers.tunnel.hint = hint;
     return [p.name, { ok: false, reason, ms: local.ms || 0, error: layers.tunnel.error, layers, at }];
   }
