@@ -426,6 +426,8 @@ function overviewKey() {
     val: s.validation && s.validation.errors ? s.validation.errors.length : 0,
     // 服务器面板地址可能在连上服务器后被自动探测出来，变化时要重绘 hero 按钮
     durl: s.dashboardUrl || '',
+    // 管理 API 口令由弱变强（或反过来）时，概览那条提示要跟着出现/消失
+    aw: s.app && s.app.adminWeak ? (s.app.adminWeak.weak ? 1 : 0) : 0,
     proxies: (s.proxies || []).map((p) => [p.name, p.status, p.publicAddress, p.health && p.health.ok, p.health && p.health.reason, p.statusError]),
   });
 }
@@ -641,6 +643,14 @@ function renderOverview(force = false) {
     const detail = parts.length ? `（${parts.join('、')}）` : '';
     issues.push(`<div class="note warn">${icon('alert')}<div>有 ${counts.unhealthy} 个代理未通过三层连通性检查${detail}，公网访问会失败。
       <div style="margin-top:10px"><button class="btn small" type="button" data-act="nav" data-view="proxies">${icon('link')}<span>去代理映射看是哪条</span></button></div>
+    </div></div>`);
+  }
+  /* 本机 frpc 管理 API 用默认口令：不提示的话没人会想起它 */
+  const adminWeak = (state.app && state.app.adminWeak) || null;
+  if (adminWeak && adminWeak.weak) {
+    const adminPortShown = (state.settings && state.settings.adminPort) || 7400;
+    issues.push(`<div class="note warn">${icon('alert')}<div>本机 frpc 的<b>管理 API</b>（${esc(String(adminPortShown))} 端口）<b>${esc((adminWeak.reasons || []).join('、'))}</b>。它只监听 127.0.0.1，但本机任何程序都能连上去读配置、改代理——顺手换一个随机口令更稳妥。
+      <div style="margin-top:10px"><button class="btn small" type="button" data-act="admin.rotate">${icon('shield')}<span>生成随机口令</span></button></div>
     </div></div>`);
   }
   /* 路径 404 单独一条：隧道是通的，只是访问的路径在目标服务上不存在
@@ -5340,6 +5350,29 @@ async function handleAction(act, dataset, btn) {
           const input = $('#pf-remote');
           if (input) input.value = res.data.port;
         }
+        break;
+      }
+      case 'admin.rotate': {
+        const okRotate = await confirmDialog({
+          title: '换成随机口令？',
+          body: '会把本机 frpc 的「管理 API」口令换成一个 20 位随机串（用户名不变）。它只影响本机回环上的管理接口，不影响隧道；如果隧道正在跑，会重启一次 frpc 让新口令生效。新口令之后能在「设置 → 客户端管理 API」里查看。',
+          confirmText: '换',
+          cancelText: '取消',
+        });
+        if (!okRotate) break;
+        const alphabet = 'abcdefghijkmnpqrstuvwxyz23456789';
+        let newPass = '';
+        for (let i = 0; i < 20; i += 1) newPass += alphabet[Math.floor(Math.random() * alphabet.length)];
+        const savedRes = await FRP.saveSettings({ adminPassword: newPass })
+          .catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+        if (!savedRes || !savedRes.ok) { toast('error', '口令没保存成功', (savedRes && savedRes.error) || ''); break; }
+        const rtNow = (S.state && S.state.runtime) || {};
+        if (rtNow.mode === 'managed' || rtNow.childAlive) {
+          await FRP.restartTunnel().catch(() => {});
+        }
+        toast('ok', '管理 API 口令已换成随机口令', '在「设置 → 客户端管理 API」里可以查看');
+        const refreshed = await FRP.refresh().catch(() => null);
+        if (refreshed && refreshed.ok) { S.state = refreshed.data; updateChrome(); renderCurrent({ force: true }); }
         break;
       }
       case 'proxyform.random': {

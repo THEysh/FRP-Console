@@ -1385,6 +1385,19 @@ function pruneOpenPaths() {
   return dropped;
 }
 
+/* frpc 管理 API 的凭据强度：空口令 / 默认口令 / 短口令都算弱。
+ * 它只监听 127.0.0.1，但本机任何进程都能连上去读 token、改代理、重启隧道。 */
+function adminWeakness() {
+  const user = String((settings && settings.adminUser) || 'admin');
+  const pass = String((settings && settings.adminPassword) || '');
+  const reasons = [];
+  if (!pass) reasons.push('还没有设置口令');
+  else if (pass === 'admin' || pass === 'password' || pass === '123456') reasons.push('用的是默认口令');
+  else if (pass.length < 10) reasons.push('口令太短（少于 10 位）');
+  if (user === 'admin' && pass === 'admin') reasons.push('用户名和口令都是默认的 admin');
+  return { weak: reasons.length > 0, reasons, user, length: pass.length };
+}
+
 function buildState() {
   if (!manager) {
     return {
@@ -1441,6 +1454,8 @@ function buildState() {
       version: app.getVersion(),
       frpcVersion,
       elevated,
+      /* 本机 frpc 管理 API 的凭据强度：默认 admin/admin 或空口令意味着本机任何程序都能改隧道。 */
+      adminWeak: adminWeakness(),
       platform: process.platform,
       arch: process.arch,
       /* 设置页用它说明「不继承系统代理」现在有没有意义（Windows 的「系统代理」不写这些变量）。 */
