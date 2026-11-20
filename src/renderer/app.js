@@ -2472,7 +2472,9 @@ function renderServer(force = false) {
         ${metricCard('开机自启', boot.label, boot.sub, boot.cls)}
       </section>
 
-      ${dashRisk ? `<div class="note ${dashRisk.cls}">${icon('alert')}<div><strong>${esc(dashRisk.title)}</strong><br>${esc(dashRisk.detail)}</div></div>` : ''}
+      ${dashRisk ? `<div class="note ${dashRisk.cls}">${icon('alert')}<div><strong>${esc(dashRisk.title)}</strong><br>${esc(dashRisk.detail)}
+        <div style="margin-top:10px"><button class="btn small" type="button" data-act="dash.rotate">${icon('shield')}<span>换成随机口令</span></button></div>
+      </div></div>` : ''}
 
       <section class="card selftest-card" id="selftest-panel">${selftestMarkup()}</section>
 
@@ -5350,6 +5352,41 @@ async function handleAction(act, dataset, btn) {
           const input = $('#pf-remote');
           if (input) input.value = res.data.port;
         }
+        break;
+      }
+      case 'dash.rotate': {
+        const srv = S.server || {};
+        if (!srv.connected || !srv.config) { toast('warn', '先连上服务器再换面板口令'); break; }
+        const okIdea = await confirmDialog({
+          title: '换成随机口令？',
+          body: '会改服务器上 frps.toml 里 [webServer] 的 password，然后重启一次 frps——隧道会短暂中断几秒，之后自动恢复。',
+          confirmText: '换',
+          cancelText: '取消',
+          danger: true,
+        });
+        if (!okIdea) break;
+        await withBusy(btn, async () => {
+          /* 口令生成与 TOML 改写放在主进程（frpsconfig.rotateWebPassword），
+           * 保存仍走「保存并重启 frps」这条既有路径，校验/备份/冲突确认都在那儿。 */
+          const rot = await FRP.serverRotateWebPassword()
+            .catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+          if (!rot || !rot.ok) {
+            toast('error', '口令没换成', (rot && rot.error) || '没找到 [webServer] 段');
+            return;
+          }
+          const newConf = rot.data.content;
+          const dashPass = rot.data.password;
+          const res = await FRP.serverSaveConfig(newConf, true)
+            .catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+          if (!res || !res.ok) { toast('error', '口令没换成', (res && res.error) || ''); return; }
+          await confirmDialog({
+            title: '面板口令已更换',
+            body: `新口令（现在抄下来，之后不再显示）：<br><br><code style="font-size:13px">${esc(dashPass)}</code><br><br>面板用户名不变。frps 已重启，稍等几秒隧道会自己连回来。`,
+            confirmText: '知道了',
+            cancelText: '关闭',
+          });
+          await loadServerState({ silent: true }).catch(() => {});
+        });
         break;
       }
       case 'admin.rotate': {

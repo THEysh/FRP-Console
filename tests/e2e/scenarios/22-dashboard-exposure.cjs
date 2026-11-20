@@ -77,6 +77,12 @@ module.exports = {
       const note = await wantNote();
       check('空口令 + 0.0.0.0 → 红色提示', !!note && /note bad/.test(note.cls), note && note.text);
       check('提示里点名 auth.token 泄露风险', !!note && /auth\.token/.test(note.text), note && note.text);
+      /* 1.2.131：提示里带一个「换成随机口令」的入口 */
+      const btn = await ctx.eval(`(() => {
+        const b = document.querySelector('[data-act="dash.rotate"]');
+        return b ? (b.textContent || '').replace(/\\s+/g, ' ').trim() : '';
+      })()`);
+      check('提示里有「换成随机口令」按钮', /随机口令/.test(String(btn || '')), String(btn || ''));
     });
 
     /* ② 面板 0.0.0.0 + 6 位口令 → 橙色，并给出「改 127.0.0.1」的出路 */

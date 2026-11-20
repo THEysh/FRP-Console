@@ -121,6 +121,7 @@ contextBridge.exposeInMainWorld('FRP', {
   serverKillPorts: (ports) => invoke('server:kill-ports', { ports }),
   serverControl: (action) => invoke('server:control', { action }),
   serverSaveConfig: (content, restart, resolve) => invoke('server:save-config', { content, restart, resolve }),
+  serverRotateWebPassword: () => invoke('server:rotate-web-password'),
   serverLogs: (lines) => invoke('server:logs', { lines }),
   probeTcp: (host, port, timeout) => invoke('probe:tcp', { host, port, timeout }),
   getLogs: (limit, since) => invoke('logs:get', { limit, since }),

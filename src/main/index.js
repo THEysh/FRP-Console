@@ -4259,6 +4259,22 @@ function registerIpc() {
     return ok({ ...result, serverId: sessionServerId, state: serverState() });
   });
 
+  /* 服务器侧 frps 面板口令轮换：只算出新内容交回渲染层，
+   * 再由它走「保存并重启 frps」那条既有路径（校验、备份、冲突确认都在那儿）。 */
+  ipcMain.handle('server:rotate-web-password', async () => {
+    if (!serverSession.connected) return fail('尚未连接服务器', { state: serverState() });
+    if (!serverConfig.content) return fail('还没读到服务器上的 frps.toml', { state: serverState() });
+    const password = randomToken(20);
+    const content = frpsConfig.rotateWebPassword(serverConfig.content, password);
+    if (!content) {
+      return fail('这份 frps.toml 里没有 [webServer] 段，没法自动换面板口令', {
+        hint: '可以在下面的「配置文件」里手动加一个 [webServer] 段，或者用「从零初始化」重新生成配置。',
+        state: serverState(),
+      });
+    }
+    return ok({ content, password });
+  });
+
   ipcMain.handle('server:save-config', async (event, payload = {}) => {
     let content = String(payload.content || '');
     const resolve = payload.resolve || null; // { action: 'remap' } 自动换端口

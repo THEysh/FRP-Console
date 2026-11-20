@@ -266,6 +266,56 @@ function setTopLevelInt(content, key, value) {
   return lines.join('\n');
 }
 
+/* 把 frps.toml 里 [webServer] 的口令换成新值，两种写法都认：
+ *   [webServer] + password = "…"，以及点号写法 webServer.password = "…"
+ * 段落存在但没有 password 行时补一行；没有该段也没有点号写法时返回 null。 */
+function rotateWebPassword(text, pass) {
+  const src = String(text || '');
+  if (!src) return null;
+  const lines = src.split(/\r?\n/);
+  const value = '"' + String(pass).replace(/"/g, '') + '"';
+  let inWeb = false;
+  let start = -1;
+  let end = -1;
+  let replaced = false;
+  for (let i = 0; i < lines.length; i += 1) {
+    const trimmed = lines[i].trim();
+    if (/^\[/.test(trimmed)) {
+      if (inWeb) {
+        end = i;
+        inWeb = false;
+      }
+      if (/^\[webServer\]$/.test(trimmed)) {
+        inWeb = true;
+        start = i;
+        end = lines.length;
+      }
+      continue;
+    }
+    if (inWeb && /^password\s*=/.test(trimmed)) {
+      lines[i] = 'password = ' + value;
+      replaced = true;
+    } else if (!inWeb && /^webServer\.password\s*=/.test(trimmed)) {
+      lines[i] = 'webServer.password = ' + value;
+      replaced = true;
+    }
+  }
+  if (replaced) return lines.join('\n');
+  if (start >= 0) {
+    let insertAt = end;
+    while (insertAt > start + 1 && lines[insertAt - 1].trim() === '') insertAt -= 1;
+    lines.splice(insertAt, 0, 'password = ' + value);
+    return lines.join('\n');
+  }
+  let lastWeb = -1;
+  for (let i = 0; i < lines.length; i += 1) if (/^webServer\./.test(lines[i].trim())) lastWeb = i;
+  if (lastWeb >= 0) {
+    lines.splice(lastWeb + 1, 0, 'webServer.password = ' + value);
+    return lines.join('\n');
+  }
+  return null;
+}
+
 module.exports = {
   DEFAULT_FIELDS,
   parseConfig,
@@ -278,4 +328,5 @@ module.exports = {
   allowPortsToText,
   setTopLevelInt,
   randomDashboardPassword,
+  rotateWebPassword,
 };
