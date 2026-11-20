@@ -1483,7 +1483,7 @@ function metricCard(label, value, sub = '', cls = '') {
 function selftestStepMarkup(steps, key, index, title, hint) {
   const step = (steps && steps[key]) || { state: 'idle' };
   const state = step.state || 'idle';
-  const iconText = { idle: '○', running: '…', ok: '✓', fail: '✕', skipped: '—' }[state] || '○';
+  const iconText = state === 'ok' && step.warn ? '!' : { idle: '○', running: '…', ok: '✓', fail: '✕', skipped: '—' }[state] || '○';
   const detail = state === 'ok' ? step.detail : state === 'fail'
     ? (step.detail ? (step.reason && step.reason !== step.detail ? `${step.reason} · ${step.detail}` : step.detail) : (step.reason || '检测失败'))
     : state === 'skipped' ? '上一层已失败，已短路' : hint;
@@ -1502,13 +1502,16 @@ function selftestMarkup() {
   const st = S.server.selftest || {};
   const steps = st.steps || {};
   const conclusion = st.conclusion || '';
-  const tone = conclusion === SELFTEST_OK ? 'green' : conclusion ? 'red' : 'muted';
+  /* 有「提醒级」结果（例如 frps 在跑但没设开机自启）时，徽标不再是纯绿，避免看着比实际更稳。 */
+  const anyWarn = SELFTEST_LAYERS.some((k) => steps[k] && steps[k].warn && steps[k].state === 'ok');
+  const tone = anyWarn && conclusion === SELFTEST_OK ? 'amber' : conclusion === SELFTEST_OK ? 'green' : conclusion ? 'red' : 'muted';
+  const conclusionText = anyWarn && conclusion === SELFTEST_OK ? '就绪（有提醒）' : conclusion;
   return `
     <div class="card-head">
       <div class="ch-icon">${icon('activity')}</div>
       <div class="grow"><h3>服务器就绪检查</h3><p>只判断这台服务器是否准备好接收客户端：SSH → frps 运行 → bindPort 监听 → Token 一致。任一层失败立即短路。</p></div>
       <div class="page-actions">
-        ${conclusion ? `<span class="badge ${tone}"><span class="bdot"></span>${esc(conclusion)}</span>` : ''}
+        ${conclusion ? `<span class="badge ${tone}"><span class="bdot"></span>${esc(conclusionText)}</span>` : ''}
         <button class="btn primary" type="button" data-act="server.selftest" ${st.busy ? 'disabled' : ''}>${icon('activity')}<span>${st.busy ? '检查中…' : '检查服务器'}</span></button>
       </div>
     </div>
@@ -3679,8 +3682,10 @@ async function runServerSelfTest() {
     renderSelfTest();
     const res = await FRP.serverSelfTest(layer);
     const data = res && res.ok ? res.data : { ok: false, reason: res ? res.error : '检查失败' };
+    const warnFlag = !!(res && res.ok && res.data && res.data.warn);
     S.server.selftest.steps[layer] = {
       state: data.ok ? 'ok' : 'fail',
+      warn: data.ok ? warnFlag : false,
       detail: data.detail || '',
       reason: data.reason || data.detail || '',
       ms: data.ms || 0,

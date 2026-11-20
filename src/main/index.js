@@ -4074,12 +4074,19 @@ function registerIpc() {
       const dockerUp = !!dockerLine && /up|healthy|running/i.test(dockerParts[1] || '') && !/unhealthy|restarting|dead/i.test(dockerParts[1] || '');
       if (unitActive === 'active' || pid || dockerUp) {
         const where = unitActive === 'active' ? `${unit}.service 正在运行` : dockerUp ? `容器 ${dockerParts[0]} 正在运行` : `frps 进程运行中（PID ${pid || '—'}）`;
-        const boot = unitEnabled === 'enabled' ? '，已设为开机自启' : '';
+        /* 正在跑 ≠ 重启后还能起来。没设开机自启时以前只是少半句话，用户看不出来，
+         * 这里明确点出来并置 warn，让界面显示成「就绪（有提醒）」。 */
+        const notEnabled = unitActive === 'active' && unitEnabled !== 'enabled';
+        const boot = notEnabled
+          ? '，但没有设为开机自启——服务器重启后 frps 不会自己起来（在服务器上执行 systemctl enable frps，或用「从零初始化」）'
+          : unitEnabled === 'enabled'
+            ? '，已设为开机自启'
+            : '';
         /* 进程在跑不等于装好了：二进制被移走时它还能撑到下次重启。 */
         const info = serverSession.info || {};
         const gone = info.binaryExists === false;
         const warn = gone ? `；但可执行文件 ${info.installedPath || 'frps'} 已不存在，重启 frps 或重启机器后会起不来` : '';
-        return ok({ layer, ok: true, warn: gone, ms: Date.now() - startedAt, detail: `${where}${boot}${warn}` });
+        return ok({ layer, ok: true, warn: gone || notEnabled, ms: Date.now() - startedAt, detail: `${where}${boot}${warn}` });
       }
       return ok({
         layer,
