@@ -2115,6 +2115,28 @@ function disposeShellTerm(notifyClosed) {
 /* 终端右键菜单：只做三件最常用的事（复制 / 粘贴 / 清屏）。
  * 菜单挂在 document.body 上，避免被 .term-shell 的 overflow 裁掉；
  * 点外面 / 按 Esc / 滚轮 / 窗口失焦都会关掉它。 */
+/* 统一的多行粘贴入口：>1 行（非空）先确认，避免一次性把整段脚本灌进 root shell。 */
+async function pasteIntoShell(term, text) {
+  if (!term || !text) return false;
+  const lines = String(text).split(/\r?\n/).filter((l) => l.trim().length);
+  if (lines.length <= 1) {
+    term.paste(text);
+    return true;
+  }
+  const preview = lines.slice(0, 5).map((l) => l.length > 100 ? l.slice(0, 100) + '…' : l).join('\n');
+  const more = lines.length > 5 ? `\n…还有 ${lines.length - 5} 行` : '';
+  const go = await confirmDialog({
+    title: `粘贴 ${lines.length} 行命令？`,
+    body: `这个终端是服务器上的 root shell：粘进去的每一行都会被**立刻执行**。\n\n${preview.replace(/[<>]/g, '')}${more}\n\n确认是你想执行的命令再继续。`,
+    confirmText: '粘贴并执行',
+    cancelText: '取消',
+    danger: true,
+  });
+  if (!go) return false;
+  term.paste(text);
+  return true;
+}
+
 const SHELL_CTX_ITEMS = [
   { id: 'copy', label: '复制' },
   { id: 'paste', label: '粘贴' },
@@ -2160,7 +2182,7 @@ function openShellContextMenu(x, y) {
     } else if (action === 'paste') {
       const res = await FRP.clipboardRead().catch(() => null);
       const text = res && res.ok && res.data && res.data.text;
-      if (text) term.paste(text);
+      if (text) await pasteIntoShell(term, text);
     } else if (action === 'clear') {
       // 先本地清屏（立刻见效），再发一个 ^L（Ctrl+L）让 bash/zsh 重画提示符。
       // 只写 ESC[2J 会把提示符一起擦掉、屏幕上只剩光标，看着像终端挂了。
@@ -2273,7 +2295,7 @@ async function openShellTerm() {
           if (ev.stopPropagation) ev.stopPropagation();
           FRP.clipboardRead().then((res) => {
             const text = res && res.ok && res.data && res.data.text;
-            if (text) term.paste(text);
+            if (text) pasteIntoShell(term, text);
           }).catch(() => {});
           term.focus();
           return false; // 已处理：粘贴剪贴板内容
