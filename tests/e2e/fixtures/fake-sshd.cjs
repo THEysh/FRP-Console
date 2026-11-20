@@ -113,6 +113,8 @@ const FRPS_TOML = [
   '',
   'auth.method = "token"',
   'auth.token = "' + token + '"',
+  /* 用 FAKE_SUB_DOMAIN_HOST="frp.example.com" 造「服务器开了 subdomain」的场景 */
+  ...(process.env.FAKE_SUB_DOMAIN_HOST ? [`subDomainHost = "${process.env.FAKE_SUB_DOMAIN_HOST}"`] : []),
   '',
   /* 用 FAKE_FRPS_WEB="addr:port:user:password" 造「面板暴露」这类场景 */
   ...(() => {
