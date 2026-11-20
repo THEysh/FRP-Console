@@ -420,3 +420,26 @@ test('normalize：普通主机名与 IPv4 不受影响', () => {
   assert.equal(config.normalize({ serverAddr: 'frp.example.com' }).serverAddr, 'frp.example.com');
   assert.equal(config.normalize({ serverAddr: '1.2.3.4' }).serverAddr, '1.2.3.4');
 });
+
+
+test('formatHostPort：IPv6 加方括号，IPv4/域名原样', () => {
+  const { formatHostPort } = config;
+  assert.equal(formatHostPort('::1', 24601), '[::1]:24601');
+  assert.equal(formatHostPort('[::1]', 24601), '[::1]:24601');
+  assert.equal(formatHostPort('fd00::1', 80), '[fd00::1]:80');
+  assert.equal(formatHostPort('127.0.0.1', 7000), '127.0.0.1:7000');
+  assert.equal(formatHostPort('example.com', 7000), 'example.com:7000');
+  assert.equal(formatHostPort('', 7000), '');
+  assert.equal(formatHostPort('::1', 0), '');
+});
+
+test('IPv6 服务器地址下，tcp 代理的公网地址与探测 URL 都带方括号', () => {
+  const { publicAddressFor, probeTargetFor } = config;
+  const model = { serverAddr: '::1', serverPort: 7000, proxies: [{ name: 'a', type: 'tcp', localIP: '127.0.0.1', localPort: 18080, remotePort: 24601, openPath: '/' }] };
+  const proxy = model.proxies[0];
+  assert.equal(publicAddressFor(model, proxy, {}), '[::1]:24601');
+  const target = probeTargetFor(model, proxy, {});
+  assert.equal(target.kind, 'tcp');
+  assert.equal(target.host, '::1');
+  assert.equal(target.port, 24601);
+});

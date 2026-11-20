@@ -728,10 +728,19 @@ function effectiveDomainOf(proxy, options = {}) {
   return subdomainHostOf(proxy, options) || String(proxy.subdomain || '');
 }
 
+/* 拼「主机:端口」时，IPv6 字面量必须带方括号，否则 ::1:24601 既不像地址也没法复制。 */
+function formatHostPort(addr, port) {
+  const raw = String(addr || '').trim();
+  if (!raw || !port) return '';
+  const bare = raw.replace(/^\[|\]$/g, '');
+  const host = net.isIP(bare) === 6 ? `[${bare}]` : raw;
+  return `${host}:${port}`;
+}
+
 function publicAddressFor(model, proxy, options = {}) {
   if (!model.serverAddr) return '';
   if (HOST_TYPES.includes(proxy.type)) {
-    return proxy.remotePort ? `${model.serverAddr}:${proxy.remotePort}` : '';
+    return proxy.remotePort ? formatHostPort(model.serverAddr, proxy.remotePort) : '';
   }
   if (proxy.type === 'http' || proxy.type === 'https') {
     const domains = Array.isArray(proxy.customDomains) ? proxy.customDomains : [];
@@ -818,7 +827,7 @@ function probeTargetFor(model, proxy, options = {}) {
     const port = vhostPortOf('http', options);
     return {
       kind: 'http',
-      url: `http://${model.serverAddr}:${port}${openPath}`,
+      url: `http://${formatHostPort(model.serverAddr, port)}${openPath}`,
       host: domain,
       port,
       openPath: openPathLabel,
@@ -831,7 +840,7 @@ function probeTargetFor(model, proxy, options = {}) {
     const port = vhostPortOf('https', options);
     return {
       kind: 'http',
-      url: `https://${model.serverAddr}:${port}${openPath}`,
+      url: `https://${formatHostPort(model.serverAddr, port)}${openPath}`,
       /* Host 头也要带上域名：frps 做 TLS 终止（https2http/https2https）时会按 Host
        * 校验请求是不是发给这个代理的，只填 SNI、不填 Host 会得到 421。 */
       host: domain,
@@ -955,5 +964,6 @@ module.exports = {
   formatAllowPorts,
   startNamesOf,
   publicAddressFor,
+  formatHostPort,
   makeProxy,
 };
