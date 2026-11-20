@@ -52,7 +52,9 @@ function check(name, ok, detail = '') {
   await cdp.waitReady(PORT);
 
   const conn = await cdp.evalIn(PORT, `(async () => {
-    const r = await FRP.serverConnect({ host: ${JSON.stringify(HOST)}, port: 22, username: 'root', password: ${JSON.stringify(PASS)} });
+    /* adoptProfile: false —— 传的地址与「当前选中的服务器档案」经常对不上（档案可能停在另一台机器上），
+     * 不指定的话主进程会以「输入的地址与所选档案不一致」拒绝连接。 */
+    const r = await FRP.serverConnect({ host: ${JSON.stringify(HOST)}, port: 22, username: 'root', password: ${JSON.stringify(PASS)}, adoptProfile: false });
     return { ok: !!r.ok, err: String(r.error || '') };
   })()`);
   check('连上服务器', conn.ok === true, conn.err);
