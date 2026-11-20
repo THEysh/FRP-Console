@@ -607,6 +607,11 @@ class ServerSession {
     }
     if (!version) version = 'unknown';
 
+    /* 版本号只有两种来源：真的能跑（frps -v 有输出），或者退回 'unknown'。
+     * 二进制存在却跑不起来（被换成 /bin/false、文件损坏、架构不对）时进程可能还活着，
+     * 界面就一直显示"运行中"——这是颗定时炸弹：一旦重启 frps 就再也起不来。 */
+    const binaryBroken = !!(binaryExists && version === 'unknown' && !docker);
+
     // systemd 的 `activating (auto-restart)` 表示服务反复崩溃重启（例如端口被占用），
     // unitActive="activating"、serviceSub="auto-restart" 都不匹配 failed/error，
     // 不单独识别会把「起不来的服务」误报成 stopped。
@@ -666,6 +671,7 @@ class ServerSession {
       dockerRunning,
       version,
       versionSource,
+      binaryBroken,
       arch,
       installedPath,
       binaryExists,

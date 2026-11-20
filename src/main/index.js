@@ -4055,6 +4055,10 @@ function registerIpc() {
     }
 
     if (layer === 'service') {
+      /* info 是「连上那一刻」的快照：服务器上把 frps 二进制换掉 / 删掉之后，
+       * 拿旧快照判断只会说"一切正常"。点自检就是要看现在，所以先重新探一次。 */
+      await serverSession.inspect().catch(() => null);
+      if (epoch !== sessionEpoch) return staleFail();
       /* 一条脚本读三种托管方式，免得为了“在不在跑”来回 SSH 三趟。 */
       const rawUnit = (active && active.serviceName) || (serverSession.info && serverSession.info.serviceName) || 'frps';
       // 单元名会拼进 shell 命令，只放行 systemd 允许的字符，避免带引号的名字造成注入。
@@ -4094,8 +4098,13 @@ function registerIpc() {
         /* 进程在跑不等于装好了：二进制被移走时它还能撑到下次重启。 */
         const info = serverSession.info || {};
         const gone = info.binaryExists === false;
-        const warn = gone ? `；但可执行文件 ${info.installedPath || 'frps'} 已不存在，重启 frps 或重启机器后会起不来` : '';
-        return ok({ layer, ok: true, warn: gone || notEnabled, ms: Date.now() - startedAt, detail: `${where}${boot}${warn}` });
+        const broken = !gone && info.binaryBroken === true;
+        const warn = gone
+          ? `；但可执行文件 ${info.installedPath || 'frps'} 已不存在，重启 frps 或重启机器后会起不来`
+          : broken
+            ? `；但可执行文件 ${info.installedPath || 'frps'} 跑不起来（可能被替换成别的文件或已损坏），重启 frps 或重启机器后会起不来`
+            : '';
+        return ok({ layer, ok: true, warn: gone || broken || notEnabled, ms: Date.now() - startedAt, detail: `${where}${boot}${warn}` });
       }
       return ok({
         layer,
