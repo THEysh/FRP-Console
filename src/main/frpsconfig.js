@@ -48,7 +48,11 @@ function parseAllowPorts(text) {
   const raw = String(text || '').trim();
   if (!raw) return { ok: true, value: null };
   const items = [];
-  for (const part of raw.split(/[,，\s]+/).filter(Boolean)) {
+  /* 先把「20000 - 20010」里的空格收掉，再按逗号/空格切分：
+   * 以前直接切会把范围切成 20000 / - / 20010，报错变成「无法识别端口范围：-」，
+   * 用户根本看不出是自己多打了空格。现在两种写法（逗号分隔、空格分隔）都支持。 */
+  const normalized = raw.replace(/(\d)\s*-\s*(\d)/g, '$1-$2');
+  for (const part of normalized.split(/[,，\s]+/).filter(Boolean)) {
     const range = /^(\d+)\s*-\s*(\d+)$/.exec(part);
     const single = /^(\d+)$/.exec(part);
     if (range) {
@@ -61,7 +65,7 @@ function parseAllowPorts(text) {
       if (port < 1 || port > 65535) return { ok: false, error: `端口无效：${part}` };
       items.push({ single: port });
     } else {
-      return { ok: false, error: `无法识别端口范围：${part}（示例 2000-3000,3001）` };
+      return { ok: false, error: `无法识别端口范围：${part}（多个端口用英文逗号分隔，范围写成 2000-3000）` };
     }
   }
   return { ok: true, value: items };

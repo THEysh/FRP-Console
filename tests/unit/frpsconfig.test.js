@@ -194,3 +194,22 @@ test('applyWizard: 关闭鉴权时不生成 token', () => {
   assert.equal(r.generatedToken, '');
   assert.doesNotMatch(r.text, /\[auth\]/);
 });
+
+test('parseAllowPorts：范围中间有空格也认（以前会被拆成「-」）', () => {
+  const r = frps.parseAllowPorts('20000 - 20010');
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.value, [{ start: 20000, end: 20010 }]);
+});
+
+test('parseAllowPorts：空格分隔多个端口仍然支持（不能为了范围把空格禁掉）', () => {
+  const r = frps.parseAllowPorts('2000 3000');
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.value, [{ single: 2000 }, { single: 3000 }]);
+});
+
+test('parseAllowPorts：认不出来时把整段原文写进报错，并提示用逗号', () => {
+  const r = frps.parseAllowPorts('abc def');
+  assert.equal(r.ok, false);
+  assert.match(r.error, /abc def|abc/);
+  assert.match(r.error, /逗号/);
+});
