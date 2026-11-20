@@ -2765,6 +2765,14 @@ function registerIpc() {
       if (!openPathAllowedForType(proxy.type)) {
         // 类型不允许时静默忽略不礼貌，放进 warnings 里说明
         openPathIgnored = true;
+      } else if (rawOpenPath.length > 200) {
+        /* 以前是「悄悄截到 200 字符」：用户贴了一大串路径，存下来的却是前半截，
+         * 公网访问自然 404，还查不出为什么。宁可报错。 */
+        return {
+          ok: false,
+          error: `访问路径太长（${rawOpenPath.length} 字符，最长 200 字符）。只填路径部分即可，例如 /panel/。`,
+          validation,
+        };
       } else {
         openPath = normalizeOpenPath(rawOpenPath);
         if (!openPath) {

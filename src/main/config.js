@@ -274,6 +274,11 @@ function validate(model, options = {}) {
         if (BROWSER_UNSAFE_PORTS.has(proxy.remotePort)) {
           push('warn', `proxies[${index}].remotePort`, `${label} 的公网端口 ${proxy.remotePort} 是浏览器（Chrome/Edge）的禁用端口，浏览器会拒绝访问（ERR_UNSAFE_PORT），建议换一个端口`);
         }
+        /* 1024 以下是特权端口：frps 以 root 跑才绑得上。
+         * 不提示的话，用户配完、隧道也连上了，只是这条代理永远 start error。 */
+        if (proxy.remotePort < 1024) {
+          push('warn', `proxies[${index}].remotePort`, `${label} 的公网端口 ${proxy.remotePort} 是特权端口（<1024），需要 frps 以 root 运行才能绑定；非 root 时这条代理会启动失败，服务器端会报 permission denied`);
+        }
         if (!portInAllowList(proxy.remotePort, allowPorts)) {
           const range = formatAllowPorts(allowPorts);
           push('warn', `proxies[${index}].remotePort`, `${label} 的公网端口 ${proxy.remotePort} 不在服务器 allowPorts 允许范围${range ? `（${range}）` : ''}内，frps 会拒绝注册`);

@@ -238,3 +238,16 @@ test('allowPorts 还有空闲时只在白名单里挑', () => {
   const port = config.suggestRemotePort(model, 'tcp', { allowPorts: [{ single: 20000 }, { single: 20001 }] });
   assert.equal(port, 20001);
 });
+
+/* 边界：1024 以下是特权端口，frps 非 root 时绑不上，至少要给一条警告 */
+test('公网端口 <1024 会给特权端口警告', () => {
+  const model = { serverAddr: '1.2.3.4', serverPort: 7000, auth: { method: 'token', token: 't0k' }, proxies: [{ name: 'p', type: 'tcp', localIP: '127.0.0.1', localPort: 8080, remotePort: 80 }] };
+  const v = config.validate(model);
+  assert.ok(v.warnings.some((w) => /特权端口/.test(w.message)), JSON.stringify(v.warnings));
+});
+
+test('公网端口 >=1024 不会误报特权端口', () => {
+  const model = { serverAddr: '1.2.3.4', serverPort: 7000, auth: { method: 'token', token: 't0k' }, proxies: [{ name: 'p', type: 'tcp', localIP: '127.0.0.1', localPort: 8080, remotePort: 18080 }] };
+  const v = config.validate(model);
+  assert.ok(!v.warnings.some((w) => /特权端口/.test(w.message)), JSON.stringify(v.warnings));
+});
