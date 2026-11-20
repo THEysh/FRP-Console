@@ -104,7 +104,7 @@ const httpGet = (options, timeout = 8000) =>
       const r = await FRP.saveConfig({ serverAddr: '${HOST}', serverPort: 7000, auth: { method: 'token', token: '${TOKEN}' }, log: { to: './frpc.log', level: 'info' } });
       return { ok: r.ok, err: String(r.error || '').slice(0, 120) };
     })()`);
-    step('测试实例指向广州 frps', cfg.ok === true, cfg.err || '');
+    step('测试实例指向 ' + HOST, cfg.ok === true, cfg.err || '');
 
     /* ④ 建两条代理 */
     const p1 = await evalIn(`(async () => {
