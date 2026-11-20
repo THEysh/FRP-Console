@@ -251,3 +251,33 @@ test('公网端口 >=1024 不会误报特权端口', () => {
   const v = config.validate(model);
   assert.ok(!v.warnings.some((w) => /特权端口/.test(w.message)), JSON.stringify(v.warnings));
 });
+
+/* 边界：只差大小写的两个代理名 frpc 允许，但人分不清，给一条警告 */
+test('代理名只差大小写时给警告', () => {
+  const model = {
+    serverAddr: '1.2.3.4',
+    serverPort: 7000,
+    auth: { method: 'token', token: 't0k' },
+    proxies: [
+      { name: 'web1', type: 'tcp', localIP: '127.0.0.1', localPort: 80, remotePort: 18080 },
+      { name: 'WEB1', type: 'tcp', localIP: '127.0.0.1', localPort: 80, remotePort: 18081 },
+    ],
+  };
+  const v = config.validate(model);
+  assert.equal(v.errors.length, 0, JSON.stringify(v.errors));
+  assert.ok(v.warnings.some((w) => /只差大小写/.test(w.message)), JSON.stringify(v.warnings));
+});
+
+test('完全不同的名字不会误报大小写警告', () => {
+  const model = {
+    serverAddr: '1.2.3.4',
+    serverPort: 7000,
+    auth: { method: 'token', token: 't0k' },
+    proxies: [
+      { name: 'web1', type: 'tcp', localIP: '127.0.0.1', localPort: 80, remotePort: 18080 },
+      { name: 'web2', type: 'tcp', localIP: '127.0.0.1', localPort: 80, remotePort: 18081 },
+    ],
+  };
+  const v = config.validate(model);
+  assert.ok(!v.warnings.some((w) => /只差大小写/.test(w.message)), JSON.stringify(v.warnings));
+});

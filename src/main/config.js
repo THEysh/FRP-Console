@@ -241,7 +241,15 @@ function validate(model, options = {}) {
         push('warn', `proxies[${index}].name`, `代理名称「${proxy.name.slice(0, 12)}…」有 ${proxy.name.length} 个字符，列表里会换行显示，建议缩短到 64 个字符以内`);
       }
       if (names.has(proxy.name)) push('error', `proxies[${index}].name`, `代理名称「${proxy.name}」与「${names.get(proxy.name)}」重复`);
-      else names.set(proxy.name, label);
+      else {
+        /* 只差大小写的两个名字 frpc 认为不同、都能注册，但人在列表里几乎分不出来，
+         * 而且我们自己的「访问路径」是按名字存的，改的时候容易改错那一条。 */
+        const sameIgnoringCase = [...names.keys()].find((n) => n.toLowerCase() === proxy.name.toLowerCase());
+        if (sameIgnoringCase) {
+          push('warn', `proxies[${index}].name`, `代理名称「${proxy.name}」与「${sameIgnoringCase}」只差大小写：frpc 当作两条不同代理，但列表里几乎分不出来，建议改个能区分的名字`);
+        }
+        names.set(proxy.name, label);
+      }
 
       if (startNames.length && !startNames.includes(proxy.name)) {
         const listed = startNames.slice(0, 4).join('、') + (startNames.length > 4 ? ` 等 ${startNames.length} 个` : '');
