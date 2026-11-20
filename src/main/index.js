@@ -3006,6 +3006,15 @@ function registerIpc() {
         summary: parsed.ok ? frpsConfig.summary(parsed.data) : null,
         error: parsed.ok ? '' : `配置解析失败：${parsed.error}`,
       };
+      /* 文件能读出来不等于 frps 认它：服务器上被人手改过（塞错字段、写坏引号）时，
+       * 现在是「读进来、界面上看着一切正常」，可一旦重启 frps 就起不来。
+       * 用服务器自己的 frps verify 过一遍，不通过就把错误摊在配置卡上。 */
+      if (parsed.ok) {
+        const verified = await serverSession.verifyConfigFile(configResult.path).catch(() => ({ ok: true, skipped: true }));
+        if (!verified.ok) {
+          serverConfig.error = `服务器上的 frps.toml 校验没通过：${verified.message}（现在跑着的还是旧配置，但重启 frps 或重启机器后会起不来）`;
+        }
+      }
     } else {
       serverConfig = { path: serverSession.configPath || '', content: '', summary: null, error: configResult.error || '' };
     }

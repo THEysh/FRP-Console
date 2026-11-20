@@ -512,6 +512,10 @@ node tests/soak.cjs 10                  # 长稳抽查：隧道 + 20 条代理�
 
 ## 更新日志
 
+### 1.2.123
+
+- **服务器上的 frps.toml 被外部改坏时能发现**：以前只是把文件读进界面，摘要看着一切正常，但 frps 其实不认这份配置——重启 frps 或重启机器就再也起不来。现在每次读到服务器配置都会用服务器自己的 frps verify 校验，不通过就在配置卡上摊出原始错误（例如 json: unknown field "bogusField"）并说明「现在跑的仍是旧配置，重启后会起不来」。
+
 ### 1.2.122
 
 - **服务器上没有 nginx 时，部署证书不再甩一句 shell 报错**：以前会得到「nginx 配置校验失败：bash: line 1: nginx: command not found」——用户看不出来该装 nginx。现在部署前先确认 nginx 在不在，不在就直接说「这台服务器上没有可用的 nginx：先到『HTTPS 域名反代（nginx）』卡片点『安装 nginx 并配置』，装好之后再部署证书」；`nginx -t`/`reload` 里遇到 `command not found` 也统一翻译成这句话。

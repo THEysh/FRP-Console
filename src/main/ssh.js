@@ -1075,6 +1075,18 @@ class ServerSession {
     return { ok: true, path: this.configPath, content: result.stdout };
   }
 
+  /* 用服务器自己的 frps 校验一份配置文件（服务器上的文件被人手改过时用得上）。
+   * 返回 { ok, skipped, message }：没有 frps 二进制、或 frps 不支持 verify 时算「跳过」。 */
+  async verifyConfigFile(file = this.configPath) {
+    const cmd = await this.verifyCommandFor(file).catch(() => '');
+    if (!cmd) return { ok: true, skipped: true, message: '' };
+    const r = await this.exec(cmd, 15000).catch(() => ({ ok: true, stdout: '', stderr: '' }));
+    const message = `${r.stdout || ''}\n${r.stderr || ''}`.trim();
+    if (r.ok || /unknown command|not supported|no such file/i.test(message)) return { ok: true, message };
+    const lines = message.split('\n').map((s) => s.trim()).filter(Boolean);
+    return { ok: false, message: lines.slice(-2).join(' ') || 'frps verify 未通过' };
+  }
+
   async verifyCommandFor(remoteFile) {
     const info = this.info || {};
     if (info.dockerRunning && info.docker) {
