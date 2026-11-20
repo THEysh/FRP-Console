@@ -160,7 +160,9 @@ function normalize(raw, options = {}) {
   expect('webServer', 'webServer', isPlainObject, '「[webServer] 表」');
   expect('transport', 'transport', isPlainObject, '「[transport] 表」');
   const model = {
-    serverAddr: typeof src.serverAddr === 'string' ? src.serverAddr.trim() : '',
+    /* frpc 会把 serverAddr 当成「主机」直接拼端口：写 [::1] 会变成 [[::1]]:7000 连不上。
+     * 模型里统一存裸地址（::1），方括号在 loadConfigFromDisk 里会从文件中去掉。 */
+    serverAddr: typeof src.serverAddr === 'string' ? src.serverAddr.trim().replace(/^\[([^\]]+)\]$/, '$1') : '',
     serverPort: toInt(src.serverPort, 7000) ?? 7000,
     loginFailExit: src.loginFailExit !== false,
     auth: normalizeAuth(src.auth),

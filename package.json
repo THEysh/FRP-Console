@@ -1,7 +1,7 @@
 {
   "name": "frp-console",
   "productName": "FRP控制台",
-  "version": "1.2.142",
+  "version": "1.2.143",
   "description": "FRP 内网穿透图形控制台：代理管理、本机端口扫描、frps 远程管理、热重载与实时日志",
   "main": "src/main/index.js",
   "author": "杨盛晖",
@@ -37,7 +37,8 @@
     "dist:dir": "node tools/fetch-frpc.cjs && electron-builder --win dir --x64 && node tools/after-build.cjs",
     "fetch:frpc": "node tools/fetch-frpc.cjs",
     "tray-icons": "node tools/make-tray-icons.cjs",
-    "test:real": "node tests/real/full-script.cjs"
+    "test:real": "node tests/real/full-script.cjs",
+    "test:real:reinstall": "node tests/real/reinstall.cjs"
   },
   "dependencies": {
     "@xterm/addon-fit": "^0.11.0",

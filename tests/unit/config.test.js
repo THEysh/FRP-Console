@@ -298,3 +298,15 @@ test('connFingerprint 对地址/端口/token 变化敏感', () => {
   assert.notEqual(fp, connFingerprint({ ...base, auth: { method: 'token', token: 't2' } }));
   assert.equal(connFingerprint(null), '');
 });
+
+test('normalize：serverAddr 写成 [::1] 时剥掉方括号（frpc 会拼成 [[::1]]:7000）', () => {
+  const m = config.normalize({ serverAddr: '[::1]', serverPort: 7000 });
+  assert.equal(m.serverAddr, '::1');
+  const m2 = config.normalize({ serverAddr: '  [fd00::1]  ', serverPort: 7000 });
+  assert.equal(m2.serverAddr, 'fd00::1');
+});
+
+test('normalize：普通主机名与 IPv4 不受影响', () => {
+  assert.equal(config.normalize({ serverAddr: 'frp.example.com' }).serverAddr, 'frp.example.com');
+  assert.equal(config.normalize({ serverAddr: '1.2.3.4' }).serverAddr, '1.2.3.4');
+});

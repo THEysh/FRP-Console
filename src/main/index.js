@@ -1599,6 +1599,17 @@ function loadConfigFromDisk({ initial = false } = {}) {
   try {
     const text = fs.readFileSync(paths.configPath, 'utf8');
     model = configModule.parseConfigText(text, { nginxProxyEnabled: yModeEnabled() });
+    /* 文件里写了 serverAddr = "[::1]"：frpc 会拼成 [[::1]]:7000。模型里已经剥成 ::1，
+     * 这里把文件也改回来，否则「看着保存成功、隧道却一直连不上」。 */
+    const bracketed = /^\s*serverAddr\s*=\s*["']\[([^\]]+)\]["']/m.exec(text);
+    if (bracketed && model && model.serverAddr === bracketed[1]) {
+      try {
+        const written = configModule.writeConfig(paths.configPath, model);
+        if (written && written.ok !== false) {
+          notify('warn', '服务器地址的方括号已去掉', `frpc 不认「[${bracketed[1]}]」这种写法（会拼成 [[…]]:端口），已按 ${bracketed[1]} 写回配置文件`);
+        }
+      } catch { /* 写不回去就只是提示，不阻断启动 */ }
+    }
     configHash = hashText(text);
     const st = fs.statSync(paths.configPath);
     configStamp = { mtimeMs: st.mtimeMs, size: st.size };
