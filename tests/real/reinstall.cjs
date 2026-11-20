@@ -93,6 +93,25 @@ function check(name, ok, detail = '') {
 
   await ssh('systemctl restart frps; sleep 2; systemctl is-active frps').then((v) => check('重启后仍然 active', v.trim() === 'active', v.trim()));
 
+  /* 重装后配置必须「只有一份、值不跑偏」：bindPort 是 7000（历史上被故障注入脚本留过 7001），
+   * vhost 两个端口都在，面板口令是这次传进去的那个（1.2.103 之后空口令会自动生成，
+   * 所以「口令被悄悄换掉」和「口令为空」都要能发现）。 */
+  const after2 = await ssh('grep -E "^(bindPort|vhostHTTPPort|vhostHTTPSPort|subDomainHost) " /etc/frp/frps.toml; grep -c "' + DASH_PASS + '" /etc/frp/frps.toml; ls -1 /etc/frp/frps.toml* | wc -l');
+  const lines = after2.split(/\r?\n/).map((s) => s.trim());
+  const kv = {};
+  for (const l of lines) { const m = /^(bindPort|vhostHTTPPort|vhostHTTPSPort|subDomainHost)\s*=\s*(.+)$/.exec(l); if (m) kv[m[1]] = m[2].replace(/"/g, ''); }
+  const passHit = Number(lines.find((l) => /^\d+$/.test(l)) || 0);
+  check('bindPort 仍是 7000（没被别的实验带偏）', String(kv.bindPort || '') === '7000', `bindPort=${kv.bindPort}`);
+  check('vhost 两个端口都写进去了', String(kv.vhostHTTPPort || '') === '8080' && String(kv.vhostHTTPSPort || '') === '8443', JSON.stringify(kv));
+  check('面板口令就是这次传进去的那个', passHit >= 1, `matched=${passHit}`);
+  const fileCount = Number(lines[lines.length - 1]) || 0;
+  check('配置备份不会被无限堆积（≤10 份）', fileCount >= 1 && fileCount <= 11, `含备份共 ${fileCount} 个文件`);
+
+  const dash = await ssh('curl -s -o /dev/null -w "%{http_code}" -u admin:' + DASH_PASS + ' http://127.0.0.1:4096/api/serverinfo; echo; curl -s -o /dev/null -w "%{http_code}" -u admin:wrong-pass http://127.0.0.1:4096/api/serverinfo');
+  const [ok401, okWrong] = dash.split(/\s+/);
+  check('面板用新口令能登录', ok401 === '200', `200? ${ok401}`);
+  check('面板用错误口令被拒', okWrong === '401', `401? ${okWrong}`);
+
   await cdp.evalIn(PORT, `(async () => { await FRP.serverDisconnect(); return 1; })()`).catch(() => {});
 
   const failed = checks.filter((c) => !c.ok);
