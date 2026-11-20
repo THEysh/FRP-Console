@@ -38,7 +38,8 @@
     "fetch:frpc": "node tools/fetch-frpc.cjs",
     "tray-icons": "node tools/make-tray-icons.cjs",
     "test:real": "node tests/real/full-script.cjs",
-    "test:real:reinstall": "node tests/real/reinstall.cjs"
+    "test:real:reinstall": "node tests/real/reinstall.cjs",
+    "test:all": "node tools/test-all.cjs"
   },
   "dependencies": {
     "@xterm/addon-fit": "^0.11.0",

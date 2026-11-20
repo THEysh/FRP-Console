@@ -561,6 +561,7 @@ npm run test:e2e       # L2 端到端：起一个真 Electron、真 frpc、真 f
 npm run test:e2e -- --only=tunnel        # 只跑名字含 tunnel 的场景
 npm run test:e2e -- --keep               # 保留现场（数据目录与进程），便于排查
 node tests/soak.cjs 10                  # 长稳抽查：隧道 + 20 条代理跑 10 分钟，看内存/健康检查/日志缓冲趋势
+node tools/test-all.cjs                # 等价于 npm test，但不需要 npm（Git Bash 里 npm 是 npm.cmd，直接调用会 exit 126）
 ```
 
 | 层 | 内容 | 依赖 |
