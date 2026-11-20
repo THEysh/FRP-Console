@@ -121,6 +121,9 @@ let settings = null;
 let paths = { frpcPath: '', configPath: '', logPath: '' };
 let model = null;
 let configError = null;
+/* 磁盘上的配置能解析、但 frpc 自己不认（未知字段、参数写错）：与上面的解析失败分开记，
+ * 界面上要说清「这是 frpc 的判断」。 */
+let configVerifyError = null;
 let configHash = '';
 let configStamp = { mtimeMs: 0, size: 0 };
 /* 配置文件被外部删掉/移走时只提醒一次，别每 3 秒刷一遍通知 */
@@ -1390,6 +1393,7 @@ function buildState() {
       paths: pathsForState(),
       config: null,
       configError,
+      configVerifyError,
       validation: { errors: [], warnings: [] },
       runtime: { mode: 'stopped', running: false, connected: false },
       service: serviceCache,
@@ -1456,6 +1460,7 @@ function buildState() {
     paths: pathsForState(),
     config: configForState(),
     configError,
+    configVerifyError,
     validation,
     runtime,
     service: serviceCache,
@@ -1613,13 +1618,30 @@ function persistModel(nextModel, { reload = true } = {}) {
 }
 
 async function applyAndMaybeReload(nextModel, { reload = true, restartRecommended = false } = {}) {
+  /* 回滚用的原文：写盘前先留一份，frpc 拒绝新配置时用得上 */
+  const previousText = paths.configPath && fs.existsSync(paths.configPath) ? fs.readFileSync(paths.configPath, 'utf8') : null;
   const saved = persistModel(nextModel);
   if (!saved.ok) return saved;
   let reloadResult = null;
   if (reload && manager && manager.apiOk) {
     reloadResult = await manager.reload();
     if (!reloadResult.ok) {
-      return { ok: false, error: `配置已保存，但热重载被 frpc 拒绝：${reloadFailureText(reloadResult.error, model.proxies)}`, saved: true };
+      /* frpc 拒绝了新配置：回滚。留着坏配置的话，用户以为没保存成功，
+       * 但下次启动隧道会被这份配置卡死（插件证书缺失之类会拦住整条隧道）。 */
+      let rolledBack = false;
+      if (previousText !== null && paths.configPath) {
+        const back = configModule.writeRawConfig(paths.configPath, previousText);
+        rolledBack = back.ok !== false;
+        if (rolledBack) {
+          loadConfigFromDisk();
+          await manager.reload().catch(() => {});
+        }
+      }
+      healthCache.clear();
+      scheduleHealth(900);
+      const reason = reloadFailureText(reloadResult.error, model.proxies);
+      const tail = rolledBack ? '（已回滚到修改前的内容）' : `（回滚失败，请手动检查 ${paths.configPath}）`;
+      return { ok: false, error: `frpc 拒绝了这份配置：${reason}${tail}`, saved: false, rolledBack, restartRecommended };
     }
   }
   await manager.refresh().catch(() => {});
@@ -2155,6 +2177,26 @@ async function checkHealth() {
   for (const name of Array.from(healthCache.keys())) if (!alive.has(name)) healthCache.delete(name);
 }
 
+/* 用 frpc 自己的解析器过一遍配置：像 `bogusTopLevel` 这种字段我们读得懂（进了 _extra），
+ * frpc 却会在启动时直接报 `json: unknown field` 并退出——不做这一步，界面只会显示
+ * 「隧道未运行 / 管理 API 未启动」，用户完全看不出是自己手改坏了配置。 */
+async function verifyConfigWithFrpc(file) {
+  if (!paths.frpcPath || !fs.existsSync(paths.frpcPath) || !file || !fs.existsSync(file)) {
+    return { ok: true, skipped: true };
+  }
+  const pick = (text) => String(text || '').trim().split('\n').filter(Boolean).slice(-1)[0] || '';
+  try {
+    const r = await execFileP(paths.frpcPath, ['verify', '-c', file], { timeout: 8000 });
+    /* execFileP 失败时是「正常返回 {ok:false,...}」而不是抛异常（见 util.execFileP） */
+    if (r && r.ok === false) {
+      return { ok: false, error: pick(r.stdout) || pick(r.stderr) || r.message || 'frpc 校验未通过' };
+    }
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: pick(e && (e.stderr || e.stdout || e.message)) || 'frpc 校验未通过' };
+  }
+}
+
 async function checkExternalConfig() {
   if (!paths.configPath) return;
   let st;
@@ -2173,7 +2215,9 @@ async function checkExternalConfig() {
     return;
   }
   configMissingNotified = false;
-  if (st.mtimeMs === configStamp.mtimeMs && st.size === configStamp.size) return;
+  if (st.mtimeMs === configStamp.mtimeMs && st.size === configStamp.size) {
+    return;
+  }
   let text;
   try {
     text = fs.readFileSync(paths.configPath, 'utf8');
@@ -2186,8 +2230,9 @@ async function checkExternalConfig() {
     // 文件内容跟「最后一次成功解析」的一样（比如坏的写完又改回来了）。
     // 如果还挂着上一轮坏文件的解析错误，要清掉，否则界面上会一直红着，
     // 用户把文件改回去也看不到恢复。
-    if (configError) {
+    if (configError || configVerifyError) {
       configError = null;
+      configVerifyError = null;
       pushState();
     }
     return;
@@ -2199,6 +2244,17 @@ async function checkExternalConfig() {
     configStamp = { mtimeMs: st.mtimeMs, size: st.size };
     configError = null;
     updateLogFile();
+    /* 先让 frpc 自己校验：不通过就不重载、也不改运行状态，只把原因摆到界面上。
+     * 否则 frpc 会带着坏配置退出，界面上只剩「隧道未运行」，看不出为什么。 */
+    const verdict = await verifyConfigWithFrpc(paths.configPath);
+    if (!verdict.ok) {
+      configVerifyError = `frpc 不认这份配置：${verdict.error}`;
+      configStamp = { mtimeMs: st.mtimeMs, size: st.size };
+      pushState();
+      send('notify', { kind: 'error', title: '配置文件有问题', message: verdict.error });
+      return;
+    }
+    configVerifyError = null;
     send('notify', { kind: 'info', title: '配置文件已更新', message: '检测到外部修改，正在重新载入。' });
     if (settings.autoReload && manager.apiOk) {
       const r = await manager.reload();

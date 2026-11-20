@@ -595,6 +595,7 @@ function renderOverview(force = false) {
   const issues = [];
   if (state.binding && state.binding.unarchived) issues.push(orphanTunnelNote());
   if (state.configError) issues.push(`<div class="note error">${icon('alert')}<div>${esc(state.configError)}</div></div>`);
+  if (state.configVerifyError) issues.push(`<div class="note error">${icon('alert')}<div>${esc(state.configVerifyError)}<br><span style="opacity:.75">隧道仍在用上一次的配置运行；把 frpc.toml 改对后会自动重新载入。</span></div></div>`);
   if (info.foreign) {
     const port = (info.r && info.r.adminPort) || 7400;
     issues.push(`<div class="note error">${icon('alert')}<div><strong>管理端口 ${esc(port)} 上跑着另一个 frpc</strong><br>它连的服务器或代理名单跟这份配置对不上（多半是另一份配置、另一个控制台实例，或手工开的 frpc）。本配置的隧道没有在跑，这里也不能停它。<br><span style="opacity:.75">到「设置 → 运行模式与行为」换一个管理 API 端口，或先把那个 frpc 关掉。</span></div></div>`);
@@ -800,6 +801,7 @@ function renderProxies(force = false) {
 
       ${orphanTunnelNote()}
       ${state.configError ? `<div class="note error" style="margin-bottom:14px">${icon('alert')}<div>${esc(state.configError)}</div></div>` : ''}
+      ${state.configVerifyError ? `<div class="note error" style="margin-bottom:14px">${icon('alert')}<div>${esc(state.configVerifyError)}<br><span style="opacity:.75">隧道仍在用上一次的配置运行；把 frpc.toml 改对后会自动重新载入。</span></div></div>` : ''}
 
       <section class="card table-card">
         <div class="toolbar">
