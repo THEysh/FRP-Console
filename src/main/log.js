@@ -25,10 +25,21 @@ function stripAnsi(text) {
   return raw.includes('\u001b') ? raw.replace(ANSI_ESCAPE, '') : raw;
 }
 
+/* 单行上限。frpc 偶尔会把整份 JSON / 证书 / 请求体打进一行，
+ * 那种行既看不懂又拖慢 IPC 与渲染（实测 200 KB 一行会让刷新从 130ms 涨到 520ms）。 */
+const MAX_LINE_CHARS = 2000;
+
+function clampLine(text) {
+  if (text.length <= MAX_LINE_CHARS) return text;
+  const rest = text.length - MAX_LINE_CHARS;
+  return text.slice(0, MAX_LINE_CHARS) + `…（这一行共 ${text.length} 字符，已截断后面 ${rest} 个）`;
+}
+
 function parseLine(raw, id) {
-  const text = stripAnsi(raw).replace(/\r$/, '');
+  let text = stripAnsi(raw).replace(/\r$/, '');
   if (!text.trim()) return null;
   if (ADMIN_POLL_NOISE.test(text)) return null;
+  text = clampLine(text);
   const ts = parseTimestamp(text);
   const level = logLevelOf(text);
   const time = ts
@@ -202,4 +213,4 @@ class LogFollower extends EventEmitter {
   }
 }
 
-module.exports = { LogFollower, parseLine };
+module.exports = { clampLine, MAX_LINE_CHARS, LogFollower, parseLine };
