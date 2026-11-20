@@ -876,6 +876,20 @@ function normalizePlugin(input, owner) {
   return plugin;
 }
 
+/* 连接参数指纹：只取影响「连哪台 frps」的几项。
+ * 隧道跑着的时候改了服务器地址/端口/token，frpc 仍然连着旧的那台 ——
+ * 界面必须能看出来，否则「已连接」是假的（真机全剧本就这么假绿过一次）。 */
+function connFingerprint(model) {
+  if (!model) return '';
+  const auth = (model && model.auth) || {};
+  return JSON.stringify({
+    a: String((model && model.serverAddr) || ''),
+    p: Number((model && model.serverPort) || 0),
+    t: String(auth.token || ''),
+    m: String(auth.method || ''),
+  });
+}
+
 module.exports = {
   explainWriteError,
   PROXY_TYPES,
@@ -889,6 +903,7 @@ module.exports = {
   writeRawConfig,
   backupConfig,
   probeTargetFor,
+  connFingerprint,
   firstDomainOf,
   vhostPortOf,
   ensureAdmin,

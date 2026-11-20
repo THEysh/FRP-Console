@@ -1255,6 +1255,10 @@ function lastConnectProblem() {
   return fileProblem;
 }
 
+/* 「正在跑的 frpc 用的是哪份连接参数」。和当前配置不一致 = 界面显示的
+ * 「已连接」其实连的是旧服务器（真机全剧本就这么假绿过一次）。 */
+let startedFingerprint = '';
+
 function runtimeView(runtime) {
   const apiOk = !!runtime.connected;
   /* 只有 frpc 真的会去启动的代理才算「本该注册」：
@@ -1286,6 +1290,9 @@ function runtimeView(runtime) {
   const unconfirmed = loginFailed && !detected;
   return {
     ...runtime,
+    /* 跑着的 frpc 不是用当前配置起的：改了服务器地址/端口/token 但没重启，
+     * 或者外部改了配置文件而重载没生效。 */
+    staleConfig: !!(runtime.mode === 'managed' && startedFingerprint && startedFingerprint !== configModule.connFingerprint(model)),
     loggedIn: apiOk && !loginFailed,
     loginFailed,
     // 管理 API 通了、但代理还没注册上，且还没到判定超时的时候：这叫“正在登录”，别急着报错。
@@ -2642,7 +2649,21 @@ function registerIpc() {
     if (!result.ok) return result;
     ensureClientServerProfile({ activate: connChanged });
     pushState();
-    return ok({ state: result.state, reloaded: result.reloaded, restartRecommended: connChanged });
+    /* 连接参数变了、隧道还在跑：frpc 不会自己换服务器，直接重启一次。
+     * 不重启的话界面显示「已连接」，实际连的还是旧的那台。 */
+    let restarted = false;
+    let restartError = '';
+    if (connChanged && manager && manager.isChildAlive) {
+      const r = await manager.restart({ runMode: settings.runMode });
+      restarted = !!(r && r.ok !== false);
+      if (restarted) startedFingerprint = configModule.connFingerprint(model);
+      else restartError = String((r && r.error) || '重启失败');
+      await manager.refresh().catch(() => {});
+      healthCache.clear();
+      scheduleHealth(1200);
+      pushState();
+    }
+    return ok({ state: buildState(), reloaded: result.reloaded, restartRecommended: connChanged, restarted, restartError });
   });
 
   /* frpc.toml 原文（配置编辑器用）：读、校验、保存。 */
@@ -2920,11 +2941,13 @@ function registerIpc() {
     scheduleHealth(1500);
     pushState();
     if (!result.ok) return fail(result.error, { state: buildState() });
+    startedFingerprint = configModule.connFingerprint(model);
     return ok({ state: buildState(), mode: result.mode, adminNote: adminNote || '' });
   });
 
   ipcMain.handle('tunnel:stop', async () => {
     suppressExitUntil = Date.now() + 12000;
+    startedFingerprint = '';
     await refreshService({ detect: false });
     const result = await manager.stop({ runMode: settings.runMode });
     await manager.refresh().catch(() => {});

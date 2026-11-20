@@ -430,6 +430,7 @@ function overviewKey() {
     durl: s.dashboardUrl || '',
     // 管理 API 口令由弱变强（或反过来）时，概览那条提示要跟着出现/消失
     aw: s.app && s.app.adminWeak ? (s.app.adminWeak.weak ? 1 : 0) : 0,
+    stale: s.runtime && s.runtime.staleConfig ? 1 : 0,
     proxies: (s.proxies || []).map((p) => [p.name, p.status, p.publicAddress, p.health && p.health.ok, p.health && p.health.reason, p.statusError]),
   });
 }
@@ -647,6 +648,10 @@ function renderOverview(force = false) {
       <div style="margin-top:10px"><button class="btn small" type="button" data-act="nav" data-view="proxies">${icon('link')}<span>去代理映射看是哪条</span></button></div>
     </div></div>`);
   }
+  /* 跑着的 frpc 不是用当前配置起的：最容易出现在「改了服务器地址但没重启」之后 */
+  const staleNote = staleConfigNote();
+  if (staleNote) issues.unshift(staleNote);
+
   /* 本机 frpc 管理 API 用默认口令：不提示的话没人会想起它 */
   const adminWeak = (state.app && state.app.adminWeak) || null;
   if (adminWeak && adminWeak.weak) {
@@ -6597,7 +6602,23 @@ async function saveClientLogOptions(level, loginFailExit) {
     transport: config.transport || null,
   });
   if (res && res.ok && res.data && res.data.state) S.state = res.data.state;
+  /* 连接参数变了而隧道在跑时主进程会自动重启一次；把结果告诉用户，
+   * 否则改了服务器地址却不知道隧道到底换没换。 */
+  if (res && res.ok && res.data && res.data.restarted) {
+    toast('info', '已按新服务器重启隧道', 'frpc 原来连的是旧地址，已经替你重启到新配置。');
+  } else if (res && res.ok && res.data && res.data.restartError) {
+    toast('warn', '隧道没能自动重启', String(res.data.restartError).slice(0, 160));
+  }
   return res;
+}
+
+/* 跑着的 frpc 用的不是当前配置（改了服务器但没重启、或外部改文件没重载成功）。 */
+function staleConfigNote() {
+  const rt = (S.state && S.state.runtime) || {};
+  const model = (S.state && S.state.config) || {};
+  if (!rt.staleConfig) return '';
+  const target = `${model.serverAddr || '?'}:${model.serverPort || '?'}`;
+  return `<div class="note warn">${icon('alert')}<div><strong>隧道还在用旧配置运行</strong><br>界面里的 ${esc(target)} 还没生效——正在跑的 frpc 是用改之前的参数连的。点右边按钮按当前配置重启一次。</div><button class="btn small" data-act="tunnel.restart">${icon('reload')}重启隧道</button></div>`;
 }
 
 /* 管理 API 口令的强度提示：空 / 老默认 admin / 太短，都值得说一句。 */

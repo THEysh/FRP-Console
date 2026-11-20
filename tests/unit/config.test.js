@@ -281,3 +281,20 @@ test('完全不同的名字不会误报大小写警告', () => {
   const v = config.validate(model);
   assert.ok(!v.warnings.some((w) => /只差大小写/.test(w.message)), JSON.stringify(v.warnings));
 });
+
+const { connFingerprint } = require('../../src/main/config.js');
+
+test('connFingerprint 只认连接参数，改代理不影响它', () => {
+  const a = connFingerprint({ serverAddr: '1.2.3.4', serverPort: 7000, auth: { method: 'token', token: 't1' }, proxies: [{ name: 'x' }] });
+  const b = connFingerprint({ serverAddr: '1.2.3.4', serverPort: 7000, auth: { method: 'token', token: 't1' }, proxies: [{ name: 'y' }] });
+  assert.equal(a, b);
+});
+
+test('connFingerprint 对地址/端口/token 变化敏感', () => {
+  const base = { serverAddr: '1.2.3.4', serverPort: 7000, auth: { method: 'token', token: 't1' } };
+  const fp = connFingerprint(base);
+  assert.notEqual(fp, connFingerprint({ ...base, serverAddr: '5.6.7.8' }));
+  assert.notEqual(fp, connFingerprint({ ...base, serverPort: 7001 }));
+  assert.notEqual(fp, connFingerprint({ ...base, auth: { method: 'token', token: 't2' } }));
+  assert.equal(connFingerprint(null), '');
+});
