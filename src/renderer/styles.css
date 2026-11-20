@@ -1520,6 +1520,10 @@ label .icon-btn svg { width: 13px; height: 13px; }
 .ctx-menu .ctx-item:disabled { opacity: 0.42; cursor: default; background: transparent; }
 
 /* ---------------- 实时日志页：来源切换（本机 frpc / 服务器 frps） ---------------- */
+.log-src-seg .is-off {
+  opacity: 0.55;
+}
+
 .log-src-seg { margin-right: 4px; }
 .log-src-seg button { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* 服务器页「运行监控」区现在只剩「本机映射」一张卡：让它铺满整行，别留半边空白。 */

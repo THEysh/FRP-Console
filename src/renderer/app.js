@@ -1047,10 +1047,12 @@ function filteredLogs() {
 /* 日志来源切换：本机 frpc（文件/进程输出）与服务器 frps（SSH + journalctl）。
  * 两者都是日志，放在同一页更符合直觉，也省得在服务器页里再开一块。 */
 function logSourceSeg() {
-  const host = S.server.connected ? String(S.server.host || '') : '';
+  const connected = !!S.server.connected;
+  const host = connected ? String(S.server.host || '') : '';
+  const serverLabel = connected ? `服务器 frps${host ? ` · ${esc(host)}` : ''}` : '服务器 frps（未连接）';
   return `<div class="seg log-src-seg">
     <button type="button" data-act="logs.source" data-source="local" class="${S.logSource === 'local' ? 'active' : ''}">本机 frpc</button>
-    <button type="button" data-act="logs.source" data-source="server" class="${S.logSource === 'server' ? 'active' : ''}">服务器 frps${host ? ` · ${esc(host)}` : ''}</button>
+    <button type="button" data-act="logs.source" data-source="server" class="${S.logSource === 'server' ? 'active' : ''}${connected ? '' : ' is-off'}"${connected ? '' : ' title="先连上服务器才能读它的 frps 日志"'}>${serverLabel}</button>
   </div>`;
 }
 
@@ -1231,7 +1233,10 @@ function serverSeqStale(seq) {
 
 function applyServerState(data, seq) {
   if (!data) return false;
-  if (seq !== undefined && serverSeqStale(seq)) return false;
+  /* 序号过期只说明「有更新的请求在飞」，不代表这份数据是错的。但连接状态是硬事实：
+   * 一旦丢弃，界面会停在与主进程相反的那一侧，且没有任何东西会主动纠正它
+   * （实测：自动连接重试期间 serverSeq 被反复推高，界面会永久显示「未连接」）。 */
+  if (seq !== undefined && serverSeqStale(seq) && !!data.connected === !!S.server.connected) return false;
   S.server.loaded = true;
   const wasConnected = !!S.server.connected;
   S.server.connected = !!data.connected;
@@ -1240,6 +1245,14 @@ function applyServerState(data, seq) {
     S.server.logsError = '';
     S.server.logs = S.server.logs || '';
     S.server.logsAutoAt = 0;
+  }
+  /* 断开之后不要再让「服务器 frps · <host>」继续高亮：正文已经是空的、页头却写着未连接，
+   * 两处对不上。这里直接切回本机来源，并提示一句。 */
+  if (wasConnected && !S.server.connected && S.logSource === 'server') {
+    S.logSource = 'local';
+    S.lastKeys.logs = '';
+    if (S.view === 'logs') renderLogs(true);
+    toast('info', '已切回本机日志', '服务器连接断开了，服务器上的 frps 日志读不到。');
   }
   S.server.host = data.host || S.server.host || '';
   S.server.port = data.port || S.server.port || 22;
@@ -1277,7 +1290,11 @@ function applyServerState(data, seq) {
 async function loadServerState({ autoConnect = false } = {}) {
   const seq = serverSeq();
   const res = await FRP.serverState();
-  if (serverSeqStale(seq)) return;
+  if (serverSeqStale(seq)) {
+    /* 同 applyServerState：连接状态与界面相反时不能丢，否则界面会一直停在错误状态。 */
+    const flips = !!(res && res.ok && res.data && !!res.data.connected !== !!S.server.connected);
+    if (!flips) return;
+  }
   if (res && res.ok) {
     applyServerState(res.data, seq);
     if (S.view === 'server') renderServer(true);
@@ -5372,6 +5389,10 @@ async function handleAction(act, dataset, btn) {
         break;
       case 'logs.source': {
         const src = btn.dataset.source === 'server' ? 'server' : 'local';
+        if (src === 'server' && !S.server.connected) {
+          toast('warn', '先连上服务器', '服务器还没连上，读不到它的 frps 日志；连上之后这里会自动出现。');
+          break;
+        }
         if (src === S.logSource) break;
         S.logSource = src;
         S.lastKeys.logs = '';
