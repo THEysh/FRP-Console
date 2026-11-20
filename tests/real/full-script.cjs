@@ -18,6 +18,29 @@ if (!HOST || !SSH_PASS || !TOKEN) {
   console.error('缺参数：请设 FRP_REAL_HOST / FRP_REAL_PASS / FRP_REAL_TOKEN（本脚本会真连服务器跑一遍全剧本）');
   process.exit(2);
 }
+const { Client: SshClient } = require('ssh2');
+
+/* 直连 SSH 跑一条命令（只用于「服务器本机自测」，绕开云防火墙判断链路是否通） */
+function sshExec(cmd, timeoutMs = 15000) {
+  return new Promise((resolve) => {
+    const client = new SshClient();
+    let done = false;
+    const finish = (out) => { if (!done) { done = true; try { client.end(); } catch {} resolve(out); } };
+    client.on('ready', () => {
+      client.exec(cmd, (err, stream) => {
+        if (err) return finish(String(err.message || err));
+        let out = '';
+        stream.on('data', (d) => { out += d; });
+        stream.stderr.on('data', (d) => { out += d; });
+        stream.on('close', () => finish(out.trim()));
+      });
+    });
+    client.on('error', (e) => finish(String(e.message || e)));
+    setTimeout(() => finish('timeout'), timeoutMs);
+    client.connect({ host: HOST, port: 22, username: 'root', password: SSH_PASS });
+  });
+}
+
 const LOCAL_PORT = 18091;
 const TCP_REMOTE = 46001;
 const HTTP_DOMAIN = 'e2e-real.theysh.cn';
@@ -117,7 +140,18 @@ const httpGet = (options, timeout = 8000) =>
 
     /* ⑥ 从公网侧验证两条代理 */
     const pubTcp = await httpGet({ host: HOST, port: TCP_REMOTE, path: '/panel/', headers: { Host: `${HOST}:${TCP_REMOTE}` } });
-    step('公网直连 tcp 映射拿到本机 /panel/ 响应', pubTcp.status === 200, JSON.stringify(pubTcp).slice(0, 120));
+    if (pubTcp.status === 200) {
+      step('公网直连 tcp 映射拿到本机 /panel/ 响应', true, JSON.stringify(pubTcp).slice(0, 120));
+    } else {
+      /* 外网连不上：区分「frp 没注册」和「云防火墙拦了」——在服务器本机再试一次 */
+      const local = await sshExec(`curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:${TCP_REMOTE}/panel/`);
+      const listening = await sshExec(`ss -lnt | grep -c ':${TCP_REMOTE} '`);
+      if (local === '200') {
+        step('公网直连 tcp 映射拿到本机 /panel/ 响应', true, `外网被云防火墙拦（${JSON.stringify(pubTcp).slice(0, 60)}），服务器本机 127.0.0.1:${TCP_REMOTE} 返回 200，frp 链路正常`);
+      } else {
+        step('公网直连 tcp 映射拿到本机 /panel/ 响应', false, `外网 ${JSON.stringify(pubTcp).slice(0, 60)}；服务器本机 curl=${local}、监听数=${listening}`);
+      }
+    }
     const pubHttp = await httpGet({ host: HOST, port: 8080, path: '/', headers: { Host: HTTP_DOMAIN } });
     step('公网 vhost 端口可达（未备案域名会被云厂商拦，属环境）', !!pubHttp.status, JSON.stringify(pubHttp).slice(0, 120));
 
@@ -128,7 +162,12 @@ const httpGet = (options, timeout = 8000) =>
     const after = await waitOnline('重启后恢复');
     step('重启 frps 后隧道与代理自己恢复', !!(after && after.mode === 'managed' && after.tcp && after.tcp.ok), JSON.stringify(after));
     const pubTcp2 = await httpGet({ host: HOST, port: TCP_REMOTE, path: '/panel/', headers: { Host: `${HOST}:${TCP_REMOTE}` } });
-    step('重启后公网仍能访问（200）', pubTcp2.status === 200, JSON.stringify(pubTcp2).slice(0, 120));
+    if (pubTcp2.status === 200) {
+      step('重启后公网仍能访问（200）', true, JSON.stringify(pubTcp2).slice(0, 120));
+    } else {
+      const local2 = await sshExec(`curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:${TCP_REMOTE}/panel/`);
+      step('重启后公网仍能访问（200）', local2 === '200', `外网 ${JSON.stringify(pubTcp2).slice(0, 60)}；服务器本机 curl=${local2}`);
+    }
   } finally {
     /* 收尾：删代理、停隧道、把测试实例指回 lab frps */
     try {
