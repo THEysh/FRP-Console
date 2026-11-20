@@ -2281,7 +2281,16 @@ function pluginCertProblems() {  const out = [];
     for (const [field, value] of [['crtPath', plugin.crtPath], ['keyPath', plugin.keyPath]]) {
       const p = String(value || '').trim();
       if (!p) { missing.push(`${field} 未填写`); continue; }
-      if (!fs.existsSync(p)) missing.push(`${field} 不存在：${p}`);
+      if (!fs.existsSync(p)) { missing.push(`${field} 不存在：${p}`); continue; }
+      /* 文件在但内容不是 PEM（空文件、选错了文件、被截断）时 frpc 同样会拒绝整份配置，
+       * 这里粗检一行 header 就能拦住绝大多数误选。 */
+      try {
+        const head = fs.readFileSync(p, 'utf8').slice(0, 4096);
+        const want = field === 'crtPath' ? /-----BEGIN CERTIFICATE-----/ : /-----BEGIN [A-Z ]*PRIVATE KEY-----/;
+        if (!want.test(head)) missing.push(`${field} 不是 PEM 格式（${p}）`);
+      } catch (error) {
+        missing.push(`${field} 读取失败：${(error && error.message) || error}`);
+      }
     }
     if (missing.length) out.push({ name: proxy.name, missing });
   }

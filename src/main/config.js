@@ -782,7 +782,7 @@ function makeProxy(input, options = {}) {
   }
   if (type === 'tcpmux') base.multiplexer = String(input.multiplexer || 'httpconnect').trim() || 'httpconnect';
   if (type === 'http' || type === 'https') {
-    const plugin = normalizePlugin(input.plugin);
+    const plugin = normalizePlugin(input.plugin, input);
     if (plugin) {
       base.plugin = plugin;
       // https2http / https2https 只在 https 类型下有效：它们让 frps 终止 TLS，
@@ -811,13 +811,20 @@ function makeProxy(input, options = {}) {
 /* http/https 代理的 TLS 终止插件（frp 的 https2http / https2https）。
  * 只认这两个：别的 plugin 类型（如 http_proxy、static_file）不在这里暴露，
  * 用户手改配置写进去的其它 plugin 会经 normalizeProxy 原样保留。 */
-function normalizePlugin(input) {
+function normalizePlugin(input, owner) {
   if (!isPlainObject(input)) return null;
   const type = String(input.type || '').trim().toLowerCase();
   if (!['https2http', 'https2https'].includes(type)) return null;
   const plugin = { type };
   const str = (v) => String(v || '').trim();
   if (str(input.localAddr)) plugin.localAddr = str(input.localAddr);
+  /* localAddr 不填时按 localIP:localPort 兜底 —— frpc 对 https2http/https2https 要求
+   * 必须给 localAddr，缺了它会拒绝加载整份配置，所有代理一起起不来。 */
+  if (!plugin.localAddr && isPlainObject(owner)) {
+    const host = str(owner.localIP) || '127.0.0.1';
+    const port = Number(owner.localPort);
+    if (Number.isInteger(port) && port > 0) plugin.localAddr = `${host}:${port}`;
+  }
   if (str(input.crtPath)) plugin.crtPath = str(input.crtPath);
   if (str(input.keyPath)) plugin.keyPath = str(input.keyPath);
   if (str(input.hostHeaderRewrite)) plugin.hostHeaderRewrite = str(input.hostHeaderRewrite);

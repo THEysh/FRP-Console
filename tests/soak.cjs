@@ -19,14 +19,19 @@ const SAMPLE_MS = 30000;
 const PROXIES = 20;
 
 function rssOfPid(pid) {
+  if (!pid) return null;
+  /* 先试 tasklist（快），拿不到再退回 PowerShell（某些环境 tasklist 会被安全软件限制） */
   try {
     const out = execFileSync('tasklist', ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'], { encoding: 'utf8' });
     const m = out.match(/"([^"]*)","(\d+)","[^"]*","([^"]*)","([\d,]+) K"/);
-    if (!m) return null;
-    return Math.round(Number(m[4].replace(/,/g, '')) / 1024);
-  } catch {
-    return null;
-  }
+    if (m) return Math.round(Number(m[4].replace(/,/g, '')) / 1024);
+  } catch {}
+  try {
+    const out = execFileSync('powershell', ['-NoProfile', '-Command', `(Get-Process -Id ${pid}).WorkingSet64`], { encoding: 'utf8' });
+    const bytes = Number(String(out).trim());
+    if (Number.isFinite(bytes) && bytes > 0) return Math.round(bytes / 1024 / 1024);
+  } catch {}
+  return null;
 }
 
 (async () => {
@@ -121,9 +126,11 @@ function rssOfPid(pid) {
     }
 
     const withMb = samples.filter((s) => s.mainMB);
-    const first = withMb[0];
-    const lastS = withMb[withMb.length - 1];
-    const grow = first && lastS ? lastS.mainMB - first.mainMB : 0;
+    /* 内存采样全失败时退回用最后一条样本，别让结论行自己抛异常 */
+    const first = withMb[0] || samples[0];
+    const lastS = withMb[withMb.length - 1] || samples[samples.length - 1];
+    if (!withMb.length) console.log('（这台机器上读不到主进程内存占用，内存增长这一项跳过）');
+    const grow = withMb.length >= 2 ? withMb[withMb.length - 1].mainMB - withMb[0].mainMB : 0;
     const stalled = samples.length >= 2 && samples[samples.length - 1].at === samples[0].at;
     const logsGrew = samples[samples.length - 1].logLines - samples[0].logLines;
 
@@ -134,7 +141,7 @@ function rssOfPid(pid) {
     console.log(`日志缓冲：${samples[0].logLines} → ${samples[samples.length - 1].logLines} 行（涨 ${logsGrew}）`);
     console.log(`在线代理：${lastS.online} / ${lastS.total}`);
     const neverManaged = samples.every((s) => s.mode !== 'managed');
-    const ok = grow <= 40 && !stalled && !neverManaged;
+    const ok = grow <= 40 && !stalled && !neverManaged && lastS.online === lastS.total;
     if (neverManaged) console.log('✗ 全程没有进入 managed 模式：采样期间隧道根本没在跑');
     console.log(ok ? '✓ 通过' : '✗ 需要关注');
     fs.writeFileSync(path.join(dataRoot, 'samples.json'), JSON.stringify(samples, null, 2));
