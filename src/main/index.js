@@ -2226,6 +2226,20 @@ async function verifyConfigWithFrpc(file) {
   }
 }
 
+/* 内存里的配置模型可能落后于磁盘（用户手改、外部脚本改、或者启动瞬间）。
+ * 需要用「磁盘上的真实内容」做判断之前，先对一次。 */
+function syncModelFromDiskIfChanged() {
+  if (!paths.configPath || !fs.existsSync(paths.configPath)) return false;
+  try {
+    const text = fs.readFileSync(paths.configPath, 'utf8');
+    if (configHash && hashText(text) === configHash) return false;
+    loadConfigFromDisk();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function checkExternalConfig() {
   if (!paths.configPath) return;
   let st;
@@ -5214,6 +5228,9 @@ async function bootstrap() {
     getPaths: () => paths,
     getConfig: () => model,
     ensureAdminConfig: async () => {
+      /* 先用磁盘上的内容覆盖内存模型：否则「文件里没有 webServer」这种情况
+       * 会被内存里的旧值挡住，什么也不写，frpc 就用默认 7400/admin 起来。 */
+      syncModelFromDiskIfChanged();
       const changed = configModule.ensureAdmin(model, settings);
       if (changed) {
         const saved = persistModel(model, { reload: false });
