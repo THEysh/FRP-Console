@@ -4383,6 +4383,18 @@ async function syncCertToServerNginx(cert) {
       acmeManager.markNginx(cert.domain, r, serverHost);
       return r;
     }
+    /* 没有 nginx 时后面每一步都没有意义（写进去的配置也没人 reload），
+     * 而且原来的报错是 "bash: line 1: nginx: command not found"，用户看不出该干什么。 */
+    const nginxNow = await serverSession.detectNginx().catch((e) => ({ installed: false, error: String((e && e.message) || e) }));
+    if (!nginxNow.installed) {
+      const r = {
+        ok: false,
+        error: '这台服务器上没有可用的 nginx：先到「HTTPS 域名反代（nginx）」卡片点「安装 nginx 并配置」，装好之后再部署证书',
+        nginxMissing: true,
+      };
+      acmeManager.markNginx(cert.domain, r, serverHost);
+      return r;
+    }
     const frpsHttpPort = Number(vhost.port) || 8080;
     const upload = await serverSession.uploadCertToNginx(cert.domain, { certPath: cert.crtPath, keyPath: cert.keyPath });
     if (!upload.ok) { acmeManager.markNginx(cert.domain, upload, serverHost); return upload; }

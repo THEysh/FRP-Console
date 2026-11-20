@@ -2336,10 +2336,22 @@ class ServerSession {
     const test = await this.exec(`${prefix}nginx -t 2>&1`, 15000);
     const testText = `${test.stdout || ''}\n${test.stderr || ''}`;
     if (!test.ok && !/syntax is ok|test is successful/i.test(testText)) {
-      return { ok: false, error: `nginx 配置校验失败：${(test.stderr || test.stdout || '未知错误').trim()}` };
+      const raw = (test.stderr || test.stdout || '未知错误').trim();
+      /* nginx 根本没装时，这里拿到的是 "bash: line 1: nginx: command not found"，
+       * 说成「配置校验失败」会让用户去改配置，方向全错。 */
+      if (/command not found|No such file or directory/i.test(raw)) {
+        return { ok: false, error: '这台服务器上没有可用的 nginx（命令找不到）：先安装 nginx，再部署证书', nginxMissing: true };
+      }
+      return { ok: false, error: `nginx 配置校验失败：${raw}` };
     }
     const reload = await this.exec(`${prefix}systemctl reload nginx 2>&1 || ${prefix}service nginx reload 2>&1 || ${prefix}nginx -s reload 2>&1`, 15000);
-    if (!reload.ok) return { ok: false, error: `nginx reload 失败：${(reload.stderr || reload.stdout || '未知错误').trim()}` };
+    if (!reload.ok) {
+      const raw = (reload.stderr || reload.stdout || '未知错误').trim();
+      if (/command not found|No such file or directory/i.test(raw)) {
+        return { ok: false, error: '这台服务器上没有可用的 nginx（命令找不到）：先安装 nginx，再部署证书', nginxMissing: true };
+      }
+      return { ok: false, error: `nginx reload 失败：${raw}` };
+    }
     return { ok: true };
   }
 
