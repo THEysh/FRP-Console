@@ -511,6 +511,11 @@ node tests/soak.cjs 10                  # 长稳抽查：隧道 + 20 条代理�
 - frps 初始化会写入 `/etc/frp/frps.toml`、注册系统服务并重启 frps；**若服务器上原有的 frps 正在服务其他隧道，这会短暂中断并替换其配置**，执行前请确认影响范围。
 
 ## 更新日志
+### 1.2.141
+
+- 「从零初始化 frps」时如果开了鉴权却把 Token 留空，会自动生成 24 位随机 Token，并在初始化完成后弹窗告诉你（空 Token 的 frps 等于不校验身份）。
+- 初始化结果里同时回显这个 Token，方便在其它设备上填同样的值。
+
 ### 1.2.140
 
 - **修：frps 起不来时把「哪个端口被占」说准，不再一律让人去改 `bindPort`。** frps 有四类端口（bindPort / Dashboard / vhostHTTP / vhostHTTPS），以前不管哪一类被占，报错都只写「这个端口被占用」并建议改 bindPort —— 面板端口被占时照做只会改错地方。现在会从日志里取出具体端口号，对照当前配置说清「被占的是 4096，它是 Dashboard 面板端口（`webServer.port`）」，并给出 `ss -lntp | grep 4096` 的排查命令。

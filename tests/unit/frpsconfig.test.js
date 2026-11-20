@@ -83,8 +83,9 @@ test('applyWizard：关掉鉴权 / 关掉 Dashboard 时对应段落被删除', (
   assert.equal(out.data.dashboard, undefined, '旧字段名也要清掉');
 });
 
+/* 1.2.141 起「开了鉴权但 token 为空」会自动生成，不再算校验失败；这里改用端口越界来覆盖同一条路径。 */
 test('applyWizard：校验失败时不产出文本', () => {
-  const out = frps.applyWizard({}, { bindPort: 7000, authEnabled: true, token: '' });
+  const out = frps.applyWizard({}, { bindPort: 70000, authEnabled: true, token: 'abcdefghijk' });
   assert.equal(out.ok, false);
   assert.equal(out.text, undefined);
   assert.ok(Array.isArray(out.errors) && out.errors.length > 0);
@@ -169,4 +170,27 @@ test('refineStartError：与端口无关的错误原样返回', () => {
   const raw = '启动后 frps 未运行（异常）（日志：frps[1]: json: cannot unmarshal string into Go struct field ServerConfig.bindPort of type int）';
   assert.equal(refineStartError(raw, { bindPort: 7000 }), raw);
   assert.equal(refineStartError('', {}), '');
+});
+
+test('applyWizard: 开了鉴权但 token 留空 → 自动生成 24 位并写进配置', () => {
+  const r = frps.applyWizard({}, { authEnabled: true, token: '' });
+  assert.ok(r.ok, JSON.stringify(r.errors));
+  assert.match(r.generatedToken, /^[A-Za-z0-9]{24}$/);
+  assert.match(r.text, /\[auth\]/);
+  assert.ok(r.text.includes(r.generatedToken), '生成的 token 必须真的写进配置');
+  assert.ok(r.warnings.some((w) => w.includes('鉴权 Token 原来是空的')), JSON.stringify(r.warnings));
+});
+
+test('applyWizard: token 已填时不覆盖', () => {
+  const r = frps.applyWizard({}, { authEnabled: true, token: 'keep-me-1234567890' });
+  assert.ok(r.ok);
+  assert.equal(r.generatedToken, '');
+  assert.ok(r.text.includes('keep-me-1234567890'));
+});
+
+test('applyWizard: 关闭鉴权时不生成 token', () => {
+  const r = frps.applyWizard({}, { authEnabled: false, token: '' });
+  assert.ok(r.ok);
+  assert.equal(r.generatedToken, '');
+  assert.doesNotMatch(r.text, /\[auth\]/);
 });

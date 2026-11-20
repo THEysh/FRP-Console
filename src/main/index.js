@@ -3685,6 +3685,7 @@ function registerIpc() {
       localSync,
       /* 面板密码留空时我们自动生成了一个：这里带回去让界面提示用户记下。 */
       generatedPassword: generated.generatedPassword || '',
+      generatedToken: generated.generatedToken || '',
       warnings: generated.warnings || [],
       state: serverState(),
       appState: buildState(),

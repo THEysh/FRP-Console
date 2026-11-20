@@ -3631,6 +3631,8 @@ async function runServerBootstrap(btn) {
   if (res.data && res.data.appState) S.state = res.data.appState;
   /* 面板密码留空时后端会自动生成一个：必须让用户看到，否则他登录不进 Dashboard。 */
   const generatedPw = (res.data && res.data.generatedPassword) || '';
+  /* 鉴权 token 留空时后端也会自动生成一个：本机 frpc 已被同步成它，但用户在别的设备上要用同一个。 */
+  const generatedToken = (res.data && res.data.generatedToken) || '';
   renderServer(true);
   await loadServerLogs();
   if (generatedPw) {
@@ -3644,6 +3646,22 @@ async function runServerBootstrap(btn) {
         generatedPw,
         '',
         '想改成自己的密码：在「配置文件」里改 [webServer] 的 password，保存并重启 frps。',
+      ].join('\n'),
+      confirmText: '我记下了',
+      cancelText: '关闭',
+    });
+  }
+  if (generatedToken) {
+    await confirmDialog({
+      title: '已自动生成鉴权 Token',
+      body: [
+        '你开了鉴权但 Token 留空了——空 Token 的 frps 等于不校验身份，谁都能把流量接上去。',
+        '',
+        '这次已自动生成一个，请记下来（本机 frpc 已经换成它）：',
+        '',
+        generatedToken,
+        '',
+        '想自己定：在「配置文件」里改 [auth] 的 token，保存并重启 frps（本机 frpc 会在保存后同步）。',
       ].join('\n'),
       confirmText: '我记下了',
       cancelText: '关闭',

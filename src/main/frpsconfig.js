@@ -194,11 +194,23 @@ function applyWizard(baseData, fields, { includeMeta = false } = {}) {
     generatedPassword = randomDashboardPassword();
     f.webPassword = generatedPassword;
   }
+  /* 开了鉴权但 token 留空 = 任何客户端都能连上来接管代理：同样自动生成。 */
+  let generatedToken = '';
+  if (f.authEnabled && !String(f.token || '').trim()) {
+    generatedToken = randomDashboardPassword(24);
+    f.token = generatedToken;
+  }
   const check = validateFields(f);
   if (generatedPassword) {
     check.warnings = [
       ...(check.warnings || []),
       `Dashboard 密码原来是空的，已自动生成：${generatedPassword}（请记下，登录面板时要用）`,
+    ];
+  }
+  if (generatedToken) {
+    check.warnings = [
+      ...(check.warnings || []),
+      `鉴权 Token 原来是空的（等于不校验身份），已自动生成：${generatedToken}（本机 frpc 会自动换成它）`,
     ];
   }
   if (!check.ok) return { ok: false, errors: check.errors, warnings: check.warnings };
@@ -235,7 +247,7 @@ function applyWizard(baseData, fields, { includeMeta = false } = {}) {
   else delete data.allowPorts;
 
   const text = includeMeta ? buildText(data, f, check) : stringify(data);
-  return { ok: true, text, data, warnings: check.warnings, generatedPassword };
+  return { ok: true, text, data, warnings: check.warnings, generatedPassword, generatedToken };
 }
 
 function buildText(data, fields, check) {
