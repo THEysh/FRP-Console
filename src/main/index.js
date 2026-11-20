@@ -1476,7 +1476,7 @@ function buildState() {
     const st = runtime.foreign ? null : manager.proxyStatus.get(proxy.name) || null;
     const health = healthCache.get(proxy.name) || null;
     const openPath = proxyOpenPath(proxy.name);
-    const publicAddress = configModule.publicAddressFor(model, proxy, { ...settings, ...boundVhostPorts(), nginxProxyEnabled: yModeEnabled() });
+    const publicAddress = configModule.publicAddressFor(model, proxy, { ...settings, ...boundVhostPorts(), subDomainHost: sessionSubDomainHost(), nginxProxyEnabled: yModeEnabled() });
     return {
       ...proxy,
       // 公网地址跟「隧道绑定档案」的 nginx 状态走，不再读全局（多服务器时全局是

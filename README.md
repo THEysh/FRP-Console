@@ -58,6 +58,10 @@
 
 内置的 `frpc.exe` 位于 `<安装目录>\resources\frpc\frpc.exe`，**不要手动改它，也不要往里写配置**——安装目录在升级时会被整个替换。「设置 → 可执行文件与路径」里那张路径卡就是它，`frpc.toml` 则固定放在数据目录（`%LOCALAPPDATA%\frp-console\frpc.toml`）。想用自己的 frpc 版本，就在那里手动选一个 exe，选中后以你的为准。
 
+### 1.2.160
+
+- 服务器配了 `subDomainHost` 时，只填 subdomain 的代理现在会显示成完整地址（如 `https://demo.你的域名`）——之前探测用的是完整域名、列表里显示的却还是 `subdomain:demo`，两边不一致。
+
 ### 1.2.159
 
 - 「只有 subdomain、还不知道服务器后缀」时，公网地址显示 `subdomain:demo`、**不再**生成一个必然打不开的 `http://subdomain:demo` 链接（复制/打开按钮此时给空地址）。
