@@ -204,7 +204,10 @@ function validate(model, options = {}) {
   if (!model.serverAddr) push('error', 'serverAddr', '服务器地址不能为空');
   else if (/\s/.test(model.serverAddr)) push('error', 'serverAddr', '服务器地址不能包含空格');
   else if (/^[a-z]+:\/\//i.test(model.serverAddr)) push('error', 'serverAddr', '服务器地址只填主机名或 IP，不要带 http:// 前缀');
-  else if (!/^[A-Za-z0-9.:-]+$/.test(model.serverAddr) && !isHostLike(model.serverAddr)) {
+  else if (model.serverAddr.includes(':') && !net.isIP(model.serverAddr.replace(/^\[|\]$/g, ''))) {
+    /* 带冒号但不是 IPv6 字面量：多半是把端口一起填进来了 */
+    push('error', 'serverAddr', '服务器地址只填主机名或 IP，不要带 :端口（端口填到"服务器端口"）');
+  } else if (!isHostLike(model.serverAddr)) {
     push('warn', 'serverAddr', '服务器地址看起来不是常见的主机名或 IP');
   }
   // 顶层字段类型不对（proxies = "oops" 这种）：frpc 会整份拒绝，界面上却像是"没有代理"
