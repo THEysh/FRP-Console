@@ -11,8 +11,8 @@
 const path = require('node:path');
 const frps = require('../helpers/frps.cjs');
 
-const A = { port: 17100, dash: 17600, token: 'switch-a-token-0001' };
-const B = { port: 17101, dash: 17601, token: 'switch-b-token-0002' };
+const A = { port: 17200, dash: 17700, token: 'switch-a-token-0001' };
+const B = { port: 17201, dash: 17701, token: 'switch-b-token-0002' };
 
 module.exports = {
   id: 'config-switch',
@@ -23,7 +23,7 @@ module.exports = {
     const a = await frps.startFrps({ dir: path.join(ctx.dataDir, 'frps-a'), bindPort: A.port, dashPort: A.dash, token: A.token });
     const b = await frps.startFrps({ dir: path.join(ctx.dataDir, 'frps-b'), bindPort: B.port, dashPort: B.dash, token: B.token });
     if (!a || !b) {
-      check('准备两台测试 frps', false, '缺少 frps 二进制');
+      check('准备两台测试 frps', false, 'frps 没起来：要么缺二进制，要么端口 17200/17201 或 17700/17701 被占用');
       return;
     }
     try {
