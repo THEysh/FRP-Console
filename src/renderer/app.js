@@ -4715,6 +4715,10 @@ function renderSettings(force = false) {
                 ${switchRow('关闭窗口时最小化到托盘', '退出请使用托盘菜单中的“退出”', 'closeToTray', settings.closeToTray !== false)}
                 ${switchRow('启动时自动启动隧道', '控制台启动后立即建立 frpc 连接', 'launchTunnelOnStart', !!settings.launchTunnelOnStart)}
                 ${switchRow('开机自动启动', '登录 Windows 后自动运行控制台（写当前用户的启动项，不需要管理员权限）', 'launchAtLogin', !!settings.launchAtLogin)}
+                <div class="field-hint">
+                  <button class="btn sm" type="button" data-act="settings.openstartup">${icon('folder')}<span>打开启动文件夹</span></button>
+                  <span style="margin-left:8px">系统不让程序写启动项时，把程序快捷方式拖进这个文件夹，效果一样</span>
+                </div>
                 ${app.launchAtLoginBlocked ? `<div class="note warn" style="margin:2px 0 10px">${icon('alert')}<div>启动项已被系统「任务管理器 → 启动」禁用，重启后不会运行。要恢复请到那里把「FRP 控制台」设为「已启用」；或者换个办法：把快捷方式放进 <code>shell:startup</code>。</div></div>` : ''}
                 ${settings.launchAtLogin && settings.runMode === 'managed' ? `<div class="note warn" style="margin:2px 0 10px">${icon('alert')}<div>当前是「应用托管进程」模式：开机只会自动打开控制台，隧道要等控制台把 frpc 拉起来才算通；控制台一退隧道就断。</div></div>` : ''}
                 ${switchRow('以最小化状态启动', '仅显示托盘图标', 'startMinimized', !!settings.startMinimized)}
@@ -5501,6 +5505,11 @@ async function handleAction(act, dataset, btn) {
         const input = $('#in-adminpass');
         if (!input) break;
         input.type = input.type === 'password' ? 'text' : 'password';
+        break;
+      }
+      case 'settings.openstartup': {
+        const res = await FRP.openStartupFolder();
+        if (!res || !res.ok) toastResult(res);
         break;
       }
       case 'settings.save.behavior':
@@ -6784,8 +6793,10 @@ async function saveBehavior(btn) {
       return;
     }
     if (res.data && res.data.state) S.state = res.data.state;
-    const adminWarnings = (res.data && Array.isArray(res.data.warnings) ? res.data.warnings : []).filter(Boolean);
-    if (adminWarnings.length) toast('warn', '设置已保存，但有一处没落到配置文件', adminWarnings[0]);
+    /* warnings 现在不只来自管理 API：开机自启写不进注册表、退到「启动」文件夹快捷方式时
+     * 也会走这里。标题别再写死「没落到配置文件」，否则文案对不上。 */
+    const saveWarnings = (res.data && Array.isArray(res.data.warnings) ? res.data.warnings : []).filter(Boolean);
+    if (saveWarnings.length) toast('warn', '设置已保存，但有 1 项没完全生效', saveWarnings[0]);
     /* 日志级别 / loginFailExit 落在 frpc.toml 里，同一个按钮一起写掉，
      * 免得用户改完日志级别还要再找一次“保存配置在哪”。 */
     const cfg = await saveClientLogOptions(level, loginFailExit);

@@ -83,6 +83,7 @@ contextBridge.exposeInMainWorld('FRP', {
   serverKnownHosts: () => invoke('server:known-hosts'),
   serverTrustHost: (payload) => invoke('server:trust-host', payload),
   serverForgetHost: (payload) => invoke('server:forget-host', payload),
+  openStartupFolder: () => invoke('app:open-startup-folder'),
   serverRecheck: () => invoke('server:recheck'),
   serverSelect: (id) => invoke('server:select', { id }),
   serverProfileSave: (payload) => invoke('server:profile-save', payload),

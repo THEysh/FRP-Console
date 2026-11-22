@@ -26,6 +26,7 @@ if (process.env.ELECTRON_RUN_AS_NODE === '1') {
 }
 
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const net = require('node:net');
 const { execFileSync } = require('node:child_process');
@@ -732,6 +733,57 @@ function launchAtLoginSnapshot() {
 
 function launchAtLoginState() {
   return launchAtLoginSnapshot().enabled;
+}
+
+/* 注册表写不进去时的退路：把快捷方式放进当前用户的「启动」文件夹。
+ * 这个路径（%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup）通常不需要提升权限，
+ * 也不会被 HKCU\...\Run 那条 ACL 挡住。用 WScript.Shell 生成 .lnk，免掉手写 COM 互操作。 */
+/* PowerShell 的 stderr 是 CLIXML：<Objs…><S S="Error">正文</S>…，并且换行被写成 _x000D__x000A_。
+ * 直接塞进 warning 给用户看是一串乱码，这里抽正文、还原换行、去掉行号上下文。 */
+function humanizePowerShellError(text) {
+  const raw = String(text || '');
+  if (!raw) return '';
+  const parts = [...raw.matchAll(/<S S="Error">([\s\S]*?)<\/S>/g)].map((m) => m[1]);
+  const body = (parts.length ? parts.join(' ') : raw)
+    .replace(/_x000D__x000A_/g, '\n')
+    .replace(/\+\s*~+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return body.slice(0, 300);
+}
+
+function startupShortcutPath() {
+  const appData = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
+  return path.join(appData, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'FRP 控制台.lnk');
+}
+
+async function writeStartupShortcut(enabled) {
+  const link = startupShortcutPath();
+  const esc = (s) => String(s || '').replace(/'/g, "''");
+  if (!enabled) {
+    try {
+      if (fs.existsSync(link)) fs.unlinkSync(link);
+      return { ok: true, target: '' };
+    } catch (e) {
+      return { ok: false, error: `删除启动文件夹快捷方式失败：${e.message || e}` };
+    }
+  }
+  const cmd = loginItemCommand();
+  const target = cmd.path;
+  const args = (cmd.args || []).join(' ');
+  const script = [
+    '$ws = New-Object -ComObject WScript.Shell;',
+    `$lnk = $ws.CreateShortcut('${esc(link)}');`,
+    `$lnk.TargetPath = '${esc(target)}';`,
+    `$lnk.Arguments = '${esc(args)}';`,
+    `$lnk.WorkingDirectory = '${esc(path.dirname(target))}';`,
+    '$lnk.WindowStyle = 1;',
+    '$lnk.Save();',
+  ].join(' ');
+  const res = await powershell(script);
+  const ok = !res.error && fs.existsSync(link);
+  if (!ok) console.warn('[startup-shortcut] 创建失败', JSON.stringify({ error: res.error && String(res.error.message || res.error).slice(0, 200), code: res.code, stderr: String(res.stderr || '').slice(0, 200), link, target, args }));
+  return ok ? { ok: true, target: link } : { ok: false, error: humanizePowerShellError(res.stderr) || (res.error && res.error.message) || '创建快捷方式失败' };
 }
 
 async function applyLaunchAtLogin(enabled) {
@@ -2575,11 +2627,29 @@ function registerIpc() {
         .filter(Boolean)
         .slice(0, 8);
     }
-    // 开机自启要真的写进系统，写不进去就别保存，免得界面显示“已开启”但重启无效。
+    /* 开机自启：值没变就不去动系统（否则每次「保存行为设置」都会为一个没改的开关去写注册表，
+     * 写不进去就把整次保存丢掉）；真写不进去时退到「启动」文件夹的快捷方式；
+     * 两者都不成也只回一条 warning —— 不能让「开机自启」一项否决其它所有设置。 */
+    const settingWarnings = [];
     if (clean.launchAtLogin !== undefined) {
-      const result = await applyLaunchAtLogin(!!clean.launchAtLogin);
-      if (!result.ok) return fail(result.error);
-      clean.launchAtLogin = !!result.actual;
+      const desired = !!clean.launchAtLogin;
+      if (desired === !!settings.launchAtLogin && launchAtLoginSnapshot().enabled === desired) {
+        clean.launchAtLogin = desired;
+      } else {
+        let result = await applyLaunchAtLogin(desired);
+        if (!result.ok) {
+          const viaShortcut = await writeStartupShortcut(desired);
+          if (viaShortcut.ok) {
+            result = { ok: true, actual: desired };
+            settingWarnings.push('注册表里的开机启动项写不进去，已改用「启动」文件夹里的快捷方式，效果一样。');
+          } else {
+            console.warn('[settings] 开机自启两条路都失败：', result.error, '|', viaShortcut.error);
+            settingWarnings.push(`开机自启没设成功：${result.error}。也可以点下方的「打开启动文件夹」，把 FRP 控制台的快捷方式拖进去（效果一样）。`);
+          }
+        }
+        if (result.ok) clean.launchAtLogin = !!result.actual;
+        else delete clean.launchAtLogin;
+      }
     }
     if (clean.pollIntervalMs !== undefined) clean.pollIntervalMs = Math.min(30000, Math.max(1000, Number(clean.pollIntervalMs) || 3000));
     /* 端口类字段以前是「静默夹取」：填 70000 会变成 65535、填 0 会变回默认值，界面不吭声，
@@ -2688,8 +2758,20 @@ function registerIpc() {
     }
     await manager.refresh().catch(() => {});
     pushState();
-    return ok({ state: buildState(), paths: pathsForState(), warnings: adminWarnings });
+    return ok({ state: buildState(), paths: pathsForState(), warnings: [...settingWarnings, ...adminWarnings] });
   }
+
+  /* 开机自启自动写不进去时（注册表 ACL、安全软件、组策略都可能拦），
+   * 给用户一个能自己动手的出口：直接打开「启动」文件夹。 */
+  ipcMain.handle('app:open-startup-folder', async () => {
+    const dir = path.dirname(startupShortcutPath());
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+    } catch { /* 目录已存在或没权限，交给下面 openPath 报 */ }
+    const err = await shell.openPath(dir);
+    if (err) return fail(`打不开启动文件夹：${err}`);
+    return ok({ path: dir });
+  });
 
   ipcMain.handle('paths:pick', async (event, kind) => {
     const target = kind === 'config' ? 'configPath' : 'frpcPath';
