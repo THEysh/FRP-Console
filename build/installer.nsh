@@ -135,6 +135,80 @@ Var /GLOBAL FrpRescueOk
     Rename "$INSTDIR\frp-console-data" "$FrpRescueDir\frp-console-data"
 
   frp_rescue_end:
+
+  ; $INSTDIR 整个目录改一次名：任何一个文件被别的进程锁住（反作弊、杀软、
+    ; 资源管理器的预览句柄都会锁 DLL），这次 Rename 都会失败——正好当探针。
+    ; 3 次重试只是给正在退出的应用一点时间，避免误判。
+    StrCpy $R1 "0"
+    frp_lock_try:
+      IntOp $R1 $R1 + 1
+      StrCmp $R1 "4" frp_lock_locked 0
+      ClearErrors
+      Rename "$INSTDIR" "$INSTDIR.frp-lock-probe"
+      IfErrors 0 frp_lock_free
+        Sleep 600
+        Goto frp_lock_try
+    frp_lock_free:
+      ClearErrors
+      Rename "$INSTDIR.frp-lock-probe" "$INSTDIR"
+      IfErrors 0 frp_lock_end
+        ; 改不回去基本不可能（刚才能改名），但别卡死流程
+        Goto frp_lock_end
+    frp_lock_locked:
+      DetailPrint "安装目录里有文件被其它程序占用，跳过旧版卸载，改为原地覆盖安装"
+      ; 旧卸载器（1.2.162 及之前）搬文件用的是逐个 Rename，遇到被锁文件直接
+      ; Abort，安装器随即报 “Failed to uninstall old application files.: 2”，
+      ; 而且此时未锁的文件已经被搬走、安装目录等于被剥空。
+      ; 摘掉旧卸载注册表键，让本次安装走「原地覆盖」：能写的文件全部换成新版，
+      ; 被锁的那几个（几乎总是逐版不变的 Electron 运行时 DLL）保持原样。
+      ; 新的卸载键在安装收尾时由安装器自己写回，不会丢。
+      DeleteRegKey SHELL_CONTEXT "${UNINSTALL_REGISTRY_KEY}"
+      !ifdef UNINSTALL_REGISTRY_KEY_2
+        DeleteRegKey SHELL_CONTEXT "${UNINSTALL_REGISTRY_KEY_2}"
+      !endif
+  frp_lock_end:
+
+!macroend
+
+; ---------------------------------------------------------------------------
+; 卸载器自己的「删文件」也要能容忍被占用的文件（1.2.163 起新装的卸载器生效）。
+;
+; 模板默认行为（uninstaller.nsh）：
+;   isUpdated（被新安装器调起来升级）时逐文件 Rename 到 $PLUGINSDIR\old-install，
+;   任何一个文件被锁 → Abort → 升级整次失败，且未锁文件已经被搬走（剥空）。
+;   正常卸载时 RMDir /r $INSTDIR，被锁文件删不掉就留着（“卸载不干净”）。
+;
+; 这里整体替换成：
+;   isUpdated：搬不动的（被锁）就留在原地，让新安装器直接覆盖——升级不再失败；
+;   正常卸载：RMDir 加 /REBOOTOK，被锁文件挂起到下次重启删除，不再留尾巴。
+; ---------------------------------------------------------------------------
+!macro customRemoveFiles
+  ${if} ${isUpdated}
+    CreateDirectory "$PLUGINSDIR\old-install"
+
+    Push ""
+    Call un.atomicRMDir
+    Pop $R0
+
+    ${if} $R0 != 0
+      DetailPrint "有文件被其它程序占用（$R0），留在原地，安装器将直接覆盖"
+      # 把刚才已经搬走的文件放回去，避免安装目录被剥空
+      Push ""
+      Call un.restoreFiles
+      Pop $R0
+    ${endif}
+  ${endif}
+
+  # Move out of $INSTDIR so it can be removed
+  SetOutPath $TEMP
+  # Remove all files (or remaining shallow directories from the block above)
+  ${if} ${isUpdated}
+    # 升级路径不能用 /REBOOTOK：重启时挂起的删除会把刚装进去的新文件删掉
+    RMDir /r $INSTDIR
+  ${else}
+    # 正常卸载：被锁的文件挂起到重启删除，卸载本身不再“不干净”
+    RMDir /r /REBOOTOK $INSTDIR
+  ${endif}
 !macroend
 
 !macro customInstall
