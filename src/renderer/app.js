@@ -242,6 +242,9 @@ function runtimeInfo() {
   /* 管理 API 有响应，但 /api/config 显示它不是这份配置的 frpc：
    * 那个端口上跑的是别人的隧道，既不能接管，也不能让“停止隧道”去杀它。 */
   const foreign = !!r.foreign || r.mode === 'foreign';
+  /* 自动重连进行中：hero 直接说“第几次、还有几秒”，比笼统的“未连接”有用得多。 */
+  const rc = r.reconnect || {};
+  const reconnecting = (rc.state === 'waiting' || rc.state === 'running') && !online;
   // 只有在“本来该由系统服务提供隧道”的模式下，服务停了才值得单独提示。
   // 托管模式下服务停着是常态，再报“系统服务未运行”只会把人引偏。
   const wantsService = runMode === 'auto' || runMode === 'service';
@@ -254,7 +257,14 @@ function runtimeInfo() {
   let label = '未连接';
   let title = '隧道未运行';
   let desc = '';
-  if (online && !starting) {
+  if (reconnecting) {
+    tone = 'warn';
+    label = '自动重连中';
+    title = `第 ${rc.attempts} 次重连中`;
+    desc = rc.state === 'waiting'
+      ? `${Math.max(1, Math.round((rc.nextInMs || 0) / 1000))} 秒后重试${rc.slowMode ? '（慢速，每 5 分钟一次）' : ''}`
+      : '正在拉起 frpc…';
+  } else if (online && !starting) {
     if (orphan) {
       tone = 'warn';
       label = '隧道在线 · 无档案';
@@ -611,6 +621,24 @@ function renderOverview(force = false) {
     issues.push(`<div class="note error">${icon('alert')}<div><strong>配置存在 ${validationErrors.length} 处错误</strong><br>${esc(validationErrors[0].message)}</div></div>`);
   }
   const runtime = state.runtime || {};
+  /* 自动重连进行中：先说清楚“它自己在救自己”，别让人以为卡死了又要手点。
+   * 慢速阶段（第 10 次之后）明说是每 5 分钟一次，用户才知道该等还是该查。 */
+  const rc = runtime.reconnect || null;
+  if (rc && (rc.state === 'waiting' || rc.state === 'running')) {
+    const secs = Math.max(1, Math.round((rc.nextInMs || 0) / 1000));
+    const head =
+      rc.state === 'waiting'
+        ? `隧道断了，正在自动重连：第 ${esc(String(rc.attempts))} 次，${esc(String(secs))} 秒后开始`
+        : `正在重连（第 ${esc(String(rc.attempts))} 次）…`;
+    const tail = rc.slowMode
+      ? '已经重试 10 次仍没连上，现在改成每 5 分钟试一次。先看看下面的原因，改完会自动连上。'
+      : '不用手动点，连上之后这条提示会自己消失。';
+    issues.push(`<div class="note warn">${icon('refresh')}<div><strong>${head}</strong><br>${esc(tail)}${rc.reason ? `<br><span style="opacity:.75">上次断开的原因：${esc(rc.reason)}</span>` : ''}
+      <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn small" type="button" data-act="tunnel.start">${icon('play')}<span>立即重连</span></button>
+        <button class="btn small" type="button" data-act="tunnel.stop">${icon('stop')}<span>停止重试</span></button>
+      </div></div></div>`);
+  }
   // 两种情况都算“没连上”：frpc 没起来 / 起来了但没登录上 frps / 日志里明确记着连不上。
   const offline = !!(runtime.loginFailed || runtime.connectFailed);
   // 隧道根本没连上时，代理“三层不通”只是结果。这时说清楚连不上谁、为什么，
@@ -4712,6 +4740,7 @@ function renderSettings(force = false) {
             <div class="field span-2">
               <div class="stack" style="gap:0">
                 ${switchRow('自动热重载', '检测到配置文件被外部修改后自动调用管理 API 重载', 'autoReload', settings.autoReload !== false)}
+                ${switchRow('断线自动重连', 'frpc 进程被杀、管理接口卡死或睡眠唤醒后连接假死时自动重连；第 10 次之后每 5 分钟试一次', 'autoReconnect', settings.autoReconnect !== false)}
                 ${switchRow('关闭窗口时最小化到托盘', '退出请使用托盘菜单中的“退出”', 'closeToTray', settings.closeToTray !== false)}
                 ${switchRow('启动时自动启动隧道', '控制台启动后立即建立 frpc 连接', 'launchTunnelOnStart', !!settings.launchTunnelOnStart)}
                 ${switchRow('开机自动启动', '登录 Windows 后自动运行控制台（写当前用户的启动项，不需要管理员权限）', 'launchAtLogin', !!settings.launchAtLogin)}
@@ -6763,6 +6792,7 @@ async function saveBehavior(btn) {
     runMode: form.querySelector('[name="runMode"]').value,
     pollIntervalMs: Number(form.querySelector('[name="pollIntervalMs"]').value),
     autoReload: isOn('autoReload'),
+    autoReconnect: isOn('autoReconnect'),
     closeToTray: isOn('closeToTray'),
     launchTunnelOnStart: isOn('launchTunnelOnStart'),
     launchAtLogin: isOn('launchAtLogin'),

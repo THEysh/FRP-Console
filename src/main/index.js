@@ -30,7 +30,7 @@ const os = require('node:os');
 const path = require('node:path');
 const net = require('node:net');
 const { execFileSync } = require('node:child_process');
-const { app, BrowserWindow, ipcMain, dialog, shell, clipboard, Tray, Menu, nativeImage, Notification } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, clipboard, Tray, Menu, nativeImage, Notification, powerMonitor } = require('electron');
 
 app.setName('frp-console');
 /* 和 package.json 的 build.appId 保持一致：Windows 靠它把通知、托盘气泡、
@@ -69,6 +69,7 @@ if (process.platform === 'win32') app.setAppUserModelId('cn.ysh.frp-console');
 const settingsModule = require('./settings');
 const configModule = require('./config');
 const { FrpcManager, reloadFailureText } = require('./frpc');
+const { ReconnectSupervisor } = require('./supervisor');
 const { LogFollower } = require('./log');
 const service = require('./service');
 const netport = require('./netport');
@@ -140,9 +141,22 @@ let pollTimer = null;
 let suppressExitUntil = 0;
 let tickBusy = false;
 let lastServiceDetect = 0;
+/* 用户希望隧道是“开着”的：成功启动 / 启动时自动连接 / 托盘启动都置 true，
+ * 用户主动停止、退出应用、升级安装前置为 false。自动重连只看这个标志，
+ * 否则“用户明明点了停止，程序又自己拉起来”会非常吓人。 */
+let tunnelDesired = false;
+/* 应用内更新期间不能重连：安装器要覆盖文件，抢一个 frpc 只会让升级失败。 */
+let updatingNow = false;
+/* 健康守护：进程还在但管理 API 连续不通的时间起点（0 = 当前是通的）。 */
+let apiDownSince = 0;
+/* 上一次看到的网络接口快照，用来发现“换网/网卡重连”。 */
+let netSnapshot = '';
+/* 发现网络变化的时间点：给 20 秒让 frpc 自己重连，没恢复才交给守护。 */
+let netChangedAt = 0;
 
 const follower = new LogFollower('', { maxLines: 600 });
 let manager = null;
+let supervisor = null;
 const acmeManager = new AcmeManager({ userDataDir: settingsModule.dataDir() });
 
 /* 当前 DNS 验证渠道（现阶段只有 Cloudflare）。证书签发 / 自动续期共用。 */
@@ -936,6 +950,10 @@ function trayMenuSpec(runtime) {
     'win.hide': () => hideMainWindow(),
     'tun.start': async () => {
       const result = await manager.start({ runMode: settings.runMode });
+      if (result.ok) {
+        tunnelDesired = true;
+        if (supervisor) supervisor.cancel('');
+      }
       notify(result.ok ? 'info' : 'error', result.ok ? '隧道已启动' : '启动失败', result.error || '');
       await manager.refresh().catch(() => {});
       pushState();
@@ -943,6 +961,8 @@ function trayMenuSpec(runtime) {
     },
     'tun.stop': async () => {
       suppressExitUntil = Date.now() + 12000;
+      tunnelDesired = false;
+      if (supervisor) supervisor.cancel('用户停止了隧道');
       const result = await manager.stop({ runMode: settings.runMode });
       notify(result.ok ? 'info' : 'error', result.ok ? '隧道已停止' : '停止失败', result.error || '');
       await manager.refresh().catch(() => {});
@@ -1329,6 +1349,22 @@ function lastConnectProblem() {
  * 「已连接」其实连的是旧服务器（真机全剧本就这么假绿过一次）。 */
 let startedFingerprint = '';
 
+/* 返回“现在不该自动重连”的原因；空串表示可以重连。
+ * 抽成函数是为了出问题时有话可说：日志里能看到到底被哪一条挡住。 */
+function supervisorBlockReason() {
+  if (!settings) return '设置还没加载';
+  if (settings.autoReconnect === false) return '用户关掉了「断线自动重连」';
+  if (!tunnelDesired) return '隧道不是程序启动的（用户没让它开）';
+  if (updatingNow) return '正在安装更新';
+  if (!manager) return '管理器还没准备好';
+  if (manager.snapshot().foreign) return '管理端口上是别人的 frpc';
+  const snap = manager.snapshot();
+  if (snap.mode === 'service' || snap.runtimeMode === 'service') return '隧道由系统服务托管，进程不归程序管';
+  const errors = (buildState().validation && buildState().validation.errors) || [];
+  if (errors.length) return `配置有 ${errors.length} 处错误，先改配置`;
+  return '';
+}
+
 function runtimeView(runtime) {
   const apiOk = !!runtime.connected;
   /* 只有 frpc 真的会去启动的代理才算「本该注册」：
@@ -1358,6 +1394,10 @@ function runtimeView(runtime) {
   const detected = !!problem && problem.kind !== 'unknown';
   // 有“没注册上”的结论、却抓不到具体报错文本：照样要报出来，只是原因说不细。
   const unconfirmed = loginFailed && !detected;
+  /* 自动重连进度（守卫可能还是 null：bootstrap 早期） */
+  const reconnect = supervisor
+    ? supervisor.view()
+    : { state: 'idle', active: false, attempts: 0, nextInMs: 0, reason: '', lastError: '', slowMode: false };
   return {
     ...runtime,
     /* 跑着的 frpc 不是用当前配置起的：改了服务器地址/端口/token 但没重启，
@@ -1373,6 +1413,8 @@ function runtimeView(runtime) {
     connectKind: detected ? problem.kind : unconfirmed ? 'unconfirmed' : '',
     // 管理端口被别的 frpc 占着：状态、代理列表、停止操作都不能当真
     foreign: !!runtime.foreign,
+    // 断线自动重连的进度：界面用它显示「第 N 次重连 · X 秒后」和取消按钮
+    reconnect,
     adminConflict: runtime.foreign ? `管理端口 ${runtime.adminPort || 7400} 上的 frpc 不是本配置启动的` : '',
   };
 }
@@ -1827,6 +1869,40 @@ async function tick({ force = false } = {}) {
      * 继续做三层检查只会把每条代理都刷成“隧道未建立”，把真正的原因
      * （端口冲突）淹掉。这时保留上一次结果并停止探测，等端口冲突解决了再查。 */
     const foreignNow = !!manager.snapshot().foreign;
+    /* 健康守护（档 2）：frpc 进程还活着，但管理 API 连续 15 秒不响应 ——
+     * 这不是“正在连接”，是卡死了（socket 假活 / 进程挂起）。交给守护重启，
+     * 否则界面会一直停在“正在连接服务器”，用户还是只能手动点。 */
+    if (supervisor && tunnelDesired && !foreignNow && !updatingNow && manager.isChildAlive) {
+      if (manager.snapshot().connected) {
+        apiDownSince = 0;
+      } else if (!apiDownSince) {
+        apiDownSince = Date.now();
+      } else if (Date.now() - apiDownSince > 15000 && !supervisor.isWaiting()) {
+        apiDownSince = 0;
+        supervisor.arm('管理 API 连续 15 秒无响应');
+      }
+    } else {
+      apiDownSince = 0;
+    }
+    /* 档 3：换网 / 网卡重连 / 睡眠唤醒。frpc 自己会重连，但假活的 socket 不会自己好，
+     * 给 20 秒宽限，仍然没连上就交给守护重启。 */
+    if (Date.now() - (tick.lastNet || 0) > 15000) {
+      tick.lastNet = Date.now();
+      const snapText = JSON.stringify(
+        Object.entries(os.networkInterfaces()).map(([name, list]) => [name, (list || []).map((x) => `${x.address}/${x.netmask}`)])
+      );
+      if (netSnapshot && snapText !== netSnapshot) {
+        netChangedAt = Date.now();
+        console.warn('[reconnect] 网络接口发生变化，20 秒后仍未连上就重启隧道');
+      }
+      netSnapshot = snapText;
+    }
+    if (netChangedAt && Date.now() - netChangedAt > 20000) {
+      netChangedAt = 0;
+      if (tunnelDesired && !updatingNow && !foreignNow && supervisor && !supervisor.isWaiting() && !manager.snapshot().connected) {
+        supervisor.arm('网络变化后没能自动恢复');
+      }
+    }
     if (!healthBusy && !foreignNow && Date.now() - (tick.lastHealth || 0) > 14000 && model && model.proxies.length) {
       tick.lastHealth = Date.now();
       healthBusy = true;
@@ -2615,7 +2691,7 @@ function registerIpc() {
     const allowed = [
       'frpcPath', 'configPath', 'frpsDashboardUrl', 'serviceName', 'runMode',
       'adminPort', 'adminUser', 'adminPassword', 'autoReload', 'pollIntervalMs', 'closeToTray',
-      'startMinimized', 'launchTunnelOnStart', 'serviceAutoDetect', 'logBuffer',
+      'startMinimized', 'launchTunnelOnStart', 'autoReconnect', 'serviceAutoDetect', 'logBuffer',
       'stripProxyEnv', 'launchAtLogin', 'vhostHttpPort', 'vhostHttpsPort',
       'acmeEmail', 'dnsProvider', 'certDirs',
     ];
@@ -3120,19 +3196,28 @@ function registerIpc() {
     if (certProblem) return fail(certProblem, { state: buildState() });
     const adminNote = await ensureAdminPortUsable();
     await refreshService({ detect: true });
+    /* 用户点了启动 = 希望隧道是开着的；就算这次失败，也该由守护继续试，
+     * 而不是让他每隔几秒回来点一次。 */
+    tunnelDesired = true;
     const result = await manager.start({ runMode: settings.runMode });
     await manager.refresh().catch(() => {});
     healthCache.clear();
     scheduleHealth(1500);
     pushState();
-    if (!result.ok) return fail(result.error, { state: buildState() });
+    if (!result.ok) {
+      if (supervisor) supervisor.arm(result.error || '启动失败');
+      return fail(result.error, { state: buildState() });
+    }
     startedFingerprint = configModule.connFingerprint(model);
+    if (supervisor) supervisor.cancel('');
     return ok({ state: buildState(), mode: result.mode, adminNote: adminNote || '' });
   });
 
   ipcMain.handle('tunnel:stop', async () => {
     suppressExitUntil = Date.now() + 12000;
     startedFingerprint = '';
+    tunnelDesired = false;
+    if (supervisor) supervisor.cancel('用户停止了隧道');
     await refreshService({ detect: false });
     const result = await manager.stop({ runMode: settings.runMode });
     await manager.refresh().catch(() => {});
@@ -3150,6 +3235,8 @@ function registerIpc() {
     await manager.refresh().catch(() => {});
     pushState();
     if (!result.ok) return fail(result.error, { state: buildState() });
+    tunnelDesired = true;
+    if (supervisor) supervisor.cancel('');
     return ok({ state: buildState(), mode: result.mode });
   });
 
@@ -5432,6 +5519,44 @@ async function bootstrap() {
   }
   follower.maxLines = Math.min(2000, Math.max(100, Number(settings.logBuffer) || 600));
   updateLogFile();
+  /* 隧道守护：只决定“什么时候再试一次”，真正拉起的动作在 restart 回调里。
+   * 依赖 manager（在下面创建），所以回调里用惰性引用。 */
+  supervisor = new ReconnectSupervisor({
+    restart: async () => {
+      if (!manager) return { ok: false, error: '管理器还没准备好' };
+      suppressExitUntil = Date.now() + 12000;
+      const result = await manager.start({ runMode: settings.runMode });
+      await manager.refresh().catch(() => {});
+      if (result && result.ok) {
+        /* 用当前配置起来的，记下指纹：否则界面会一直挂着“配置变了，重启隧道才生效”。 */
+        startedFingerprint = configModule.connFingerprint(model);
+      }
+      healthCache.clear();
+      scheduleHealth(1500);
+      return result;
+    },
+    canRestart: () => {
+      const why = supervisorBlockReason();
+      if (why) {
+        // 只在“本来想重连但被挡住”时说一句，便于现场排查（正常停止不会走到这里）。
+        console.warn(`[reconnect] 跳过自动重连：${why}`);
+        return false;
+      }
+      return true;
+    },
+    onChange: () => {
+      pushState();
+      refreshTray();
+    },
+    log: (message, level) => {
+      const line = `${new Date().toISOString().slice(0, 19).replace('T', ' ')} ${level === 'error' ? 'ERR' : 'WRN'} ${message}`;
+      try {
+        follower.appendLines(line);
+      } catch (e) {
+        /* 日志失败不影响重连 */
+      }
+    },
+  });
   manager = new FrpcManager({
     getSettings: () => settings,
     getPaths: () => paths,
@@ -5466,10 +5591,18 @@ async function bootstrap() {
     manager.refresh().catch(() => {});
     pushState();
     refreshTray();
+    /* 判“意外”看的是有没有错误文本，而不是退出码：
+     * 用户主动停止时 frpc 可能返回 1（停止时代理还没登录上），那不是故障。 */
+    const unexpected = !!(info && info.error);
+    /* 自动重连不受 suppressExitUntil 影响 —— 那个窗口只是“别弹通知”的静音期
+     *（用户刚点过停止/重启时不要把正常退出报成故障）。以前把重连也塞在窗口里，
+     * 结果「停止后 12 秒内又启动、然后进程被杀」这类真实场景不会重连。 */
+    if (unexpected && supervisor && tunnelDesired) {
+      const why = String(info.error || '').slice(0, 120);
+      console.warn(`[reconnect] frpc 意外退出，排队重连：${why}`);
+      supervisor.arm(why || 'frpc 意外退出');
+    }
     if (Date.now() > suppressExitUntil) {
-      // 判“意外”看的是有没有错误文本，而不是退出码：
-      // 用户主动停止时 frpc 可能返回 1（停止时代理还没登录上），那不是故障。
-      const unexpected = !!(info && info.error);
       send('notify', {
         kind: unexpected ? 'error' : 'info',
         title: unexpected ? '隧道意外停止' : '隧道已停止',
@@ -5527,6 +5660,9 @@ async function quitApp({ source = 'user' } = {}) {
   if (quitFlowStarted) return; // 正在退，别重复
   quitFlowStarted = true;
   isQuitting = true;
+  /* 退出时把自动重连彻底关掉：否则守护的定时器可能在退出过程中把 frpc 又拉起来。 */
+  tunnelDesired = false;
+  if (supervisor) supervisor.cancel('退出应用');
 
   const hardExit = setTimeout(() => {
     // eslint-disable-next-line no-console
@@ -5652,6 +5788,9 @@ function updateFlagPath() {
 }
 
 async function prepareUpdateInstall() {
+  /* 更新期间绝不能重连：安装器要覆盖安装目录，抢一个 frpc 会让升级失败。 */
+  updatingNow = true;
+  if (supervisor) supervisor.cancel('正在安装更新');
   // 记录更新前隧道是否由控制台托管（用于更新后自动接回）
   const wasManaged = !!(manager && manager.isChildAlive);
   // 1) 优雅停掉控制台托管的 frpc（如果还在跑）
@@ -5744,9 +5883,29 @@ function startApp() {
     if (settings.launchTunnelOnStart || restoreTunnel) {
       bootstrapReady
         .then(() => manager.start({ runMode: settings.runMode }))
-        .then(() => manager.refresh())
+        .then(() => {
+          tunnelDesired = true;
+          return manager.refresh();
+        })
         .then(() => pushState())
         .catch(() => {});
+    }
+    /* 档 3：系统唤醒 / 解锁 / 换网之后，连接常常已经假死了（socket 还在，包发不出去）。
+     * 这里先让 frpc 自己试 20 秒，没恢复就交给守护重启。 */
+    const afterSystemResume = (why) => {
+      if (!tunnelDesired || updatingNow) return;
+      setTimeout(() => {
+        if (!tunnelDesired || updatingNow) return;
+        manager.refresh().catch(() => {});
+        if (manager.snapshot().connected) return;
+        if (supervisor && !supervisor.isWaiting()) supervisor.arm(why);
+      }, 20000);
+    };
+    try {
+      powerMonitor.on('resume', () => afterSystemResume('系统从睡眠中唤醒后没恢复'));
+      powerMonitor.on('unlock-screen', () => afterSystemResume('解锁后没恢复'));
+    } catch (e) {
+      if (process.env.FRP_CONSOLE_DEBUG) console.warn('[reconnect] 监听电源事件失败', e && e.message);
     }
     if (process.env.FRP_CONSOLE_SMOKE === '1') {
       setTimeout(() => {

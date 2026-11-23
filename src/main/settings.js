@@ -32,6 +32,9 @@ const DEFAULT_SETTINGS = {
   acmeEmail: '',
   dnsProvider: '',
   autoReload: true,
+  /* 隧道断了（frpc 进程退出 / 管理 API 卡死 / 睡眠唤醒后假死）时自动重连。
+   * 第一次 1 秒后重试，逐步退避；第 10 次之后改成每 5 分钟一次，直到成功或用户停手。 */
+  autoReconnect: true,
   pollIntervalMs: 3000,
   // 默认不把系统 HTTP_PROXY 传给 frpc：frp 会拿它去代理 TCP 握手，多半被网关 502 拒掉。
   stripProxyEnv: true,
@@ -183,6 +186,7 @@ const BOOL_KEYS = [
   'serviceAutoDetect',
   'nginxProxyEnabled',
   'autoReload',
+  'autoReconnect',
   'stripProxyEnv',
   'closeToTray',
   'startMinimized',
