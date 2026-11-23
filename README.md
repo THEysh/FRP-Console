@@ -28,7 +28,7 @@
 | **概览** | 隧道状态、服务器信息、在线/异常代理计数、最近日志，一眼看清隧道到底通没通 |
 | **代理映射** | TCP / UDP / HTTP / HTTPS / STCP / XTCP 代理的增删改；公网端口支持**自动建议 / 随机 / 检测**（检测会连服务器查端口占用、`allowPorts` 白名单和防火墙放行，能一键放行）；可选**访问路径**（如 `/panel/`），复制地址时直接带上；压缩与加密开关；单条测试公网可达 |
 | **服务发现** | 扫本机 TCP 监听端口并显示进程与地址分类（回环 / 全网 / Docker / 内网），勾一个端口就变成公网代理 |
-| **服务器（frps）** | SSH 连接后识别 systemd / 裸进程 / Docker 四种运行方式，展示版本与 Token 状态，支持启停、**frps.toml / frpc.toml 在线编辑**、**服务器就绪检查**、结构化日志、**服务器防火墙管理**、**端口与连通矩阵**、**SSH 交互式终端**、一键初始化 / 卸载 |
+| **服务器（frps）** | SSH 连接后识别 systemd / 裸进程 / Docker 三种运行方式，展示版本与 Token 状态，支持启停、**frps.toml / frpc.toml 在线编辑**、**服务器就绪检查**、结构化日志、**服务器防火墙管理**、**端口与连通矩阵**、**SSH 交互式终端**、一键初始化 / 卸载 |
 | **HTTPS 证书** | 用 Let's Encrypt 给自定义域名自动签发证书（DNS-01，支持通配符），一键填进 `https2http` / `https2https` 代理，到期前自动续期并在续期后**自动重新部署**；支持 **nginx 反代（方案 Y）** 一键部署、DNS 自动解析、**nginx 配置体检**（`nginx -t` + 悬空证书引用，可一键修复/注释） |
 | **实时日志** | 本机 `frpc.log` 与服务器 `journalctl -u frps` 两种来源，按级别过滤、暂停、导出 |
 | **设置** | frpc 路径、日志级别、运行模式、开机自启、管理 API、托盘行为、版本更新（**不含任何服务器连接配置**） |
@@ -71,25 +71,9 @@
 
 ### 系统要求
 - Windows 10 / 11（x64）
-- 会被管理的隧道需要本机有 `frpc.exe`；服务端管理需要目标机器开启 SSH
+- `frpc.exe` 安装包自带（`resources\frpc\frpc.exe`），不用自己准备；想换版本可以在「设置」里指定
+- 服务端管理需要目标机器开启 SSH；不连服务器，只用本机隧道也可以
 - 不做跨平台：服务控制走 `sc` / UAC，端口扫描走 `netstat` + PowerShell，都是 Windows 专有实现
-
-## 从源码运行
-
-```bash
-git clone https://github.com/THEysh/FRP-Console.git
-cd FRP-Console
-npm install
-npm start
-```
-
-国内网络建议先设镜像：
-
-```powershell
-$env:ELECTRON_MIRROR = "https://npmmirror.com/mirrors/electron/"
-$env:ELECTRON_BUILDER_BINARIES_MIRROR = "https://npmmirror.com/mirrors/electron-builder-binaries/"
-npm install --cache .\.npm-cache
-```
 
 ## 快速上手
 
@@ -100,7 +84,7 @@ npm install --cache .\.npm-cache
 3. **在「服务器」页把 frps 弄好**：连上后会识别 systemd / 裸进程 / Docker。服务器上还没有 frps 就点「一键初始化并启动」——上传、写配置、注册服务、开机自启一次做完，并且默认勾选「同时把本机 frpc 的地址与 Token 改为本次配置」。做完点「检查服务器」，四步全绿就代表这台服务器**已经准备好接收客户端**。
 4. **在「代理映射」加隧道**：新增一条代理（或用「服务发现」扫一个本机端口直接发布）。公网端口可以点「随机」自动挑一个安全的，或点「检测」连服务器查这个端口有没有被占用、是否在服务器的 `allowPorts` 白名单内。加完回到**概览**或**代理映射**看链路：三层全绿才是真的能用。
 
-> 想开机自启就走 Windows 服务模式（见 [运行模式](#运行模式)）；只是临时用，让控制台托管进程更省事——关掉控制台 frpc 也会一起停。
+> 想让隧道「不依赖控制台、开机就通」，把 frpc 装成 Windows 服务（nssm 之类），「自动」模式会识别并使用它（见 [运行模式](#运行模式)）；只是临时用，让控制台托管进程更省事——关掉控制台 frpc 也会一起停。
 
 ## 新手教程：从零到「别人能访问你的服务」
 
@@ -162,7 +146,7 @@ frp 是「内网穿透」工具。你的电脑通常没有公网 IP，外面的�
 http://<你的服务器公网IP>:<远程端口>
 ```
 
-比如 `http://154.36.178.154:10001`，能打开你的网站就说明穿透成功。
+比如 `http://203.0.113.10:10001`（把 IP 换成你的服务器），能打开你的网站就说明穿透成功。
 
 > **服务器本机测通了、外面连不上**：多半是云服务商（阿里云/腾讯云等）的**安全组**没放行那个端口——这是最容易被漏掉的一步。去云控制台给该端口加一条入站规则。程序能自动放开服务器系统里的 `ufw` / `firewalld` 防火墙，但云平台的安全组在程序管不到的地方。
 
@@ -248,6 +232,7 @@ http://<你的服务器公网IP>:<远程端口>
 - 档案字段：名称、IP/域名、SSH 端口与用户名、frps 端口、Token、远程配置路径、面板地址。日常只需要填前四个。
 - **Token 自动生成**：新建档案时后端生成一把随机 Token，它同时是「一键初始化 frps」时的默认值——写进 `frps.toml` 的 `auth.token` 和写进本机 `frpc.toml` 的是同一个字符串。想接管一台已经配好 frps 的服务器（Token 早已定死），再在「高级选项」里把它填回去即可。
 - 密码**按档案独立保存**（Windows DPAPI 加密），档案之间不共享、不回退——不会出现"拿 A 的密码去连 B"。
+- **同一台机器（IP + SSH 端口）只保留一条档案**：再连一次会更新那条，不会越连越多；历史上产生的重复档案，启动时会自动合并（先把 `settings.json` 与密码库备份到 `userData\backups\`），下拉框里也能手动「整理重复」。
 - 「服务器」页顶部的下拉框切换的是**查看目标**，不动隧道；只有点「切换隧道并重启」才会改写 `frpc.toml` 并重启 frpc。
 - **新建档案会断开上一台的 SSH 会话**：页面立刻变成这台新服务器的连接表单，不会继续显示上一台的状态，也不会在顶部弹"本机隧道指向其他服务器"这种吓人的提示。
 
@@ -259,6 +244,30 @@ http://<你的服务器公网IP>:<远程端口>
 切换前会先探一次目标服务器的 frps 端口：连不上就不动配置，弹窗说明原因（拒绝 / 超时 / 解析失败），是否继续由你决定。切换过程有进度浮层，按「写入 frpc.toml → 重启 frpc → 等待新隧道上线」三步推进，不靠估算。
 
 记住密码后，选中档案就会自动连接并读取状态，不用每次点「连接并读取状态」。
+
+## 代理映射（隧道）
+
+一张表管所有「公网 → 本机」的映射，改完立即写 `frpc.toml` 并热重载，其他代理不断线。
+
+| 类型 | 什么时候用 | 公网访问形式 |
+| --- | --- | --- |
+| `tcp` | 远程桌面、SSH、游戏服务端、数据库……任何裸 TCP | `服务器IP:远程端口` |
+| `udp` | 游戏 / DNS / 语音等 UDP 服务 | `服务器IP:远程端口/UDP` |
+| `http` | 想用域名访问网页，走 frps 的 vhost | `域名:vhostHTTPPort`（配好 nginx 反代后就是 `https://域名`） |
+| `https` | 同上，但 TLS 由 frps 终止（`https2http` 插件） | `域名:vhostHTTPSPort` |
+| `stcp` / `sudp` / `xtcp` | 点对点，不暴露公网端口，访问方也要装 frpc | 只能被「访问者」连 |
+| `tcpmux` | 一条端口多路复用（依赖服务器开 `tcpmuxHTTPConnectPort`） | 由域名 / Host 区分 |
+
+- **公网端口**：点「随机」直接给一个安全端口（自动避开已占用、服务器 `allowPorts` 白名单、以及浏览器自己的禁用端口——`10080` 这类端口 Chrome/Edge 会直接拦下来报 `ERR_UNSAFE_PORT`）；点「检测」会连服务器三查：端口是否被占用、是否在 `allowPorts` 里、防火墙有没有放行，没放行能一键放。
+- **访问路径**（可选）：很多服务（面板、Jellyfin、Grafana）根路径是 404，必须带 `/panel/`、`/web/` 才能打开。frp 只按 Host / 端口路由、**不会改写路径**，所以这个字段只做两件事：复制/打开链接时带上它、三层检查用它判断「路径对不对」（根路径 404 会单独报「路径 404」，不计入"公网不可达"）。配了 nginx 反代时，程序还会在 `location = /` 上加一条 302，把裸域名跳到这个路径。
+- **证书快捷填入**：类型选 `https` + 插件 `https2http` 时，填完自定义域名后下面会出现「证书快捷填入」下拉，只列**覆盖这个域名**的已签发证书，选中即填好 `crtPath` / `keyPath`。
+- **外部改配置会同步**：`frpc.toml` 被外部编辑器改过、或改坏了（frp 不认的字段），控制台会检测到并说明是哪一种——合法改动自动重载，坏配置**不重载**并提示具体报错，正在跑的隧道不受影响。
+
+## 服务发现
+
+「服务发现」页扫本机正在监听的 TCP 端口，列出进程名与地址分类（回环 / 全网 / Docker / 内网 / 公网），筛选后点「添加代理」直接把那个端口变成公网隧道——省得自己去翻到底是什么在占用某个端口。
+
+> 分类只是提示：`0.0.0.0` 表示对外全开，`127.0.0.1` 只能本机访问（外部要靠 frp 转发），`172.17.x` 通常是 Docker 网桥。
 
 ## frps 服务端控制台
 
@@ -275,7 +284,7 @@ http://<你的服务器公网IP>:<远程端口>
 
 ## 端口与连通（服务器页）
 
-v1.2.56 起，原来那张「服务器防火墙」卡片升级成 **「端口与连通」**：它不再只是列规则，而是把**三个信号交叉起来判定**，直接告诉你端口到底被哪一层拦住。
+服务器页这张卡片不只是列规则，而是把**三个信号交叉起来判定**，直接告诉你端口到底被哪一层拦住。
 
 三个信号：
 
@@ -309,7 +318,7 @@ v1.2.56 起，原来那张「服务器防火墙」卡片升级成 **「端口与
 
 ## 服务器防火墙（规则管理）
 
-卡片下半部分仍然是规则管理区，能力与 1.2.47 一致：
+卡片下半部分仍然是规则管理区：
 
 - **自动识别**：读 `ufw status` / `firewall-cmd --state` 判断服务器用的是哪种防火墙、当前是启用还是未启用。
 - **一键放行**：点「放行 frps 与代理端口」把上面这些端口全部加到防火墙白名单（ufw / firewalld / iptables 三种都支持）。
@@ -320,11 +329,15 @@ v1.2.56 起，原来那张「服务器防火墙」卡片升级成 **「端口与
 
 ## 运行模式
 
+设置页的「运行模式」只有两个选项：
+
 | 模式 | 说明 |
 | --- | --- |
-| **Windows 服务** | 通过 `sc` / UAC 启停已安装的 frpc 服务，适合开机自启 |
+| **自动**（默认） | 先看本机有没有把 frpc 装成 Windows 服务（`frpc` / `nssmfrpc` 等）。有就用它——控制台只负责读状态、需要时启停；没有就由控制台托管进程 |
 | **应用托管进程** | 控制台直接拉起 `frpc.exe -c frpc.toml`，退出控制台会一并结束 |
-| **自动** | 优先使用已安装的 Windows 服务，没有再托管进程 |
+
+- 控制台**不再提供「把 frpc 装成 Windows 服务」的入口**（以前那套要管理员权限、还要处理 nssm，和「装上就能用」冲突）。想要「不依赖控制台、开机就通」，用 [nssm](https://nssm.cc/) 之类把 `frpc.exe -c <数据目录>\frpc.toml` 注册成服务，控制台的「自动」会识别它并在需要时用 `sc` 启停（这一步会弹 UAC）。
+- 选「应用托管进程」时，设置页会明确提示：控制台一退隧道就断，别拿它做无人值守。
 
 ## 开机自启与重启验收
 
@@ -332,7 +345,7 @@ v1.2.56 起，原来那张「服务器防火墙」卡片升级成 **「端口与
 
 | 位置 | 靠什么活着 | 验收命令 / 看哪里 |
 | --- | --- | --- |
-| 本机 frpc | Windows 服务的启动类型 | `Get-Service frpc \| Select-Object Status,StartType` → `Running / Automatic` |
+| 本机 frpc | Windows 服务的启动类型（**仅当已把 frpc 装成服务时**） | `Get-Service frpc \| Select-Object Status,StartType` → `Running / Automatic` |
 | 服务器 frps | systemd 的 `is-enabled`，或容器的 RestartPolicy | `systemctl is-enabled frps; systemctl is-active frps` |
 | 控制台窗口 | 当前用户的登录项（`HKCU\...\Run`） | 设置页开关；任务管理器「启动」里是否为「已启用」 |
 
@@ -412,7 +425,7 @@ v1.2.56 起，原来那张「服务器防火墙」卡片升级成 **「端口与
 - **点 X 后程序还在**：默认「关闭到托盘」，隧道不会断。要真正退出用**托盘右键 → 退出**。
 - **换了服务器地址但仍连旧服务器**：frpc 的 reload 不会重建服务器连接，必须重启隧道（服务器页「切换隧道并重启」，或概览页「重启」）。
 - **公网端口不通**：先在代理列表点「测试公网端口」；仍不通就检查三层——服务器系统防火墙（服务器页「服务器防火墙」卡片可一键放行）、云平台安全组（阿里云 / 腾讯云控制台，程序管不到）、代理是否为 `running`。隧道报 `EOF` / `session shutdown` 且服务器本机 `ss -tn` 看不到连接时，基本就是云防火墙没放行。
-- **服务启停弹 UAC**：Windows 服务需要管理员权限；取消授权不影响已有隧道。
+- **启停本机 frpc 服务时弹 UAC**：只有「自动」模式命中了已安装的 Windows 服务时才会去动服务，这一步需要管理员权限；取消授权不影响已经在跑的隧道。
 - **一键初始化卡在「下载 frps」**：程序要从 GitHub 取 `frp_0.61.0_linux_<arch>.tar.gz`。连不上时手动下载解压，把 `frps` 放到 `%LOCALAPPDATA%\frp-console\frps-cache\frp_0.61.0_linux_amd64\frps`（或程序目录 `resources\frps\linux-amd64\frps`），再点一次初始化即可走本地文件；也可以设环境变量 `FRP_DOWNLOAD_MIRROR=https://ghproxy.net/` 之类的前缀走代理。
 - **开了「开机自动启动」但重启后没自动运行**：这条设置写在当前用户的启动项里（`HKCU\...\Run`，不需要管理员权限）。被安全软件或组策略拦下时保存会直接报错、开关不会假装打开；这种情况可以在 `shell:startup`（Win+R 输入后回车打开的那个文件夹）里放一个控制台的快捷方式代替。另外建议同时打开「以最小化状态启动」，免得每次开机都弹窗。
 - **看到两个控制台窗口**：不会。单实例锁 + 固定端口 47823 双保险，后启动的副本会叫出已有窗口后退出。
@@ -421,6 +434,23 @@ v1.2.56 起，原来那张「服务器防火墙」卡片升级成 **「端口与
 - **升级后安装目录里的 frpc.exe / frpc.toml 不见了**：升级是「卸载旧版 + 装新版」，安装目录整体重建。现在 `frpc.exe` 由安装包自带（`resources\frpc\frpc.exe`），`frpc.toml` 一律写在数据目录，所以正常情况下不会丢；只有你自己把配置文件放到过安装目录，才需要依赖安装器的 `upgrade-rescue` 兜底搬运。
 - **找不到 frpc.exe / 提示路径缺失**：安装版不会出现——它在 `<安装目录>\resources\frpc\frpc.exe`。便携版和解压运行（zip 解压、`win-unpacked`）时同样在 `resources\frpc\` 下；如果被杀软删掉了，重新装一次，或在「设置 → 可执行文件与路径」里指向你自己下载的 frpc。
 - **检查更新连不上**：它走 `github.com` 的 Release，网络受限时会失败（报错会写明是网络问题）。可以手动到 Releases 下载安装包覆盖安装，效果一样。
+
+## 从源码运行
+
+```bash
+git clone https://github.com/THEysh/FRP-Console.git
+cd FRP-Console
+npm install
+npm start
+```
+
+国内网络建议先设镜像：
+
+```powershell
+$env:ELECTRON_MIRROR = "https://npmmirror.com/mirrors/electron/"
+$env:ELECTRON_BUILDER_BINARIES_MIRROR = "https://npmmirror.com/mirrors/electron-builder-binaries/"
+npm install --cache .\.npm-cache
+```
 
 ## 开发
 
@@ -433,14 +463,22 @@ src/main/          主进程
   service.js       Windows 服务检测与启停
   ssh.js           SSH 会话、frps 状态识别
   frpsconfig.js    frps 配置解析、生成与校验（allowPorts / 面板口令轮换）
-  netport.js       本机 TCP 监听端口扫描
-  log.js           日志跟随
+  frpsBinary.js    frps 二进制获取（按架构下载 / 本地缓存）
+  acme.js          Let's Encrypt 证书签发与续期（acme-client，DNS-01）
+  dns.js           Cloudflare DNS 记录读写
+  dnscheck.js      域名解析结果判定（对齐 / 过期 / 指向别处 / CDN 代理）
+  knownhosts.js    SSH 主机密钥指纹（首次信任 + 之后比对）
+  netprobe.js      用 Chromium 网络栈复验公网可达（本机 TLS 被拦时兜底）
+  portmatrix.js    端口与连通矩阵的判定规则
+  netport.js       本机 TCP 监听端口扫描与地址分类
+  log.js           日志跟随与单行长度截断
   update.js        自动更新（electron-updater，仅安装版）
   preload.js       contextBridge 暴露 window.FRP
 src/renderer/      无框架单页界面（index.html / styles.css / app.js）
 assets/            应用与托盘图标（托盘图标由脚本生成）
-resources/frps/    内置 frps 二进制（linux-amd64 / linux-arm64），一键初始化用
-vendor/frpc/       打包前由 tools/fetch-frpc.cjs 下载的 frpc.exe（不入库）
+resources/frps/    frps 二进制的可选放置位置（默认不内置，见该目录 README）
+vendor/frpc/       打包用的 frpc.exe（由 tools/fetch-frpc.cjs 从 vendor/frp-src 解出，不入库）
+vendor/frp-src/    官方 frp 压缩包（入库，打包时离线校验 sha256 后解压，不再依赖 GitHub 下载）
 tools/             CDP 自检脚本与构建辅助
 build/installer.nsh  NSIS 安装脚本
 ```
@@ -472,7 +510,7 @@ npm run dist
 `tools/` 下是基于 CDP 的自动化脚本。用独立的 userData 和实例端口跑，不会碰到你正在用的实例：
 
 ```bash
-FRP_INSTANCE_PORT=47827 PORTABLE_EXECUTABLE_DIR=/tmp/frpsmoke \
+FRP_INSTANCE_PORT=47827 PORTABLE_EXECUTABLE_DIR=D:/tmp/frpsmoke \
   npx electron . --no-sandbox --remote-debugging-port=9333
 
 node tools/ui-test.cjs                     # 逐页自检 + 截图（横向溢出、元素越界、console.error）
@@ -489,7 +527,7 @@ node tools/cdp-shot.cjs .proxy-row out.png # 按选择器截单个元素
 
 ```bash
 npm test               # L0 语法检查 + L1 单元测试 + 机密扫描，约 4 秒，CI 每次推送都跑
-npm run test:e2e       # L2 端到端：起一个真 Electron、真 frpc、真 frps、假 sshd，跑完 12 个场景
+npm run test:e2e       # L2 端到端：起真 Electron、真 frpc、真 frps、假 sshd，跑完 51 个场景（约 2 分钟）
 npm run test:e2e -- --only=tunnel        # 只跑名字含 tunnel 的场景
 npm run test:e2e -- --keep               # 保留现场（数据目录与进程），便于排查
 node tests/soak.cjs 10                  # 长稳抽查：隧道 + 20 条代理跑 10 分钟，看内存/健康检查/日志缓冲趋势
@@ -500,7 +538,7 @@ node tools/test-all.cjs                # 等价于 npm test，但不需要 npm�
 | --- | --- | --- |
 | L0 `tools/check-syntax.cjs` | 对 `src/ tools/ tests/` 逐个 `node --check` | 无 |
 | L1 `tests/unit/*.test.js` | 纯函数单测（配置解析与校验、端口矩阵、SSH 输出解析、DNS 判定、证书域名匹配、设置合并…） | 无 |
-| L2 `tests/e2e` | 冷启动、代理增删改与校验、真隧道三层全通、健康检查如实报错、服务器页、证书页与 DNS 面板、SSH 终端与日志、布局体检、20 条代理不截断、访问路径 404、外部改配置热重载、设置边界值 | 本机 electron；frpc 自动从 `vendor/frpc/` 找；frps 可选（缺了对应场景跳过） |
+| L2 `tests/e2e` | **51 个场景**：冷启动、代理增删改与校验、真隧道三层全通、健康检查如实报错、服务器页与就绪检查、证书页与 DNS 面板、SSH 终端/日志/断线、布局体检、20 与 60 条代理、访问路径 404、外部改配置热重载、设置边界值、多服务器切换、并发点击、只读配置、插件证书、端口被占、域名冲突 | 本机 electron；frpc 自动从 `vendor/frpc/` 找；frps 可选（缺了对应场景跳过） |
 
 端到端跑批把数据目录放在仓库内的 `.e2e-tmp/run-*`（已 gitignore），可以用 `E2E_DATA_ROOT` 换个位置——**不要放到 `%TEMP%`**，那会让 Electron 建单实例锁失败（`Error code: 5`）直接退不到界面。跑完要清理时删掉 `.e2e-tmp` 即可。
 
