@@ -72,6 +72,7 @@ module.exports = {
 
       /* 5) 界面切走再切回，值不退回默认 */
       const ui = await inst.eval(`(async () => {
+        for (let i = 0; i < 40 && !document.querySelector('.nav-item[data-view="settings"]'); i += 1) await new Promise((r) => setTimeout(r, 250));
         document.querySelector('.nav-item[data-view="settings"]').click();
         await new Promise((r) => setTimeout(r, 800));
         document.querySelector('.nav-item[data-view="overview"]').click();

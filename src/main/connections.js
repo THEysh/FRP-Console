@@ -189,6 +189,29 @@ function applyLegacyPaths(connections, activeId, patch = {}) {
   return { connections: next, changed };
 }
 
+/* http/https/tcpmux 代理对外发布的域名。subdomain 只给出前缀，
+ * 真正的主机名还要拼服务器的 subDomainHost（未知时按前缀匹配即可）。 */
+function proxyPublishesDomain(proxy, domain) {
+  if (!proxy || !domain) return false;
+  const want = String(domain).toLowerCase().replace(/^\*\./, '').trim();
+  if (!want) return false;
+  if (!['http', 'https', 'tcpmux'].includes(proxy.type)) return false;
+  const exact = (proxy.customDomains || [])
+    .map((x) => String(x).toLowerCase().replace(/^\*\./, '').trim())
+    .filter(Boolean);
+  /* customDomains 是完整主机名：只认精确相等（或用它的通配符覆盖子域） */
+  if (exact.some((x) => x === want || want.endsWith(`.${x}`))) return true;
+  /* subdomain 只是前缀：'demo' 发布的是 demo.<subDomainHost>，host 未知时按前缀判 */
+  const sub = String(proxy.subdomain || '').toLowerCase().trim();
+  return !!sub && (sub === want || want.startsWith(`${sub}.`) || sub.startsWith(`${want}.`));
+}
+
+/* 这份 frpc 配置（config.js 的模型）里有没有代理在发布这个域名 */
+function ownsDomain(model, domain) {
+  if (!model || !Array.isArray(model.proxies)) return false;
+  return model.proxies.some((p) => proxyPublishesDomain(p, domain));
+}
+
 module.exports = {
   DEFAULT_CONNECTION_ID,
   MAX_CONNECTIONS,
@@ -202,4 +225,6 @@ module.exports = {
   findConnection,
   applyLegacyPaths,
   clampPort,
+  proxyPublishesDomain,
+  ownsDomain,
 };

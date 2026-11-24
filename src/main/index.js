@@ -5353,13 +5353,46 @@ function nginxRootRedirectFor(serverNames) {
   return '';
 }
 
-async function syncCertToServerNginx(cert) {
+/* 这个域名属于「哪条连接」：frpc 连的是哪台 frps，nginx 就该在哪台机器上。
+ * 多连接之后「当前 SSH 会话」与「发布该域名的连接」可能是两台机器（1.2.172）。 */
+function domainOwners(domain) {
+    const want = String(domain || '').toLowerCase().replace(/^\*\./, '');
+    if (!want) return [];
+    const out = [];
+    const conns = Array.isArray(settings.connections) ? settings.connections : [];
+    for (const conn of conns) {
+      let connModel = null;
+      try { connModel = connectionModel(conn); } catch { connModel = null; }
+      if (!connModel) continue;
+      if (connectionsModule.ownsDomain(connModel, want)) {
+        out.push({ id: conn.id, name: conn.name || conn.id, serverAddr: String(connModel.serverAddr || '') });
+      }
+    }
+    return out;
+  }
+
+  async function syncCertToServerNginx(cert, options = {}) {
     if (!cert || !Array.isArray(cert.domains) || !cert.domains.length) {
       return { ok: false, error: '缺少证书信息' };
     }
     const serverHost = serverSession.connected ? String(serverSession.host || '') : '';
     if (!serverSession.connected) {
       const r = { ok: false, error: '尚未连接服务器，证书已保存到本机但未上传到 nginx' };
+      acmeManager.markNginx(cert.domain, r, serverHost);
+      return r;
+    }
+    /* 跨连接守卫：域名属于连接 A（frpc 连 154.36…），现在 SSH 连的却是 B（8.148…），
+     * 部署上去没有任何意义——frps 不在这台机器上，traffic 也到不了。以前这种情况会写成功。 */
+    const owners = domainOwners(cert.domain);
+    const owner = owners.find((o) => o.serverAddr) || null;
+    if (owner && owner.serverAddr !== serverHost && options.force !== true) {
+      const r = {
+        ok: false,
+        needsForce: true,
+        wrongServer: true,
+        owner,
+        error: `这个域名属于连接「${owner.name}」（它连的是 ${owner.serverAddr}），你现在连的服务器是 ${serverHost}：证书部署到当前这台没意义，frps 不在这里。换到那台服务器再部署。`,
+      };
       acmeManager.markNginx(cert.domain, r, serverHost);
       return r;
     }
@@ -5393,7 +5426,15 @@ async function syncCertToServerNginx(cert) {
     if (!reload.ok) { acmeManager.markNginx(cert.domain, reload, serverHost); return reload; }
     // 反代配置写成功并 reload 后，公网入口就是 nginx 443，代理地址不再带端口。
     setProfileNginxProxy(profileForSession(serverSession).id, true);
-    const r = { ok: true, serverNames, certDir: upload.dir, frpsHttpPort, vhost };
+    const r = {
+      ok: true,
+      serverNames,
+      certDir: upload.dir,
+      frpsHttpPort,
+      vhost,
+      owner: owner || null,
+      wrongServer: !!(owner && owner.serverAddr && owner.serverAddr !== serverHost),
+    };
     acmeManager.markNginx(cert.domain, r, serverHost);
     return r;
   }
@@ -5467,8 +5508,8 @@ async function syncCertToServerNginx(cert) {
       if (!domain) return fail('缺少域名：要部署哪一张证书');
       const cert = acmeManager.get(domain);
       if (!cert || !cert.exists) return fail(`本地没有 ${domain} 的证书`);
-      const sync = await syncCertToServerNginx(cert);
-      if (!sync.ok) return fail(sync.error);
+      const sync = await syncCertToServerNginx(cert, { force: payload.force === true });
+      if (!sync.ok) return fail(sync.error, { needsForce: !!sync.needsForce, owner: sync.owner || null });
       pushState();
       return ok(sync);
     } catch (e) {
