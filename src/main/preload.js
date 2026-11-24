@@ -60,6 +60,10 @@ contextBridge.exposeInMainWorld('FRP', {
   stopTunnel: () => invoke('tunnel:stop'),
   restartTunnel: () => invoke('tunnel:restart'),
   reloadTunnel: () => invoke('tunnel:reload'),
+  /* 多连接：按 id 操作某一条（现有 tunnel:* 仍作用于「当前选中」的那条） */
+  connections: () => invoke('connections:list'),
+  connectionStart: (id) => invoke('connections:start', id),
+  connectionStop: (id) => invoke('connections:stop', id),
   scanListeners: () => invoke('listen:scan'),
   certList: () => invoke('cert:list'),
   certIssue: (payload) => invoke('cert:issue', payload),

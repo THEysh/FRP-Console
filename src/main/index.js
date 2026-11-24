@@ -69,6 +69,7 @@ if (process.platform === 'win32') app.setAppUserModelId('cn.ysh.frp-console');
 const settingsModule = require('./settings');
 const configModule = require('./config');
 const { FrpcManager, reloadFailureText } = require('./frpc');
+const connectionsModule = require('./connections');
 const { ReconnectSupervisor } = require('./supervisor');
 const { LogFollower } = require('./log');
 const service = require('./service');
@@ -157,6 +158,8 @@ let netChangedAt = 0;
 const follower = new LogFollower('', { maxLines: 600 });
 let manager = null;
 let supervisor = null;
+/* 多连接运行期状态（bootstrap 里初始化；null 表示还没起来）。 */
+let multiConnection = null;
 const acmeManager = new AcmeManager({ userDataDir: settingsModule.dataDir() });
 
 /* 当前 DNS 验证渠道（现阶段只有 Cloudflare）。证书签发 / 自动续期共用。 */
@@ -1348,6 +1351,109 @@ function lastConnectProblem() {
 /* 「正在跑的 frpc 用的是哪份连接参数」。和当前配置不一致 = 界面显示的
  * 「已连接」其实连的是旧服务器（真机全剧本就这么假绿过一次）。 */
 let startedFingerprint = '';
+
+/* ===== 多连接的运行期辅助（阶段 2） ===== */
+
+/* 按 id 找连接；找不到返回 null（不用 findConnection 的“落回第一条”，
+ * 否则传错 id 会静默操作另一条隧道 —— 那比报错危险得多）。 */
+function connectionById(connId) {
+  const list = (settings && settings.connections) || [];
+  return list.find((item) => item.id === connId) || null;
+}
+
+/* 每条连接自己的那三样路径。frpcPath 全局共用（同一个可执行文件）。 */
+function connectionPaths(conn) {
+  return {
+    frpcPath: paths.frpcPath,
+    configPath: conn.configPath || '',
+    logPath: conn.logPath || '',
+  };
+}
+
+/* 连接自己的配置模型：当前连接用全局 model，其它连接按需读自己的 frpc.toml。
+ * 读不到就返回 null —— 让 FrpcManager 报“配置不可用”，而不是拿别人的配置去连。 */
+function connectionModel(conn) {
+  if (!conn) return null;
+  if (conn.id === settings.activeConnectionId) return model;
+  const cache = multiConnection && multiConnection.parkedModels;
+  if (cache && cache.has(conn.id)) return cache.get(conn.id);
+  let parsedModel = null;
+  try {
+    /* 用 configModule.readConfig：它负责读文件 + 解析 + 保留原文（BOM 也在别处统一处理），
+     * 别自己 toml.parse —— 1.2.113 那次 execFileP 按 reject 写就踩过“想当然的 API”。 */
+    parsedModel = configModule.readConfig(conn.configPath);
+  } catch (e) {
+    parsedModel = null;
+  }
+  if (cache) cache.set(conn.id, parsedModel);
+  return parsedModel;
+}
+
+/* 非当前连接启动前也要保证它自己的 frpc.toml 里有管理端口与口令，
+ * 否则 frpc 会用默认 7400/admin 起来，和多连接抢占同一个端口。 */
+function ensureAdminForConnection(conn) {
+  if (!conn || !conn.configPath) return { ok: false, error: '这条连接还没有配置文件' };
+  const connModel = connectionModel(conn);
+  if (!connModel) return { ok: false, error: `读不到配置文件：${conn.configPath}` };
+  const changed = configModule.ensureAdmin(connModel, settings);
+  if (!changed) return { ok: true };
+  const write = configModule.writeConfig(conn.configPath, connModel);
+  if (write.ok === false) return { ok: false, error: write.error };
+  return { ok: true };
+}
+
+/* 拿一条连接的管理器；懒创建。当前连接直接用全局 manager，保证既有代码都走同一条路径。 */
+function managerForConnection(connId) {
+  const conn = connectionById(connId);
+  if (!conn) return null;
+  if (conn.id === settings.activeConnectionId) return manager;
+  const store = multiConnection && multiConnection.extraManagers;
+  if (!store) return null;
+  if (store.has(conn.id)) return store.get(conn.id);
+  const created = new FrpcManager({
+    getSettings: () => settings,
+    getPaths: () => connectionPaths(conn),
+    getConfig: () => connectionModel(conn),
+    ensureAdminConfig: async () => ensureAdminForConnection(conn),
+    /* 服务模式只支持一台（README 里写明）：多出来的连接一律托管进程，
+     * 这样也不会去 sc start 一个和别的连接同名的服务。 */
+    stopService: async () => ({ ok: false, error: '多连接只支持「应用托管进程」' }),
+  });
+  created.on('exit', () => {
+    pushState();
+    refreshTray();
+  });
+  created.on('error', (e) => {
+    if (process.env.FRP_CONSOLE_DEBUG) console.warn('[connections] manager error', e && e.message);
+  });
+  store.set(conn.id, created);
+  return created;
+}
+
+/* 一条连接的对外摘要（给界面/诊断用，不含配置内容与 token）。 */
+function connectionSummary(conn) {
+  const mm = conn.id === settings.activeConnectionId ? manager : (multiConnection && multiConnection.extraManagers.get(conn.id));
+  const snap = mm ? mm.snapshot() : null;
+  return {
+    id: conn.id,
+    name: conn.name,
+    serverId: conn.serverId,
+    configPath: conn.configPath,
+    adminPort: (snap && snap.adminPort) || conn.adminPort,
+    enabled: conn.enabled,
+    active: conn.id === settings.activeConnectionId,
+    runtime: snap
+      ? {
+        mode: snap.mode,
+        running: snap.running,
+        connected: snap.connected,
+        foreign: snap.foreign,
+        pid: snap.pid,
+        proxyCount: (snap.proxies || []).length,
+      }
+      : { mode: 'stopped', running: false, connected: false, foreign: false, pid: null, proxyCount: 0 },
+  };
+}
 
 /* 返回“现在不该自动重连”的原因；空串表示可以重连。
  * 抽成函数是为了出问题时有话可说：日志里能看到到底被哪一条挡住。 */
@@ -3253,6 +3359,62 @@ function registerIpc() {
     pushState();
     if (!result.ok) return fail(result.error, { state: buildState() });
     return ok({ state: buildState(), status: result.status });
+  });
+
+  /* ===== 多连接（阶段 2：只提供“看清 + 单独启停”的能力，界面暂不展示）=====
+   * 现有 tunnel:* IPC 全部作用于「当前选中」的连接，语义不变；
+   * 这三个接口按 id 操作某一条，供后续界面与自动化使用。 */
+  ipcMain.handle('connections:list', async () => ok({
+    activeConnectionId: settings.activeConnectionId,
+    connections: (settings.connections || []).map(connectionSummary),
+  }));
+
+  ipcMain.handle('connections:start', async (event, connId) => {
+    const conn = connectionById(String(connId || ''));
+    if (!conn) return fail('连接不存在（可能已被删除）');
+    if (!conn.configPath) return fail('这条连接还没有配置文件：先给它选一个 frpc.toml');
+    if (!conn.enabled) return fail('这条连接被设为不启用');
+    if (conn.id === settings.activeConnectionId) {
+      /* 当前连接走原路径：它还要处理服务模式、端口冲突提示、插件证书校验等。 */
+      const result = await manager.start({ runMode: settings.runMode });
+      await manager.refresh().catch(() => {});
+      if (result.ok) {
+        tunnelDesired = true;
+        startedFingerprint = configModule.connFingerprint(model);
+        if (supervisor) supervisor.cancel('');
+      }
+      pushState();
+      return result.ok ? ok({ connection: connectionSummary(conn) }) : fail(result.error, { connection: connectionSummary(conn) });
+    }
+    const mm = managerForConnection(conn.id);
+    if (!mm) return fail('多连接运行期还没准备好');
+    /* 非当前连接一律托管进程：服务模式只能有一台（否则要处理 nssm 多实例与 UAC）。 */
+    const result = await mm.start({ runMode: 'managed' });
+    await mm.refresh().catch(() => {});
+    pushState();
+    if (!result.ok) return fail(result.error, { connection: connectionSummary(conn) });
+    return ok({ connection: connectionSummary(conn), mode: result.mode });
+  });
+
+  ipcMain.handle('connections:stop', async (event, connId) => {
+    const conn = connectionById(String(connId || ''));
+    if (!conn) return fail('连接不存在（可能已被删除）');
+    if (conn.id === settings.activeConnectionId) {
+      suppressExitUntil = Date.now() + 12000;
+      tunnelDesired = false;
+      startedFingerprint = '';
+      if (supervisor) supervisor.cancel('用户停止了隧道');
+      const result = await manager.stop({ runMode: settings.runMode });
+      await manager.refresh().catch(() => {});
+      pushState();
+      return result.ok ? ok({ connection: connectionSummary(conn) }) : fail(result.error, { connection: connectionSummary(conn) });
+    }
+    const mm = managerForConnection(conn.id);
+    if (!mm) return fail('多连接运行期还没准备好');
+    const result = await mm.stop({ runMode: 'managed' });
+    await mm.refresh().catch(() => {});
+    pushState();
+    return result.ok ? ok({ connection: connectionSummary(conn) }) : fail(result.error, { connection: connectionSummary(conn) });
   });
 
   ipcMain.handle('listen:scan', async () => {
@@ -5633,6 +5795,18 @@ async function bootstrap() {
     if (text.trim()) follower.appendLines(text);
   });
   follower.start();
+  /* ===== 多连接运行期（阶段 2）=====
+   * 一条连接 = 一个 FrpcManager。「当前选中」的那条继续用上面的 manager
+   *（大量既有代码都通过它工作，包括 IPC、健康检查、托盘），其它连接用
+   * extraManagers 惰性创建，互不干扰。
+   *
+   * 关键点：非当前连接没有全局 model，所以它们的 ctx 各自从自己的 frpc.toml
+   * 读一份模型（只读缓存），绝不复用当前连接的 model —— 否则两条隧道会拿
+   * 对方的代理列表和 token 去连（1.2.138 那类“配置与会话对不上”的翻版）。
+   */
+  const extraManagers = new Map();
+  const parkedModels = new Map();
+  multiConnection = { extraManagers, parkedModels };
   /* 这几步拿的都是"锦上添花"的信息，读不到不该让整个启动失败。
    * sc.exe 被安全软件拉黑 / 权限不足的机器上，原来会在 refreshService 直接抛出，
    * 连轮询都起不来，界面从此定格在初始状态。 */
