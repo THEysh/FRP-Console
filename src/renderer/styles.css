@@ -1551,3 +1551,165 @@ label .icon-btn svg { width: 13px; height: 13px; }
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+
+/* 多连接：侧栏底部的连接切换器。只在连接 >1 时出现，单连接用户看不到它。 */
+.conn-switch {
+  margin: 0 12px 10px;
+  padding: 10px;
+  border-radius: 10px;
+  background: rgba(148, 163, 184, 0.06);
+  border: 1px solid rgba(148, 163, 184, 0.12);
+}
+.conn-switch .cs-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 7px;
+}
+.conn-switch .cs-head .grow { flex: 1; }
+.conn-switch .cs-select {
+  width: 100%;
+  height: 30px;
+  border-radius: 8px;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  background: rgba(11, 16, 24, 0.6);
+  color: var(--fg);
+  font-size: 12px;
+  padding: 0 6px;
+}
+.conn-switch .cs-row {
+  display: flex;
+  gap: 6px;
+  margin-top: 7px;
+}
+.conn-switch .cs-row .btn { flex: 1; justify-content: center; }
+.conn-switch .cs-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--muted); flex: 0 0 auto;
+}
+.conn-switch .cs-dot.on { background: var(--green, #3ddc97); box-shadow: 0 0 6px rgba(61, 220, 151, 0.6); }
+.conn-switch .cs-dot.warn { background: var(--amber, #f0b429); }
+.conn-list { display: grid; gap: 8px; }
+.conn-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(148, 163, 184, 0.05);
+  border: 1px solid rgba(148, 163, 184, 0.1);
+}
+.conn-row.active { border-color: rgba(90, 209, 255, 0.35); background: rgba(90, 209, 255, 0.06); }
+.conn-row .cr-name { font-weight: 600; font-size: 12.5px; }
+.conn-row .cr-meta { font-size: 11px; color: var(--muted); margin-top: 2px; }
+
+
+/* 多连接：侧栏底部的连接切换器。只在连接 >1 时出现，单连接用户看不到它。 */
+.conn-switch {
+  margin: 0 12px 10px;
+  padding: 10px;
+  border-radius: 10px;
+  background: rgba(148, 163, 184, 0.06);
+  border: 1px solid rgba(148, 163, 184, 0.12);
+}
+.conn-switch .cs-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 7px;
+}
+.conn-switch .cs-head .grow { flex: 1; }
+.conn-switch .cs-select {
+  width: 100%;
+  height: 30px;
+  border-radius: 8px;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  background: rgba(11, 16, 24, 0.6);
+  color: var(--fg);
+  font-size: 12px;
+  padding: 0 6px;
+}
+.conn-switch .cs-row {
+  display: flex;
+  gap: 6px;
+  margin-top: 7px;
+}
+.conn-switch .cs-row .btn { flex: 1; justify-content: center; }
+.conn-switch .cs-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--muted); flex: 0 0 auto;
+}
+.conn-switch .cs-dot.on { background: var(--green, #3ddc97); box-shadow: 0 0 6px rgba(61, 220, 151, 0.6); }
+.conn-switch .cs-dot.warn { background: var(--amber, #f0b429); }
+.conn-list { display: grid; gap: 8px; }
+.conn-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(148, 163, 184, 0.05);
+  border: 1px solid rgba(148, 163, 184, 0.1);
+}
+.conn-row.active { border-color: rgba(90, 209, 255, 0.35); background: rgba(90, 209, 255, 0.06); }
+.conn-row .cr-name { font-weight: 600; font-size: 12.5px; }
+.conn-row .cr-meta { font-size: 11px; color: var(--muted); margin-top: 2px; }
+
+
+/* 多连接：侧栏底部的连接切换器。只在连接 >1 时出现，单连接用户看不到它。 */
+.conn-switch {
+  margin: 0 12px 10px;
+  padding: 10px;
+  border-radius: 10px;
+  background: rgba(148, 163, 184, 0.06);
+  border: 1px solid rgba(148, 163, 184, 0.12);
+}
+.conn-switch .cs-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 7px;
+}
+.conn-switch .cs-head .grow { flex: 1; }
+.conn-switch .cs-select {
+  width: 100%;
+  height: 30px;
+  border-radius: 8px;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  background: rgba(11, 16, 24, 0.6);
+  color: var(--fg);
+  font-size: 12px;
+  padding: 0 6px;
+}
+.conn-switch .cs-row {
+  display: flex;
+  gap: 6px;
+  margin-top: 7px;
+}
+.conn-switch .cs-row .btn { flex: 1; justify-content: center; }
+.conn-switch .cs-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--muted); flex: 0 0 auto;
+}
+.conn-switch .cs-dot.on { background: var(--green, #3ddc97); box-shadow: 0 0 6px rgba(61, 220, 151, 0.6); }
+.conn-switch .cs-dot.warn { background: var(--amber, #f0b429); }
+.conn-list { display: grid; gap: 8px; }
+.conn-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(148, 163, 184, 0.05);
+  border: 1px solid rgba(148, 163, 184, 0.1);
+}
+.conn-row.active { border-color: rgba(90, 209, 255, 0.35); background: rgba(90, 209, 255, 0.06); }
+.conn-row .cr-name { font-weight: 600; font-size: 12.5px; }
+.conn-row .cr-meta { font-size: 11px; color: var(--muted); margin-top: 2px; }

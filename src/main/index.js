@@ -1825,6 +1825,9 @@ function buildState() {
      * 每条带 runtime 与 counts；顶层 proxies 仍然只描述「当前连接」。 */
     connections: connectionList(),
     connectionsAgg: connectionAggregate(),
+    /* 当前连接 id 必须跟着状态一起下发：界面的切换器/高亮全靠它，
+     * 少了它渲染层只能按“第一条”猜（切过去下拉框不动，看起来像没生效）。 */
+    activeConnectionId: settings.activeConnectionId || '',
     counts: (() => {
       /* 只有“隧道状态 running 且三层检查真的通过”才算在线。
        * 以前 `!p.health || p.health.ok` 把“还没检查”也当成在线，

@@ -349,6 +349,107 @@ function updateNavBadge() {
   badge.textContent = counts ? String(counts.total) : '0';
 }
 
+
+/* ===== 多连接：侧栏切换器 =====
+ * 只在「连接 >1 条」时出现；单连接用户界面与以前完全一致。
+ * 切换会停掉正在跑的隧道（主进程如此设计：全局 manager 的配置上下文是一个），
+ * 所以按钮文案直接把后果写出来，别让人以为是点击无反应。 */
+function connList() {
+  const state = S.state || {};
+  return Array.isArray(state.connections) ? state.connections : [];
+}
+function activeConnId() {
+  const state = S.state || {};
+  return state.activeConnectionId || (connList()[0] || {}).id || '';
+}
+function connRuntimeLabel(conn) {
+  const rt = conn.runtime || {};
+  if (rt.connected) return '已连上服务器';
+  if (rt.mode === 'starting') return '正在连接';
+  if (rt.mode === 'external') return '外部 frpc 在跑';
+  return '未启动';
+}
+function renderConnectionSwitch() {
+  const box = $('#conn-switch');
+  if (!box) return;
+  const list = connList();
+  if (list.length <= 1) {
+    box.hidden = true;
+    box.innerHTML = '';
+    return;
+  }
+  box.hidden = false;
+  const activeId = activeConnId();
+  const active = list.find((c) => c.id === activeId) || list[0];
+  const running = !!(active && active.runtime && active.runtime.connected);
+  box.innerHTML = `
+    <div class="cs-head">
+      <span class="cs-dot ${running ? 'on' : ''}"></span>
+      <span class="grow">隧道连接 · ${list.length}</span>
+      <button class="icon-btn" type="button" data-act="conn.add" title="再加一条连接（连另一台 frps）">${icon('plus')}</button>
+    </div>
+    <select class="cs-select" id="conn-select" title="切换当前连接（会先停掉正在跑的隧道）">
+      ${list.map((c) => `<option value="${esc(c.id)}"${c.id === activeId ? ' selected' : ''}>${esc(c.name || c.id)}${c.runtime && c.runtime.connected ? ' · 在线' : ''}</option>`).join('')}
+    </select>
+    <div class="cs-row">
+      ${running
+        ? `<button class="btn small danger" type="button" data-act="conn.toggle" data-id="${esc(activeId)}">${icon('stop')}<span>停止</span></button>`
+        : `<button class="btn small primary" type="button" data-act="conn.toggle" data-id="${esc(activeId)}">${icon('play')}<span>启动</span></button>`}
+      <button class="btn small" type="button" data-act="nav" data-view="proxies">${icon('link')}<span>代理</span></button>
+    </div>`;
+}
+
+/* 概览里的「连接」卡片：多于一条时才有意义。 */
+function connectionsSection() {
+  const list = connList();
+  if (list.length <= 1) return '';
+  const activeId = activeConnId();
+  const agg = (S.state && S.state.connectionsAgg) || {};
+  const rows = list.map((c) => {
+    const rt = c.runtime || {};
+    const counts = c.counts || {};
+    const isActive = c.id === activeId;
+    return `
+      <div class="conn-row${isActive ? ' active' : ''}">
+        <span class="cs-dot ${rt.connected ? 'on' : (rt.mode === 'starting' ? 'warn' : '')}"></span>
+        <div class="grow">
+          <div class="cr-name">${esc(c.name || c.id)}${isActive ? ' <span class="tag ok">当前</span>' : ''}</div>
+          <div class="cr-meta">${esc(connRuntimeLabel(c))} · 在线 ${esc(String(counts.online || 0))} / ${esc(String(counts.total || 0))}</div>
+        </div>
+        ${isActive
+          ? (rt.connected
+            ? `<button class="btn small danger" type="button" data-act="conn.toggle" data-id="${esc(c.id)}">${icon('stop')}<span>停止</span></button>`
+            : `<button class="btn small primary" type="button" data-act="conn.toggle" data-id="${esc(c.id)}">${icon('play')}<span>启动</span></button>`)
+          : (rt.connected
+            ? `<button class="btn small danger" type="button" data-act="conn.toggle" data-id="${esc(c.id)}">${icon('stop')}<span>停止</span></button>`
+            : `<button class="btn small" type="button" data-act="conn.switch" data-id="${esc(c.id)}">切换到它</button>`)}
+      </div>`;
+  }).join('');
+  return `
+    <section class="card section" style="margin-top:16px">
+      <div class="section-head">
+        <div class="section-title">
+          <strong>隧道连接</strong>
+          <span>${esc(String(agg.connections || list.length))} 条 · ${esc(String(agg.running || 0))} 条已连上 · 合计在线代理 ${esc(String(agg.online || 0))} / ${esc(String(agg.total || 0))}</span>
+        </div>
+        <button class="btn ghost small" type="button" data-act="conn.add">${icon('plus')}再连一台</button>
+      </div>
+      <div class="conn-list" style="padding:0 16px 16px">${rows}</div>
+    </section>`;
+}
+
+/* 代理页顶部提醒：当前页只显示「当前连接」的代理。 */
+function otherConnectionsNote() {
+  const list = connList().filter((c) => c.id !== activeConnId());
+  if (!list.length) return '';
+  const running = list.filter((c) => c.runtime && c.runtime.connected);
+  const detail = list
+    .map((c) => `${esc(c.name || c.id)}（${c.runtime && c.runtime.connected ? `在线 ${esc(String((c.counts || {}).online || 0))}` : '未启动'}）`)
+    .join('、');
+  return `<div class="note">${icon('link')}<div>这一页只列出<b>当前连接</b>的代理；另有 ${list.length} 条连接（${detail}）${running.length ? '，它们的隧道仍在跑' : ''}。
+    要管理别的连接，用左下角的连接切换器。</div></div>`;
+}
+
 function updateChrome() {
   const info = runtimeInfo();
   const pill = $('#tb-status');
@@ -370,6 +471,7 @@ function updateChrome() {
   const crumb = $('#tb-crumb');
   if (crumb) crumb.textContent = (NAV_ITEMS.find((n) => n.id === S.view) || NAV_ITEMS[0]).label;
   updateNavBadge();
+  renderConnectionSwitch();
 }
 
 function setView(view, { force = false } = {}) {
@@ -438,6 +540,9 @@ function overviewKey() {
     val: s.validation && s.validation.errors ? s.validation.errors.length : 0,
     // 服务器面板地址可能在连上服务器后被自动探测出来，变化时要重绘 hero 按钮
     durl: s.dashboardUrl || '',
+    // 多连接：连接条数/名称/在线状态变了就要重绘（否则新增一条连接后概览不刷新）
+    conn: (s.connections || []).map((c) => [c.id, c.name, !!(c.runtime && c.runtime.connected), (c.counts || {}).online || 0].join(':')).join('|'),
+    connAct: s.activeConnectionId || '',
     // 管理 API 口令由弱变强（或反过来）时，概览那条提示要跟着出现/消失
     aw: s.app && s.app.adminWeak ? (s.app.adminWeak.weak ? 1 : 0) : 0,
     stale: s.runtime && s.runtime.staleConfig ? 1 : 0,
@@ -719,6 +824,8 @@ function renderOverview(force = false) {
         </div>
       </section>
 
+      ${connectionsSection()}
+
       <section class="card section" style="margin-top:16px">
         <div class="section-head">
           <div class="section-title"><strong>公网地址</strong><span>${addrList.length ? `在线 ${onlineCount} / 共 ${addrList.length} 条 · 别人通过这些地址访问你的服务` : '还没有公网映射'}</span></div>
@@ -809,6 +916,8 @@ function proxiesKey() {
     // 隧道起停会决定「无档案」提示要不要出现，必须进 key，否则页面不重绘
     rc: (s.runtime && s.runtime.connected) ? 1 : 0,
     orph: s.binding && s.binding.unarchived ? `${s.binding.addr}:${s.binding.port}` : '',
+    // 「另有 N 条连接」这行提示要跟着连接状态变，否则切了连接它还挂着
+    conn: (s.connections || []).map((c) => [c.id, !!(c.runtime && c.runtime.connected)].join(':')).join('|') + (s.activeConnectionId || ''),
     list: (s.proxies || []).map((p) => [p.name, p.type, p.status, p.statusError, p.publicAddress, p.localPort, p.health && p.health.ok, p.health && p.health.ms, p.health && p.health.reason]),
   });
 }
@@ -845,6 +954,7 @@ function renderProxies(force = false) {
       </div>
 
       ${orphanTunnelNote()}
+      ${otherConnectionsNote()}
       ${state.configError ? `<div class="note error" style="margin-bottom:14px">${icon('alert')}<div>${esc(state.configError)}</div></div>` : ''}
       ${state.configVerifyError ? `<div class="note error" style="margin-bottom:14px">${icon('alert')}<div>${esc(state.configVerifyError)}<br><span style="opacity:.75">隧道仍在用上一次的配置运行；把 frpc.toml 改对后会自动重新载入。</span></div></div>` : ''}
 
@@ -4909,7 +5019,57 @@ async function handleAction(act, dataset, btn) {
       case 'nav':
         setView(dataset.view);
         break;
-      case 'tunnel.start': {
+  
+    case 'conn.add': {
+      const name = await promptDialog({
+        title: '再连一台 frps',
+        label: '给这条连接起个名字',
+        placeholder: '例如：广州 frp / 家里的 frps',
+        confirmText: '创建',
+        hint: '新连接会得到一份空的 frpc.toml（不会复制当前连接的服务器地址和 Token），建好后到服务器页或配置文件页把它填上。',
+      });
+      if (!name || !String(name).trim()) return;
+      const res = await FRP.connectionAdd({ name: String(name).trim() }).catch(() => null);
+      if (!res || !res.ok) { toast('error', '创建失败', (res && res.error) || '请稍后再试'); return; }
+      await loadStateAndRender();
+      toast('success', '已创建连接', `${String(name).trim()} · 用左下角的连接切换器选它`);
+      return;
+    }
+    case 'conn.toggle': {
+      const id = actionEl && actionEl.dataset ? actionEl.dataset.id : '';
+      const conn = connList().find((c) => c.id === id);
+      if (!conn) return;
+      const isRunning = !!(conn.runtime && conn.runtime.connected);
+      /* withBusy 的第一个参数必须是按钮元素且会吞掉返回值，这里直接用 IPC 结果。 */
+      const res = isRunning
+        ? await FRP.connectionStop(id).catch(() => null)
+        : await FRP.connectionStart(id).catch(() => null);
+      if (!res || !res.ok) { toast('error', isRunning ? '停止失败' : '启动失败', (res && res.error) || '请稍后再试'); return; }
+      await loadStateAndRender();
+      toast('success', isRunning ? '已停止' : '已启动', conn.name || id);
+      return;
+    }
+    case 'conn.switch': {
+      const id = (actionEl && actionEl.dataset && actionEl.dataset.id) || '';
+      const target = connList().find((c) => c.id === id);
+      if (!target) return;
+      const anyRunning = connList().some((c) => c.runtime && c.runtime.connected);
+      if (anyRunning) {
+        const yes = await confirmDialog({
+          title: '切换连接会停掉正在跑的隧道',
+          body: '每条连接用的是自己那份 frpc.toml，切换时旧隧道必须先停（否则改配置、健康检查、日志会错位）。切过去之后点「启动」重新连。',
+          confirmText: '切换并停止',
+          danger: true,
+        });
+        if (!yes) return;
+      }
+      const res = await FRP.connectionActive(id).catch(() => null);
+      if (!res || !res.ok) { toast('error', '切换失败', (res && res.error) || '请稍后再试'); return; }
+      await loadStateAndRender();
+      toast('success', '已切换当前连接', target.name || id);
+      return;
+    }
+    case 'tunnel.start': {
         await withBusy(btn, async () => {
           const res = await FRP.startTunnel();
           if (res && res.ok) { if (res.data && res.data.state) S.state = res.data.state; toast('success', '隧道已启动'); }
@@ -6568,6 +6728,52 @@ function confirmDialog({ title = '确认', body = '', confirmText = '确定', ca
   });
 }
 
+
+/* Electron 不支持 window.prompt（会抛 "prompt() is and will not be supported"）。
+ * 需要用户填一个短文本时用它，返回字符串或 null。 */
+function promptDialog({ title = '请输入', label = '', value = '', placeholder = '', confirmText = '确定', hint = '' } = {}) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (data) => {
+      if (settled) return;
+      settled = true;
+      closeModal();
+      resolve(data);
+    };
+    openModal(`
+      <div class="modal" style="width:460px">
+        <div class="modal-head">
+          <div class="mh-icon" style="color:var(--accent)">${icon('edit')}</div>
+          <div class="grow"><h3>${esc(title)}</h3></div>
+          <button class="icon-btn modal-close" type="button" id="pd-x">${icon('x')}</button>
+        </div>
+        <div class="modal-body">
+          ${label ? `<div class="field"><label>${esc(label)}</label><input class="input" id="pd-input" type="text" value="${esc(value)}" placeholder="${esc(placeholder)}" autocomplete="off" /></div>` : ''}
+          ${hint ? `<div class="field-hint">${esc(hint)}</div>` : ''}
+        </div>
+        <div class="modal-foot">
+          <span class="mf-left"></span>
+          <button class="btn" type="button" id="pd-cancel">取消</button>
+          <button class="btn primary" type="button" id="pd-ok">${esc(confirmText)}</button>
+        </div>
+      </div>`);
+    const input = $('#pd-input');
+    if (input) {
+      input.focus();
+      input.select();
+      input.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Enter') { ev.preventDefault(); finish(String(input.value || '')); }
+      });
+    }
+    const ok = $('#pd-ok');
+    if (ok) ok.addEventListener('click', () => finish(String((input && input.value) || '')));
+    const cancel = $('#pd-cancel');
+    if (cancel) cancel.addEventListener('click', () => finish(null));
+    const x = $('#pd-x');
+    if (x) x.addEventListener('click', () => finish(null));
+  });
+}
+
 function confirmNginxPortConflict(conflicts = []) {
   return new Promise((resolve) => {
     let settled = false;
@@ -6957,6 +7163,18 @@ function bindStaticEvents() {
     });
   }
 }
+
+
+/* 侧栏连接下拉：change 不走 data-act（select 不是按钮） */
+document.addEventListener('change', (ev) => {
+  const el = ev.target;
+  if (!el || el.id !== 'conn-select') return;
+  const id = String(el.value || '');
+  if (!id) return;
+  const target = connList().find((c) => c.id === id);
+  if (!target || target.id === activeConnId()) return;
+  handleAction('conn.switch', { dataset: { id } }).catch(() => {});
+});
 
 async function boot() {
   bindStaticEvents();
