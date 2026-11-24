@@ -6351,6 +6351,29 @@ async function quitApp({ source = 'user' } = {}) {
     await new Promise((resolve) => setTimeout(resolve, 400));
   }
 
+  /* 非当前连接的 frpc 也要一起停：它们由 extraManagers 管，上面那段只处理 manager，
+   * 漏掉就会留下孤儿进程继续占着管理端口和公网端口（双连接退出时实测复现）。 */
+  try {
+    if (multiConnection && multiConnection.extraManagers && multiConnection.extraManagers.size) {
+      const jobs = [];
+      for (const [id, mm] of multiConnection.extraManagers.entries()) {
+        jobs.push((async () => {
+          try {
+            multiConnection.stopRequests.set(id, Date.now());
+            await Promise.race([
+              mm.stop({ runMode: 'managed' }).catch(() => ({ ok: false })),
+              new Promise((resolve) => setTimeout(resolve, 4000)),
+            ]);
+            if (mm.isChildAlive && mm.child) {
+              try { mm.child.kill(); } catch { /* ignore */ }
+            }
+          } catch { /* ignore */ }
+        })());
+      }
+      await Promise.all(jobs);
+    }
+  } catch { /* ignore */ }
+
   try { serverSession.disconnect(); } catch { /* ignore */ }
   if (instanceChannel) {
     try { instanceChannel.close(); } catch { /* ignore */ }
