@@ -10,6 +10,9 @@ module.exports = {
   title: '服务器地址写成 [::1] 时自动纠正并写回配置',
   async run(ctx) {
     const own = await ctx.startApp({
+      /* 独占 CDP 端口：多场景连跑时上一轮的 app 退出慢会占着默认端口，
+       * 连过去就成了「Target closed」→ 报 Cannot read properties of undefined (reading 'result')。 */
+      cdpOffset: 14,
       seed: (dir) => {
         const userData = path.join(dir, 'frp-console-data');
         fs.mkdirSync(userData, { recursive: true });

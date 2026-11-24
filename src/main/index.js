@@ -1538,6 +1538,7 @@ function connectionSummary(conn) {
     name: conn.name,
     serverId: conn.serverId,
     configPath: conn.configPath,
+    logPath: conn.logPath || '',
     adminPort: (snap && snap.adminPort) || conn.adminPort,
     enabled: conn.enabled,
     active: conn.id === settings.activeConnectionId,
@@ -3706,6 +3707,8 @@ function crossConnectionPortClash(proxy, { excludeName = '' } = {}) {
       id,
       name,
       configPath: cfg,
+      /* 每条连接自己的日志文件：不填的话 frpc 默认写 console，界面里这条连接就没有日志可看。 */
+      logPath: path.join(dir, 'frpc.log'),
       adminPort,
       enabled: payload.enabled !== false,
     });
@@ -3736,6 +3739,8 @@ function crossConnectionPortClash(proxy, { excludeName = '' } = {}) {
         return fail('配置文件不存在');
       }
       patch.configPath = wanted;
+      /* 换了配置文件就跟着换日志文件：否则这条连接还往旧目录写日志。 */
+      patch.logPath = path.join(path.dirname(wanted), 'frpc.log');
     }
     if (payload.adminPort !== undefined) {
       const port = connectionsModule.clampPort(payload.adminPort);

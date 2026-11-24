@@ -152,6 +152,18 @@ async function main() {
       const instancePort = INSTANCE_PORT + cdpOffset;
       const inst = await appHelper.start({ cdpPort, instancePort, dataDir: dir });
       const ready = await cdp.waitReady(cdpPort, 40);
+      /* 端口可连 ≠ 界面可用：等侧栏渲染出来（index.html 解析完、app.js 首帧跑完）。 */
+      if (ready) {
+        try {
+          await waitFor(
+            () => cdp.evalIn(cdpPort, '!!document.querySelector(".nav-item")'),
+            (v) => v === true,
+            { timeout: 30000, label: '界面就绪' },
+          );
+        } catch {
+          /* 起不来时让场景自己去报更有意义的错（比如读 app.log） */
+        }
+      }
       return {
         dir,
         cdpPort,

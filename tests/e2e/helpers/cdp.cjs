@@ -11,9 +11,15 @@ function httpJson(port, p) {
   });
 }
 
-async function evalIn(port, expr, timeoutMs = 120000) {
+/* 主窗口优先：托盘面板 / devtools 也会出现在 /json/list 里，但它们随时会被关掉。 */
+function pickPage(list) {
+  const pages = (list || []).filter((x) => x.type === 'page' && x.webSocketDebuggerUrl);
+  return pages.find((p) => /index\.html/.test(p.url || '')) || pages[0] || null;
+}
+
+async function evalOnce(port, expr, timeoutMs) {
   const list = await httpJson(port, '/json/list');
-  const page = list.find((x) => x.type === 'page' && x.webSocketDebuggerUrl);
+  const page = pickPage(list);
   if (!page) throw new Error('no page target');
   const ws = new WebSocket(page.webSocketDebuggerUrl);
   await new Promise((r, j) => { ws.onopen = r; ws.onerror = j; });
@@ -29,12 +35,32 @@ async function evalIn(port, expr, timeoutMs = 120000) {
       params: { expression: expr, awaitPromise: true, returnByValue: true },
     }));
   });
-  ws.close();
-  if (msg.result && msg.result.exceptionDetails) {
+  try { ws.close(); } catch { /* 已经关了 */ }
+  if (msg.error) throw new Error(`CDP eval 失败：${(msg.error && msg.error.message) || JSON.stringify(msg.error)}`);
+  if (!msg.result) throw new Error('CDP eval 没有拿到结果（页面可能已关闭或导航中）');
+  if (msg.result.exceptionDetails) {
     const ex = msg.result.exceptionDetails;
     throw new Error((ex.exception && (ex.exception.description || ex.exception.value)) || JSON.stringify(ex));
   }
   return msg.result.result.value;
+}
+
+function retryable(err) {
+  return /Execution context was destroyed|Target closed|no page target|Session closed/i.test(String((err && err.message) || err));
+}
+
+async function evalIn(port, expr, timeoutMs = 120000) {
+  let last = null;
+  for (let i = 0; i < 3; i += 1) {
+    try {
+      return await evalOnce(port, expr, timeoutMs);
+    } catch (e) {
+      last = e;
+      if (!retryable(e)) throw e;
+      await new Promise((r) => setTimeout(r, 700));
+    }
+  }
+  throw last;
 }
 
 async function waitReady(port, tries = 60) {
@@ -52,7 +78,7 @@ async function waitReady(port, tries = 60) {
 /* 重载渲染进程（改了 app.js / styles.css 之后不用重启 electron） */
 async function reloadPage(port) {
   const list = await httpJson(port, '/json/list');
-  const page = list.find((x) => x.type === 'page' && x.webSocketDebuggerUrl);
+  const page = pickPage(list);
   if (!page) throw new Error('no page target');
   const ws = new WebSocket(page.webSocketDebuggerUrl);
   await new Promise((r, j) => { ws.onopen = r; ws.onerror = j; });

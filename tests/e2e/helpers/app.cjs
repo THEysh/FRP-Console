@@ -41,6 +41,34 @@ function frpcBinary() {
   }) || '';
 }
 
+/* 上一次跑留下的实例可能还占着同一个 CDP 端口（关窗口/退出慢，或上一轮被中途杀掉）。
+ * 不清掉的话 waitReady 会连到「正在消失的页面」，求值报 Execution context was destroyed /
+ * Target closed —— 表现成随机失败，还会让人误以为是产品 bug。 */
+function killPort(port) {
+  try {
+    const out = execFileSync('netstat', ['-ano'], { encoding: 'utf8', windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
+    const pids = new Set();
+    const needle = `:${port} `;
+    for (const line of out.split('\n')) {
+      if (!line.includes(needle)) continue;
+      if (!/LISTENING/i.test(line)) continue;
+      const parts = line.trim().split(/\s+/);
+      const pid = Number(parts[parts.length - 1]);
+      if (Number.isInteger(pid) && pid > 0) pids.add(pid);
+    }
+    for (const pid of pids) {
+      try {
+        execFileSync('taskkill', ['/F', '/T', '/PID', String(pid)], { stdio: 'ignore', windowsHide: true });
+      } catch {
+        /* 已经没了 */
+      }
+    }
+    return pids.size;
+  } catch {
+    return 0;
+  }
+}
+
 async function start(options = {}) {
   const cdpPort = Number(options.cdpPort || 9450);
   const instancePort = Number(options.instancePort || 47950);
@@ -91,6 +119,9 @@ async function start(options = {}) {
     );
   }
 
+  /* 起之前先把占着这个 CDP 端口的旧实例清掉（见 killPort 注释）。 */
+  killPort(cdpPort);
+
   const env = { ...process.env };
   delete env.ELECTRON_RUN_AS_NODE;
   env.PORTABLE_EXECUTABLE_DIR = dir;
@@ -135,4 +166,4 @@ async function start(options = {}) {
   };
 }
 
-module.exports = { start, electronBinary, frpcBinary, ROOT };
+module.exports = { start, electronBinary, frpcBinary, killPort, ROOT };
