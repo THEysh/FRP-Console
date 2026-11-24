@@ -1475,6 +1475,28 @@ function managerForConnection(connId) {
   return created;
 }
 
+/* 连接列表（含运行时与计数），给界面与托盘用。 */
+function connectionList() {
+  return ((settings && settings.connections) || []).map(connectionSummary);
+}
+
+/* 跨连接汇总：hero 上「N 条隧道 / 在线 X」就是从这里来的。
+ * 只统计 enabled 的连接；running 指「这条连接的 frpc 真的连着 frps」。 */
+function connectionAggregate() {
+  const list = connectionList();
+  const agg = { connections: list.length, enabled: 0, running: 0, total: 0, online: 0, unchecked: 0, unhealthy: 0 };
+  for (const conn of list) {
+    if (conn.enabled) agg.enabled += 1;
+    if (conn.runtime && conn.runtime.connected) agg.running += 1;
+    const c = conn.counts || {};
+    agg.total += Number(c.total) || 0;
+    agg.online += Number(c.online) || 0;
+    agg.unchecked += Number(c.unchecked) || 0;
+    agg.unhealthy += Number(c.unhealthy) || 0;
+  }
+  return agg;
+}
+
 /* 一条连接的代理计数。口径与概览一致：status=running 且（没有健康数据或健康通过）才算在线，
  * 「没测过」单独计一档，方便界面显示「待检测」而不是假装在线。 */
 function connectionCounts(conn) {
@@ -1799,6 +1821,10 @@ function buildState() {
     runtime,
     service: serviceCache,
     proxies,
+    /* 多连接：界面的切换器/托盘/概览汇总都读这里。
+     * 每条带 runtime 与 counts；顶层 proxies 仍然只描述「当前连接」。 */
+    connections: connectionList(),
+    connectionsAgg: connectionAggregate(),
     counts: (() => {
       /* 只有“隧道状态 running 且三层检查真的通过”才算在线。
        * 以前 `!p.health || p.health.ok` 把“还没检查”也当成在线，
@@ -3540,6 +3566,159 @@ function registerIpc() {
     return result.ok ? ok({ connection: connectionSummary(conn) }) : fail(result.error, { connection: connectionSummary(conn) });
   });
 
+  /* 新建一条连接：给它一个独立的配置文件（空的起步配置），不是复制当前连接的内容 ——
+   * 复制会把 serverAddr/token 带过去，等于悄悄多开一条连同一台服务器的隧道。 */
+  ipcMain.handle('connections:add', async (event, payload = {}) => {
+    const name = String((payload && payload.name) || '').trim();
+    if (!name) return fail('请给这条连接起个名字（例如「广州 frp」）');
+    const list = (settings.connections || []);
+    if (list.length >= connectionsModule.MAX_CONNECTIONS) return fail(`最多 ${connectionsModule.MAX_CONNECTIONS} 条连接`);
+    if (list.some((conn) => String(conn.name || '').trim().toLowerCase() === name.toLowerCase())) return fail(`已经有叫「${name}」的连接了`);
+    const id = connectionsModule.newConnectionId();
+    if (list.some((conn) => conn.id === id)) return fail('生成连接 id 失败，请重试');
+    /* 每条连接一个目录：配置文件、日志、备份都落在自己的目录里，互不覆盖。 */
+    const dir = path.join(settingsModule.dataDir(), 'connections', id);
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+    } catch (e) {
+      return fail(`创建连接目录失败：${(e && e.message) || e}`);
+    }
+    const cfg = path.join(dir, 'frpc.toml');
+    if (!fs.existsSync(cfg)) {
+      fs.writeFileSync(cfg, STARTER_CONFIG, 'utf8');
+    }
+    /* nextFreePort 要 Set；同时避开所有已有连接与全局投影的端口。 */
+    const usedPorts = new Set([Number(settings.adminPort) || 0, ...list.map((conn) => Number(conn.adminPort) || 0)]);
+    const adminPort = connectionsModule.nextFreePort(usedPorts, Number(settings.adminPort) || 7400);
+    const conn = connectionsModule.normalizeConnection({
+      id,
+      name,
+      configPath: cfg,
+      adminPort,
+      enabled: payload.enabled !== false,
+    });
+    settings = settingsModule.save({ connections: [...list, conn] });
+    pushState();
+    return ok({ connection: connectionSummary(connectionById(id)), connections: connectionList() });
+  });
+
+  /* 改连接的名字 / 配置文件 / 启用状态。改当前连接的配置路径时，全局投影要一起换。 */
+  ipcMain.handle('connections:update', async (event, payload = {}) => {
+    const conn = connectionById(String((payload && payload.id) || ''));
+    if (!conn) return fail('连接不存在（可能已被删除）');
+    const patch = {};
+    if (payload.name !== undefined) {
+      const name = String(payload.name || '').trim();
+      if (!name) return fail('连接名不能为空');
+      const taken = (settings.connections || []).some((item) => item.id !== conn.id && String(item.name || '').trim().toLowerCase() === name.toLowerCase());
+      if (taken) return fail(`已经有叫「${name}」的连接了`);
+      patch.name = name;
+    }
+    if (payload.configPath !== undefined) {
+      const wanted = String(payload.configPath || '').trim();
+      if (!wanted) return fail('配置文件路径不能为空');
+      try {
+        const st = fs.statSync(wanted);
+        if (st.isDirectory()) return fail('这是一个文件夹，不是配置文件');
+      } catch {
+        return fail('配置文件不存在');
+      }
+      patch.configPath = wanted;
+    }
+    if (payload.adminPort !== undefined) {
+      const port = connectionsModule.clampPort(payload.adminPort);
+      const clash = (settings.connections || []).some((item) => item.id !== conn.id && Number(item.adminPort) === port);
+      if (clash) return fail(`管理端口 ${port} 已经被另一条连接占用（每条连接必须用不同端口）`);
+      patch.adminPort = port;
+    }
+    if (payload.enabled !== undefined) patch.enabled = payload.enabled !== false;
+    if (!Object.keys(patch).length) return ok({ connection: connectionSummary(conn), changed: false });
+    if (patch.adminPort !== undefined && patch.adminPort !== conn.adminPort) {
+      /* 端口变了，正在跑的进程会 mismatch：先停，避免“配置写进去了但还在用旧端口”。 */
+      const mm = managerForConnection(conn.id);
+      if (mm && mm.snapshot().running) await mm.stop({ runMode: conn.id === settings.activeConnectionId ? settings.runMode : 'managed' }).catch(() => {});
+    }
+    settings = settingsModule.save({
+      connections: (settings.connections || []).map((item) => (item.id === conn.id ? { ...item, ...patch } : item)),
+    });
+    if (conn.id === settings.activeConnectionId) {
+      /* 当前连接的投影在顶层：路径/端口变了要立刻反映，否则后续读写还在用旧路径。 */
+      const fresh = connectionById(conn.id);
+      settings = settingsModule.save({
+        configPath: fresh.configPath,
+        adminPort: Number(fresh.adminPort) || settings.adminPort,
+        logPath: fresh.logPath || settingsModule.logPathFromConfig(connectionModel(fresh), fresh.configPath) || '',
+      });
+      paths = { ...paths, configPath: settings.configPath, adminPort: settings.adminPort, logPath: settings.logPath };
+      invalidateConnectionModel(conn.id);
+      loadConfigFromDisk();
+      updateLogFile();
+    }
+    pushState();
+    return ok({ connection: connectionSummary(connectionById(conn.id)), changed: true, connections: connectionList() });
+  });
+
+  /* 删一条连接：只删档案条目，磁盘上的 frpc.toml 保留（不替用户删数据）。 */
+  ipcMain.handle('connections:remove', async (event, connId) => {
+    const conn = connectionById(String(connId || ''));
+    if (!conn) return fail('连接不存在（可能已被删除）');
+    if (conn.id === settings.activeConnectionId) return fail('这是当前连接：先切到另一条连接，再删它');
+    const mm = multiConnection && multiConnection.extraManagers.get(conn.id);
+    if (mm && mm.snapshot().running) await mm.stop({ runMode: 'managed' }).catch(() => {});
+    const guard = multiConnection && multiConnection.guards.get(conn.id);
+    if (guard) guard.cancel('连接被删除');
+    if (multiConnection) {
+      multiConnection.extraManagers.delete(conn.id);
+      multiConnection.guards.delete(conn.id);
+      multiConnection.stopRequests.delete(conn.id);
+      invalidateConnectionModel(conn.id);
+    }
+    settings = settingsModule.save({
+      connections: (settings.connections || []).filter((item) => item.id !== conn.id),
+    });
+    pushState();
+    return ok({ removed: true, configPath: conn.configPath, connections: connectionList() });
+  });
+
+  /* 切换当前连接：先停掉正在跑的隧道，再换投影。
+   * 之所以要停：全局 manager 的 ctx 读的是全局 model，切过去而进程还活着，
+   * 两边就会各说各话（改配置、健康检查、日志跟随全部错位）。 */
+  ipcMain.handle('connections:active', async (event, connId) => {
+    const conn = connectionById(String(connId || ''));
+    if (!conn) return fail('连接不存在（可能已被删除）');
+    if (conn.id === settings.activeConnectionId) return ok({ changed: false, connections: connectionList() });
+    const stopped = [];
+    if (manager && manager.snapshot().running) {
+      tunnelDesired = false;
+      if (supervisor) supervisor.cancel('切换连接');
+      await manager.stop({ runMode: settings.runMode }).catch(() => {});
+      await manager.refresh().catch(() => {});
+      stopped.push(settings.activeConnectionId);
+    }
+    for (const [id, mm] of (multiConnection ? multiConnection.extraManagers : new Map())) {
+      if (!mm || !mm.snapshot().running) continue;
+      const guard = multiConnection.guards.get(id);
+      if (guard) guard.cancel('切换连接');
+      await mm.stop({ runMode: 'managed' }).catch(() => {});
+      await mm.refresh().catch(() => {});
+      stopped.push(id);
+    }
+    healthCache.clear();
+    settings = settingsModule.save({
+      activeConnectionId: conn.id,
+      configPath: conn.configPath,
+      adminPort: Number(conn.adminPort) || settings.adminPort,
+      logPath: conn.logPath || settingsModule.logPathFromConfig(connectionModel(conn), conn.configPath) || '',
+    });
+    paths = { ...paths, configPath: settings.configPath, adminPort: settings.adminPort, logPath: settings.logPath };
+    startedFingerprint = '';
+    invalidateConnectionModel(conn.id);
+    loadConfigFromDisk();
+    updateLogFile();
+    await manager.refresh().catch(() => {});
+    pushState();
+    return ok({ changed: true, stopped, connections: connectionList(), state: buildState() });
+  });
   ipcMain.handle('listen:scan', async () => {
     const result = await netport.listListeners();
     if (!result.ok) return fail(result.error, { listeners: [] });
