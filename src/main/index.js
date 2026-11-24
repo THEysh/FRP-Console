@@ -5488,6 +5488,16 @@ function ensureStarterConfig() {
 
 async function bootstrap() {
   settings = settingsModule.load();
+  /* 多连接迁移只在第一次升级时写盘一次（load 本身是只读的）。
+   * 落盘之后，settings.json 里才有 connections[]；界面与运行期行为都不变。 */
+  try {
+    if (settingsModule.persistMigration()) {
+      settings = settingsModule.load();
+      console.log('[connections] 已把单份配置迁移成一条连接（id=c-default）');
+    }
+  } catch (e) {
+    console.warn('[connections] 迁移落盘失败，本次仍按内存结果运行：', e && e.message);
+  }
   /* 管理 API 的口令。
    * 老版本写死 admin/admin，本机任何进程只要知道这个口令（写在文档里）就能
    * GET /api/config 读到自己 frpc 配置的明文 —— 里面带着 frps 的 auth.token。

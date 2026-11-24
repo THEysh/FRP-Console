@@ -475,6 +475,7 @@ npm install --cache .\.npm-cache
 src/main/          主进程
   index.js         IPC、窗口、托盘、状态机
   frpc.js          frpc 进程托管、管理 API、热重载
+  connections.js   多连接的数据层（每条 = 一个 frpc 进程 + 一份配置 + 一个管理端口）
   settings.js      设置、服务器档案、按档案加密的密码库（DPAPI）
   config.js        frpc.toml 解析与写入
   service.js       Windows 服务检测与启停

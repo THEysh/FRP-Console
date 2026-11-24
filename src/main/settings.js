@@ -5,6 +5,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { app, safeStorage } = require('electron');
 const { readJson, writeJsonAtomic, ensureDir } = require('./util');
+const connections = require('./connections');
 
 const DEFAULT_SETTINGS = {
   version: 2,
@@ -51,6 +52,11 @@ const DEFAULT_SETTINGS = {
   servers: [],
   activeServerId: '',
   clientServerId: '',
+  /* 多连接：每条 = 一个 frpc 进程 + 一份 frpc.toml + 一个管理端口。
+   * 老用户第一次升级时会被迁移成一条（id=c-default），行为与升级前完全一致。
+   * 详见 src/main/connections.js 头部的不变量说明。 */
+  connections: [],
+  activeConnectionId: '',
   /* 代理的「访问路径」：很多服务（Go 写的面板、Jellyfin 的反代前置等）根路径直接 404，
    * 真正入口在 /panel/ 这类子路径上。frpc 不认这个字段（未知字段会让整份配置 unmarshal 失败），
    * 所以存在我们自己这边，按代理名索引，只用于生成链接与健康检查探测。 */
@@ -161,6 +167,8 @@ function mergeDuplicateServers(list) {
 }
 
 let cached = null;
+/* 多连接迁移是否还没落盘（load() 只改内存，见 persistMigration）。 */
+let migrationPending = false;
 // v1 的 settings.server.host 只在首次载入时存在，单独记一份，
 // 避免 save() 之后丢掉线索导致单密码永远无法迁移。
 let legacyHostMemo = '';
@@ -223,13 +231,18 @@ function sanitizeSettings(input) {
     ? out.certDirs.filter((item) => typeof item === 'string' && item.trim()).slice(0, 8)
     : [];
   if (!out.proxyOpenPaths || typeof out.proxyOpenPaths !== 'object' || Array.isArray(out.proxyOpenPaths)) out.proxyOpenPaths = {};
+  /* 连接列表只做「形状」收敛：真正的迁移（造第一条、端口去重、id 去重）在
+   * migrateConnections 里做，避免这里生成随机 id 导致每次 load 都“有变化”。 */
+  out.connections = Array.isArray(out.connections)
+    ? out.connections.filter((item) => item && typeof item === 'object').slice(0, connections.MAX_CONNECTIONS)
+    : [];
+  out.activeConnectionId = typeof out.activeConnectionId === 'string' ? out.activeConnectionId : '';
   for (const key of OBSOLETE_KEYS) delete out[key];
   return out;
 }
 
 function load() {
-  if (cached) return cached;
-  const raw = readJson(settingsFile(), {});
+  if (cached) return cached;  const raw = readJson(settingsFile(), {});
   const base = raw && typeof raw === 'object' ? raw : {};
   const servers = normalizeServers(base.servers);
   // v1 迁移：旧的 settings.server 是唯一的一份 SSH 连接信息，升级成第一个档案。
@@ -290,8 +303,32 @@ function load() {
    * 字符串回到默认值。 */
   cached = sanitizeSettings(cached);
   delete cached.server;
+  /* 多连接迁移：老数据（只有顶层 configPath/logPath/adminPort）在这里变成一条连接。
+   * 迁移只改内存，落盘交给 persistMigration()——index.js 启动时调用一次，
+   * 这样 load() 保持“只读”，单测里不会往磁盘写东西。 */
+  const migrated = connections.migrateConnections(cached);
+  cached.connections = migrated.connections;
+  cached.activeConnectionId = migrated.activeConnectionId;
+  migrationPending = migrated.changed;
+  /* 投影：阶段 1 的运行期代码仍然只读顶层这三个字段，所以让它们跟着“当前连接”走。
+   * 等到进程层多实例化完成后，这份投影就只用于兼容旧代码，不再是真相。 */
+  const activeConn = connections.findConnection(cached.connections, cached.activeConnectionId);
+  if (activeConn) {
+    cached.configPath = activeConn.configPath || '';
+    cached.logPath = activeConn.logPath || '';
+    cached.adminPort = activeConn.adminPort || DEFAULT_SETTINGS.adminPort;
+  }
   legacyHostMemo = String((base.server && base.server.host) || legacyHostMemo || '');
   return cached;
+}
+
+/* 迁移是否需要落盘（只在第一次升级时 true）。 */
+function persistMigration() {
+  load();
+  if (!migrationPending) return false;
+  migrationPending = false;
+  writeJsonAtomic(settingsFile(), cached);
+  return true;
 }
 
 function legacyServerHost() {
@@ -443,6 +480,32 @@ function save(patch) {
   cached.version = 2;
   cached.servers = normalizeServers(cached.servers);
   delete cached.server;
+  /* 连接列表：切换/新增走 patch.activeConnectionId / patch.connections；
+   * 只改 configPath/logPath/adminPort 时，写回“当前连接”，避免两边各说各话。 */
+  const incoming = connections.migrateConnections(cached);
+  let list = incoming.connections;
+  const wantedActive = String((patch && patch.activeConnectionId) || '');
+  const switching = !!(wantedActive && wantedActive !== incoming.activeConnectionId
+    && list.some((item) => item.id === wantedActive));
+  const activeId = switching ? wantedActive : incoming.activeConnectionId;
+  if (switching) {
+    // 切到另一条：顶层三个字段跟着新的那条走（不要把新连接的路径覆盖成旧的）
+    const target = connections.findConnection(list, activeId);
+    if (target) {
+      cached.configPath = target.configPath || '';
+      cached.logPath = target.logPath || '';
+      cached.adminPort = target.adminPort || DEFAULT_SETTINGS.adminPort;
+    }
+  } else {
+    const applied = connections.applyLegacyPaths(list, activeId, {
+      configPath: cached.configPath,
+      logPath: cached.logPath,
+      adminPort: cached.adminPort,
+    });
+    list = applied.connections;
+  }
+  cached.connections = list;
+  cached.activeConnectionId = activeId;
   if (!cached.servers.some((item) => item.id === cached.activeServerId)) {
     // 优先落回“本机隧道绑定”的档案，其次才取第一个，避免当前查看的档案被随机改掉。
     const fallback = cached.servers.find((item) => item.id === cached.clientServerId) || cached.servers[0];
@@ -577,6 +640,7 @@ module.exports = {
   newServerId,
   normalizeServerProfile,
   sanitizeSettings,
+  persistMigration,
   OBSOLETE_KEYS,
   serverProfileKey,
   mergeDuplicateServers,
