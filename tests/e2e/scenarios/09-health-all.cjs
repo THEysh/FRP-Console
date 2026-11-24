@@ -48,8 +48,10 @@ module.exports = {
         const bulk = (r.data.proxies || []).filter((p) => /^bulk-/.test(p.name));
         return { total: bulk.length, withHealth: bulk.filter((p) => p.health).length, reasons: bulk.filter((p) => p.health && !p.health.ok).map((p) => p.name + ':' + (p.health.reason || '')) };
       })()`),
-      (s) => s && s.total >= 20 && s.withHealth >= 20,
-      { timeout: 60000, label: '20 条代理全部被检查到' },
+      /* 只等「都检查到」会在 reload 边界上误报：最后一两条还是上一轮的结果。
+       * 等「都检查到且都正常」，真有问题也只是拖到超时，不会把正常情况报成故障。 */
+      (s) => s && s.total >= 20 && s.withHealth >= 20 && s.reasons.length === 0,
+      { timeout: 90000, label: '20 条代理全部检查到且都正常' },
     );
     check('20 条代理都有健康结果（没有被 slice 截断）', checked.withHealth >= 20, JSON.stringify(checked).slice(0, 240));
     check('全部判定为通', checked.reasons.length === 0, JSON.stringify(checked.reasons));

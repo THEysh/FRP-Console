@@ -326,7 +326,15 @@ class FrpcManager extends EventEmitter {
     return this.startPromise;
   }
 
-  async _start({ runMode = 'auto' } = {}) {
+  async _start({ runMode = 'auto', force = false } = {}) {
+    /* force：重连守护专用。
+     * 进程刚被外面杀掉时，apiOk 还是上一次刷新的结果（true），下面那句
+     * 「已经在跑」会让重连变成空操作 —— 守护数着次数、隧道却一直没起来。
+     * 先刷一次状态，并确认子进程真的没了再清掉 apiOk。 */
+    if (force) {
+      await this.refresh().catch(() => {});
+      if (!this.isChildAlive) this.apiOk = false;
+    }
     if (this.apiOk) {
       // 端口被别人的 frpc 占着：既不能接管，也不能假装已经启动成功
       if (this.ownership === 'foreign') {
@@ -349,11 +357,30 @@ class FrpcManager extends EventEmitter {
     /* 起进程前先看一眼管理端口：端口上已经有人（通常是另一份配置/安装版控制台的 frpc），
      * frpc 必然 bind 失败 —— 而它只会吐一句 Go 原文，还要白等十几秒 API 超时。
      * 这里提前判掉，直接给「换端口 / 关掉它」的处理办法。 */
-    const adminFree = await tcpCheck('127.0.0.1', this.admin.port, 700)
-      .then((r) => !(r && r.ok))
-      .catch(() => true);
+    /* 「停了马上又启」时，刚退出的 frpc 可能还占着管理端口几百毫秒。
+     * 直接判「端口被占用」会让用户以为有别的程序，实际是我们自己上一秒的进程。
+     * 所以给 3 秒宽限：每次 400ms，中途放行了就走。 */
+    let adminFree = false;
+    for (let i = 0; i < 8; i += 1) {
+      adminFree = await tcpCheck('127.0.0.1', this.admin.port, 700)
+        .then((r) => !(r && r.ok))
+        .catch(() => true);
+      if (adminFree) break;
+      await sleep(400);
+    }
     if (!adminFree) return { ok: false, error: adminPortBusyText(this.admin.port) };
-    return this.spawnManaged();
+    /* 端口探测说「空着」不等于 frpc 就能 bind 成功：刚被 taskkill 的进程，套接字释放
+     * 比 TCP 探测看到 ECONNREFUSED 要晚一点，frpc 会以 "bind: Only one usage of each
+     * socket address" 退出。重连守护只等 1 秒就重试，正好撞上这个窗口 —— 表现为
+     * 「第 1 次重连成功」紧接着又退出、之后每次都因端口占用失败。
+     * 所以在这一层再补几次重试，把「上一秒还是我们自己的进程」这段时间熬过去。 */
+    let result = await this.spawnManaged();
+    for (let i = 0; i < 8 && result && result.ok === false && /管理端口|Only one usage/i.test(String(result.error || '')); i += 1) {
+      await sleep(2000);
+      this.lastExit = null;
+      result = await this.spawnManaged();
+    }
+    return result;
   }
 
   async stop({ runMode = 'auto' } = {}) {
@@ -468,6 +495,9 @@ class FrpcManager extends EventEmitter {
         code,
         signal,
         at: Date.now(),
+        /* 这次退出是不是「用户让停的」。外面 taskkill 掉 frpc 时退出码可能是 0，
+         * 只看 error/退出码会把「被杀了」当成正常结束，自动重连一次都不会触发。 */
+        intentional: !!intentional,
         error: intentional || code === 0 || signal
           ? null
           : startFailureText((stderr || stdout || `frpc 退出（代码 ${code}）`).split(/\r?\n/).slice(-3).join(' '), this.admin.port),

@@ -1370,6 +1370,12 @@ function connectionPaths(conn) {
   };
 }
 
+/* 配置文件被改写（启动前补 webServer、外部改动、用户保存）之后必须丢掉缓存，
+ * 否则健康检查还按旧端口/旧代理列表判，界面会显示上一次的状态。 */
+function invalidateConnectionModel(connId) {
+  if (multiConnection && multiConnection.parkedModels) multiConnection.parkedModels.delete(connId);
+}
+
 /* 连接自己的配置模型：当前连接用全局 model，其它连接按需读自己的 frpc.toml。
  * 读不到就返回 null —— 让 FrpcManager 报“配置不可用”，而不是拿别人的配置去连。 */
 function connectionModel(conn) {
@@ -1395,10 +1401,17 @@ function ensureAdminForConnection(conn) {
   if (!conn || !conn.configPath) return { ok: false, error: '这条连接还没有配置文件' };
   const connModel = connectionModel(conn);
   if (!connModel) return { ok: false, error: `读不到配置文件：${conn.configPath}` };
-  const changed = configModule.ensureAdmin(connModel, settings);
+  /* 用「这条连接自己的」管理端口/口令，不能拿全局 settings：
+   * 全局那份描述的是当前连接，写进别的连接会让两条隧道抢同一个端口。 */
+  const connSettings = {
+    ...settings,
+    adminPort: Number(conn.adminPort) || settings.adminPort,
+  };
+  const changed = configModule.ensureAdmin(connModel, connSettings);
   if (!changed) return { ok: true };
   const write = configModule.writeConfig(conn.configPath, connModel);
   if (write.ok === false) return { ok: false, error: write.error };
+  invalidateConnectionModel(conn.id);
   return { ok: true };
 }
 
@@ -1411,7 +1424,7 @@ function managerForConnection(connId) {
   if (!store) return null;
   if (store.has(conn.id)) return store.get(conn.id);
   const created = new FrpcManager({
-    getSettings: () => settings,
+    getSettings: () => ({ ...settings, adminPort: Number(conn.adminPort) || settings.adminPort }),
     getPaths: () => connectionPaths(conn),
     getConfig: () => connectionModel(conn),
     ensureAdminConfig: async () => ensureAdminForConnection(conn),
@@ -1419,15 +1432,66 @@ function managerForConnection(connId) {
      * 这样也不会去 sc start 一个和别的连接同名的服务。 */
     stopService: async () => ({ ok: false, error: '多连接只支持「应用托管进程」' }),
   });
-  created.on('exit', () => {
+  /* 非当前连接也要能自己回来：它和当前连接一样会遇到「frpc 被外面杀掉 / 睡眠后假死」。
+   * 每条连接一个守护，互不影响（当前连接的守护在 bootstrap 里建，逻辑不变）。 */
+  const guard = new ReconnectSupervisor({
+    restart: async () => {
+      suppressExitUntil = Date.now() + 8000;
+      /* force：进程是被外面杀掉的，apiOk 还是旧值，不 force 会误判『已经在跑』。 */
+      const result = await created.start({ runMode: 'managed', force: true });
+      await created.refresh().catch(() => {});
+      pushState();
+      return result;
+    },
+    canRestart: () => settings.autoReconnect !== false && conn.enabled !== false,
+    onChange: () => pushState(),
+    log: (message, level) => {
+      const line = `${new Date().toISOString().slice(0, 19).replace('T', ' ')} ${level === 'error' ? 'ERR' : 'WRN'} [${conn.name}] ${message}`;
+      if (process.env.FRP_CONSOLE_DEBUG) console.log('[guard]', conn.id, message);
+      try {
+        follower.appendLines(line);
+      } catch { /* 日志失败不影响重连 */ }
+    },
+  });
+  created.on('exit', (info) => {
+    if (process.env.FRP_CONSOLE_DEBUG) console.log('[guard-exit]', conn.id, JSON.stringify(info));
+    invalidateConnectionModel(conn.id);
     pushState();
     refreshTray();
+    const stoppedAt = (multiConnection && multiConnection.stopRequests.get(conn.id)) || 0;
+    const justStoppedByUs = Date.now() - stoppedAt < 3000;
+    if (process.env.FRP_CONSOLE_DEBUG) console.log('[guard-window]', conn.id, 'sinceStop=', Date.now() - stoppedAt, 'skip=', justStoppedByUs);
+    /* 不再看 info.intentional：frpc 的 stopping 标记在 stop→start 边界上不可靠
+     *（探针里被 taskkill 掉的进程仍报 intentional:true），只信时间窗。 */
+    if (info && !justStoppedByUs) {
+      guard.arm(String(info.error || '连接意外退出').slice(0, 120));
+    }
   });
+  if (multiConnection) multiConnection.guards.set(conn.id, guard);
   created.on('error', (e) => {
     if (process.env.FRP_CONSOLE_DEBUG) console.warn('[connections] manager error', e && e.message);
   });
   store.set(conn.id, created);
   return created;
+}
+
+/* 一条连接的代理计数。口径与概览一致：status=running 且（没有健康数据或健康通过）才算在线，
+ * 「没测过」单独计一档，方便界面显示「待检测」而不是假装在线。 */
+function connectionCounts(conn) {
+  const isActive = conn.id === settings.activeConnectionId;
+  const connModel = isActive ? model : connectionModel(conn);
+  const mm = isActive ? manager : (multiConnection && multiConnection.extraManagers.get(conn.id));
+  const statuses = (mm && mm.proxyStatus) || new Map();
+  const list = (connModel && connModel.proxies) || [];
+  let online = 0;
+  let unchecked = 0;
+  for (const proxy of list) {
+    const st = statuses.get(proxy.name) || null;
+    const health = healthCache.get(connectionsModule.keyOf(conn.id, proxy.name)) || null;
+    if (!health) unchecked += 1;
+    if (st && st.status === 'running' && (!health || health.ok)) online += 1;
+  }
+  return { total: list.length, online, unchecked, unhealthy: list.length - online };
 }
 
 /* 一条连接的对外摘要（给界面/诊断用，不含配置内容与 token）。 */
@@ -1442,6 +1506,7 @@ function connectionSummary(conn) {
     adminPort: (snap && snap.adminPort) || conn.adminPort,
     enabled: conn.enabled,
     active: conn.id === settings.activeConnectionId,
+    counts: connectionCounts(conn),
     runtime: snap
       ? {
         mode: snap.mode,
@@ -1674,7 +1739,8 @@ function buildState() {
   const proxies = (model ? model.proxies : []).map((proxy) => {
     // 管理端口上是别人的 frpc 时，它报的代理状态与本配置无关，一律当作没同步
     const st = runtime.foreign ? null : manager.proxyStatus.get(proxy.name) || null;
-    const health = healthCache.get(proxy.name) || null;
+    /* 健康缓存的键带连接前缀：两台服务器可能有同名代理，按裸名字查会互相串。 */
+    const health = healthCache.get(connectionsModule.keyOf(settings.activeConnectionId, proxy.name)) || null;
     const openPath = proxyOpenPath(proxy.name);
     const publicAddress = configModule.publicAddressFor(model, proxy, { ...settings, ...boundVhostPorts(), subDomainHost: sessionSubDomainHost(), nginxProxyEnabled: yModeEnabled() });
     return {
@@ -2155,6 +2221,8 @@ async function checkProxyHealth(p, ctx) {
   const at = Date.now();
   const layers = {};
   const type = p.type || 'tcp';
+  /* 多连接：本地探测与代理状态都取自「这条连接自己的」管理器。 */
+  const mm = ctx.mm || manager;
   /* start 列表外的代理 frpc 不会启动：本地服务通不通都没意义，
    * 直接给定这一档原因，别让它落到「隧道未建立」把人骗去查网络。 */
   if (p.startExcluded) {
@@ -2167,7 +2235,7 @@ async function checkProxyHealth(p, ctx) {
     // 硬拿 tcpCheck 去连只会把好好的 UDP 服务误报成「本地服务不通」。本地层跳过。
     local = { ok: true, ms: 0, error: null, skipped: true };
   } else {
-    local = await manager.testLocal(p);
+    local = await mm.testLocal(p);
   }
   layers.local = { ok: !!local.ok, ms: local.ms || 0, error: local.error || null, skipped: !!local.skipped };
   if (!local.ok) {
@@ -2184,7 +2252,7 @@ async function checkProxyHealth(p, ctx) {
   }
 
   // 第 2 层：本地 frpc 已连上远程服务器，且该代理已在服务端注册（frpc 状态 running）。
-  const status = manager.proxyStatus.get(p.name);
+  const status = mm.proxyStatus.get(p.name);
   const running = !!status && status.status === 'running';
   if (!running) {
     const raw = String((status && (status.err || status.status)) || '').trim();
@@ -2456,45 +2524,48 @@ async function checkProxyHealth(p, ctx) {
   }];
 }
 
-async function checkHealth() {
-  if (!model) return;
-  // 还没填服务器地址时，隧道和公网两层必然不通，检查出来全是红色异常，
-  // 反而让第一次打开的人以为自己配错了。等用户在设置里填好再开始算。
-  if (!model.serverAddr) {
-    healthCache.clear();
+/* 一条连接的健康检查。
+ *
+ * 缓存键必须带连接前缀：两台服务器出现同名代理完全合法，而 healthCache 过去
+ * 只按名字做键 —— 多连接之后那样会让 A 的「三层全通」直接套到 B 的同名代理上。
+ */
+async function checkConnectionHealth(connId, connModel, mm) {
+  const prefix = `${connId}::`;
+  const dropMine = () => {
+    for (const key of Array.from(healthCache.keys())) if (key.startsWith(prefix)) healthCache.delete(key);
+  };
+  if (!connModel || !connModel.serverAddr) {
+    dropMine();
     return;
   }
   /* frpc 没在跑（没启动 / 已停止 / 管理 API 不可达）时不要做检查：
    * 隧道层必然失败，于是每条代理都被判成「隧道未建立」，概览一片红字
    * 「16 个隧道未建立」——用户明明是自己没启动，却像是全坏了。
    * 清掉缓存，界面回到「待检测」，等隧道起来再测。 */
-  {
-    const snap = manager ? manager.snapshot() : null;
-    /* connected = 本机管理 API 有响应且不是别人的 frpc（snapshot 里没有 apiOk 字段） */
-    if (!snap || !snap.connected) {
-      healthCache.clear();
-      return;
-    }
+  const snap = mm ? mm.snapshot() : null;
+  if (!snap || !snap.connected) {
+    dropMine();
+    return;
   }
   // plugin 代理里，socks5/http_proxy/static_file 等没有可探测的本地后端，跳过；
   // 但 https2http/https2https 有 plugin.localAddr 后端 + https vhost 公网入口，正常测。
-  const startNames = configModule.startNamesOf(model);
-  const targets = model.proxies.filter((p) => {
-    // 被 start 列表排除的代理不探测（下面直接写一条明确原因），别白花时间也别误报
+  const startNames = configModule.startNamesOf(connModel);
+  /* 访问路径按「当前连接」取：proxyOpenPaths 在阶段 6 才会加连接前缀，
+   * 现阶段只有当前连接的代理在界面上可见，拿自己的路径就够了。 */
+  const isActive = connId === settings.activeConnectionId;
+  const targets = connModel.proxies.filter((p) => {
     if (startNames.length && !startNames.includes(p.name)) return false;
     if (!p.plugin) return true;
     const pt = p.plugin && p.plugin.type;
     return pt === 'https2http' || pt === 'https2https';
   }).map((p) => ({
-    /* 把「访问路径」挂到探测用的副本上（frpc.toml 里没有这个字段，存在 settings）。
-     * probeTargetFor 用它拼探测 URL，404 时才能说清是「路径不对」而不是「公网不可达」。 */
     ...p,
-    openPath: proxyOpenPath(p.name),
+    openPath: isActive ? proxyOpenPath(p.name) : '',
   }));
-  const ctx = { serverAddr: model.serverAddr };
+  const ctx = { serverAddr: connModel.serverAddr, mm };
   let serverCheck = null;
   ctx.serverCheck = () => {
-    if (!serverCheck) serverCheck = tcpCheck(ctx.serverAddr, Number(model.serverPort), 2500);
+    if (!serverCheck) serverCheck = tcpCheck(ctx.serverAddr, Number(connModel.serverPort), 2500);
     return serverCheck;
   };
 
@@ -2515,18 +2586,45 @@ async function checkHealth() {
       }];
     }
   });
-  for (const item of results) if (item) healthCache.set(item[0], item[1]);
+  for (const item of results) if (item) healthCache.set(connectionsModule.keyOf(connId, item[0]), item[1]);
   /* 被 start 列表排除的代理也给一条结果：否则它们既不在「在线」也不在「异常」，
    * 只会挂在「还没测完」，界面上永远显示「待检测」。 */
   if (startNames.length) {
-    for (const p of model.proxies) {
+    for (const p of connModel.proxies) {
       if (startNames.includes(p.name)) continue;
-      healthCache.set(p.name, { ok: false, startExcluded: true, reason: '不在 start 列表里（frpc 不会启动它）', ms: 0, error: null, layers: {}, at: started });
+      healthCache.set(connectionsModule.keyOf(connId, p.name), { ok: false, startExcluded: true, reason: '不在 start 列表里（frpc 不会启动它）', ms: 0, error: null, layers: {}, at: started });
     }
   }
-  // 配置里已经删掉的代理要顺手清掉，否则以后加回同名代理会读到上一次的旧结果
-  const alive = new Set(model.proxies.map((p) => p.name));
-  for (const name of Array.from(healthCache.keys())) if (!alive.has(name)) healthCache.delete(name);
+  // 配置里已经删掉的代理要顺手清掉，否则以后加回同名代理会读到上一次的旧结果。
+  // 只清这条连接的键：别的连接的缓存不能连带删掉。
+  const alive = new Set(connModel.proxies.map((p) => connectionsModule.keyOf(connId, p.name)));
+  for (const key of Array.from(healthCache.keys())) {
+    if (key.startsWith(prefix) && !alive.has(key)) healthCache.delete(key);
+  }
+}
+
+/* 一轮健康检查：把「所有有 frpc 在跑的连接」都过一遍。
+ *
+ * 当前连接用全局 model 与 manager；其它连接用各自缓存的模型与 extraManagers。
+ * 串行跑（而不是 Promise.all）：SSH/本机探测都是 IO，串行能让总耗时可控，
+ * 也避免几十条代理同时打满连接数。 */
+async function checkHealth() {
+  const list = (settings && settings.connections) || [];
+  const activeId = settings ? settings.activeConnectionId : '';
+  if (!list.length) {
+    // 还没迁移出连接（理论上 bootstrap 之后不会发生）：退回单连接行为
+    await checkConnectionHealth(activeId || '', model, manager);
+    return;
+  }
+  for (const conn of list) {
+    const isActive = conn.id === activeId;
+    const mm = isActive ? manager : (multiConnection && multiConnection.extraManagers.get(conn.id));
+    const connModel = isActive ? model : connectionModel(conn);
+    /* 未启动的连接不必探测：manager 为 undefined 时 checkConnectionHealth 会清掉它的缓存。 */
+    await checkConnectionHealth(conn.id, connModel, mm).catch((e) => {
+      if (process.env.FRP_CONSOLE_DEBUG) console.warn('[health] 连接检查失败', conn.id, e && e.message);
+    });
+  }
 }
 
 /* 用 frpc 自己的解析器过一遍配置：像 `bogusTopLevel` 这种字段我们读得懂（进了 _extra），
@@ -2673,17 +2771,37 @@ async function ensureAdminPortUsable() {
   const taken = async (port) => tcpCheck('127.0.0.1', port, 400).then((r) => !!(r && r.ok)).catch(() => true);
   if (!(await taken(settings.adminPort))) return '';
   const from = Number(settings.adminPort) || 7400;
+  /* 别的连接预留的端口不能用：它们不属于「空闲」，只是还没启动。
+   * 不排除的话，A 会挪到 B 的端口上，B 之后永远起不来（而且报的是「被别的 frpc 占用」，
+   * 排查方向完全跑偏）。 */
+  const reserved = new Set(((settings && settings.connections) || [])
+    .filter((conn) => conn && conn.id !== settings.activeConnectionId)
+    .map((conn) => Number(conn.adminPort) || 0));
   let picked = 0;
   for (let port = from + 1; port <= Math.min(65535, from + 30); port += 1) {
+    if (reserved.has(port)) continue;
     // eslint-disable-next-line no-await-in-loop
     if (!(await taken(port))) { picked = port; break; }
   }
   if (!picked) return '';
   settings = settingsModule.save({ adminPort: picked });
+  /* 连接档案上的端口也要跟着改，否则界面读的是旧值、frpc.toml 却是新值。 */
+  if (settings.activeConnectionId) {
+    settings = settingsModule.save({
+      connections: (settings.connections || []).map((conn) => (conn.id === settings.activeConnectionId
+        ? { ...conn, adminPort: picked }
+        : conn)),
+    });
+  }
   configModule.ensureAdmin(model, settings);
   const saved = persistModel(model, { reload: false });
   if (!saved.ok) {
-    settings = settingsModule.save({ adminPort: from });
+    settings = settingsModule.save({
+      adminPort: from,
+      connections: (settings.connections || []).map((conn) => (conn.id === settings.activeConnectionId
+        ? { ...conn, adminPort: from }
+        : conn)),
+    });
     return '';
   }
   pushState();
@@ -3386,6 +3504,8 @@ function registerIpc() {
       pushState();
       return result.ok ? ok({ connection: connectionSummary(conn) }) : fail(result.error, { connection: connectionSummary(conn) });
     }
+    /* 外部可能刚改过这份配置：启动前必须重新读，否则用旧模型补齐 webServer/做健康检查。 */
+    invalidateConnectionModel(conn.id);
     const mm = managerForConnection(conn.id);
     if (!mm) return fail('多连接运行期还没准备好');
     /* 非当前连接一律托管进程：服务模式只能有一台（否则要处理 nssm 多实例与 UAC）。 */
@@ -3411,6 +3531,9 @@ function registerIpc() {
     }
     const mm = managerForConnection(conn.id);
     if (!mm) return fail('多连接运行期还没准备好');
+    const guard = multiConnection && multiConnection.guards.get(conn.id);
+    if (guard) guard.cancel('用户停止了这条连接');
+    if (multiConnection) multiConnection.stopRequests.set(conn.id, Date.now());
     const result = await mm.stop({ runMode: 'managed' });
     await mm.refresh().catch(() => {});
     pushState();
@@ -5697,7 +5820,8 @@ async function bootstrap() {
     restart: async () => {
       if (!manager) return { ok: false, error: '管理器还没准备好' };
       suppressExitUntil = Date.now() + 12000;
-      const result = await manager.start({ runMode: settings.runMode });
+      /* force：同上，避免『apiOk 还是旧值 ⇒ already』把重连吞掉。 */
+      const result = await manager.start({ runMode: settings.runMode, force: true });
       await manager.refresh().catch(() => {});
       if (result && result.ok) {
         /* 用当前配置起来的，记下指纹：否则界面会一直挂着“配置变了，重启隧道才生效”。 */
@@ -5765,7 +5889,9 @@ async function bootstrap() {
     refreshTray();
     /* 判“意外”看的是有没有错误文本，而不是退出码：
      * 用户主动停止时 frpc 可能返回 1（停止时代理还没登录上），那不是故障。 */
-    const unexpected = !!(info && info.error);
+    /* 「意外」= 不是用户让停的。以前看 info.error，而 taskkill 掉的 frpc 可能以 0 退出、
+     * error 为空 → 被当成正常停止，自动重连不触发（多连接阶段 3 的探针抓到的）。 */
+    const unexpected = !!(info && info.intentional !== true);
     /* 自动重连不受 suppressExitUntil 影响 —— 那个窗口只是“别弹通知”的静音期
      *（用户刚点过停止/重启时不要把正常退出报成故障）。以前把重连也塞在窗口里，
      * 结果「停止后 12 秒内又启动、然后进程被杀」这类真实场景不会重连。 */
@@ -5806,7 +5932,12 @@ async function bootstrap() {
    */
   const extraManagers = new Map();
   const parkedModels = new Map();
-  multiConnection = { extraManagers, parkedModels };
+  const guards = new Map();
+  /* 每条连接最后一次「用户要求停止」的时刻。frpc 的 stopping 标记在
+   * stop→start 的边界上不可靠（探针里被外面杀掉的进程仍报 intentional:true），
+   * 所以额外用时间窗兜一层：刚点过停止就别再当成意外退出。 */
+  const stopRequests = new Map();
+  multiConnection = { extraManagers, parkedModels, guards, stopRequests };
   /* 这几步拿的都是"锦上添花"的信息，读不到不该让整个启动失败。
    * sc.exe 被安全软件拉黑 / 权限不足的机器上，原来会在 refreshService 直接抛出，
    * 连轮询都起不来，界面从此定格在初始状态。 */
@@ -5847,6 +5978,10 @@ async function quitApp({ source = 'user' } = {}) {
   /* 退出时把自动重连彻底关掉：否则守护的定时器可能在退出过程中把 frpc 又拉起来。 */
   tunnelDesired = false;
   if (supervisor) supervisor.cancel('退出应用');
+  if (multiConnection) {
+    for (const guard of multiConnection.guards.values()) guard.cancel('退出应用');
+    multiConnection.stopRequests.clear();
+  }
 
   const hardExit = setTimeout(() => {
     // eslint-disable-next-line no-console
@@ -5975,6 +6110,9 @@ async function prepareUpdateInstall() {
   /* 更新期间绝不能重连：安装器要覆盖安装目录，抢一个 frpc 会让升级失败。 */
   updatingNow = true;
   if (supervisor) supervisor.cancel('正在安装更新');
+  if (multiConnection) {
+    for (const guard of multiConnection.guards.values()) guard.cancel('正在安装更新');
+  }
   // 记录更新前隧道是否由控制台托管（用于更新后自动接回）
   const wasManaged = !!(manager && manager.isChildAlive);
   // 1) 优雅停掉控制台托管的 frpc（如果还在跑）

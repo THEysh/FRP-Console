@@ -61,6 +61,9 @@ class ReconnectSupervisor {
     this.fastFails = 0;
     this.lastStartAt = 0;
     this.stableTimer = null;
+    /* 每次 cancel 自增：进行中的 run() 回来后发现自己过期就收手，
+     * 不能把「用户刚点了停止」的守护又推回 stable。 */
+    this.generation = 0;
   }
 
   /* 现在是否有一个“待重连”在排队 */
@@ -116,12 +119,14 @@ class ReconnectSupervisor {
     this.nextAt = 0;
     this.changed();
     this.lastStartAt = this.now();
+    const gen = this.generation;
     let result;
     try {
       result = await this.hooks.restart();
     } catch (e) {
       result = { ok: false, error: (e && e.message) || String(e) };
     }
+    if (gen !== this.generation) return; // 期间用户停止了/条件变了：这次结果作废
     if (result && result.ok) {
       this.lastError = '';
       this.state = 'stable';
@@ -167,6 +172,7 @@ class ReconnectSupervisor {
 
   /* 运行期发现连接断了（进程还在，但管理 API 不通）时也要重置到“可以重连”的状态 */
   cancel(reason = '') {
+    this.generation += 1;
     if (this.timer) this.clearTimeout(this.timer);
     if (this.stableTimer) this.clearTimeout(this.stableTimer);
     const had = !!(this.timer || this.stableTimer || this.state !== 'idle');
