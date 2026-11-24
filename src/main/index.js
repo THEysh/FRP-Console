@@ -1476,6 +1476,19 @@ function managerForConnection(connId) {
 }
 
 /* 连接列表（含运行时与计数），给界面与托盘用。 */
+/* bootstrap 里 manager 是异步创建的，而 IPC 早就可用了：用户刚双击打开就点
+ * 「启动隧道」完全可能撞上这个窗口。等一小会儿比直接抛 TypeError 友好得多。 */
+async function waitForManager(timeout = 25000) {
+  const started = Date.now();
+  /* 等两样东西：manager（当前连接）与 multiConnection（多连接的运行期容器）。
+   * bootstrap 在这之前要做 refreshPaths / dedupeServerProfiles 之类的事情，
+   * 慢机器上确实要几秒；用「等」而不是「报错」，用户刚打开就点启动才不冤。 */
+  while ((!manager || !multiConnection) && Date.now() - started < timeout) {
+    await new Promise((r) => setTimeout(r, 120));
+  }
+  return manager;
+}
+
 function connectionList() {
   return ((settings && settings.connections) || []).map(connectionSummary);
 }
@@ -1789,6 +1802,11 @@ function buildState() {
       runtime: { mode: 'stopped', running: false, connected: false },
       service: serviceCache,
       proxies: [],
+      /* 提前返回也必须带上连接信息：运行期容器还没建好时界面照样要能列出连接，
+       * 否则启动那一两秒里侧栏连接选择器是空的，看起来像「连接都没了」。 */
+      connections: [],
+      connectionsAgg: { connections: 0, enabled: 0, running: 0, total: 0, online: 0, unchecked: 0, unhealthy: 0 },
+      activeConnectionId: '',
     };
   }
   /* 注意：这里必须先算好 runtimeView 再映射代理。
@@ -2292,6 +2310,10 @@ function browserUrlFor(target) {
 async function checkProxyHealth(p, ctx) {
   const at = Date.now();
   const layers = {};
+  /* 多连接：每个连接有自己的 frpc.toml。探测公网端口、提示里的服务器地址
+   * 都必须用**这条连接自己的** model —— 用全局 model 会拿 A 的地址去探 B 的端口，
+   * 明明通的代理被判「公网不可达」（真机双连接实测抓到）。 */
+  const m = ctx.model || model;
   const type = p.type || 'tcp';
   /* 多连接：本地探测与代理状态都取自「这条连接自己的」管理器。 */
   const mm = ctx.mm || manager;
@@ -2336,7 +2358,7 @@ async function checkProxyHealth(p, ctx) {
      * 用户把公网端口填成了 frps 自己的 bindPort——原来的提示完全不指向问题。 */
     const portUnavailable = /port unavailable/i.test(raw);
     const hitsServerPort = portUnavailable && Number(p.remotePort) > 0
-      && Number(p.remotePort) === Number(model && model.serverPort);
+      && Number(p.remotePort) === Number(m && m.serverPort);
     const reject = (status && status.status === 'start error') || conflict;
     /* 服务器没配 subDomainHost 时，frpc 只回一句英文
      * "subdomain is not supported because this feature is not enabled in server"，
@@ -2398,7 +2420,7 @@ async function checkProxyHealth(p, ctx) {
       layers.dns = { ok: dnsInfo.resolved.length > 0, skipped: false, resolved: dnsInfo.resolved, pointsToServer: dnsInfo.pointsToServer, error: dnsInfo.error };
     }
   }
-  const target = configModule.probeTargetFor(model, p, vhostOpts);
+  const target = configModule.probeTargetFor(m, p, vhostOpts);
   if (!target) {
     pub = { ok: false, ms: 0, error: type === 'http' || type === 'https' ? '缺少公网域名' : '缺少公网端口' };
     layers.public = { ok: false, ms: 0, error: pub.error, skipped: true };
@@ -2499,11 +2521,11 @@ async function checkProxyHealth(p, ctx) {
       if (!dnsInfo.resolved.length) {
         reason = '域名没有解析';
         error = `${pubDomain} 查不到 A/AAAA 记录${dnsInfo.error ? `（${dnsInfo.error}）` : ''} —— 浏览器打开也会是「找不到服务器」`;
-        hint = `到域名服务商给 ${pubDomain} 加一条 A 记录指向 ${model.serverAddr}（Cloudflare 记得把云朵关掉，走灰云直连）；生效后本页下一轮检查会自动变绿。`;
+        hint = `到域名服务商给 ${pubDomain} 加一条 A 记录指向 ${m.serverAddr}（Cloudflare 记得把云朵关掉，走灰云直连）；生效后本页下一轮检查会自动变绿。`;
       } else {
         reason = '域名没指向这台服务器';
-        error = `${pubDomain} 现在解析到 ${dnsInfo.resolved.join('、')}，而这条隧道连的是 ${model.serverAddr}`;
-        hint = `二选一：把 ${pubDomain} 的 A 记录改成 ${model.serverAddr}，或者换一个已经指向这台服务器的域名；DNS 缓存里可能还留着旧值，刚改完要等 TTL。`
+        error = `${pubDomain} 现在解析到 ${dnsInfo.resolved.join('、')}，而这条隧道连的是 ${m.serverAddr}`;
+        hint = `二选一：把 ${pubDomain} 的 A 记录改成 ${m.serverAddr}，或者换一个已经指向这台服务器的域名；DNS 缓存里可能还留着旧值，刚改完要等 TTL。`
           + '（如果这个域名走的是 Cloudflare 代理，A 记录本来就会显示 CF 的地址而不是服务器 IP —— 那种情况属于正常，重点看上面公网那一层的报错。）';
       }
     } else if (pub.pathMissing) {
@@ -2634,7 +2656,8 @@ async function checkConnectionHealth(connId, connModel, mm) {
     ...p,
     openPath: proxyOpenPath(p.name, connId),
   }));
-  const ctx = { serverAddr: connModel.serverAddr, mm };
+  /* 把这条连接自己的 model 交给 checkProxyHealth：它要用它探公网端口、拼提示。 */
+  const ctx = { serverAddr: connModel.serverAddr, mm, model: connModel };
   let serverCheck = null;
   ctx.serverCheck = () => {
     if (!serverCheck) serverCheck = tcpCheck(ctx.serverAddr, Number(connModel.serverPort), 2500);
@@ -3518,6 +3541,7 @@ function crossConnectionPortClash(proxy, { excludeName = '' } = {}) {
   });
 
   ipcMain.handle('tunnel:start', async () => {
+    if (!(await waitForManager())) return fail('应用还在启动：隧道管理器没就绪，请稍等一两秒再点。');
     /* Windows 服务模式只能托管一份 frpc.toml；多开连接时用服务模式会互相覆盖配置，
      * 而且服务是以另一个身份跑的，界面里“启动成功”其实连的是别处的配置。 */
     if (settings.runMode === 'service' && (settings.connections || []).length > 1) {
@@ -3607,6 +3631,7 @@ function crossConnectionPortClash(proxy, { excludeName = '' } = {}) {
     if (!conn.enabled) return fail('这条连接被设为不启用');
     if (conn.id === settings.activeConnectionId) {
       /* 当前连接走原路径：它还要处理服务模式、端口冲突提示、插件证书校验等。 */
+      if (!(await waitForManager())) return fail('应用还在启动：隧道管理器没就绪，请稍等一两秒再试。');
       const result = await manager.start({ runMode: settings.runMode });
       if (manager) await manager.refresh().catch(() => {});
       if (result.ok) {
@@ -3620,7 +3645,7 @@ function crossConnectionPortClash(proxy, { excludeName = '' } = {}) {
     /* 外部可能刚改过这份配置：启动前必须重新读，否则用旧模型补齐 webServer/做健康检查。 */
     invalidateConnectionModel(conn.id);
     const mm = managerForConnection(conn.id);
-    if (!mm) return fail('多连接运行期还没准备好');
+    if (!mm) return fail('多连接运行期还没准备好（应用刚启动时可能还要一两秒，请稍后再点）');
     /* 非当前连接一律托管进程：服务模式只能有一台（否则要处理 nssm 多实例与 UAC）。 */
     const result = await mm.start({ runMode: 'managed' });
     await mm.refresh().catch(() => {});
@@ -3643,7 +3668,7 @@ function crossConnectionPortClash(proxy, { excludeName = '' } = {}) {
       return result.ok ? ok({ connection: connectionSummary(conn) }) : fail(result.error, { connection: connectionSummary(conn) });
     }
     const mm = managerForConnection(conn.id);
-    if (!mm) return fail('多连接运行期还没准备好');
+    if (!mm) return fail('多连接运行期还没准备好（应用刚启动时可能还要一两秒，请稍后再点）');
     const guard = multiConnection && multiConnection.guards.get(conn.id);
     if (guard) guard.cancel('用户停止了这条连接');
     if (multiConnection) multiConnection.stopRequests.set(conn.id, Date.now());
@@ -6065,61 +6090,8 @@ async function bootstrap() {
   paths = { ...paths, ...(await settingsModule.refreshPaths()) };
   ensureStarterConfig();
   loadConfigFromDisk();
-  ensureClientServerProfile();
-  migrateLegacyServerSecret();
-  /* 老数据里同一个 IP 可能堆着十几条档案（连接表单每连一次就新建一条）。
-   * 先合并再往下走：后面的 activeServerId 兜底、托盘菜单、下拉列表都按「一台机器一条」来。 */
-  dedupeServerProfiles();
-  /* 访问路径的历史脏数据：老版本不限字符、也不看代理类型，settings 里可能留着
-   * 「udp 代理带访问路径」或带分号/换行的路径（那种值会写进 nginx 的 return 302）。
-   * 启动时统一过一遍闸：类型不对或字符不合法的直接丢掉，免得以后改类型时突然生效。 */
-  pruneOpenPaths();
-  // 兜底：有档案但没有 activeServerId 时固定下来，避免每次启动都靠“取第一个”的隐式行为。
-  if (!settings.activeServerId && settings.servers.length) {
-    const fallback = findServerProfile(settings.clientServerId) || settings.servers[0];
-    settings = settingsModule.save({ activeServerId: fallback.id });
-  }
-  follower.maxLines = Math.min(2000, Math.max(100, Number(settings.logBuffer) || 600));
-  updateLogFile();
-  /* 隧道守护：只决定“什么时候再试一次”，真正拉起的动作在 restart 回调里。
-   * 依赖 manager（在下面创建），所以回调里用惰性引用。 */
-  supervisor = new ReconnectSupervisor({
-    restart: async () => {
-      if (!manager) return { ok: false, error: '管理器还没准备好' };
-      suppressExitUntil = Date.now() + 12000;
-      /* force：同上，避免『apiOk 还是旧值 ⇒ already』把重连吞掉。 */
-      const result = await manager.start({ runMode: settings.runMode, force: true });
-      if (manager) await manager.refresh().catch(() => {});
-      if (result && result.ok) {
-        /* 用当前配置起来的，记下指纹：否则界面会一直挂着“配置变了，重启隧道才生效”。 */
-        startedFingerprint = configModule.connFingerprint(model);
-      }
-      healthCache.clear();
-      scheduleHealth(1500);
-      return result;
-    },
-    canRestart: () => {
-      const why = supervisorBlockReason();
-      if (why) {
-        // 只在“本来想重连但被挡住”时说一句，便于现场排查（正常停止不会走到这里）。
-        console.warn(`[reconnect] 跳过自动重连：${why}`);
-        return false;
-      }
-      return true;
-    },
-    onChange: () => {
-      pushState();
-      refreshTray();
-    },
-    log: (message, level) => {
-      const line = `${new Date().toISOString().slice(0, 19).replace('T', ' ')} ${level === 'error' ? 'ERR' : 'WRN'} ${message}`;
-      try {
-        follower.appendLines(line);
-      } catch (e) {
-        /* 日志失败不影响重连 */
-      }
-    },
-  });
+  /* 运行期容器尽早建好：后面的 refreshPaths() 要 spawn `frpc -v`，被杀软拖慢时
+   * 能卡十几秒，这段时间界面不该是「什么都没有 + 启动隧道点不动」。 */
   manager = new FrpcManager({
     getSettings: () => settings,
     getPaths: () => paths,
@@ -6205,6 +6177,61 @@ async function bootstrap() {
    * 所以额外用时间窗兜一层：刚点过停止就别再当成意外退出。 */
   const stopRequests = new Map();
   multiConnection = { extraManagers, parkedModels, guards, stopRequests };
+  ensureClientServerProfile();
+  migrateLegacyServerSecret();
+  /* 老数据里同一个 IP 可能堆着十几条档案（连接表单每连一次就新建一条）。
+   * 先合并再往下走：后面的 activeServerId 兜底、托盘菜单、下拉列表都按「一台机器一条」来。 */
+  dedupeServerProfiles();
+  /* 访问路径的历史脏数据：老版本不限字符、也不看代理类型，settings 里可能留着
+   * 「udp 代理带访问路径」或带分号/换行的路径（那种值会写进 nginx 的 return 302）。
+   * 启动时统一过一遍闸：类型不对或字符不合法的直接丢掉，免得以后改类型时突然生效。 */
+  pruneOpenPaths();
+  // 兜底：有档案但没有 activeServerId 时固定下来，避免每次启动都靠“取第一个”的隐式行为。
+  if (!settings.activeServerId && settings.servers.length) {
+    const fallback = findServerProfile(settings.clientServerId) || settings.servers[0];
+    settings = settingsModule.save({ activeServerId: fallback.id });
+  }
+  follower.maxLines = Math.min(2000, Math.max(100, Number(settings.logBuffer) || 600));
+  updateLogFile();
+  /* 隧道守护：只决定“什么时候再试一次”，真正拉起的动作在 restart 回调里。
+   * 依赖 manager（在下面创建），所以回调里用惰性引用。 */
+  supervisor = new ReconnectSupervisor({
+    restart: async () => {
+      if (!manager) return { ok: false, error: '管理器还没准备好' };
+      suppressExitUntil = Date.now() + 12000;
+      /* force：同上，避免『apiOk 还是旧值 ⇒ already』把重连吞掉。 */
+      const result = await manager.start({ runMode: settings.runMode, force: true });
+      if (manager) await manager.refresh().catch(() => {});
+      if (result && result.ok) {
+        /* 用当前配置起来的，记下指纹：否则界面会一直挂着“配置变了，重启隧道才生效”。 */
+        startedFingerprint = configModule.connFingerprint(model);
+      }
+      healthCache.clear();
+      scheduleHealth(1500);
+      return result;
+    },
+    canRestart: () => {
+      const why = supervisorBlockReason();
+      if (why) {
+        // 只在“本来想重连但被挡住”时说一句，便于现场排查（正常停止不会走到这里）。
+        console.warn(`[reconnect] 跳过自动重连：${why}`);
+        return false;
+      }
+      return true;
+    },
+    onChange: () => {
+      pushState();
+      refreshTray();
+    },
+    log: (message, level) => {
+      const line = `${new Date().toISOString().slice(0, 19).replace('T', ' ')} ${level === 'error' ? 'ERR' : 'WRN'} ${message}`;
+      try {
+        follower.appendLines(line);
+      } catch (e) {
+        /* 日志失败不影响重连 */
+      }
+    },
+  });
   /* 这几步拿的都是"锦上添花"的信息，读不到不该让整个启动失败。
    * sc.exe 被安全软件拉黑 / 权限不足的机器上，原来会在 refreshService 直接抛出，
    * 连轮询都起不来，界面从此定格在初始状态。 */

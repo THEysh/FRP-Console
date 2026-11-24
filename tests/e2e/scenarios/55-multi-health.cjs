@@ -18,8 +18,12 @@ const { spawn, execFileSync } = require('node:child_process');
 const frpsHelper = require('../helpers/frps.cjs');
 
 /* 端口在 run() 里现找：全量跑时前面几十条场景可能还留着监听进程，写死端口必然偶发变红。 */
-const A = { key: 'A', bindPort: 0, dashPort: 0, token: 'mh-token-A-1234567890', adminPort: 0, conn: 'c-default', remotePort: 0, localPort: 0 };
-const B = { key: 'B', bindPort: 0, dashPort: 0, token: 'mh-token-B-1234567890', adminPort: 0, conn: 'c-two', remotePort: 0, localPort: 0 };
+/* 两台 frps 故意放在**不同主机**：A 在 127.0.0.1、B 在 127.0.0.2（Windows 上 127.0.0.0/8 全是回环）。
+ * 曾出过的真 bug：健康检查用全局 model 的 serverAddr 去探非当前连接的公网端口 ——
+ * 两台都在 127.0.0.1 时「探错机器」也能连上（端口恰好存在），场景永远绿；
+ * 换成不同地址后，探错必然失败，这个场景才钉得住（真机双服务器实测抓到过一次）。 */
+const A = { key: 'A', host: '127.0.0.1', bindPort: 0, dashPort: 0, token: 'mh-token-A-1234567890', adminPort: 0, conn: 'c-default', remotePort: 0, localPort: 0 };
+const B = { key: 'B', host: '127.0.0.2', bindPort: 0, dashPort: 0, token: 'mh-token-B-1234567890', adminPort: 0, conn: 'c-two', remotePort: 0, localPort: 0 };
 const PROXY = 'same-name';
 
 /* 从 start 开始找一个能真正 listen 的端口（bind 成功即释放，紧接着给 frpc/frps 用）。 */
@@ -40,7 +44,7 @@ function freePort(start) {
 }
 
 const frpsToml = (s) => [
-  'bindAddr = "127.0.0.1"',
+  `bindAddr = "${s.host}"`,
   `bindPort = ${s.bindPort}`,
   `vhostHTTPPort = ${s.bindPort + 1000}`,
   `vhostHTTPSPort = ${s.bindPort + 2000}`,
@@ -58,7 +62,7 @@ const frpsToml = (s) => [
 ].join('\n');
 
 const frpcToml = (s) => [
-  'serverAddr = "127.0.0.1"',
+  `serverAddr = "${s.host}"`,
   `serverPort = ${s.bindPort}`,
   'loginFailExit = false',
   '',
