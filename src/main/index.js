@@ -958,7 +958,7 @@ function trayMenuSpec(runtime) {
         if (supervisor) supervisor.cancel('');
       }
       notify(result.ok ? 'info' : 'error', result.ok ? '隧道已启动' : '启动失败', result.error || '');
-      await manager.refresh().catch(() => {});
+      if (manager) await manager.refresh().catch(() => {});
       pushState();
       refreshTray();
     },
@@ -968,7 +968,7 @@ function trayMenuSpec(runtime) {
       if (supervisor) supervisor.cancel('用户停止了隧道');
       const result = await manager.stop({ runMode: settings.runMode });
       notify(result.ok ? 'info' : 'error', result.ok ? '隧道已停止' : '停止失败', result.error || '');
-      await manager.refresh().catch(() => {});
+      if (manager) await manager.refresh().catch(() => {});
       pushState();
       refreshTray();
     },
@@ -976,7 +976,7 @@ function trayMenuSpec(runtime) {
       suppressExitUntil = Date.now() + 15000;
       const result = await manager.restart({ runMode: settings.runMode });
       notify(result.ok ? 'info' : 'error', result.ok ? '隧道已重启' : '重启失败', result.error || '');
-      await manager.refresh().catch(() => {});
+      if (manager) await manager.refresh().catch(() => {});
       pushState();
       refreshTray();
     },
@@ -1646,26 +1646,52 @@ function openPathAllowedForType(type) {
   return OPEN_PATH_TYPES.includes(String(type || '').toLowerCase());
 }
 
-function proxyOpenPath(name) {
-  const map = (settings && settings.proxyOpenPaths) || {};
-  return normalizeOpenPath(map[name]);
+/* 访问路径存在 settings.proxyOpenPaths 里（frpc.toml 不认这个字段）。
+ * 键必须是 `<connId>::<代理名>`：两台服务器可以各有一条同名代理，
+ * 过去只按裸名字做键，A 上设的 /panel/ 会跑到 B 的同名代理上。 */
+function openPathKey(name, connId = (settings && settings.activeConnectionId) || '') {
+  return connectionsModule.keyOf(connId, name);
 }
 
-function setProxyOpenPath(name, value) {
+function proxyOpenPath(name, connId) {
+  const map = (settings && settings.proxyOpenPaths) || {};
+  const key = openPathKey(name, connId);
+  if (key in map) return normalizeOpenPath(map[key]);
+  /* 兼容老数据：1.2.169 之前是裸代理名做键，只有「当前连接」能用得上。
+   * 读到就顺手迁到带前缀的键上，避免下次切连接又变成“路径丢了”。 */
+  if (name in map) {
+    const legacy = normalizeOpenPath(map[name]);
+    if (legacy && connId === undefined) {
+      const next = { ...map };
+      delete next[name];
+      next[key] = legacy;
+      settings = settingsModule.save({ proxyOpenPaths: next });
+    }
+    return legacy;
+  }
+  return '';
+}
+
+function setProxyOpenPath(name, value, connId) {
   /* 存的时候也过一遍类型闸：proxy:save 是唯一入口，但历史数据、以后的批量导入都可能
    * 绕过它 —— 类型不允许就顺手把这条记录删掉，别让它留成下一次改类型的定时炸弹。 */
   const existing = model && (model.proxies || []).find((p) => p.name === name);
   const clean = existing && !openPathAllowedForType(existing.type) ? '' : normalizeOpenPath(value);
   const map = { ...((settings && settings.proxyOpenPaths) || {}) };
-  if (clean) map[name] = clean;
-  else delete map[name];
+  const key = openPathKey(name, connId);
+  if (clean) map[key] = clean;
+  else delete map[key];
+  /* 老的裸名键一并清掉，否则「改成空」之后读老键还会把它读回来 */
+  delete map[name];
   settings = settingsModule.save({ proxyOpenPaths: map });
   return clean;
 }
 
-function dropProxyOpenPath(name) {
+function dropProxyOpenPath(name, connId) {
   const map = { ...((settings && settings.proxyOpenPaths) || {}) };
-  if (!(name in map)) return;
+  const key = openPathKey(name, connId);
+  if (!(key in map) && !(name in map)) return;
+  delete map[key];
   delete map[name];
   settings = settingsModule.save({ proxyOpenPaths: map });
 }
@@ -1675,12 +1701,38 @@ function dropProxyOpenPath(name) {
  * —— 界面上突然出现「复制/打开」跳到某个 /panel/，很难解释。每次成功读到配置后
  * 对一遍名字表，把已经不存在的清掉。 */
 function pruneProxyOpenPaths() {
+  /* 配置还没载入（启动早期、或读盘失败）时绝不能剪：names 会是空集，
+   * 那等于把用户设过的所有访问路径一次性清光，界面上表现为“路径莫名其妙没了”。 */
+  if (!model) return false;
   const map = { ...((settings && settings.proxyOpenPaths) || {}) };
-  const names = new Set(((model && model.proxies) || []).map((p) => p.name));
+  const names = ((model && model.proxies) || []).map((p) => p.name);
+  const activeId = (settings && settings.activeConnectionId) || '';
+  const valid = new Set(names.map((n) => connectionsModule.keyOf(activeId, n)));
+  /* 别的连接的键形如 <id>::<name>：我们没有它们的模型（也不该为了剪枝去读 N 个文件），
+   * 只要连接还在就保留；连接已被删掉的才清。 */
+  const connIds = new Set(((settings && settings.connections) || []).map((c) => c.id));
   let changed = false;
   for (const key of Object.keys(map)) {
-    if (!names.has(key)) {
+    if (key.includes('::')) {
+      const [connId] = connectionsModule.splitKey(key);
+      if (connIds.has(connId)) continue;
       delete map[key];
+      changed = true;
+      continue;
+    }
+    if (!names.includes(key)) {
+      delete map[key];
+      changed = true;
+    } else if (!openPathAllowedForType(((model.proxies || []).find((p) => p.name === key) || {}).type)) {
+      /* 代理还在，但类型不允许访问路径（udp/stcp 等）：旧记录一并清掉，
+       * 免得以后改回 tcp 时“凭空”冒出一个用户没设过的路径。 */
+      delete map[key];
+      changed = true;
+    } else if (!valid.has(key)) {
+      /* 裸名键属于当前连接：直接迁成带前缀的键 */
+      const legacyValue = normalizeOpenPath((settings.proxyOpenPaths || {})[key]);
+      delete map[key];
+      map[connectionsModule.keyOf(activeId, key)] = legacyValue;
       changed = true;
     }
   }
@@ -1706,20 +1758,9 @@ function startListPatch(model, { add = '', remove = '' } = {}) {
 /* 启动时清理访问路径的历史脏数据：代理已经删掉的、类型不允许的、字符不合规的一律丢掉。
  * 返回被清理掉的条数（只在确实有变化时写盘，避免每次启动都改 settings.json）。 */
 function pruneOpenPaths() {
-  const map = (settings && settings.proxyOpenPaths) || {};
-  const names = Object.keys(map);
-  if (!names.length) return 0;
-  const byName = new Map(((model && model.proxies) || []).map((p) => [p.name, p]));
-  const next = {};
-  let dropped = 0;
-  for (const name of names) {
-    const proxy = byName.get(name);
-    const clean = proxy && openPathAllowedForType(proxy.type) ? normalizeOpenPath(map[name]) : '';
-    if (clean) next[name] = clean;
-    else dropped += 1;
-  }
-  if (dropped) settings = settingsModule.save({ proxyOpenPaths: next });
-  return dropped;
+  /* 阶段 6 起键是 `<connId>::<代理名>`，裸名判断会把刚迁过去的键当成
+   * “代理已经不存在”清掉（启动一次访问路径就没了）。统一走按连接的版本。 */
+  return pruneProxyOpenPaths() ? 1 : 0;
 }
 
 /* frpc 管理 API 的凭据强度：空口令 / 默认口令 / 短口令都算弱。
@@ -2019,7 +2060,9 @@ async function applyAndMaybeReload(nextModel, { reload = true, restartRecommende
       return { ok: false, error: `frpc 拒绝了这份配置：${reason}${tail}`, saved: false, rolledBack, restartRecommended };
     }
   }
-  await manager.refresh().catch(() => {});
+  /* bootstrap 里 manager 是异步创建的：界面/IPC 可能比它更早就绪（自动化里就撞上了），
+   * 这时保存配置不该崩，只是没法立刻刷新运行时。 */
+  if (manager) await manager.refresh().catch(() => {});
   healthCache.clear();
   scheduleHealth(900);
   return { ok: true, saved: true, reloaded: !!reloadResult, restartRecommended, state: buildState() };
@@ -2589,7 +2632,7 @@ async function checkConnectionHealth(connId, connModel, mm) {
     return pt === 'https2http' || pt === 'https2https';
   }).map((p) => ({
     ...p,
-    openPath: isActive ? proxyOpenPath(p.name) : '',
+    openPath: proxyOpenPath(p.name, connId),
   }));
   const ctx = { serverAddr: connModel.serverAddr, mm };
   let serverCheck = null;
@@ -3022,6 +3065,8 @@ function registerIpc() {
      * 也没有“把 frpc 装成服务”的按钮。老客户端传上来就归一到 auto，
      * 不让它落到“未检测到 FRP 系统服务”那种死路上。 */
     if (clean.runMode === 'service') clean.runMode = 'auto';
+    /* 只有一条连接时 service 才有意义；多开时必须退回托管进程 */
+    if (clean.runMode === 'service' && (settings.connections || []).length > 1) clean.runMode = 'managed';
     if (clean.runMode && !['auto', 'managed'].includes(clean.runMode)) delete clean.runMode;
     if (clean.configPath !== undefined) {
       const wanted = String(clean.configPath || '').trim();
@@ -3081,11 +3126,11 @@ function registerIpc() {
       const snap = manager.snapshot();
       if (snap.running) {
         // 正在跑的 frpc 还按旧端口/旧口令监听，重启一次才对得上
-        await manager.restart().catch(() => {});
+        if (manager) await manager.restart().catch(() => {});
         suppressExitUntil = Date.now() + 8000;
       }
     }
-    await manager.refresh().catch(() => {});
+    if (manager) await manager.refresh().catch(() => {});
     pushState();
     return ok({ state: buildState(), paths: pathsForState(), warnings: [...settingWarnings, ...adminWarnings] });
   }
@@ -3172,7 +3217,7 @@ function registerIpc() {
       restarted = !!(r && r.ok !== false);
       if (restarted) startedFingerprint = configModule.connFingerprint(model);
       else restartError = String((r && r.error) || '重启失败');
-      await manager.refresh().catch(() => {});
+      if (manager) await manager.refresh().catch(() => {});
       healthCache.clear();
       scheduleHealth(1200);
       pushState();
@@ -3235,13 +3280,40 @@ function registerIpc() {
       const r = await manager.reload().catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
       if (r && !r.ok) reloadError = r.error;
     }
-    await manager.refresh().catch(() => {});
+    if (manager) await manager.refresh().catch(() => {});
     healthCache.clear();
     scheduleHealth(900);
     pushState();
     if (reloadError) return fail(`配置已保存，但${restart ? '重启' : '热重载'}失败：${reloadError}`, { state: buildState(), changed: write.changed, backup: write.backup });
     return ok({ state: buildState(), changed: write.changed, backup: write.backup, restarted });
   });
+
+/* 跨连接端口冲突：同一个 frps 上两条 frpc 抢同一个 remotePort，frps 只回
+ * "port already used"，界面看不出是谁占的。这里在保存时就挡住并点名。 */
+function crossConnectionPortClash(proxy, { excludeName = '' } = {}) {
+  const type = proxy && proxy.type;
+  if (!['tcp', 'udp'].includes(type)) return '';
+  const port = Number(proxy.remotePort);
+  if (!port) return '';
+  const myAddr = String((model && model.serverAddr) || '').trim().toLowerCase();
+  if (!myAddr) return '';
+  for (const conn of (settings.connections || [])) {
+    if (!conn.enabled || conn.id === (settings.activeConnectionId || '')) continue;
+    let other = null;
+    try {
+      other = connectionModel(conn);
+    } catch {
+      continue;
+    }
+    if (!other) continue;
+    if (String(other.serverAddr || '').trim().toLowerCase() !== myAddr) continue;
+    const hit = (other.proxies || []).find((p) => p.type === type && Number(p.remotePort) === port && p.name !== excludeName);
+    if (hit) {
+      return `公网端口 ${port}/${type} 已经被「${conn.name || conn.id}」这条连接里的代理「${hit.name}」占用（两条 frpc 连的是同一台 frps ${myAddr}）`;
+    }
+  }
+  return '';
+}
 
   ipcMain.handle('proxy:save', async (event, payload) => {
     if (!model) return fail('配置尚未载入');
@@ -3278,6 +3350,13 @@ function registerIpc() {
     }, { nginxProxyEnabled: yMode });
     if (mode === 'add' && model.proxies.some((p) => p.name === proxy.name)) {
       return { ok: false, error: `代理名称「${proxy.name}」已存在`, validation: configModule.validate(next, { allowPorts: serverAllowPorts() }) };
+    }
+    /* 跨连接的公网端口冲突：只有当两条 frpc 连的是**同一台** frps 才成立
+     * （不同服务器上用同一个端口是完全合法的）。以前只比当前配置里的代理，
+     * 多开连接后用户会在第二台上撞出 "port already used"，而错误来自 frps、看不出是谁占的。 */
+    if (typeof crossConnectionPortClash === 'function') {
+      const clash = crossConnectionPortClash(proxy, { excludeName: mode === 'edit' ? originalName : '' });
+      if (clash) return { ok: false, error: clash };
     }
     /* frpc 顶层 start = [...] 是「只启动列表里的代理」的白名单（手改配置时常见）。
      * 在界面上新建/改名的代理如果不在名单里，frpc 会静默跳过它 —— 用户只会看到
@@ -3439,6 +3518,11 @@ function registerIpc() {
   });
 
   ipcMain.handle('tunnel:start', async () => {
+    /* Windows 服务模式只能托管一份 frpc.toml；多开连接时用服务模式会互相覆盖配置，
+     * 而且服务是以另一个身份跑的，界面里“启动成功”其实连的是别处的配置。 */
+    if (settings.runMode === 'service' && (settings.connections || []).length > 1) {
+      return fail('多开连接时不能用「Windows 服务」运行模式：服务只能托管一份 frpc.toml。到设置页把运行模式改成「应用托管进程」，或先把其它连接删掉。');
+    }
     /* 还没配好就直接 spawn，只会弹出 "spawn EPERM" 这种没人看得懂的错误，
      * 所以先在主进程里把缺的前提说清楚。 */
     const missing = tunnelPrerequisiteError();
@@ -3453,7 +3537,7 @@ function registerIpc() {
      * 而不是让他每隔几秒回来点一次。 */
     tunnelDesired = true;
     const result = await manager.start({ runMode: settings.runMode });
-    await manager.refresh().catch(() => {});
+    if (manager) await manager.refresh().catch(() => {});
     healthCache.clear();
     scheduleHealth(1500);
     pushState();
@@ -3473,7 +3557,7 @@ function registerIpc() {
     if (supervisor) supervisor.cancel('用户停止了隧道');
     await refreshService({ detect: false });
     const result = await manager.stop({ runMode: settings.runMode });
-    await manager.refresh().catch(() => {});
+    if (manager) await manager.refresh().catch(() => {});
     pushState();
     if (!result.ok) return fail(result.error, { state: buildState() });
     return ok({ state: buildState(), mode: result.mode });
@@ -3485,7 +3569,7 @@ function registerIpc() {
     await refreshService({ detect: false });
     suppressExitUntil = Date.now() + 15000;
     const result = await manager.restart({ runMode: settings.runMode });
-    await manager.refresh().catch(() => {});
+    if (manager) await manager.refresh().catch(() => {});
     pushState();
     if (!result.ok) return fail(result.error, { state: buildState() });
     tunnelDesired = true;
@@ -3500,7 +3584,7 @@ function registerIpc() {
       return fail('隧道没有在运行，不需要热重载（配置已保存，下次启动即生效）', { state: buildState() });
     }
     const result = await manager.reload();
-    await manager.refresh().catch(() => {});
+    if (manager) await manager.refresh().catch(() => {});
     healthCache.clear();
     scheduleHealth(900);
     pushState();
@@ -3524,7 +3608,7 @@ function registerIpc() {
     if (conn.id === settings.activeConnectionId) {
       /* 当前连接走原路径：它还要处理服务模式、端口冲突提示、插件证书校验等。 */
       const result = await manager.start({ runMode: settings.runMode });
-      await manager.refresh().catch(() => {});
+      if (manager) await manager.refresh().catch(() => {});
       if (result.ok) {
         tunnelDesired = true;
         startedFingerprint = configModule.connFingerprint(model);
@@ -3554,7 +3638,7 @@ function registerIpc() {
       startedFingerprint = '';
       if (supervisor) supervisor.cancel('用户停止了隧道');
       const result = await manager.stop({ runMode: settings.runMode });
-      await manager.refresh().catch(() => {});
+      if (manager) await manager.refresh().catch(() => {});
       pushState();
       return result.ok ? ok({ connection: connectionSummary(conn) }) : fail(result.error, { connection: connectionSummary(conn) });
     }
@@ -3636,6 +3720,7 @@ function registerIpc() {
     }
     if (payload.enabled !== undefined) patch.enabled = payload.enabled !== false;
     if (!Object.keys(patch).length) return ok({ connection: connectionSummary(conn), changed: false });
+    if (patch.configPath !== undefined) invalidateConnectionModel(conn.id);
     if (patch.adminPort !== undefined && patch.adminPort !== conn.adminPort) {
       /* 端口变了，正在跑的进程会 mismatch：先停，避免“配置写进去了但还在用旧端口”。 */
       const mm = managerForConnection(conn.id);
@@ -3695,7 +3780,7 @@ function registerIpc() {
       tunnelDesired = false;
       if (supervisor) supervisor.cancel('切换连接');
       await manager.stop({ runMode: settings.runMode }).catch(() => {});
-      await manager.refresh().catch(() => {});
+      if (manager) await manager.refresh().catch(() => {});
       stopped.push(settings.activeConnectionId);
     }
     for (const [id, mm] of (multiConnection ? multiConnection.extraManagers : new Map())) {
@@ -3718,7 +3803,7 @@ function registerIpc() {
     invalidateConnectionModel(conn.id);
     loadConfigFromDisk();
     updateLogFile();
-    await manager.refresh().catch(() => {});
+    if (manager) await manager.refresh().catch(() => {});
     pushState();
     return ok({ changed: true, stopped, connections: connectionList(), state: buildState() });
   });
@@ -3864,7 +3949,7 @@ function registerIpc() {
         const rt = manager.snapshot();
         if (rt.running || rt.connected) {
           await manager.restart({ runMode: settings.runMode }).catch(() => ({}));
-          await manager.refresh().catch(() => {});
+          if (manager) await manager.refresh().catch(() => {});
           healthCache.clear();
           scheduleHealth(1200);
           send('notify', {
@@ -4129,7 +4214,7 @@ function registerIpc() {
         const stopped = await manager.stop({ runMode: settings.runMode }).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
         stoppedTunnel = !!stopped.ok;
         if (!stoppedTunnel) stopError = stopped.error || '停止隧道失败';
-        await manager.refresh().catch(() => {});
+        if (manager) await manager.refresh().catch(() => {});
       } else if (alive) {
         stopSkipped = hasService ? 'service' : 'external';
       }
@@ -4176,7 +4261,7 @@ function registerIpc() {
     send('server:switch-progress', { step: 'restart', name: profile.name });
     const restarted = await manager.restart({ runMode: settings.runMode });
     send('server:switch-progress', { step: 'done', ok: restarted.ok });
-    await manager.refresh().catch(() => {});
+    if (manager) await manager.refresh().catch(() => {});
     healthCache.clear();
     scheduleHealth(1200);
     pushState();
@@ -5142,7 +5227,7 @@ function registerIpc() {
               const rt = manager.snapshot();
               if (rt.running || rt.connected) {
                 await manager.restart({ runMode: settings.runMode }).catch(() => ({}));
-                await manager.refresh().catch(() => {});
+                if (manager) await manager.refresh().catch(() => {});
                 healthCache.clear();
                 scheduleHealth(1200);
               }
@@ -6004,7 +6089,7 @@ async function bootstrap() {
       suppressExitUntil = Date.now() + 12000;
       /* force：同上，避免『apiOk 还是旧值 ⇒ already』把重连吞掉。 */
       const result = await manager.start({ runMode: settings.runMode, force: true });
-      await manager.refresh().catch(() => {});
+      if (manager) await manager.refresh().catch(() => {});
       if (result && result.ok) {
         /* 用当前配置起来的，记下指纹：否则界面会一直挂着“配置变了，重启隧道才生效”。 */
         startedFingerprint = configModule.connFingerprint(model);
@@ -6126,7 +6211,7 @@ async function bootstrap() {
   await tickStep('refreshService', () => refreshService({ detect: true }));
   frpcVersion = (await tickStep('readFrpcVersion', readFrpcVersion)) || '';
   elevated = !!(await tickStep('isElevated', () => service.isElevated()));
-  await manager.refresh().catch(() => {});
+  if (manager) await manager.refresh().catch(() => {});
   checkHealth().catch(() => {});
   startPolling();
   scheduleAutoRenew();
@@ -6294,6 +6379,19 @@ async function prepareUpdateInstall() {
   if (supervisor) supervisor.cancel('正在安装更新');
   if (multiConnection) {
     for (const guard of multiConnection.guards.values()) guard.cancel('正在安装更新');
+  }
+  /* 其它连接（多开）也要停：它们各自的 frpc.exe 同样锁着安装目录里的
+   * resources/frpc/frpc.exe，只停当前连接会让安装器 Rename 失败（1.2.163 修的就是这个）。 */
+  if (multiConnection) {
+    for (const [id, mm] of multiConnection.extraManagers) {
+      if (!mm || !mm.snapshot().running) continue;
+      try {
+        await mm.stop({ runMode: 'managed' });
+      } catch {
+        /* 停不掉交给下面的 taskkill 兜底 */
+      }
+      log('warn', `升级前已停止连接 ${id}`);
+    }
   }
   // 记录更新前隧道是否由控制台托管（用于更新后自动接回）
   const wasManaged = !!(manager && manager.isChildAlive);
