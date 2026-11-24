@@ -39,6 +39,7 @@
     "tray-icons": "node tools/make-tray-icons.cjs",
     "test:real": "node tests/real/full-script.cjs",
     "test:real:reinstall": "node tests/real/reinstall.cjs",
+    "test:real:multi": "node tests/real/multi-connection.cjs",
     "test:all": "node tools/test-all.cjs"
   },
   "dependencies": {
