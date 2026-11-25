@@ -1165,11 +1165,12 @@ function renderDiscovery(force = false) {
               ${[['', '全部'], ['loopback', '回环'], ['all', '全网'], ['docker', 'Docker'], ['lan', '内网'], ['public', '公网']].map(([key, label]) => `<button type="button" data-act="listeners.scope" data-scope="${key}" class="${scopeFilter === key ? 'active' : ''}">${label}${key ? ` ${scopeCounts[key] || 0}` : ''}</button>`).join('')}
             </div>`
           : ''}
+        ${S.listenersError && listeners.length ? `<div class="note warn" style="margin:0 16px 12px">${icon('alert')}<div>有一部分端口的进程名读不出来：${esc(S.listenersError)}</div></div>` : ''}
         ${S.listenersBusy && !listeners.length
           ? `<div class="empty" style="padding:34px 20px"><span class="spinner-sm"></span><p style="margin-top:10px">正在扫描本机端口…</p></div>`
           : visible.length
             ? `<table class="listener-table">
-                <thead><tr><th>端口</th><th>监听地址</th><th>进程</th><th>PID</th><th style="text-align:right">发布</th></tr></thead>
+                <thead><tr><th>端口</th><th>监听地址</th><th>进程</th><th>PID</th><th style="text-align:right">操作</th></tr></thead>
                 <tbody>${visible.slice(0, 200).map(listenerRow).join('')}</tbody>
               </table>`
             : `<div class="empty" style="padding:30px 20px"><p>${listeners.length ? '这个分类下没有监听端口。' : '还没有扫描结果，点击右上角“扫描本机端口”。'}</p></div>`}
@@ -1193,11 +1194,12 @@ function listenerRow(l) {
   const badges = scopes.slice(0, 3).map((s) => `<span class="badge scope-${esc(s)}" title="${esc(scopeTitle[s] || '')}">${esc(SCOPE_LABEL[s] || s)}</span>`).join('');
   const fullTitle = (l.hosts ? l.hosts.join(', ') : '') + (scopes.length ? ` · ${scopes.map((s) => SCOPE_LABEL[s] || s).join(' / ')}` : '');
   return `<tr>
-    <td class="port-cell">${esc(l.port)}</td>
+    <td class="port-cell">${esc(l.port)}${l.risk ? ` <span class="badge ${l.risk.level === 'danger' ? 'bad' : 'amber'}" title="${l.risk.level === 'danger' ? '这类端口直接发布到公网风险很高：要么本身没有认证，要么一旦被爆破就是整台机器' : '这个端口的协议不加密（或就是登录入口），发布到公网请确认你真的需要'}">${esc(l.risk.label)}</span>` : ''}</td>
     <td class="addr-cell" title="${esc(fullTitle)}">${badges} ${esc(l.hosts ? l.hosts[0] : '')}${l.hosts && l.hosts.length > 1 ? ` +${l.hosts.length - 1}` : ''}</td>
-    <td class="proc-cell" title="${esc(l.process || '当前进程环境无法读取进程名')}">${esc(l.process || '未知')}</td>
+    <td class="proc-cell" title="${esc(l.process || '权限不足时读不到进程名：以管理员身份运行能看到全部，或按 PID 在任务管理器里对照')}">${esc(l.process || '未知（权限）')}</td>
     <td class="addr-cell">${esc(l.pid)}</td>
-    <td style="text-align:right"><button class="btn small" type="button" data-act="listener.publish" data-port="${esc(l.port)}" data-process="${esc(l.process)}">添加代理</button></td>
+    <td style="text-align:right"><button class="btn small" type="button" data-act="listener.publish" data-port="${esc(l.port)}" data-process="${esc(l.process)}"
+            data-risk="${esc(l.risk ? l.risk.level : '')}" data-risklabel="${esc(l.risk ? l.risk.label : '')}">添加代理</button></td>
   </tr>`;
 }
 
@@ -5329,6 +5331,19 @@ async function handleAction(act, dataset, btn) {
         break;
       case 'listener.publish': {
         const proc = String(dataset.process || '').replace(/\.exe$/i, '').replace(/[^A-Za-z0-9._-]/g, '');
+        /* 高危端口（SMB / 远程桌面 / 数据库 / Redis 之类）一键发布到公网前先拦一下：
+         * 这类服务要么没有认证，要么被爆破就等于交出整台机器。确认框不阻止用户，
+         * 只是把后果写在按钮前面。 */
+        if (dataset.risk === 'danger') {
+          const go = await confirmDialog({
+            title: `把 ${dataset.port}（${dataset.risklabel || '高危服务'}）发布到公网？`,
+            body: `<p>这个端口后面通常是文件共享、远程桌面或数据库这类服务：要么本身没有认证（Redis、Memcached），要么一旦被暴力破解就等于把整台机器交出去。</p>
+              <p style="margin-top:8px">如果只是自己临时用，建议先在代理上设一个足够长的访问口令，用完就停；确认要发布就继续。</p>`,
+            confirmText: '我确认，继续发布',
+            danger: true,
+          });
+          if (!go) break;
+        }
         openProxyEditor({ mode: 'add', preset: { name: uniqueName(`port-${dataset.port}${proc ? `-${proc}` : ''}`), localPort: Number(dataset.port), type: 'tcp' } });
         break;
       }

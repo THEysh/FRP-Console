@@ -48,6 +48,7 @@ async function listListeners() {
       port: item.port,
       pid: item.pid,
       process: pidToName.get(item.pid) || '',
+      risk: riskOfPort(item.port),
       hosts,
       address: hosts.join(', '),
       loopbackOnly: hosts.every((h) => /^(127\.0\.0\.1|::1)$/.test(h)),
@@ -57,6 +58,25 @@ async function listListeners() {
   });
   listeners.sort((a, b) => a.port - b.port);
   return { ok: true, listeners, processError: coverageError || processError };
+}
+
+/* 这些端口一旦直接发布到公网，等于把本机的高危服务（文件共享、远程桌面、数据库）
+ * 敞开给全网：要么本身就没有像样的认证（Redis/Memcached/Elasticsearch），要么一旦被
+ * 暴力破解就是整台机器。界面上必须显眼地标出来，而不是和普通 HTTP 端口长得一样。
+ * 只做静态判断，不联网、不探测。 */
+const RISKY_PORTS = new Map([
+  [135, 'RPC'], [137, 'NetBIOS'], [139, 'NetBIOS 文件共享'], [445, 'SMB 文件共享'],
+  [3389, '远程桌面 RDP'], [5985, 'WinRM'], [5900, 'VNC'],
+  [1433, 'SQL Server'], [3306, 'MySQL'], [5432, 'PostgreSQL'],
+  [6379, 'Redis'], [27017, 'MongoDB'], [9200, 'Elasticsearch'], [11211, 'Memcached'],
+]);
+const CAREFUL_PORTS = new Map([[21, 'FTP（明文）'], [23, 'Telnet（明文）'], [22, 'SSH']]);
+
+function riskOfPort(port) {
+  const p = Number(port);
+  if (RISKY_PORTS.has(p)) return { level: 'danger', label: RISKY_PORTS.get(p) };
+  if (CAREFUL_PORTS.has(p)) return { level: 'warn', label: CAREFUL_PORTS.get(p) };
+  return null;
 }
 
 /* 把监听地址归成几类，前端好标注“这个服务到底是只给自己、还是整个局域网/公网都能连”。
@@ -123,4 +143,4 @@ async function processNames() {
   return { names, error: names.size ? '' : `读不到进程名：${psError.join('；')}` };
 }
 
-module.exports = { listListeners, classifyHost };
+module.exports = { listListeners, classifyHost, riskOfPort };
