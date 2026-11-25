@@ -90,6 +90,17 @@ module.exports = {
       );
 
       ctx.check('「公网地址」空态给出新建代理入口', /新建一条代理/.test(view.emptyHint), view.emptyHint.slice(0, 80));
+
+      /* 服务器页同理：这一页页头原来也摆着「启动隧道」，而这条连接还没填地址（1.2.202）。 */
+      await inst.eval(`(async()=>{const b=document.querySelector('.nav-item[data-view="server"]'); if(b) b.click(); await new Promise(r=>setTimeout(r,900)); return 1;})()`);
+      await ctx.sleep(700);
+      const serverView = JSON.parse(await inst.eval(`(function(){
+        const view = document.querySelector('#view');
+        const acts = view ? [...view.querySelectorAll('button')].map(b => b.dataset.act || '') : [];
+        return JSON.stringify({ acts, text: (view ? view.innerText : '').replace(/\s+/g, ' ').slice(0, 200) });
+      })()`));
+      ctx.check('未填服务器地址时服务器页不摆「启动隧道」', !serverView.acts.includes('conn.toggle'), JSON.stringify(serverView.acts));
+      ctx.check('服务器页给出「还没填服务器地址」的提示', /还没填服务器地址/.test(serverView.text), serverView.text.slice(0, 120));
     } finally {
       try { inst.stop(); } catch { /* 忽略 */ }
     }

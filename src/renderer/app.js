@@ -2865,13 +2865,18 @@ function serverConnBar() {
     <div class="field-hint" style="margin:-6px 0 14px">当前查看：${esc(cur ? (cur.name || cur.id) : '—')} · ${ssh}。切换标签会先停掉正在跑的隧道。</div>`;
 }
 
-/* 当前连接的隧道启停：服务器页也能直接操作，不用回概览。 */
+/* 当前连接的隧道启停：服务器页也能直接操作，不用回概览。
+ * 这条连接还没填 frps 地址时不给「启动隧道」——点了只会报「服务器地址不能为空」（1.2.202）。 */
 function localTunnelBtn() {
   const st = S.state || {};
   const id = st.activeConnectionId || '';
   const c = (st.connections || []).find((x) => x.id === id);
   if (!c) return '';
   const running = !!(c.runtime && (c.runtime.running || c.runtime.connected));
+  const addr = (st.config && st.config.serverAddr) || '';
+  if (!running && !addr) {
+    return '<span class="field-hint" style="align-self:center">还没填服务器地址，先在下面连上服务器</span>';
+  }
   const label = running ? '停止隧道' : '启动隧道';
   return `<button class="btn ${running ? 'ghost' : 'primary'}" type="button" data-act="conn.toggle" data-id="${esc(id)}">${icon(running ? 'stop' : 'play')}<span>${label}</span></button>`;
 }
