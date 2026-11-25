@@ -6185,6 +6185,20 @@ async function handleAction(act, dataset, btn) {
         break;
       }
 
+      /* 从代理表单跳过来签发：把域名带进向导、切页、展开并自动检测一次（1.2.205） */
+      case 'cert.goto.issue': {
+        const domain = String(btn.dataset.domain || '').trim();
+        const w = S.certs.wizard;
+        if (domain) w.domain = domain;
+        w.expanded = true;
+        w.result = null;
+        w.dns = null;
+        closeModal();
+        setView('certs');
+        renderCerts(true);
+        if (domain) await refreshDomainWizard();
+        break;
+      }
       case 'dw.check':
         await refreshDomainWizard();
         break;
@@ -6809,7 +6823,8 @@ function certBadgeFor(primary, pluginType) {
   const certs = S.certs.list || [];
   const covering = certs.filter((c) => (c.domains || []).some((pattern) => coversDomain(pattern, primary)));
   if (covering.length) return domainBadge('证书', `已覆盖：${covering.map((c) => c.domain).join('、')}`, 'ok');
-  return domainBadge('证书', '未签发匹配证书', 'bad');
+  /* 没有匹配证书：除了说清楚，直接给一条去签发的路（1.2.205）——把域名一起带过去。 */
+  return `${domainBadge('证书', '未签发匹配证书', 'bad')}<button class="btn tiny" type="button" data-act="cert.goto.issue" data-domain="${esc(primary)}" title="去「HTTPS 证书」页签发这个域名的证书">去签发</button>`;
 }
 
 function renderDomainReadiness(badges) {
