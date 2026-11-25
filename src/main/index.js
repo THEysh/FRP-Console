@@ -1619,6 +1619,38 @@ async function syncParkedConnectionConfigs() {
   }
 }
 
+/* 兜底：把某个管理端口上的 frpc 进程强杀掉。
+ * 只在 tasklist 确认占用者是 frpc.exe 时才动手 —— 端口是用户可能复用的资源，误杀别的程序代价太大。 */
+function killFrpcOnPort(port) {
+  const target = Number(port);
+  if (!target) return false;
+  try {
+    const out = execFileSync('netstat', ['-ano'], { encoding: 'utf8', windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
+    let killed = false;
+    for (const line of out.split(/\r?\n/)) {
+      if (!line.includes(`:${target} `) || !/LISTENING/i.test(line)) continue;
+      const pid = Number(line.trim().split(/\s+/).pop());
+      if (!Number.isInteger(pid) || pid <= 0) continue;
+      let image = '';
+      try {
+        image = execFileSync('tasklist', ['/FI', `PID eq ${pid}`, '/NH'], { encoding: 'utf8', windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
+      } catch {
+        image = '';
+      }
+      if (!/frpc\.exe/i.test(image)) continue;
+      try {
+        execFileSync('taskkill', ['/F', '/PID', String(pid)], { stdio: 'ignore', windowsHide: true });
+        killed = true;
+      } catch {
+        /* 已经退了 */
+      }
+    }
+    return killed;
+  } catch {
+    return false;
+  }
+}
+
 /* 返回“现在不该自动重连”的原因；空串表示可以重连。
  * 抽成函数是为了出问题时有话可说：日志里能看到到底被哪一条挡住。 */
 function supervisorBlockReason() {
@@ -3885,10 +3917,12 @@ function crossConnectionPortClash(proxy, { excludeName = '' } = {}) {
     const conn = connectionById(String(connId || ''));
     if (!conn) return fail('连接不存在（可能已被删除）');
     if (conn.id === settings.activeConnectionId) return ok({ changed: false, connections: connectionList() });
+    /* 无条件先关掉「用户希望隧道在跑」的意图与重连守护：
+     * 否则上一次的火会留着，切换完几秒后按新连接的配置又把隧道拉起来。 */
+    tunnelDesired = false;
+    if (supervisor) supervisor.cancel('切换连接');
     const stopped = [];
     if (manager && manager.snapshot().running) {
-      tunnelDesired = false;
-      if (supervisor) supervisor.cancel('切换连接');
       await manager.stop({ runMode: settings.runMode }).catch(() => {});
       if (manager) await manager.refresh().catch(() => {});
       stopped.push(settings.activeConnectionId);
@@ -3900,6 +3934,18 @@ function crossConnectionPortClash(proxy, { excludeName = '' } = {}) {
       await mm.stop({ runMode: 'managed' }).catch(() => {});
       await mm.refresh().catch(() => {});
       stopped.push(id);
+    }
+    /* 停完之后确认旧连接的管理端口真的空了：frpc 有时「收到 stop 但还活着」，
+     * 那样它会以 external 的身份继续按旧配置跑，界面上看着像「切换没生效」。 */
+    for (const id of stopped) {
+      const old = connectionById(id);
+      if (!old) continue;
+      const port = Number(old.adminPort) || 0;
+      if (!port) continue;
+      for (let i = 0; i < 6; i += 1) {
+        if (!killFrpcOnPort(port)) break;
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
     }
     healthCache.clear();
     settings = settingsModule.save({
@@ -3914,6 +3960,28 @@ function crossConnectionPortClash(proxy, { excludeName = '' } = {}) {
     loadConfigFromDisk();
     updateLogFile();
     if (manager) await manager.refresh().catch(() => {});
+    /* 守护可能在上面的 await 期间又把它拉起来：这里等一小会儿再确认一次。 */
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    if (manager && manager.isChildAlive && !tunnelDesired) {
+      await manager.stop({ runMode: settings.runMode }).catch(() => {});
+      await manager.refresh().catch(() => {});
+    }
+    /* 收尾检查：新当前连接的管理端口上如果还挂着一条「不是自己拉起的」frpc，
+     * 说明上一条连接没停干净 —— 它占着端口，用户点启动会一直被当成 external。 */
+    try {
+      const snapAfter = manager ? manager.snapshot() : null;
+      const ours = !!(manager && manager.isChildAlive);
+      if (snapAfter && snapAfter.mode === 'external' && !ours) {
+        const port = Number(snapAfter.adminPort) || Number(settings.adminPort) || 0;
+        if (port && killFrpcOnPort(port)) {
+          // eslint-disable-next-line no-console
+          console.log(`[conn] 切换连接时清掉了管理端口 ${port} 上的残留 frpc`);
+          if (manager) await manager.refresh().catch(() => {});
+        }
+      }
+    } catch {
+      /* 兜底清理失败不影响切换本身 */
+    }
     pushState();
     return ok({ changed: true, stopped, connections: connectionList(), state: buildState() });
   });
