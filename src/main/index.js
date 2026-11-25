@@ -1552,6 +1552,14 @@ function connectionCounts(conn) {
 function connectionSummary(conn) {
   const mm = conn.id === settings.activeConnectionId ? manager : (multiConnection && multiConnection.extraManagers.get(conn.id));
   const snap = mm ? mm.snapshot() : null;
+  /* apiOk 只说明「frpc 进程活着、管理 API 能答」；frps 挂掉后它照样是 true。
+   * 和当前连接同一套判定：配置里有代理、frpc 却一条都没注册 → 隧道其实没通。 */
+  const declaredCount = (() => {
+    const m = connectionModel(conn);
+    return m && Array.isArray(m.proxies) ? m.proxies.length : 0;
+  })();
+  const registeredCount = snap && Array.isArray(snap.proxies) ? snap.proxies.length : 0;
+  const notRegistered = declaredCount > 0 && registeredCount === 0;
   return {
     id: conn.id,
     name: conn.name,
@@ -1566,7 +1574,8 @@ function connectionSummary(conn) {
       ? {
         mode: snap.mode,
         running: snap.running,
-        connected: snap.connected,
+        connected: snap.connected && !notRegistered,
+        tunnelDown: !!(snap.connected && notRegistered),
         foreign: snap.foreign,
         pid: snap.pid,
         proxyCount: (snap.proxies || []).length,

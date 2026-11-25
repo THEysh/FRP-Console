@@ -125,6 +125,7 @@ async function main() {
 
   const ctx = {
     dataDir,
+    dataRoot,
     cdpPort: CDP_PORT,
     sshPort: SSH_PORT,
     frps,
@@ -198,8 +199,14 @@ async function main() {
       continue;
     }
     try {
-      await scenario.run({ ...ctx, check, sleep });
+      let runtimeSkip = null;
+      await scenario.run({ ...ctx, check, sleep, skip: (reason) => { runtimeSkip = String(reason || '环境不满足'); } });
       const ms = Date.now() - started;
+      if (runtimeSkip) {
+        results.push({ id: scenario.id, status: 'skipped', reason: runtimeSkip, ms });
+        console.log(`⊘ ${scenario.id} ${scenario.title}（${ms}ms）—— 跳过（${runtimeSkip}）`);
+        continue;
+      }
       if (failures.length) {
         results.push({ id: scenario.id, status: 'fail', failures, ms });
         console.log(`✗ ${scenario.id} ${scenario.title}（${ms}ms）`);
