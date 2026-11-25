@@ -58,6 +58,25 @@ module.exports = {
       check('切换器出现且列出两条', multi.hidden === false && multi.options.length === 2, JSON.stringify(multi.options));
       check('概览出现「隧道连接」卡片', multi.rows === 2 && /隧道连接/.test(multi.agg), multi.agg);
 
+      /* 非当前连接也必须能直接启动：否则「一个客户端同时连两台 frps」在界面上无路可走
+       * （切换会把所有在跑的隧道停掉）。 */
+      const otherRow = await ev(`(() => {
+        const row = [...document.querySelectorAll('.conn-row')].find((r) => !r.classList.contains('active'));
+        if (!row) return { missing: true };
+        const acts = [...row.querySelectorAll('button')].map((b) => ({ act: b.dataset.act, label: (b.textContent || '').trim(), id: b.dataset.id }));
+        return { acts };
+      })()`);
+      check(
+        '非当前连接可以直接启动（conn.toggle）',
+        !!otherRow && Array.isArray(otherRow.acts) && otherRow.acts.some((a) => a.act === 'conn.toggle' && a.id),
+        JSON.stringify(otherRow).slice(0, 200),
+      );
+      check(
+        '同时仍能「切到它」（切换是独立动作）',
+        !!otherRow && Array.isArray(otherRow.acts) && otherRow.acts.some((a) => a.act === 'conn.switch'),
+        JSON.stringify(otherRow).slice(0, 200),
+      );
+
       const proxies = await ev(`(async () => {
         document.querySelector('.nav-item[data-view="proxies"]').click();
         await new Promise((r) => setTimeout(r, 600));

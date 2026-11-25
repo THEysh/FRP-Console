@@ -50,7 +50,19 @@ module.exports = {
       () =>
         ctx.eval(`(async () => {
           const r = await FRP.refresh();
-          return { runtime: r.data.runtime, counts: r.data.counts, connectFailed: !!r.data.runtime.connectFailed };
+          const rt = r.data.runtime || {};
+          const raw = r.data.logs;
+          const arr = Array.isArray(raw) ? raw : (raw && raw.lines) || [];
+          /* 原因字段与状态在同一次采样里取：中间若发生自动重连，lastExit 会被清掉，
+           * 分两次读就会出现「状态收敛了、原因却是空」的假失败。 */
+          return {
+            runtime: rt,
+            counts: r.data.counts,
+            connectFailed: !!rt.connectFailed,
+            connectError: rt.connectError || '',
+            lastExit: (rt.lastExit && String(rt.lastExit.error || rt.lastExit.code || '')) || '',
+            logHasExit: arr.some((l) => /exit|退出|stopped|重连|reconnect/i.test(String(l.line || l.text || l))),
+          };
         })()`),
       (v) => v && v.runtime && v.runtime.connected === false && !v.runtime.pid,
       { timeout: 20000, interval: 700, label: '状态收敛为未连接' },
@@ -58,24 +70,11 @@ module.exports = {
     ctx.check('状态如实变成未连接（不再显示已连接）', after.runtime.connected === false && !after.runtime.pid, JSON.stringify(after.runtime).slice(0, 200));
     ctx.check('在线数归零（没有把死掉的隧道算在线）', Number(after.counts.online) === 0, `online=${after.counts.online}`);
 
-    /* 失败原因要能读到人话：frpc 退出 / 连接失败 / 至少不能是空字符串。 */
-    const reason = await ctx.eval(`(async () => {
-      const r = await FRP.refresh();
-      return {
-        connectError: r.data.runtime.connectError || '',
-        connectKind: r.data.runtime.connectKind || '',
-        lastExit: (r.data.runtime.lastExit && String(r.data.runtime.lastExit.error || r.data.runtime.lastExit.code)) || '',
-        logHasExit: (() => {
-          const raw = r.data.logs;
-          const arr = Array.isArray(raw) ? raw : (raw && raw.lines) || [];
-          return arr.some((l) => /exit|退出|stopped/i.test(String(l.line || l.text || l)));
-        })(),
-      };
-    })()`);
+    /* 失败原因要能读到人话：frpc 退出码 / 连接失败文案 / 日志里出现退出或重连（用同一次采样，避免被自动重连清空）。 */
     ctx.check(
       '给出了失败原因（进程退出 / 连接失败文案）',
-      !!(reason.connectError || reason.lastExit || reason.logHasExit),
-      JSON.stringify(reason).slice(0, 240),
+      !!(after.connectError || after.lastExit || after.logHasExit),
+      JSON.stringify({ connectError: after.connectError, lastExit: after.lastExit, logHasExit: after.logHasExit }).slice(0, 240),
     );
 
     /* 重启能恢复 */

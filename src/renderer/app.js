@@ -415,13 +415,12 @@ function connectionsSection() {
           <div class="cr-name">${esc(c.name || c.id)}${isActive ? ' <span class="tag ok">当前</span>' : ''}</div>
           <div class="cr-meta">${esc(connRuntimeLabel(c))} · 在线 ${esc(String(counts.online || 0))} / ${esc(String(counts.total || 0))}</div>
         </div>
+        ${rt.connected
+          ? `<button class="btn small danger" type="button" data-act="conn.toggle" data-id="${esc(c.id)}">${icon('stop')}<span>停止</span></button>`
+          : `<button class="btn small primary" type="button" data-act="conn.toggle" data-id="${esc(c.id)}">${icon('play')}<span>启动</span></button>`}
         ${isActive
-          ? (rt.connected
-            ? `<button class="btn small danger" type="button" data-act="conn.toggle" data-id="${esc(c.id)}">${icon('stop')}<span>停止</span></button>`
-            : `<button class="btn small primary" type="button" data-act="conn.toggle" data-id="${esc(c.id)}">${icon('play')}<span>启动</span></button>`)
-          : (rt.connected
-            ? `<button class="btn small danger" type="button" data-act="conn.toggle" data-id="${esc(c.id)}">${icon('stop')}<span>停止</span></button>`
-            : `<button class="btn small" type="button" data-act="conn.switch" data-id="${esc(c.id)}">切换到它</button>`)}
+          ? ''
+          : `<button class="btn small ghost" type="button" data-act="conn.switch" data-id="${esc(c.id)}" title="切换当前连接（会先停掉所有在跑的隧道；只想让两条同时跑就别切换，直接点左侧的启动）">切到它</button>`}
       </div>`;
   }).join('');
   return `
@@ -430,6 +429,7 @@ function connectionsSection() {
         <div class="section-title">
           <strong>隧道连接</strong>
           <span>${esc(String(agg.connections || list.length))} 条 · ${esc(String(agg.running || 0))} 条已连上 · 合计在线代理 ${esc(String(agg.online || 0))} / ${esc(String(agg.total || 0))}</span>
+          <span class="field-hint" style="margin:0">每条连接一份 frpc.toml、各自一条隧道；想让两条同时在线就分别点「启动」，不需要来回切换。</span>
         </div>
         <button class="btn ghost small" type="button" data-act="conn.add">${icon('plus')}再连一台</button>
       </div>
