@@ -1070,7 +1070,11 @@ function proxyRowHtml(p) {
       ? '<span class="badge amber"><span class="bdot"></span>同步中</span>'
       : p.status === 'start error'
         ? `<span class="badge red" title="${esc(tip)}"><span class="bdot"></span>${esc((p.health && p.health.reason) || '启动失败')}</span>`
-        : '<span class="badge muted"><span class="bdot"></span>未同步</span>';
+        /* 隧道压根没跑时不写「未同步」——那不是同步问题，是这条连接还没启动，
+         * 容易让人以为要等它自动恢复。隧道在跑、只是这条代理还没注册，才叫「未同步」。 */
+        : p.connectionLive === false
+          ? `<span class="badge muted" title="这条连接的隧道没有在运行，代理还没有注册到服务器"><span class="bdot"></span>隧道未运行</span>`
+          : '<span class="badge muted"><span class="bdot"></span>未同步</span>';
   const health = p.health
     ? (p.health.ok
       ? `<span class="health-hint" title="${esc(tip)}">${icon('check')}三层连通 · ${esc(p.health.ms)}ms</span>`

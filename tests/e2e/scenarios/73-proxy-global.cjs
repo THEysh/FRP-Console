@@ -100,6 +100,8 @@ module.exports = {
       })()`));
       check('表头出现「服务器」列', dom.heads.includes('服务器'), JSON.stringify(dom.heads));
       check('多连接时出现筛选 chips（全部 + 两条）', dom.chips.length === 3, JSON.stringify(dom.chips));
+      /* 这条场景里隧道没有启动：状态列应该说「隧道未运行」，而不是含糊的「未同步」（1.2.199） */
+      check('隧道没跑时状态列写「隧道未运行」', dom.cells.length > 0 && dom.cells.every((c) => !/未同步/.test(c)) && dom.cells.some((c) => /隧道未运行/.test(c)), JSON.stringify(dom.cells));
 
       /* 跨连接删除 */
       const beforeA = read(A);

@@ -92,17 +92,27 @@ async function main() {
 
   console.log(`▶ E2E 起步：${scenarios.length} 个场景，数据目录 ${dataDir}`);
 
-  app = await appHelper.start({ cdpPort: CDP_PORT, instancePort: INSTANCE_PORT, dataDir });
-  if (!(await cdp.waitReady(CDP_PORT, 40))) {
-    console.error('✗ 应用没能在 30 秒内打开调试端口（CDP）');
-    try {
-      const log = fs.readFileSync(app.logPath, 'utf8').trim().split('\n').slice(-25).join('\n');
-      if (log) console.error(`--- 应用日志（${app.logPath}）---\n${log}`);
-    } catch {
-      console.error('（没有拿到应用日志）');
+  /* 起主实例：偶发「启动即退」（上一轮残留占着端口、或启动被拖慢），重试 3 次，
+   * 失败时把应用日志尾部打出来——不然只看到 ECONNREFUSED，完全不知道为什么。 */
+  const bootApp = async () => {
+    let lastLog = "";
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      app = await appHelper.start({ cdpPort: CDP_PORT, instancePort: INSTANCE_PORT, dataDir });
+      if (await cdp.waitReady(CDP_PORT, 40)) return true;
+      try {
+        lastLog = fs.readFileSync(app.logPath, 'utf8').trim().split('\n').slice(-20).join('\n');
+      } catch {
+        lastLog = '';
+      }
+      console.log(`ℹ 主实例第 ${attempt} 次没能打开调试端口，清掉端口后重试`);
+      try { appHelper.killPort(CDP_PORT); } catch { /* 已经没了 */ }
+      await sleep(1500);
     }
-    process.exit(1);
-  }
+    console.error('✗ 应用三次都没能打开调试端口（CDP）');
+    if (lastLog) console.error(`--- 应用日志（${app.logPath}）---\n${lastLog}`);
+    return false;
+  };
+  if (!(await bootApp())) process.exit(1);
 
   if (needs.has('frps')) {
     frps = await startFrps({ dir: path.join(dataDir, 'frps'), bindPort: 17000, dashPort: 17500 });
@@ -182,6 +192,16 @@ async function main() {
     },
   };
 
+  /* 每个场景开跑前确认主实例还活着：它中途崩掉时，后面每条都会报 ECONNREFUSED，
+   * 看起来像「产品坏了」，实际是测试环境没了。这里重启一次并明确说明。 */
+  const ensureAppAlive = async (scenarioId) => {
+    if (await cdp.waitReady(CDP_PORT, 2)) return true;
+    console.log(`ℹ ${scenarioId} 开跑前发现主实例已退出，正在重启`);
+    try { appHelper.killPort(CDP_PORT); } catch { /* ignore */ }
+    app = await appHelper.start({ cdpPort: CDP_PORT, instancePort: INSTANCE_PORT, dataDir });
+    return cdp.waitReady(CDP_PORT, 40);
+  };
+
   for (const scenario of scenarios) {
     const started = Date.now();
     const failures = [];
@@ -199,6 +219,7 @@ async function main() {
       continue;
     }
     try {
+      if (!(await ensureAppAlive(scenario.id))) throw new Error("主实例重启后仍连不上调试端口（环境问题，不是产品缺陷）");
       let runtimeSkip = null;
       await scenario.run({ ...ctx, check, sleep, skip: (reason) => { runtimeSkip = String(reason || '环境不满足'); } });
       const ms = Date.now() - started;
