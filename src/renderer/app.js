@@ -311,7 +311,7 @@ function runtimeInfo() {
     label = '未连接';
     title = '隧道未运行';
     // 这里没有任何进程在跑，apiError（“管理 API 未启动”）对用户毫无信息量，只留操作提示。
-    desc = '点击“启动隧道”建立连接';
+    desc = (state.config && state.config.serverAddr) ? '点击“启动隧道”建立连接' : '先在「服务器」页连上一台服务器';
   }
   return { tone, label, title, desc, online, running, starting, external, foreign, r, service };
 }
@@ -719,9 +719,7 @@ function renderOverview(force = false) {
     const port = (info.r && info.r.adminPort) || 7400;
     issues.push(`<div class="note error">${icon('alert')}<div><strong>管理端口 ${esc(port)} 上跑着另一个 frpc</strong><br>它连的服务器或代理名单跟这份配置对不上（多半是另一份配置、另一个控制台实例，或手工开的 frpc）。本配置的隧道没有在跑，这里也不能停它。<br><span style="opacity:.75">到「设置 → 运行模式与行为 → 客户端管理 API」换个端口，或先把那个 frpc 关掉。</span></div></div>`);
   }
-  if (onlyMissingServer) {
-    issues.push(welcomeGuideHtml());
-  } else if (validationErrors.length) {
+  if (!onlyMissingServer && validationErrors.length) {
     issues.push(`<div class="note error">${icon('alert')}<div><strong>配置存在 ${validationErrors.length} 处错误</strong><br>${esc(validationErrors[0].message)}</div></div>`);
   }
   const runtime = state.runtime || {};
@@ -820,7 +818,9 @@ function renderOverview(force = false) {
             ${info.running
               ? `<button class="btn" type="button" data-act="tunnel.restart" title="重启 frpc（连不上服务器时先试这个）">${icon('restart')}<span>重启</span></button>
                  <button class="btn danger" type="button" data-act="tunnel.stop">${icon('stop')}<span>停止隧道</span></button>`
-              : `<button class="btn primary" type="button" data-act="tunnel.start">${icon('play')}<span>启动隧道</span></button>`}
+              : config.serverAddr
+                ? `<button class="btn primary" type="button" data-act="tunnel.start">${icon('play')}<span>启动隧道</span></button>`
+                : `<button class="btn primary" type="button" data-act="nav" data-view="server">${icon('server')}<span>连接服务器</span></button>`}
             <button class="btn" type="button" data-act="tunnel.reload" title="从磁盘重新载入代理配置，不断开连接">${icon('reload')}<span>热重载</span></button>
             ${dashboard ? `<button class="btn" type="button" data-act="open" data-url="${esc(dashboard)}" title="打开 frps 面板">${icon('globe')}<span>服务器面板</span></button>` : ''}
           </div>
@@ -828,6 +828,7 @@ function renderOverview(force = false) {
         </div>
       </section>
 
+      ${onlyMissingServer ? welcomeGuideHtml() : ''}
       ${connectionsSection()}
 
       <section class="card section" style="margin-top:16px">
@@ -836,7 +837,10 @@ function renderOverview(force = false) {
           ${addrList.length ? `<button class="btn ghost small" type="button" data-act="nav" data-view="proxies">管理代理 ${icon('up')}</button>` : ''}
         </div>
         <div class="addr-list${addrList.length && !info.online ? ' paused' : ''}" style="padding:0 16px 16px">
-          ${addresses || '<div class="muted" style="font-size:11.5px;padding:10px 2px">还没有可用的公网映射</div>'}
+          ${addresses || `<div class="empty-hint">
+            <span>还没有可用的公网映射</span>
+            <button class="btn ghost small" type="button" data-act="proxy.add">${icon('plus')}<span>新建一条代理</span></button>
+          </div>`}
         </div>
       </section>
 
