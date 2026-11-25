@@ -35,6 +35,20 @@ function clampLine(text) {
   return text.slice(0, MAX_LINE_CHARS) + `…（这一行共 ${text.length} 字符，已截断后面 ${rest} 个）`;
 }
 
+/* 行首的时间戳与级别标记：界面上已经单独占了两列，正文里再带一遍纯属噪音（1.2.206）。
+ * frp 的两种写法都要认：`2026-11-26 00:17:24.612 [I] …`（文件）与带 ANSI 的 console 版本（已被 stripAnsi 处理）。 */
+const LEADING_META = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?\s*/;
+const LEADING_LEVEL = /^\[[DIWETF]\]\s*/;
+
+function stripLeadingMeta(text) {
+  let out = String(text == null ? '' : text);
+  const before = out;
+  out = out.replace(LEADING_META, '');
+  out = out.replace(LEADING_LEVEL, '');
+  /* 全是前缀（比如只有时间戳的行）时保留原文，别把整行变空。 */
+  return out.trim() ? out : before;
+}
+
 function parseLine(raw, id) {
   let text = stripAnsi(raw).replace(/\r$/, '');
   if (!text.trim()) return null;
@@ -50,6 +64,8 @@ function parseLine(raw, id) {
     ts,
     time,
     level,
+    /* body 只给界面显示用；text 是原文，导出/复制/悬停都用它 */
+    body: stripLeadingMeta(text),
     text,
   };
 }
@@ -213,4 +229,4 @@ class LogFollower extends EventEmitter {
   }
 }
 
-module.exports = { clampLine, MAX_LINE_CHARS, LogFollower, parseLine };
+module.exports = { clampLine, MAX_LINE_CHARS, LogFollower, parseLine, stripLeadingMeta };

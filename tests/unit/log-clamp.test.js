@@ -3,7 +3,7 @@
  * 而它对人没有任何价值（frpc 打整份 JSON/证书时才出现）。 */
 const test = require('node:test');
 const assert = require('node:assert');
-const { clampLine, MAX_LINE_CHARS, parseLine } = require('../../src/main/log.js');
+const { clampLine, MAX_LINE_CHARS, parseLine, stripLeadingMeta } = require('../../src/main/log.js');
 
 test('短行原样保留', () => {
   const s = '2026-11-21 01:00:00 [I] [web] start proxy success';
@@ -35,3 +35,21 @@ test('parseLine 走截断，且时间戳/级别仍解析正确', () => {
 test('空白行仍然被丢掉', () => {
   assert.strictEqual(parseLine('   ', 2), null);
 });
+
+test(
+  '行首的时间戳与 [I] 标记被剥掉，正文只剩有效信息',
+  () => {
+    const line = parseLine('2026-11-26 00:17:24.612 [I] [client/service.go:295] try to connect to server...', 9);
+    assert.ok(line);
+    assert.strictEqual(line.body, '[client/service.go:295] try to connect to server...');
+    assert.match(line.text, /^2026-11-26/, 'text 仍是原文，导出/复制用');
+  },
+);
+
+test(
+  '没有前缀的行 body 与原文一致；只有时间戳的行不变成空',
+  () => {
+    assert.strictEqual(stripLeadingMeta('[web] start proxy success'), '[web] start proxy success');
+    assert.strictEqual(stripLeadingMeta('2026-11-26 00:17:24.612'), '2026-11-26 00:17:24.612');
+  },
+);

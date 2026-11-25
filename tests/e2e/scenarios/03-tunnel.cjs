@@ -66,5 +66,18 @@ module.exports = {
     });
     check('公网端口返回 200', body.status === 200, `status=${body.status} ${body.text.slice(0, 120)}`);
     check('返回的是本地服务的内容', /hello-e2e/.test(body.text || ''), body.text.slice(0, 120));
+
+    /* 日志行不该再重复一遍时间与 [I]：界面已经有「时间 + 级别」两列（1.2.206）。 */
+    const logLines = await ctx.eval(`(async()=>{
+      document.querySelector('.nav-item[data-view="logs"]').click();
+      await new Promise(r=>setTimeout(r,900));
+      const src=[...document.querySelectorAll('[data-act="logs.source"]')].find(b=>/本机/.test(b.textContent||''));
+      if(src) { src.click(); await new Promise(r=>setTimeout(r,900)); }
+      const items=[...document.querySelectorAll('#log-body .ltx')].map(e=>e.textContent);
+      return JSON.stringify({ n: items.length, sample: items.slice(0,8) });
+    })()`);
+    const lg = JSON.parse(logLines);
+    const noisy = (lg.sample || []).filter((t) => /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}/.test(t) || /^\[[DIWETF]\]/.test(t));
+    check('日志正文不再重复时间戳与级别标记', lg.n > 0 && noisy.length === 0, JSON.stringify(lg.sample).slice(0, 240));
   },
 };

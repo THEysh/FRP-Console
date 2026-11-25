@@ -1230,7 +1230,7 @@ function logLineHtml(l) {
   return `<div class="log-line ${esc(level)}">
     <span class="lt">${esc(l.time || fmtTime(l.ts))}</span>
     <span class="lv">${esc(lv)}</span>
-    <span class="ltx" title="${esc(l.text)}">${esc(l.text)}</span>
+    <span class="ltx" title="${esc(l.text)}">${esc(l.body || l.text)}</span>
   </div>`;
 }
 
