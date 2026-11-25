@@ -3168,6 +3168,15 @@ function registerIpc() {
         try { st = fs.statSync(wanted); } catch { st = null; }
         if (!st) return fail(`配置文件不存在：${wanted}`);
         if (st.isDirectory()) return fail(`这是一个文件夹，不是配置文件：${wanted}`);
+        /* 这条路径可能正被另一条连接用着（多连接下每份配置必须是独占的）。 */
+        const wantedKey = path.resolve(wanted).toLowerCase();
+        const holder = (settings.connections || []).find(
+          (item) =>
+            item.id !== settings.activeConnectionId &&
+            item.configPath &&
+            path.resolve(item.configPath).toLowerCase() === wantedKey,
+        );
+        if (holder) return fail(`这个配置文件已经被「${holder.name}」这条连接用着（每条连接必须有自己的一份 frpc.toml）`);
       }
     }
     /* frpc.exe 同理：填了但文件不存在就直接报错。
@@ -3803,6 +3812,12 @@ function crossConnectionPortClash(proxy, { excludeName = '' } = {}) {
       } catch {
         return fail('配置文件不存在');
       }
+      /* 两条连接共用同一份配置 = 写配置互相踩、管理端口互相覆盖，必须拦住。 */
+      const wantedKey = path.resolve(wanted).toLowerCase();
+      const holder = (settings.connections || []).find(
+        (item) => item.id !== conn.id && item.configPath && path.resolve(item.configPath).toLowerCase() === wantedKey,
+      );
+      if (holder) return fail(`这个配置文件已经被「${holder.name}」这条连接用着（每条连接必须有自己的一份 frpc.toml）`);
       patch.configPath = wanted;
       /* 换了配置文件就跟着换日志文件：否则这条连接还往旧目录写日志。 */
       patch.logPath = path.join(path.dirname(wanted), 'frpc.log');
