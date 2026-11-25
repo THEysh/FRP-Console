@@ -5582,9 +5582,18 @@ function domainOwners(domain) {
       acmeManager.markNginx(cert.domain, r, serverHost);
       return r;
     }
-    // 反代的上游是 frps 的 vhost HTTP 端口：没开就先补上，否则写出来的反代一定 502。
+    /* 这个域名在这条连接里是哪种代理？决定 nginx 该把流量推给谁：
+     * http/https/tcpmux → frps 的 vhost HTTP 端口；tcp → 它自己的 remotePort。
+     * 真机取证：广州的 jellyfin/finder 都是 tcp 代理，写死 8080 时 https 永远 404。 */
+    const connNow = activeConnection();
+    const upstreamProxies = (((connNow && connectionModel(connNow)) || model || {}).proxies) || [];
+    const certDomains = (cert.domains && cert.domains.length ? cert.domains : [cert.domain]).filter(Boolean);
+    const directPort = (d) => connectionsModule.upstreamPortForDomain(upstreamProxies, d, 0);
+    const allDirect = certDomains.length > 0 && certDomains.every((d) => directPort(d) > 0);
+    // 反代的上游默认是 frps 的 vhost HTTP 端口：没开就先补上，否则写出来的反代一定 502。
+    // 但域名全部由 tcp 代理发布时不需要 vhost —— 这时别因为 vhost 没配就拒绝部署。
     const vhost = await ensureVhostPort('http').catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
-    if (!vhost.ok) {
+    if (!vhost.ok && !allDirect) {
       const r = { ok: false, error: `服务器 frps 没有可用的 vhostHTTPPort（nginx 反代的上游）：${vhost.error || '未知原因'}` };
       acmeManager.markNginx(cert.domain, r, serverHost);
       return r;
@@ -5601,17 +5610,26 @@ function domainOwners(domain) {
       acmeManager.markNginx(cert.domain, r, serverHost);
       return r;
     }
-    const frpsHttpPort = Number(vhost.port) || 8080;
+    const frpsHttpPort = (vhost.ok && Number(vhost.port)) || 8080;
     const upload = await serverSession.uploadCertToNginx(cert.domain, { certPath: cert.crtPath, keyPath: cert.keyPath });
     if (!upload.ok) { acmeManager.markNginx(cert.domain, upload, serverHost); return upload; }
     const serverNames = serverSession.nginxServerName(cert.domains);
     const rootRedirect = nginxRootRedirectFor(serverNames);
-    const write = await serverSession.writeNginxProxyConfig({ serverNames, certDir: upload.dir, frpsHttpPort, rootRedirect });
+    const upstreams = {};
+    for (const d of certDomains) upstreams[d] = connectionsModule.upstreamPortForDomain(upstreamProxies, d, frpsHttpPort) || frpsHttpPort;
+    const write = await serverSession.writeNginxProxyConfig({ serverNames, certDir: upload.dir, frpsHttpPort, rootRedirect, upstreams });
     if (!write.ok) { acmeManager.markNginx(cert.domain, write, serverHost); return write; }
     const reload = await serverSession.reloadNginx();
     if (!reload.ok) { acmeManager.markNginx(cert.domain, reload, serverHost); return reload; }
     // 反代配置写成功并 reload 后，公网入口就是 nginx 443，代理地址不再带端口。
     setProfileNginxProxy(profileForSession(serverSession).id, true);
+    /* 域名没有 http/https 代理时，nginx 反代到 frps 的 vhost 端口只会得到 404：
+     * 用户的站点可能是 tcp 代理发布的（配置里没有域名字段，我们没法猜端口）。
+     * 这种情况不报错——证书本身已经正确部署了——但必须把「443 会返回 404」说清楚。 */
+    const unpublished = certDomains.filter((d) => !connectionsModule.publishProxyForDomain(upstreamProxies, d));
+    const warning = unpublished.length
+      ? `证书已部署，但 ${unpublished.join("、")} 在当前连接的代理里没有对应的 http 代理：nginx 会把流量转给 frps 的 vhost 端口（${frpsHttpPort}），访问 https://${unpublished[0]} 很可能返回 404。如果站点是用 tcp 代理发布的，需要把这台服务器 nginx 里 443 的 proxy_pass 改成那个远程端口。`
+      : "";
     const r = {
       ok: true,
       serverNames,
@@ -5620,6 +5638,7 @@ function domainOwners(domain) {
       vhost,
       owner: owner || null,
       wrongServer: !!(owner && owner.serverAddr && owner.serverAddr !== serverHost),
+      ...(warning ? { warning } : {}),
     };
     acmeManager.markNginx(cert.domain, r, serverHost);
     return r;
@@ -5686,8 +5705,12 @@ function domainOwners(domain) {
   });
 
   /* 手动把某张已签发证书同步到服务器 nginx（用于「先签证书、后连服务器」的场景）。 */
-  ipcMain.handle('cert:nginx-sync', async (event, payload = {}) => {
+  ipcMain.handle('cert:nginx-sync', async (event, raw = {}) => {
     try {
+      /* 传参形状容错：certRenew/certRemove 收的是字符串域名，certNginxSync 收的是对象，
+       * 两者混用时（真机上我自己就写过 certNginxSync('d')）以前直接报「缺少域名」，
+       * 而证书其实在 certIssue 阶段已经自动部署过，排查起来非常费劲。 */
+      const payload = typeof raw === 'string' ? { domain: raw } : (raw || {});
       const domain = String((payload && payload.domain) || '').trim();
       /* 必须点名是哪张证书：以前域名缺省时会拿 list()[0] 顶上，等于「随便挑一张部署到当前服务器」，
        * 传参走样（比如把字符串当对象）就会把别的域名传到这台机器上，界面上还显示成功。 */

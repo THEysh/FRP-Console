@@ -2110,7 +2110,7 @@ class ServerSession {
   }
 
   /* 写 frp-console.conf：80/443 终止 TLS，反代给 frps 的 HTTP vhost。confDir 缺省自动探测（宝塔/标准）。 */
-  async writeNginxProxyConfig({ serverNames, certDir, frpsHttpPort = 8080, confDir, rootRedirect = '' }) {
+  async writeNginxProxyConfig({ serverNames, certDir, frpsHttpPort = 8080, confDir, rootRedirect = '', upstreams = {} }) {
     if (!this.connected) return { ok: false, error: '尚未连接服务器' };
     const sudo = await this.detectSudo();
     if (!sudo.ok) return sudo;
@@ -2154,9 +2154,16 @@ class ServerSession {
         '    }',
       ]
       : [];
+    /* 一个 server 块里所有 server_name 共用一个上游；它们指向不同端口时没法用一个
+     * location 表达，退回 frps vhost 端口（老行为，至少不会把配置写坏）。
+     * 为什么要按域名挑端口：用户完全可以把站点发布成 tcp 代理（jellyfin → 26296），
+     * 这时 nginx 把 443 的流量推给 frps 的 8080 只会得到 404 —— 真机上就是这样。 */
+    const names = String(serverNames || '').split(/\s+/).filter(Boolean);
+    const picked = [...new Set(names.map((n) => Number(upstreams[n]) || Number(frpsHttpPort)).filter((p) => p > 0))];
+    const upstreamPort = picked.length === 1 ? picked[0] : (Number(frpsHttpPort) || 8080);
     const proxyLines = [
       '    location / {',
-      `        proxy_pass http://127.0.0.1:${frpsHttpPort};`,
+      `        proxy_pass http://127.0.0.1:${upstreamPort};`,
       '        proxy_set_header Host $host;',
       '        proxy_set_header X-Real-IP $remote_addr;',
       '        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;',

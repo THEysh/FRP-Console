@@ -73,7 +73,7 @@ contextBridge.exposeInMainWorld('FRP', {
   certIssue: (payload) => invoke('cert:issue', payload),
   certRenew: (domain) => invoke('cert:renew', { domain }),
   certRemove: (domain, options) => invoke('cert:remove', { domain, ...(options || {}) }),
-  certNginxSync: (payload) => invoke('cert:nginx-sync', payload),
+  certNginxSync: (payload) => invoke('cert:nginx-sync', typeof payload === 'string' ? { domain: payload } : (payload || {})),
   certServerScan: (payload) => invoke('cert:server-scan', payload),
   certServerRemove: (payload) => invoke('cert:server-remove', payload),
   certReplaceRefs: (payload) => invoke('cert:replace-refs', payload),

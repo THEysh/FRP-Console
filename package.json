@@ -1,7 +1,7 @@
 {
   "name": "frp-console",
   "productName": "FRP控制台",
-  "version": "1.2.182",
+  "version": "1.2.183",
   "description": "FRP 内网穿透图形控制台：代理管理、本机端口扫描、frps 远程管理、热重载与实时日志",
   "main": "src/main/index.js",
   "author": "杨盛晖",
@@ -42,7 +42,8 @@
     "test:real:multi": "node tests/real/multi-connection.cjs",
     "soak": "node tests/soak.cjs 30",
     "soak:multi": "node tests/soak-multi.cjs 30",
-    "test:all": "node tools/test-all.cjs"
+    "test:all": "node tools/test-all.cjs",
+    "test:real:cf": "node tests/real/cloudflare-dns.cjs"
   },
   "dependencies": {
     "@xterm/addon-fit": "^0.11.0",

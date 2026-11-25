@@ -20,7 +20,9 @@ module.exports = {
       const r = await FRP.certNginxSync('finder.theysh.cn');
       return { ok: r.ok, error: r.error || '' };
     })()`);
-    check('把字符串当对象传也被拒', wrongType.ok === false && /缺少域名/.test(wrongType.error), wrongType.error);
+    /* 1.2.183 起 certNginxSync 对「字符串」做形状容错（当域名看待），
+     * 所以这里应该走到「本地没有这张证书」，而不是「缺少域名」。 */
+    check('字符串参数被当成域名（不再报缺少域名）', wrongType.ok === false && /没有 .* 的证书|本地没有/.test(wrongType.error), wrongType.error);
 
     const ghost = await ctx.eval(`(async () => {
       const r = await FRP.certNginxSync({ domain: 'no-such-domain.invalid' });

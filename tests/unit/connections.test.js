@@ -114,3 +114,18 @@ test('上限：连接数被截到 MAX_CONNECTIONS', () => {
   const r = conn.migrateConnections({ connections: many });
   assert.equal(r.connections.length, conn.MAX_CONNECTIONS);
 });
+
+test('upstreamPortForDomain：tcp 代理用它自己的 remotePort，http 走 vhost 端口', () => {
+  const proxies = [
+    { name: 'jellyfin', type: 'tcp', remotePort: 26296, customDomains: ['jellyfin.example.com'] },
+    { name: 'site', type: 'http', customDomains: ['site.example.com'], remotePort: 0 },
+  ];
+  // tcp 代理没有域名字段 → 不猜端口，退回 vhost 端口（并由上层给提示）
+  assert.equal(conn.upstreamPortForDomain(proxies, 'jellyfin.example.com', 8080), 8080);
+  assert.equal(conn.upstreamPortForDomain(proxies, 'site.example.com', 8080), 8080);
+  assert.equal(conn.upstreamPortForDomain(proxies, 'nothing.example.com', 8080), 8080);
+  assert.equal(conn.upstreamPortForDomain([], 'x.example.com', 8080), 8080);
+  assert.equal(conn.upstreamPortForDomain(proxies, 'jellyfin.example.com', 0), 0);
+  assert.equal(conn.publishProxyForDomain(proxies, 'site.example.com').name, 'site');
+  assert.equal(conn.publishProxyForDomain(proxies, 'jellyfin.example.com'), null);
+});

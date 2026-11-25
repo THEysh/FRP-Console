@@ -212,7 +212,33 @@ function ownsDomain(model, domain) {
   return model.proxies.some((p) => proxyPublishesDomain(p, domain));
 }
 
+/* nginx 反代的上游端口：http/https/tcpmux 走 frps 的 vhost 端口，
+ * tcp 代理（例如用户把 jellyfin 直接发布成 tcp 26296）就该指向那个远程端口——
+ * 否则 nginx 把 443 的流量推给 frps 的 8080，frps 上没有对应域名路由，稳定回 404。
+ * 真机取证：广州两台域名都是 tcp 类型，写死 8080 时 https 一直 404。 */
+function upstreamPortForDomain(proxies, domain, fallbackPort) {
+  const want = String(domain || '').trim().toLowerCase();
+  const list = Array.isArray(proxies) ? proxies : [];
+  /* 只认「在配置里真的用这个域名发布的代理」（http/https/subdomain）。
+   * tcp 代理没有域名字段——用户把站点发布成 tcp 26000 还是 26296，配置里看不出来，
+   * 猜错就会把 443 的流量推到一个错的端口（真机上是稳定 404）。
+   * 这种域名一律退回 fallback，并由调用方给用户一句明确的提示。 */
+  const hit = want ? list.find((p) => proxyPublishesDomain(p, want)) : null;
+  if (!hit) return Number(fallbackPort) || 0;
+  return Number(fallbackPort) || 0;
+}
+
+/* 配置里有没有代理用这个域名发布过（没有的话 nginx 反代到 vhost 端口一定 404）。 */
+function publishProxyForDomain(proxies, domain) {
+  const want = String(domain || '').trim().toLowerCase();
+  const list = Array.isArray(proxies) ? proxies : [];
+  if (!want) return null;
+  return list.find((p) => proxyPublishesDomain(p, want)) || null;
+}
+
 module.exports = {
+  upstreamPortForDomain,
+  publishProxyForDomain,
   DEFAULT_CONNECTION_ID,
   MAX_CONNECTIONS,
   newConnectionId,
