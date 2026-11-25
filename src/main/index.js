@@ -3818,6 +3818,8 @@ function crossConnectionPortClash(proxy, { excludeName = '' } = {}) {
   ipcMain.handle('connections:add', async (event, payload = {}) => {
     const name = String((payload && payload.name) || '').trim();
     if (!name) return fail('请给这条连接起个名字（例如「广州 frp」）');
+    /* 以前超长会被 normalizeConnection 静默截到 60 字符（保存成功但名字变了）。 */
+    if (name.length > 60) return fail(`连接名太长（${name.length} 字符，最长 60 字符）`);
     const list = (settings.connections || []);
     if (list.length >= connectionsModule.MAX_CONNECTIONS) return fail(`最多 ${connectionsModule.MAX_CONNECTIONS} 条连接`);
     if (list.some((conn) => String(conn.name || '').trim().toLowerCase() === name.toLowerCase())) return fail(`已经有叫「${name}」的连接了`);
@@ -3859,6 +3861,7 @@ function crossConnectionPortClash(proxy, { excludeName = '' } = {}) {
     if (payload.name !== undefined) {
       const name = String(payload.name || '').trim();
       if (!name) return fail('连接名不能为空');
+      if (name.length > 60) return fail(`连接名太长（${name.length} 字符，最长 60 字符）`);
       const taken = (settings.connections || []).some((item) => item.id !== conn.id && String(item.name || '').trim().toLowerCase() === name.toLowerCase());
       if (taken) return fail(`已经有叫「${name}」的连接了`);
       patch.name = name;
