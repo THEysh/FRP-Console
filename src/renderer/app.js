@@ -832,10 +832,10 @@ function renderOverview(force = false) {
 
       <section class="card section" style="margin-top:16px">
         <div class="section-head">
-          <div class="section-title"><strong>公网地址</strong><span>${addrList.length ? `在线 ${onlineCount} / 共 ${addrList.length} 条 · 别人通过这些地址访问你的服务` : '还没有公网映射'}</span></div>
+          <div class="section-title"><strong>公网地址</strong><span>${addrList.length ? (!info.online ? `隧道未运行，下面这些地址暂时打不开 · 共 ${addrList.length} 条` : `在线 ${onlineCount} / 共 ${addrList.length} 条 · 别人通过这些地址访问你的服务`) : '还没有公网映射'}</span></div>
           ${addrList.length ? `<button class="btn ghost small" type="button" data-act="nav" data-view="proxies">管理代理 ${icon('up')}</button>` : ''}
         </div>
-        <div class="addr-list" style="padding:0 16px 16px">
+        <div class="addr-list${addrList.length && !info.online ? ' paused' : ''}" style="padding:0 16px 16px">
           ${addresses || '<div class="muted" style="font-size:11.5px;padding:10px 2px">还没有可用的公网映射</div>'}
         </div>
       </section>
