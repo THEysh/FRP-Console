@@ -1575,6 +1575,41 @@ function connectionSummary(conn) {
   };
 }
 
+/* 非当前连接的配置文件被外部改了：frpc 不会自己重读，需要主动 reload，
+ * 否则界面（按新配置算）和真实隧道（还按旧配置跑）会越走越远。 */
+async function syncParkedConnectionConfigs() {
+  if (!multiConnection || !settings || !Array.isArray(settings.connections)) return;
+  for (const conn of settings.connections) {
+    if (!conn || conn.id === settings.activeConnectionId || !conn.configPath) continue;
+    const mm = multiConnection.extraManagers.get(conn.id);
+    if (!mm) continue;
+    if (!mm.isChildAlive && !mm.apiOk) continue;
+    let stamp = null;
+    try {
+      const st = fs.statSync(conn.configPath);
+      stamp = `${st.mtimeMs}:${st.size}`;
+    } catch {
+      stamp = '';
+    }
+    const before = multiConnection.appliedStamps.get(conn.id);
+    if (before === undefined) {
+      multiConnection.appliedStamps.set(conn.id, stamp);
+      continue;
+    }
+    if (before === stamp) continue;
+    multiConnection.appliedStamps.set(conn.id, stamp);
+    invalidateConnectionModel(conn.id);
+    if (!stamp) continue; /* 文件没了：不 reload，交给界面报错 */
+    try {
+      await mm.reload();
+      // eslint-disable-next-line no-console
+      console.log(`[conn] ${conn.name} 的配置被外部改动，已让 frpc 重新加载`);
+    } catch {
+      /* reload 失败就维持现状，健康检查会显示为未建立 */
+    }
+  }
+}
+
 /* 返回“现在不该自动重连”的原因；空串表示可以重连。
  * 抽成函数是为了出问题时有话可说：日志里能看到到底被哪一条挡住。 */
 function supervisorBlockReason() {
@@ -2141,6 +2176,8 @@ async function tick({ force = false } = {}) {
   tickBusy = true;
   try {
     await tickStep('checkExternalConfig', checkExternalConfig);
+    /* 非当前连接的配置被外部改了，frpc 不会自己重读 —— 这里主动 reload 一次。 */
+    await tickStep('syncParkedConnectionConfigs', syncParkedConnectionConfigs);
     // 先刷隧道真实状态：它决定了界面"通不通"，优先级高于服务托管信息
     await tickStep('manager.refresh', () => manager.refresh());
     if (Date.now() - lastServiceCheck > 3800 || force) {
@@ -6238,12 +6275,14 @@ async function bootstrap() {
   const parkedModels = new Map();
   /* 每条非当前连接的配置指纹（mtime+size），用来判断缓存是否过期。 */
   const parkedStamps = new Map();
+  /* 已经让 frpc 应用过的配置指纹（每条非当前连接），用来决定要不要 reload。 */
+  const appliedStamps = new Map();
   const guards = new Map();
   /* 每条连接最后一次「用户要求停止」的时刻。frpc 的 stopping 标记在
    * stop→start 的边界上不可靠（探针里被外面杀掉的进程仍报 intentional:true），
    * 所以额外用时间窗兜一层：刚点过停止就别再当成意外退出。 */
   const stopRequests = new Map();
-  multiConnection = { extraManagers, parkedModels, parkedStamps, guards, stopRequests };
+  multiConnection = { extraManagers, parkedModels, parkedStamps, appliedStamps, guards, stopRequests };
   ensureClientServerProfile();
   migrateLegacyServerSecret();
   /* 老数据里同一个 IP 可能堆着十几条档案（连接表单每连一次就新建一条）。
