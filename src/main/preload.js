@@ -51,7 +51,7 @@ contextBridge.exposeInMainWorld('FRP', {
   configRaw: () => invoke('config:raw'),
   configVerifyRaw: (content) => invoke('config:verify-raw', { content }),
   configSaveRaw: (content, restart) => invoke('config:save-raw', { content, restart }),
-  saveProxy: (mode, originalName, proxy) => invoke('proxy:save', { mode, originalName, proxy }),
+  saveProxy: (mode, originalName, proxy, connectionId) => invoke('proxy:save', { mode, originalName, proxy, connectionId: connectionId || '' }),
   deleteProxy: (name) => invoke('proxy:delete', name),
   suggestPort: (type) => invoke('proxy:suggest-port', type),
   randomPort: (type) => invoke('proxy:random-port', type),

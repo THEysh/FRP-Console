@@ -1603,6 +1603,16 @@ function connectionSummary(conn) {
     id: conn.id,
     name: conn.name,
     serverId: conn.serverId,
+    /* 界面「目标服务器」下拉要标出哪条还没配地址（`未配置`）。
+     * 取的是这条连接自己 frpc.toml 里的 serverAddr，不是当前会话那台。 */
+    serverAddr: (() => {
+      try {
+        const m = connectionModel(conn);
+        return String((m && m.serverAddr) || '');
+      } catch {
+        return '';
+      }
+    })(),
     configPath: conn.configPath,
     logPath: conn.logPath || '',
     adminPort: (snap && snap.adminPort) || conn.adminPort,
@@ -2228,6 +2238,27 @@ async function applyAndMaybeReload(nextModel, { reload = true, restartRecommende
   healthCache.clear();
   scheduleHealth(900);
   return { ok: true, saved: true, reloaded: !!reloadResult, restartRecommended, state: buildState() };
+}
+
+/* 把代理写进「不是当前连接」的那条：写它自己的 frpc.toml，它自己的 frpc 跑着就重载它。
+ * 当前连接仍走 applyAndMaybeReload（带 frpc 拒绝时回滚、健康检查刷新、全局 state），
+ * 非当前连接绝不能碰全局 model/paths —— 那是当前连接的东西。 */
+async function applyToParkedConnection(conn, nextModel) {
+  const target = String((conn && conn.configPath) || '');
+  if (!target) return { ok: false, error: '这条连接还没有配置文件路径' };
+  const written = configModule.writeConfig(target, nextModel);
+  if (written && written.ok === false) return { ok: false, error: written.error || '写入配置文件失败' };
+  invalidateConnectionModel(conn.id);
+  const mm = managerForConnection(conn.id);
+  let reloaded = false;
+  let reloadError = '';
+  if (mm && mm.apiOk) {
+    const res = await mm.reload().catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+    reloaded = !!res.ok;
+    if (!res.ok) reloadError = res.error || '';
+  }
+  if (mm) await mm.refresh().catch(() => {});
+  return { ok: true, saved: true, reloaded, reloadError, connectionId: conn.id, state: buildState() };
 }
 
 async function refreshService({ detect = false } = {}) {
@@ -3468,15 +3499,20 @@ function registerIpc() {
 
 /* 跨连接端口冲突：同一个 frps 上两条 frpc 抢同一个 remotePort，frps 只回
  * "port already used"，界面看不出是谁占的。这里在保存时就挡住并点名。 */
-function crossConnectionPortClash(proxy, { excludeName = '' } = {}) {
+function crossConnectionPortClash(proxy, { excludeName = '', connId = '' } = {}) {
   const type = proxy && proxy.type;
   if (!['tcp', 'udp'].includes(type)) return '';
   const port = Number(proxy.remotePort);
   if (!port) return '';
-  const myAddr = String((model && model.serverAddr) || '').trim().toLowerCase();
+  /* mine 是「这次要写进去的那条连接」：可能是当前连接，也可能不是（1.2.189 起代理
+   * 可以指定目标服务器）。比错对象就会出现「明明不同服务器却报端口冲突」。 */
+  const mineId = connId || (settings.activeConnectionId || '');
+  const mineModel = mineId === (settings.activeConnectionId || '') ? model : connectionModel(connectionById(mineId));
+  const myAddr = String((mineModel && mineModel.serverAddr) || '').trim().toLowerCase();
+  const myPort = Number((mineModel && mineModel.serverPort) || 0);
   if (!myAddr) return '';
   for (const conn of (settings.connections || [])) {
-    if (!conn.enabled || conn.id === (settings.activeConnectionId || '')) continue;
+    if (!conn.enabled || conn.id === mineId) continue;
     let other = null;
     try {
       other = connectionModel(conn);
@@ -3485,9 +3521,11 @@ function crossConnectionPortClash(proxy, { excludeName = '' } = {}) {
     }
     if (!other) continue;
     if (String(other.serverAddr || '').trim().toLowerCase() !== myAddr) continue;
+    /* 同一台机器上可以跑两个 frps（不同 bindPort）：端口各自独立，别误报冲突。 */
+    if (myPort && Number(other.serverPort || 0) !== myPort) continue;
     const hit = (other.proxies || []).find((p) => p.type === type && Number(p.remotePort) === port && p.name !== excludeName);
     if (hit) {
-      return `公网端口 ${port}/${type} 已经被「${conn.name || conn.id}」这条连接里的代理「${hit.name}」占用（两条 frpc 连的是同一台 frps ${myAddr}）`;
+      return `公网端口 ${port}/${type} 已经被「${conn.name || conn.id}」这条连接里的代理「${hit.name}」占用（两条 frpc 连的是同一台 frps ${myAddr}:${myPort || ''}）`;
     }
   }
   return '';
@@ -3497,20 +3535,37 @@ function crossConnectionPortClash(proxy, { excludeName = '' } = {}) {
     if (!model) return fail('配置尚未载入');
     const { mode = 'add', originalName = '', proxy: input } = payload || {};
     if (!input) return fail('缺少代理参数');
+    /* 目标连接：界面上的「目标服务器」。不传 = 当前连接（老调用方行为不变）。
+     * 非当前连接要写它自己的 frpc.toml，校验/端口冲突/重载也只能针对它。 */
+    const activeId = (settings && settings.activeConnectionId) || '';
+    const wantConnId = String((payload && payload.connectionId) || '').trim();
+    const targetConn = wantConnId && wantConnId !== activeId ? connectionById(wantConnId) : null;
+    if (wantConnId && wantConnId !== activeId && !targetConn) return fail('这条连接已经不存在了（可能被删掉）');
+    const targetId = targetConn ? targetConn.id : activeId;
+    const isCurrent = !targetConn;
+    const targetModel = isCurrent ? model : connectionModel(targetConn);
+    if (!targetModel) return fail('这条连接的配置文件读不到：' + String((targetConn && targetConn.configPath) || ''));
+    if (!isCurrent && !String(targetModel.serverAddr || '').trim()) {
+      return fail('这条连接还没有服务器地址：先去服务器页把它配好，再来加代理');
+    }
+    /* allowPorts 来自「当前 SSH 会话那台服务器」；目标不是它时不能拿它的限制去卡别人。 */
+    const allowPorts = isCurrent ? serverAllowPorts() : [];
     /* 全新安装时本机 frpc.toml 里还是空的：用户在服务器页刚把 frps 配好，转头来加第一条
      * 隧道，不该被「服务器地址不能为空」顶回去 —— 那是我们自己没把目标填上，不是他漏填。
      * 只在地址为空时补，一律取「当前 SSH 会话那台」，没有会话才退到当前档案；
      * 已经配好的地址绝不覆盖。 */
-    const seed = !model.serverAddr ? (findServerProfile(sessionServerId) || activeServerProfile()) : null;
+    const seed = isCurrent && !targetModel.serverAddr ? (findServerProfile(sessionServerId) || activeServerProfile()) : null;
     const base = seed && seed.host
       ? {
-        ...model,
+        ...targetModel,
         serverAddr: seed.host,
         serverPort: Number(seed.clientPort) || 7000,
         auth: { ...(model.auth || {}), method: 'token', token: seed.clientToken || '' },
       }
-      : model;
-    const yMode = yModeEnabled();
+      : targetModel;
+    /* 方案 Y（nginx 终止 TLS）是「某台服务器」的事实：目标不是当前连接时不套用，
+     * 免得把 https 代理悄悄改成 http。 */
+    const yMode = isCurrent ? yModeEnabled() : false;
     const proxy = configModule.makeProxy(input, { nginxProxyEnabled: yMode });
     const next = configModule.normalize({
       ...base._extra,
@@ -3522,18 +3577,18 @@ function crossConnectionPortClash(proxy, { excludeName = '' } = {}) {
       transport: base.transport,
       webServer: base.webServer,
       proxies: mode === 'edit'
-        ? model.proxies.map((p) => (p.name === originalName ? { ...proxy, ...(p.secretKey && !proxy.secretKey ? { secretKey: p.secretKey } : {}) } : p))
-        : [...model.proxies, proxy],
-      visitors: model.visitors,
+        ? targetModel.proxies.map((p) => (p.name === originalName ? { ...proxy, ...(p.secretKey && !proxy.secretKey ? { secretKey: p.secretKey } : {}) } : p))
+        : [...targetModel.proxies, proxy],
+      visitors: targetModel.visitors,
     }, { nginxProxyEnabled: yMode });
-    if (mode === 'add' && model.proxies.some((p) => p.name === proxy.name)) {
-      return { ok: false, error: `代理名称「${proxy.name}」已存在`, validation: configModule.validate(next, { allowPorts: serverAllowPorts() }) };
+    if (mode === 'add' && targetModel.proxies.some((p) => p.name === proxy.name)) {
+      return { ok: false, error: `代理名称「${proxy.name}」已存在`, validation: configModule.validate(next, { allowPorts }) };
     }
     /* 跨连接的公网端口冲突：只有当两条 frpc 连的是**同一台** frps 才成立
      * （不同服务器上用同一个端口是完全合法的）。以前只比当前配置里的代理，
      * 多开连接后用户会在第二台上撞出 "port already used"，而错误来自 frps、看不出是谁占的。 */
     if (typeof crossConnectionPortClash === 'function') {
-      const clash = crossConnectionPortClash(proxy, { excludeName: mode === 'edit' ? originalName : '' });
+      const clash = crossConnectionPortClash(proxy, { excludeName: mode === 'edit' ? originalName : '', connId: targetId });
       if (clash) return { ok: false, error: clash };
     }
     /* frpc 顶层 start = [...] 是「只启动列表里的代理」的白名单（手改配置时常见）。
@@ -3544,7 +3599,7 @@ function crossConnectionPortClash(proxy, { excludeName = '' } = {}) {
       remove: mode === 'edit' && originalName && originalName !== proxy.name ? originalName : '',
     });
     if (startPatch) next._extra = { ...(next._extra || {}), start: startPatch.list };
-    const validation = configModule.validate(next, { allowPorts: serverAllowPorts() });
+    const validation = configModule.validate(next, { allowPorts });
     if (validation.errors.length) {
       return { ok: false, error: validation.errors[0].message, errors: validation.errors, validation };
     }
@@ -3605,17 +3660,26 @@ function crossConnectionPortClash(proxy, { excludeName = '' } = {}) {
     if (yMode && wantedTls && proxy.type === 'http') {
       proxyWarnings.push('此服务器已由 nginx 统一终止 TLS：已自动改为 http 类型（无需证书插件），浏览器访问 https://域名 即可');
     }
-    const result = await applyAndMaybeReload(next);
+    const result = isCurrent ? await applyAndMaybeReload(next) : await applyToParkedConnection(targetConn, next);
     if (!result.ok) return result;
     /* 访问路径存在我们这边（frpc.toml 不认这个字段）。改名时把旧名下的记录搬过来，
      * 免得「改个名访问路径就丢了」。 */
-    if (mode === 'edit' && originalName && originalName !== proxy.name) dropProxyOpenPath(originalName);
-    setProxyOpenPath(proxy.name, openPath);
+    if (mode === 'edit' && originalName && originalName !== proxy.name) dropProxyOpenPath(originalName, targetId);
+    setProxyOpenPath(proxy.name, openPath, targetId);
     // 地址是这次现填的：顺手把「本机隧道目标」记到这个档案上，概览和服务器页才不会
     // 出现「本机隧道还没有归属到任何档案」。
     if (seed) settings = settingsModule.save({ clientServerId: seed.id });
     pushState();
-    return ok({ state: result.state, reloaded: result.reloaded, proxy, seededFrom: seed ? seed.name : '', warnings: proxyWarnings });
+    return ok({
+      state: result.state,
+      reloaded: result.reloaded,
+      reloadError: result.reloadError || '',
+      proxy,
+      connectionId: targetId,
+      connectionName: targetConn ? targetConn.name : '',
+      seededFrom: seed ? seed.name : '',
+      warnings: proxyWarnings,
+    });
   });
 
   ipcMain.handle('proxy:delete', async (event, name) => {

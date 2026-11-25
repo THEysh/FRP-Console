@@ -5835,6 +5835,11 @@ async function handleAction(act, dataset, btn) {
         refreshDomainReadiness();
         break;
       }
+      case 'proxyform.goto.server': {
+        closeModal();
+        setView('server');
+        break;
+      }
       case 'proxyform.cert.fill': {
         const domain = $('#pf-plugin-cert-fill') ? $('#pf-plugin-cert-fill').value : '';
         if (!domain) break;
@@ -6263,6 +6268,40 @@ function uniqueName(base) {
   return `${clean}-${i}`;
 }
 
+/* 「目标服务器」= 这条代理要写进哪一条连接的 frpc.toml。数据源是**全部连接**
+ * （含已停止、未配置），未配置的选项置灰并说明先去配置；一条连接都没有时给引导。
+ * 编辑时锁定：代理存在某条连接的配置文件里，换服务器等于搬走它，先不做。 */
+function targetServerFieldHtml(selectedId, locked) {
+  const list = S.state && Array.isArray(S.state.connections) ? S.state.connections : [];
+  if (!list.length) {
+    return [
+      '<div class="field-hint warn">还没有连接任何服务器：先到「服务器」页连上一台（或新建一条连接），再回来加代理。</div>',
+      '<div class="page-actions"><button class="btn" type="button" data-act="proxyform.goto.server">' + icon('server') + '<span>前往连接服务器</span></button></div>',
+    ].join('');
+  }
+  const pick = String(selectedId || '');
+  const opts = list.map((c) => {
+    const configured = !!String(c.serverAddr || '').trim();
+    const rt = c.runtime || {};
+    const status = !configured ? '未配置' : (rt.connected ? '在线' : (rt.running ? '已启动 · 未连上' : '已停止'));
+    const label = (c.name || c.id) + ' · ' + (configured ? c.serverAddr : '还没有服务器地址') + ' · ' + status + (c.active ? '（当前）' : '');
+    return '<option value="' + esc(c.id) + '"' + (c.id === pick ? ' selected' : '') + (configured ? '' : ' disabled') + '>' + esc(label) + '</option>';
+  }).join('');
+  const chosen = list.find((c) => c.id === pick) || null;
+  const chosenConfigured = !!(chosen && String(chosen.serverAddr || '').trim());
+  const hint = chosenConfigured
+    ? '代理会写进这条连接的 frpc.toml；同一台服务器上不能重名。'
+    : '这条连接还没有服务器地址：先在「服务器」页把它连上并配好 frps，再回来加代理。';
+  const ctrl = locked
+    ? '<select class="input" id="pf-target" disabled>' + opts + '</select><input type="hidden" id="pf-target-locked" value="' + esc(pick) + '" />'
+    : '<select class="input" id="pf-target">' + opts + '</select>';
+  const guide = list.some((c) => String(c.serverAddr || '').trim())
+    ? ''
+    : '<div class="page-actions"><button class="btn" type="button" data-act="proxyform.goto.server">' + icon('server') + '<span>前往连接服务器</span></button></div>';
+  const lockNote = locked ? '<div class="field-hint">编辑时不能换服务器；要换请在目标服务器上重新创建这条代理。</div>' : '';
+  return '<div class="input-group">' + ctrl + '</div><div class="field-hint" id="pf-target-hint">' + esc(hint) + '</div>' + lockNote + guide;
+}
+
 function openProxyEditor({ mode, proxy = null, preset = null }) {
   const current = proxy || {};
   const initial = {
@@ -6280,6 +6319,7 @@ function openProxyEditor({ mode, proxy = null, preset = null }) {
     pluginKeyPath: current.plugin ? current.plugin.keyPath || '' : '',
     pluginHostHeaderRewrite: current.plugin ? current.plugin.hostHeaderRewrite || '' : '',
     openPath: current.openPath || '',
+    target: (S.state && S.state.activeConnectionId) || '',
   };
   S.proxyEdit = { mode, originalName: current.name || '' };
   const types = ['tcp', 'udp', 'http', 'https'];
@@ -6300,7 +6340,11 @@ function openProxyEditor({ mode, proxy = null, preset = null }) {
           <div class="field span-2">
             <label>名称 <span class="req">*</span></label>
             <input class="input" id="pf-name" name="name" value="${esc(initial.name)}" placeholder="例如 jellyfin、web、rdp" />
-            <div class="field-hint">名称会显示在控制台与服务端，不能与已有代理重复。</div>
+            <div class="field-hint">名称不能和「同一台服务器」上已有的代理重复（不同服务器可以同名）。</div>
+          </div>
+          <div class="field span-2" id="pf-target-field">
+            <label>目标服务器</label>
+            ${targetServerFieldHtml(initial.target, mode === 'edit')}
           </div>
           <div class="field span-2">
             <label>协议类型</label>
@@ -6631,6 +6675,9 @@ async function submitProxyForm(form, mode) {
   const pluginKeyPath = ($('#pf-plugin-key') ? $('#pf-plugin-key').value : '').trim();
   const pluginHostHeaderRewrite = ($('#pf-plugin-host') ? $('#pf-plugin-host').value : '').trim();
   const openPathRaw = ($('#pf-openpath') ? $('#pf-openpath').value : '').trim();
+  /* 目标连接：编辑时用锁定值（隐藏域），新增时读下拉。空串 = 当前连接。 */
+  const targetLockedEl = $('#pf-target-locked');
+  const connectionId = targetLockedEl ? targetLockedEl.value : ($('#pf-target') ? $('#pf-target').value : '');
 
   if (!name) return showError('请填写代理名称');
   if (!/^[A-Za-z0-9_.-]+$/.test(name)) return showError('名称建议只包含字母、数字、点、下划线或短横线');
@@ -6669,7 +6716,7 @@ async function submitProxyForm(form, mode) {
   }
   let res;
   try {
-    res = await FRP.saveProxy(mode, mode === 'edit' ? S.proxyEdit.originalName : '', input);
+    res = await FRP.saveProxy(mode, mode === 'edit' ? S.proxyEdit.originalName : '', input, connectionId);
   } catch (error) {
     /* IPC 直接把异常抛过来时（比如写盘失败、主进程崩溃），
      * 以前这里会静默 reject：按钮一直转、界面毫无反应。 */
@@ -6695,7 +6742,7 @@ async function submitProxyForm(form, mode) {
   toast(
     'success',
     mode === 'edit' ? '代理已更新' : '代理已创建',
-    `${name} · 配置已写入${reloaded ? '并已热重载' : '，隧道启动后生效'}`,
+    `${name} · 配置已写入${res.data && res.data.connectionName ? '「' + res.data.connectionName + '」' : ''}${reloaded ? '并已热重载' : '，隧道启动后生效'}`,
   );
   const warnings = (res.data && res.data.warnings) || [];
   if (warnings.length) toast('warn', '代理已保存，但请注意', warnings[0]);
