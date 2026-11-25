@@ -5733,6 +5733,7 @@ function domainOwners(domain) {
     }
     const result = acmeManager.removeLocal(domain);
     if (!result.ok) return fail(result.error);
+    if (result.removed === false) return fail(`本机没有 ${domain} 的证书目录，没有删任何东西`);
     pushState();
     return ok({ removed: true, usedBy });
   });

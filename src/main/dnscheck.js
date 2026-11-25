@@ -392,6 +392,27 @@ function judgeResolution({ sources, serverAddr, cfRecord = null, name = '' }) {
     };
   }
   if (allFailed) {
+    /* 四个解析来源全都没拿到结果时，还有一条线索可用：Cloudflare API 是走 HTTPS 的，
+     * 常常在本机 53 端口被封/被劫持的情况下依然能读到记录。这时候最该说的是
+     * 「记录本身在、指向对不对」，而不是笼统的「查询失败」——后者会把人引去查网络。
+     * （2026-11 真机取证：本机 DoH 被拦，面板只显示「查询失败」，用户以为记录没配好。） */
+    const cfValue = cfRecord ? String(cfRecord.content || '').trim() : '';
+    if (cfRecord && cfValue) {
+      const cfPointsHere = !!(server && IPV4.test(server) && cfValue === server);
+      const proxyNote = cfRecord.proxied
+        ? '这条记录开着橙色云朵（Cloudflare 代理），公网访问会被 CF 边缘接走再回源。'
+        : '这条记录是灰色云朵（仅 DNS），公网直接连服务器。';
+      const fails = list.map((s) => `${s.label || s.id || '来源'}${s.error ? '（' + s.error + '）' : ''}`).join('、');
+      return {
+        verdict: 'cf-only',
+        tone: cfPointsHere || cfRecord.proxied ? 'ok' : 'warn',
+        title: cfPointsHere ? 'Cloudflare 里已指向这台服务器（本机解析没答上来）' : 'Cloudflare 里有这条记录（本机解析没答上来）',
+        detail: `Cloudflare 里查到了 ${cfRecord.type} ${cfRecord.name} → ${cfValue}。${proxyNote} 本机四个解析来源都没拿到结果：${fails}。这只说明本机 DNS 出网被拦（公司网络 / VPN / 杀软网络防护），不改变 Cloudflare 上的记录，也不影响证书签发和别人的公网访问。${cfPointsHere ? '' : (server ? `注意：这条记录指向 ${cfValue}，当前服务器是 ${server}，两者不一致。` : '')}`,
+        addrs: [cfValue],
+        matchesServer: cfPointsHere,
+        cfOnly: true,
+      };
+    }
     return {
       verdict: 'unreachable',
       tone: 'warn',

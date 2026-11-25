@@ -108,3 +108,27 @@ test('extractSoaMinTtl：从 SOA 记录里取负缓存时长', () => {
   assert.equal(dns.extractSoaMinTtl(json), 1800);
   assert.equal(dns.extractSoaMinTtl({}), 0);
 });
+
+test('全部来源失败但 Cloudflare 有记录：按 cf-only 归因，不误导成「查询失败」', () => {
+  const sources = [
+    { id: 'cf', label: 'Cloudflare 1.1.1.1', ok: false, error: 'ECONNRESET', records: [] },
+    { id: 'google', label: 'Google 8.8.8.8', ok: false, error: '超时', records: [] },
+    { id: 'local', label: '本机解析器（系统 DNS）', ok: false, error: 'ENODATA', records: [] },
+    { id: 'authoritative', label: '权威 NS', ok: false, error: '拿不到权威 NS 列表', records: [] },
+  ];
+  const rec = { type: 'A', name: 'cf-probe.theysh.cn', content: '8.148.198.61', proxied: false };
+  const hit = dns.judgeResolution({ sources, serverAddr: '8.148.198.61', cfRecord: rec, name: 'cf-probe.theysh.cn' });
+  assert.equal(hit.verdict, 'cf-only');
+  assert.equal(hit.tone, 'ok');
+  assert.equal(hit.matchesServer, true);
+  assert.deepEqual(hit.addrs, ['8.148.198.61']);
+  assert.match(hit.title, /Cloudflare 里已指向这台服务器/);
+  assert.match(hit.detail, /ECONNRESET/);
+  const other = dns.judgeResolution({ sources, serverAddr: '1.2.3.4', cfRecord: rec, name: 'cf-probe.theysh.cn' });
+  assert.equal(other.verdict, 'cf-only');
+  assert.equal(other.tone, 'warn');
+  assert.equal(other.matchesServer, false);
+  assert.match(other.detail, /两者不一致/);
+  const none = dns.judgeResolution({ sources, serverAddr: '8.148.198.61', cfRecord: null, name: 'cf-probe.theysh.cn' });
+  assert.equal(none.verdict, 'unreachable');
+});

@@ -433,8 +433,14 @@ class AcmeManager {
       ? path.join(this.certsDir, entry.folder)
       : path.join(this.certsDir, certFolder(domain));
     try {
-      if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
-      return { ok: true };
+      if (!fs.existsSync(dir)) {
+        /* 目录本来就不在：不要回 ok + removed:true 骗调用方「删掉了」。
+         * （真机取证：certRemove 传错参数时目录名编出来是 `[object Object]`，
+         *  照样报成功，界面上一片正常、磁盘上证书还在。） */
+        return { ok: true, removed: false };
+      }
+      fs.rmSync(dir, { recursive: true, force: true });
+      return { ok: true, removed: true };
     } catch (e) {
       return { ok: false, error: String((e && e.message) || e) };
     }

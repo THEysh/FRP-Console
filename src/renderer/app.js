@@ -6586,6 +6586,7 @@ function refreshDomainReadiness() {
         case 'elsewhere': return `解析到 ${(judge.addrs || []).slice(0, 2).join('、')}，未指向服务器`;
         case 'missing': return '未解析（没有这条记录）';
         case 'stale': return '记录已删除（本机还缓存着旧值）';
+        case 'cf-only': return 'Cloudflare 里有记录，本机解析没答上来';
         case 'unreachable': return 'DNS 查询失败（本机出网可能受限）';
         default: return judge.title || '解析结果不确定';
       }
