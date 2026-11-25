@@ -381,6 +381,35 @@ function readServerSecret(serverId = '') {
   return decrypt(store.legacy);
 }
 
+/* 连接自己的密码（1.2.193）：同一个密文库，键加 conn: 前缀，
+ * 与「服务器档案」的密码互不覆盖（老数据还在档案键下，连接会依次回退）。 */
+function connectionSecretKey(connectionId = '') {
+  const id = String(connectionId || '').trim();
+  return id ? `conn:${id}` : '';
+}
+
+function readConnectionSecret(connectionId = '') {
+  const key = connectionSecretKey(connectionId);
+  if (!key) return '';
+  return readServerSecret(key);
+}
+
+function hasConnectionSecret(connectionId = '') {
+  return !!readConnectionSecret(connectionId);
+}
+
+function saveConnectionSecret(connectionId, password) {
+  const key = connectionSecretKey(connectionId);
+  if (!key) return { ok: false, error: '缺少连接 ID' };
+  return saveServerSecret(key, password);
+}
+
+function clearConnectionSecret(connectionId = '') {
+  const key = connectionSecretKey(connectionId);
+  if (!key) return { ok: false, error: '缺少连接 ID' };
+  return clearServerSecret(key);
+}
+
 function hasServerSecret(serverId = '') {
   return !!readServerSecret(serverId);
 }
@@ -650,6 +679,11 @@ module.exports = {
   mergeDuplicateServers,
   readServerSecret,
   hasServerSecret,
+  connectionSecretKey,
+  readConnectionSecret,
+  hasConnectionSecret,
+  saveConnectionSecret,
+  clearConnectionSecret,
   hasLegacySecret,
   saveServerSecret,
   clearServerSecret,

@@ -66,6 +66,7 @@ contextBridge.exposeInMainWorld('FRP', {
   connectionStop: (id) => invoke('connections:stop', id),
   connectionAdd: (payload) => invoke('connections:add', payload),
   connectionUpdate: (payload) => invoke('connections:update', payload),
+  connectionSecret: (payload) => invoke('connections:secret', payload),
   connectionRemove: (connId) => invoke('connections:remove', connId),
   connectionActive: (connId) => invoke('connections:active', connId),
   scanListeners: () => invoke('listen:scan'),

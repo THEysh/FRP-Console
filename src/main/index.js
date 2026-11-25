@@ -1624,6 +1624,8 @@ function connectionSummary(conn) {
     host: conn.host || '',
     port: conn.port || 22,
     username: conn.username || 'root',
+    /* 界面要能说「这条连接已经存过密码」，否则用户每次都得重新输。 */
+    hasPassword: !!(settingsModule.readConnectionSecret(conn.id) || (conn.serverId && settingsModule.hasServerSecret(conn.serverId))),
     /* 界面「目标服务器」下拉要标出哪条还没配地址（`未配置`）。
      * 取的是这条连接自己 frpc.toml 里的 serverAddr，不是当前会话那台。 */
     serverAddr: (() => {
@@ -1902,8 +1904,8 @@ function pruneProxyOpenPaths() {
   let changed = false;
   for (const key of Object.keys(map)) {
     if (key.includes('::')) {
-      const [connId] = connectionsModule.splitKey(key);
-      if (connIds.has(connId)) continue;
+      const { connectionId } = connectionsModule.splitKey(key);
+      if (connIds.has(connectionId)) continue;
       delete map[key];
       changed = true;
       continue;
@@ -3993,6 +3995,20 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '' } = {})
 
   /* 新建一条连接：给它一个独立的配置文件（空的起步配置），不是复制当前连接的内容 ——
    * 复制会把 serverAddr/token 带过去，等于悄悄多开一条连同一台服务器的隧道。 */
+  /* 连接设置弹窗保存密码用：只写 DPAPI 库，不碰 frpc.toml。 */
+  ipcMain.handle('connections:secret', async (event, payload = {}) => {
+    const conn = connectionById(String((payload && payload.id) || ''));
+    if (!conn) return fail('连接不存在（可能已被删除）');
+    const patch = {};
+    if (payload.password !== undefined) {
+      const pw = String(payload.password || '');
+      const r = pw ? settingsModule.saveConnectionSecret(conn.id, pw) : settingsModule.clearConnectionSecret(conn.id);
+      if (!r.ok) return fail(r.error || '保存密码失败');
+      patch.hasPassword = !!pw;
+    }
+    return ok({ connection: connectionSummary(conn), ...patch });
+  });
+
   ipcMain.handle('connections:add', async (event, payload = {}) => {
     const name = String((payload && payload.name) || '').trim();
     if (!name) return fail('请给这条连接起个名字（例如「广州 frp」）');
@@ -4726,6 +4742,8 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '' } = {})
     if (!profile) profile = findServerProfileByKey({ host, port });
     const wasNew = !profile;
     if (!profile) profile = upsertServerProfile({ host, port, username, name: host });
+    /* 1.2.193：密码按连接存；老数据仍在档案键下，所以依次回退。 */
+    if (!password && connNow) password = settingsModule.readConnectionSecret(connNow.id);
     if (!password) password = settingsModule.readServerSecret(profile.id);
     if (!password) return fail(changed ? '档案地址已变更，请重新输入 SSH 密码' : '请输入密码', { needsPassword: true, state: serverState() });
 
@@ -4764,8 +4782,11 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '' } = {})
     if (payload.remember) {
       const saved = settingsModule.saveServerSecret(profile.id, password);
       if (!saved.ok) return fail(saved.error, { state: serverState() });
+      /* 连接也记一份：以后这条连接不依赖档案也能自己连上。 */
+      if (connNow) settingsModule.saveConnectionSecret(connNow.id, password);
     } else if (payload.password) {
       settingsModule.clearServerSecret(profile.id);
+      if (connNow) settingsModule.clearConnectionSecret(connNow.id);
     }
     const inspected = await serverSession.inspect();
     if (sessionEpoch !== myEpoch) {

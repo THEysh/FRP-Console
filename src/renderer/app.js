@@ -420,7 +420,7 @@ function connectionsSection() {
           : `<button class="btn small primary" type="button" data-act="conn.toggle" data-id="${esc(c.id)}">${icon('play')}<span>启动</span></button>`}
         ${isActive
           ? ''
-          : `<button class="btn small ghost" type="button" data-act="conn.switch" data-id="${esc(c.id)}" title="切换当前连接（会先停掉所有在跑的隧道；只想让两条同时跑就别切换，直接点左侧的启动）">切到它</button>`}
+          : `<button class="btn small ghost" type="button" data-act="conn.switch" data-id="${esc(c.id)}" title="切换当前连接（会先停掉所有在跑的隧道；只想让两条同时跑就别切换，直接点左侧的启动）">设为当前</button>`}
       </div>`;
   }).join('');
   return `
@@ -960,7 +960,6 @@ function renderProxies(force = false) {
       </div>
 
       ${orphanTunnelNote()}
-      ${otherConnectionsNote()}
       ${state.configError ? `<div class="note error" style="margin-bottom:14px">${icon('alert')}<div>${esc(state.configError)}</div></div>` : ''}
       ${state.configVerifyError ? `<div class="note error" style="margin-bottom:14px">${icon('alert')}<div>${esc(state.configVerifyError)}<br><span style="opacity:.75">隧道仍在用上一次的配置运行；把 frpc.toml 改对后会自动重新载入。</span></div></div>` : ''}
 
@@ -2661,7 +2660,7 @@ function renderServer(force = false) {
       </div>
 
       ${serverConnBar()}
-      ${profileBarMarkup()}
+      ${connCardMarkup()}
 
       ${terminalCardMarkup()}
 
@@ -2860,6 +2859,122 @@ function localTunnelBtn() {
   const running = !!(c.runtime && (c.runtime.running || c.runtime.connected));
   const label = running ? '停止隧道' : '启动隧道';
   return `<button class="btn ${running ? 'ghost' : 'primary'}" type="button" data-act="conn.toggle" data-id="${esc(id)}">${icon(running ? 'stop' : 'play')}<span>${label}</span></button>`;
+}
+
+/* 服务器页顶部那张紧凑卡（1.2.193）：一条连接 = 一台服务器，
+ * 这里只说清「我是谁、连的是哪、frps 什么状态、密码存没存」，编辑走弹窗。 */
+function connCardMarkup() {
+  const conn = activeConnectionInfo();
+  if (!conn) return '';
+  const st = S.state || {};
+  const summary = (st.config && st.config.summary) || {};
+  /* token 的真相在磁盘上的 frpc.toml（连接里刻意不存），所以先看配置里的 auth.token，
+   * 再回退老字段 settings.hasToken —— 否则配置里有 token 也会显示「未设置」，误导用户去重填。 */
+  const cfgToken = !!(st.config && st.config.auth && st.config.auth.token);
+  const tokenState = (cfgToken || (st.settings && st.settings.hasToken)) ? '已设置' : '未设置';
+  /* 连接还没回写过地址时，退回显示配置文件里的 serverAddr：
+   * 否则卡片说「还没有填 SSH 地址」而下面的表单里明明有地址，用户会以为是两回事。 */
+  const cfgAddr = (S.state && S.state.config && S.state.config.serverAddr) || '';
+  const sshHost = conn.host || cfgAddr;
+  const ssh = sshHost
+    ? `SSH ${esc(conn.username || 'root')}@${esc(sshHost)}:${esc(conn.host ? (conn.port || 22) : 22)}${conn.host ? '' : '（来自配置文件）'}`
+    : '还没有填 SSH 地址';
+  const facts = [
+    ssh,
+    summary.bindPort ? `frps 端口 ${summary.bindPort}` : '',
+    `Token ${tokenState}`,
+    conn.hasPassword ? '密码已保存' : '密码未保存',
+  ].filter(Boolean);
+  const rt = conn.runtime || {};
+  const dot = rt.connected ? 'ok' : (rt.running ? 'warn' : 'idle');
+  const stateText = rt.connected ? '隧道已连接' : (rt.running ? '隧道运行中（还没连上）' : '隧道未运行');
+  return `<section class="card conn-card">
+    <div class="conn-main">
+      <span class="schip-dot ${dot}" style="width:9px;height:9px"></span>
+      <div class="grow">
+        <div class="conn-title"><h3>${esc(conn.name || conn.id)}</h3><span class="badge muted" style="font-size:10px">${esc(stateText)}</span></div>
+        <p class="conn-facts">${facts.map((x) => esc(x)).join('<span class="conn-sep">·</span>')}</p>
+      </div>
+      <div class="conn-actions">
+        <button class="btn" type="button" data-act="conn.edit">${icon('edit')}<span>编辑连接</span></button>
+        ${S.server.connected ? `<button class="btn ghost" type="button" data-act="server.disconnect">${icon('x')}<span>断开 SSH</span></button>` : ''}
+      </div>
+    </div>
+  </section>`;
+}
+
+/* 编辑连接：SSH 地址 / 端口 / 用户名 / 密码（密码进 DPAPI，不写 frpc.toml）。 */
+function openConnectionEditor() {
+  const conn = activeConnectionInfo();
+  if (!conn) return;
+  openModal(`
+    <div class="modal" style="width:560px">
+      <div class="modal-head">
+        <div class="mh-icon">${icon('server')}</div>
+        <div class="grow"><h3>连接设置</h3><p>这台服务器的 SSH 地址与密码。frps 的地址与 Token 在「配置文件」卡里改。</p></div>
+        <button class="icon-btn modal-close" type="button" data-act="modal.close">${icon('x')}</button>
+      </div>
+      <form id="conn-edit-form" class="modal-body" autocomplete="off" data-id="${esc(conn.id)}">
+        <div class="form-grid">
+          <div class="field span-2">
+            <label>连接名称</label>
+            <input class="input" name="name" value="${esc(conn.name || '')}" placeholder="例如 日本 frps">
+          </div>
+          <div class="field span-2">
+            <label>服务器 IP / 域名</label>
+            <input class="input" name="host" value="${esc(conn.host || '')}" placeholder="例如 frps.example.com" spellcheck="false">
+          </div>
+          <div class="field">
+            <label>SSH 端口</label>
+            <input class="input" name="port" type="number" min="1" max="65535" value="${esc(conn.port || 22)}">
+          </div>
+          <div class="field">
+            <label>SSH 用户名</label>
+            <input class="input" name="username" value="${esc(conn.username || 'root')}" spellcheck="false">
+          </div>
+          <div class="field span-2">
+            <label>SSH 密码 ${conn.hasPassword ? '<span class="field-hint">已保存，留空保持不变</span>' : ''}</label>
+            <input class="input" name="password" type="password" placeholder="${conn.hasPassword ? '使用已保存的密码' : '登录密码'}" autocomplete="new-password">
+          </div>
+        </div>
+        <div class="field-hint" id="conn-edit-hint">密码用 Windows DPAPI 加密保存在本机，不会写进 frpc.toml，也不会进日志。</div>
+      </form>
+      <div class="modal-foot">
+        <span class="mf-left"></span>
+        <button class="btn" type="button" data-act="modal.close">取消</button>
+        <button class="btn primary" type="button" id="conn-edit-save">${icon('check')}<span>保存</span></button>
+      </div>
+    </div>`);
+  const btn = $('#conn-edit-save');
+  if (!btn) return;
+  btn.addEventListener('click', async () => {
+    const form = $('#conn-edit-form');
+    if (!form) return;
+    const fd = new FormData(form);
+    const id = form.dataset.id;
+    btn.disabled = true;
+    try {
+      const patch = {
+        id,
+        name: String(fd.get('name') || '').trim(),
+        host: String(fd.get('host') || '').trim(),
+        port: Number(fd.get('port') || 22),
+        username: String(fd.get('username') || '').trim() || 'root',
+      };
+      if (!patch.host) patch.host = '';
+      const res = await FRP.connectionUpdate(patch);
+      if (!res || !res.ok) { toast('error', '保存失败', (res && res.error) || '请稍后再试'); return; }
+      const pw = String(fd.get('password') || '');
+      if (pw) {
+        const sres = await FRP.connectionSecret({ id, password: pw });
+        if (!sres || !sres.ok) { toast('error', '密码没保存成功', (sres && sres.error) || ''); return; }
+      }
+      closeModal();
+      toast('success', '连接设置已保存', patch.host || '未填写地址');
+      await reloadAfterConnectionChange();
+      renderServer(true);
+    } finally { btn.disabled = false; }
+  });
 }
 
 function profileBarMarkup(options = {}) {
@@ -3533,7 +3648,7 @@ function connectedFormMarkup() {
         <div class="page-actions">${localTunnelBtn()}</div>
       </div>
       ${serverConnBar()}
-      ${profileBarMarkup({ showDiff: false })}
+      ${connCardMarkup()}
       <section class="card">
         <div class="card-head">
           <div class="ch-icon">${icon('server')}</div>
@@ -3543,7 +3658,7 @@ function connectedFormMarkup() {
           <div class="field span-2">
             <label>服务器 IP / 域名 <span class="req">*</span></label>
             <input class="input" name="host" value="${esc(defaultHost)}" placeholder="例如 frps.example.com" spellcheck="false">
-            <div class="field-hint" id="cf-host-note">同一台机器（IP + SSH 端口）只保留一条档案；连已有的机器会更新那条，不会新建。</div>
+            <div class="field-hint" id="cf-host-note">连过的机器会记住地址与密码（密码用 Windows DPAPI 加密保存），下次直接点「连接并获取状态」即可。</div>
           </div>
           <div class="field">
             <label>SSH 端口</label>
@@ -5102,6 +5217,9 @@ async function handleAction(act, dataset, btn) {
       toast('success', isRunning ? '已停止' : '已启动', conn.name || id);
       return;
     }
+    case 'conn.edit':
+      openConnectionEditor();
+      return;
     case 'conn.switch': {
       const id = (dataset && dataset.id) || '';
       const target = connList().find((c) => c.id === id);

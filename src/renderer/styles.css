@@ -1763,3 +1763,41 @@ label .icon-btn svg { width: 13px; height: 13px; }
 .schip-dot.ok { background: #3ddc97; box-shadow: 0 0 6px rgba(61, 220, 151, 0.55); }
 .schip-dot.warn { background: #f5b94a; }
 .schip-dot.idle { background: rgba(148, 163, 184, 0.5); }
+
+/* 服务器页顶部的紧凑「连接」卡（1.2.193）。 */
+.conn-card {
+  padding: 14px 18px;
+}
+
+.conn-main {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.conn-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.conn-title h3 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.conn-facts {
+  margin: 4px 0 0;
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+
+.conn-sep {
+  margin: 0 7px;
+  opacity: 0.45;
+}
+
+.conn-actions {
+  display: flex;
+  gap: 8px;
+}

@@ -3,7 +3,7 @@
  *
  * 钉住：
  *   ① 单连接用户看不到切换器（hidden），界面与以前一致；
- *   ② 多出一条后，侧栏出现切换器（选项带名字）、概览出现「隧道连接」卡片、代理页出现「只列当前连接」提示；
+ *   ② 多出一条后，侧栏出现切换器（选项带名字）、概览出现「隧道连接」卡片、代理页表格有「服务器」列（1.2.190 起是全量视图，不再只列当前连接）；
  *   ③ 「＋」弹的是自绘输入框（Electron 没有 window.prompt），输入并确认后连接真的建出来；
  *   ④ 切当前连接后，下拉与「当前」标记跟着变（状态里必须带 activeConnectionId）。
  */
@@ -80,10 +80,12 @@ module.exports = {
       const proxies = await ev(`(async () => {
         document.querySelector('.nav-item[data-view="proxies"]').click();
         await new Promise((r) => setTimeout(r, 600));
-        const notes = [...document.querySelectorAll('.note')].map((n) => n.textContent.replace(/\\s+/g, ' ').trim());
-        return { note: notes.find((t) => t.includes('当前连接')) || '' };
+        const h1 = (document.querySelector('#view h1') || {}).textContent || '';
+        const stale = [...document.querySelectorAll('.note')].some((n) => n.textContent.includes('另有') && n.textContent.includes('条连接'));
+        return { h1, stale };
       })()`);
-      check('代理页说明「只列当前连接」', /另有 1 条连接/.test(proxies.note), proxies.note.slice(0, 80));
+      check('代理页能正常渲染（全量视图）', /代理映射/.test(proxies.h1), JSON.stringify(proxies));
+      check('旧的「只列当前连接」提示已移除', proxies.stale === false, JSON.stringify(proxies));
 
       /* 「＋」→ 自绘输入框 → 创建第三条 */
       const viaDialog = await ev(`(async () => {
@@ -117,7 +119,8 @@ module.exports = {
           if (sel && sel.value === target.id) break;
         }
         const rows = [...document.querySelectorAll('.conn-row')].map((x) => x.textContent.replace(/\\s+/g, ' ').trim());
-        return { ok: r.ok, selected: sel ? sel.value : '', expect: target.id, activeRow: rows.find((t) => t.includes('当前')) || '' };
+        /* 「设为当前」按钮文字里也有「当前」，先排除掉，只找真正被标成当前的那一行 */
+        return { ok: r.ok, selected: sel ? sel.value : '', expect: target.id, activeRow: rows.filter((t) => !t.includes('设为当前')).find((t) => t.includes('当前')) || '' };
       })()`);
       check('切换后下拉选中新连接', switched.ok === true && switched.selected === switched.expect, JSON.stringify(switched.selected));
       check('切换后概览「当前」标记跟着走', /第二台/.test(switched.activeRow || ''), switched.activeRow);
