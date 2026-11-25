@@ -33,6 +33,9 @@ const DENY_HASHES = new Set([
 ]);
 
 const PRIVATE_KEY = /-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----/;
+/* 测试夹具目录里的自签证书私钥是刻意提交的（假服务器用，CN=e2e-cert.lab，10 年期），
+ * 不算泄漏；只放行这一个目录，其它位置照旧报。 */
+const TEST_KEY_DIR = /^tests\/e2e\/fixtures\/tls\//;
 /* src/ 与 build/ 里不该出现「token = "abc…"」这种写死的值；README 的示例不受此限。 */
 const HARDCODED = /(?:\btoken|\bpassword|\bsecret|\bpasswd)\s*[:=]\s*['"]([A-Za-z0-9!@#$%^&*_+\-]{12,})['"]/i;
 /* 候选凭据片段：密码/token 常见的字符集，按空白与引号切出来逐个比对哈希。 */
@@ -73,7 +76,7 @@ for (const rel of files) {
     continue;
   }
   text.split(/\r?\n/).forEach((line, i) => {
-    if (PRIVATE_KEY.test(line)) {
+    if (PRIVATE_KEY.test(line) && !TEST_KEY_DIR.test(String(rel).replace(/\\/g, '/'))) {
       findings.push({ file: rel, line: i + 1, kind: '私钥', detail: '-----BEGIN … PRIVATE KEY-----' });
     }
     for (const token of line.match(CANDIDATE) || []) {
