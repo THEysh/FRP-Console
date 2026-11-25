@@ -2938,6 +2938,10 @@ function connCardMarkup() {
 function openConnectionEditor() {
   const conn = activeConnectionInfo();
   if (!conn) return;
+  /* 连接里没存 host 时，用这条连接 frpc.toml 里的 serverAddr 兜底预填（1.2.204）：
+   * 卡片已经这么显示了，弹窗里却空着，用户会以为地址丢了。 */
+  const hostFallback = !conn.host && conn.serverAddr ? String(conn.serverAddr) : '';
+  const hostValue = conn.host || hostFallback;
   openModal(`
     <div class="modal" style="width:560px">
       <div class="modal-head">
@@ -2953,7 +2957,8 @@ function openConnectionEditor() {
           </div>
           <div class="field span-2">
             <label>服务器 IP / 域名</label>
-            <input class="input" name="host" value="${esc(conn.host || '')}" placeholder="例如 frps.example.com" spellcheck="false">
+            <input class="input" name="host" value="${esc(hostValue)}" placeholder="例如 frps.example.com" spellcheck="false">
+            ${hostFallback ? `<div class="field-hint">这个地址是从这条连接的 frpc.toml 里带出来的；SSH 在别的机器上就改掉。</div>` : ''}
           </div>
           <div class="field">
             <label>SSH 端口</label>
