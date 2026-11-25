@@ -800,6 +800,11 @@ function renderOverview(force = false) {
     </div></div>`);
   }
 
+  /* 多条连接时，hero 必须点名「这是哪一条」，否则上面列着日本/广州、下面只说一个地址，认不出来。 */
+  const connListNow = (S.state && S.state.connections) || [];
+  const heroConn = connListNow.length > 1
+    ? (connListNow.find((c) => c.id === S.state.activeConnectionId) || {}).name || ''
+    : '';
   $('#view').innerHTML = `
     <div class="view">
       <section class="card hero">
@@ -808,7 +813,7 @@ function renderOverview(force = false) {
             <div class="hero-orb ${info.tone === 'online' ? 'online' : info.tone === 'error' ? 'error' : 'warn'}">${icon(info.tone === 'online' ? 'shield' : info.starting ? 'clock' : 'alert')}</div>
             <div class="hero-titles">
               <h2>${esc(info.title)}</h2>
-              <p>${esc(config.serverAddr ? `${config.serverAddr}:${config.serverPort}` : '尚未配置服务器')} · ${esc(info.desc)}</p>
+              <p>${heroConn ? `<span class="hero-conn">${esc(heroConn)}</span> · ` : ''}${esc(config.serverAddr ? `${config.serverAddr}:${config.serverPort}` : '尚未配置服务器')} · ${esc(info.desc)}</p>
             </div>
           </div>
           <div class="hero-actions">
