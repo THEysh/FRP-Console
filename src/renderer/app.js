@@ -266,8 +266,8 @@ function runtimeInfo() {
   } else if (online && !starting) {
     if (orphan) {
       tone = 'warn';
-      label = '隧道在线 · 无档案';
-      title = '隧道仍在运行，但没有对应的服务器档案';
+      label = '隧道在线 · 未登记';
+      title = '隧道仍在运行，但这台服务器不在连接列表里';
       desc = `frpc.toml 还在连 ${state.binding.addr}:${state.binding.port || '—'}`;
     } else {
       tone = 'online';
@@ -644,16 +644,16 @@ function orphanTunnelNote() {
   // 档案还在、只是没绑到隧道上：说清楚绑一下就行，别吓唬人说“档案没了”。
   if (b.matchProfileName) {
     return `<div class="note warn" style="margin-bottom:14px">${icon('alert')}<div>
-      <strong>本机隧道没有归属到档案</strong><br>
-      <code>frpc.toml</code> 指向 <code>${where}</code>，本机有档案「${esc(b.matchProfileName)}」与它对应，但隧道目标没有指向这份档案。
+      <strong>本机隧道目标没有对应到任何连接</strong><br>
+      <code>frpc.toml</code> 指向 <code>${where}</code>，本机有连接「${esc(b.matchProfileName)}」与它对应，只是没登记为「当前连接」。
       <div style="margin-top:10px"><button class="btn small" type="button" data-act="nav" data-view="server">${icon('server')}<span>去服务器页绑定</span></button></div>
     </div></div>`;
   }
   return `<div class="note warn" style="margin-bottom:14px">${icon('alert')}<div>
-    <strong>隧道还在跑，但已经没有对应的服务器档案</strong><br>
-    本机 <code>frpc.toml</code> 仍指向 <code>${where}</code>，这台服务器的档案已经不在了。隧道确实还能通，所以下面的状态不是误报——只是它已经不在控制台的记录里，出问题也没人帮你核对服务器侧。
+    <strong>隧道还在跑，但这条隧道已经不属于任何连接</strong><br>
+    本机 <code>frpc.toml</code> 仍指向 <code>${where}</code>，这台服务器已经不在连接列表里了。隧道确实还能通，所以下面的状态不是误报——只是它已经不在控制台的记录里，出问题也没人帮你核对服务器侧。
     <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
-      <button class="btn small" type="button" data-act="nav" data-view="server">${icon('server')}<span>去服务器页重建档案</span></button>
+      <button class="btn small" type="button" data-act="nav" data-view="server">${icon('server')}<span>去服务器页新建连接</span></button>
       <button class="btn small" type="button" data-act="tunnel.stop">${icon('stop')}<span>停止隧道</span></button>
     </div>
   </div></div>`;
@@ -753,7 +753,7 @@ function renderOverview(force = false) {
       refused: `服务器上的 frps 没在 ${config.serverPort || 7000} 端口监听：服务没启动、端口改过，或被防火墙拒绝。`,
       unreachable: '连不到服务器端口：网络 / 安全组把它丢了，也可能本机的代理、VPN 在拦截。',
       firewall: '隧道连上了服务器端口，但数据被中间设备掐断——很可能是云厂商防火墙/安全组没放行这个端口（阿里云安全组、轻量服务器防火墙等），也可能服务器内的 ufw/firewalld 在拦。',
-      auth: 'frps 在线，但 Token 校验没过：档案里的 Token 与服务端 auth.token 不一致。',
+      auth: 'frps 在线，但 Token 校验没过：这条连接的 frpc.toml 里的 Token 与服务端 auth.token 不一致。',
       proxy: '本机到服务器的链路走了 HTTP 代理，请求被网关挡回 502/503。到「设置 → 运行模式与行为」打开“不继承系统代理”，或让代理放行该端口。',
       unconfirmed: 'frpc 进程起来了，但配置里的代理一个都没在服务器上注册成功，说明还没登录上 frps（端口不对、Token 不符或被网络挡了）。',
       unknown: '具体原因见概览下方的 frpc 日志。',
@@ -1763,7 +1763,7 @@ function selftestMarkup() {
       ${selftestStepMarkup(steps, 'ssh', '①', 'SSH 通道', '用一条最小命令确认还能在服务器上执行操作')}
       ${selftestStepMarkup(steps, 'service', '②', 'frps 运行状态', '进程 / systemd / Docker 任一种在跑，并顺带确认开机自启')}
       ${selftestStepMarkup(steps, 'bindPort', '③', 'bindPort 监听', '服务器本机 ss / netstat 里能否看到 frps 的 bindPort')}
-      ${selftestStepMarkup(steps, 'token', '④', 'Token 一致', '服务端 auth.token 与本机档案里的 Token 是否完全相同')}
+      ${selftestStepMarkup(steps, 'token', '④', 'Token 一致', '服务端 auth.token 与本机 frpc.toml 里的 Token 是否完全相同')}
     </div>
     <p class="st-foot">服务器就绪 ≠ 隧道可用。真正的「本地 → 隧道 → 公网」三层连通性在概览与代理映射页检查。</p>`;
 }
@@ -3548,11 +3548,11 @@ function confirmDeleteServerProfile() {
     <div class="modal" style="width:480px">
       <div class="modal-head">
         <div class="mh-icon" style="color:var(--red)">${icon('trash')}</div>
-        <div class="grow"><h3>删除服务器档案</h3><p>只删除本机保存的 SSH / Token 信息，不会卸载服务器上的 frps。</p></div>
+        <div class="grow"><h3>清除这台服务器在本机保存的信息</h3><p>只删 SSH 地址、账号与 Token 记录；不会卸载服务器上的 frps，也不会删掉这条连接。</p></div>
         <button class="icon-btn modal-close" type="button" data-act="modal.close">${icon('x')}</button>
       </div>
       <div class="modal-body">
-        <div class="note warn">${icon('alert')}<div>确定删除档案 <strong>${esc(active.name)}</strong>（${esc(active.host)}）吗？该档案保存的密码会一并清除。</div></div>
+        <div class="note warn">${icon('alert')}<div>确定清除 <strong>${esc(active.name)}</strong>（${esc(active.host)}）保存的信息吗？保存的 SSH 密码会一并清除，下次连接需要重新输入。</div></div>
         ${bound ? `<label class="check-line" style="margin-top:12px"><input type="checkbox" id="profile-del-force"> 这是本机隧道当前目标，同时解除绑定<strong>并停止隧道</strong>（不会修改 frpc.toml，以后重建档案还能接着用）</label>` : ''}
       </div>
       <div class="modal-foot">
@@ -3614,17 +3614,17 @@ function updateConnectHostNote() {
   const key = profileKeyOf(host, port);
   if (!key) {
     note.className = 'field-hint';
-    note.textContent = '同一台机器（IP + SSH 端口）只保留一条档案；连已有的机器会更新那条，不会新建。';
+    note.textContent = '同一台机器（IP + SSH 端口）只对应一条连接；连已有的机器会更新那条，不会新建。';
     return;
   }
   const hit = (S.server.profiles || []).find((p) => profileKeyOf(p.host, p.port) === key);
   if (hit) {
     const when = Number(hit.lastConnectedAt) ? new Date(Number(hit.lastConnectedAt)).toLocaleString('zh-CN', { hour12: false }) : '';
     note.className = 'field-hint ok';
-    note.textContent = `已有档案「${hit.name || hit.host}」${when ? ` · 最近连接 ${when}` : ''}——连接会更新这条档案，不会新建。`;
+    note.textContent = `已有连接「${hit.name || hit.host}」${when ? ` · 最近连接 ${when}` : ''}——会更新这条连接，不会新建。`;
   } else {
     note.className = 'field-hint';
-    note.textContent = '这台机器还没有档案，连接成功后会新建一条。';
+    note.textContent = '这台机器还没有连接，连接成功后会新建一条。';
   }
 }
 
