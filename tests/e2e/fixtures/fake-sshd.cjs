@@ -113,6 +113,16 @@ const FRPS_TOML = [
   '',
   'auth.method = "token"',
   'auth.token = "' + token + '"',
+  /* 用 FAKE_VHOST_PORTS="8080,8443" 造「服务器已开 vhost 端口」的场景（部署证书时不用改写 frps.toml） */
+  ...(() => {
+    const raw = process.env.FAKE_VHOST_PORTS;
+    if (!raw) return [];
+    const [http, https] = String(raw).split(',');
+    return [
+      Number(http) > 0 ? `vhostHTTPPort = ${Number(http)}` : '',
+      Number(https) > 0 ? `vhostHTTPSPort = ${Number(https)}` : '',
+    ].filter(Boolean);
+  })(),
   /* 用 FAKE_SUB_DOMAIN_HOST="frp.example.com" 造「服务器开了 subdomain」的场景 */
   ...(process.env.FAKE_SUB_DOMAIN_HOST ? [`subDomainHost = "${process.env.FAKE_SUB_DOMAIN_HOST}"`] : []),
   '',

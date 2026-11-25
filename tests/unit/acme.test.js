@@ -98,3 +98,15 @@ test('issue/renew 串行执行：并发调用不会互相踩', async () => {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
+
+test('certTimes：metadata 没有 notAfter 时从证书文件补读', () => {
+  const acme = require('../../src/main/acme.js');
+  const path = require('path');
+  const pem = path.join(__dirname, '..', '..', 'tests', 'e2e', 'fixtures', 'tls', 'fullchain.pem');
+  const t = acme.certTimes(pem);
+  assert.match(String(t.notAfter), /^20\d\d-\d\d-\d\dT/);
+  /* 读不到就回 null，不抛 */
+  const bad = acme.certTimes(path.join(__dirname, 'nope.pem'));
+  assert.equal(bad.notAfter, null);
+  assert.equal(bad.notBefore, null);
+});

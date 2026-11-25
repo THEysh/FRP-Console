@@ -86,6 +86,21 @@ function readCertCoverage(crtPath) {
   }
 }
 
+/* metadata 里没写 notAfter 时，从证书文件读一次；读不到就返回 null。
+ * 只用于「展示与比较新旧」，不参与任何签发决策。 */
+function certTimes(certPath) {
+  try {
+    const pem = fs.readFileSync(String(certPath || ''), 'utf8');
+    const info = acme.crypto.readCertificateInfo(pem);
+    return {
+      notBefore: info.notBefore ? new Date(info.notBefore).toISOString() : null,
+      notAfter: info.notAfter ? new Date(info.notAfter).toISOString() : null,
+    };
+  } catch (e) {
+    return { notBefore: null, notAfter: null };
+  }
+}
+
 class AcmeManager {
   constructor({ userDataDir }) {
     this.userDataDir = userDataDir;
@@ -358,17 +373,22 @@ class AcmeManager {
           const keyPath = path.join(dir, 'key.pem');
           const certPath = path.join(dir, 'cert.pem');
           seen.add(entry.name);
+          const exists = fs.existsSync(fullchainPath) && fs.existsSync(keyPath);
+          /* 老证书 / 导入的证书 metadata 里没有 notAfter：从证书本身读，
+           * 否则 daysLeft 恒为 null，「续期后自动补部署」永远不认这类证书。 */
+          const times = (meta.notAfter ? { notBefore: meta.notBefore || null, notAfter: meta.notAfter } : null)
+            || (exists ? certTimes(fullchainPath) : { notBefore: null, notAfter: null });
           result.push({
             folder: entry.name,
             origin,
             domain: meta.domains[0],
             domains: meta.domains,
             email: meta.email || '',
-            notBefore: meta.notBefore || null,
-            notAfter: meta.notAfter || null,
-            daysLeft: daysLeft(meta.notAfter),
+            notBefore: times.notBefore,
+            notAfter: times.notAfter,
+            daysLeft: daysLeft(times.notAfter),
             issuedAt: meta.issuedAt || 0,
-            exists: fs.existsSync(fullchainPath) && fs.existsSync(keyPath),
+            exists,
             crtPath: fullchainPath,
             keyPath,
             certPath,
@@ -500,4 +520,5 @@ function shouldRedeploy(prevNginx, currentHost) {
   return { deploy: true, reason: '' };
 }
 
-module.exports = { AcmeManager, daysLeft, certFolder, coversDomain, readCertCoverage, dns01Name, shouldRedeploy };
+module.exports = {
+  certTimes, AcmeManager, daysLeft, certFolder, coversDomain, readCertCoverage, dns01Name, shouldRedeploy };
