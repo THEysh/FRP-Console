@@ -40,6 +40,8 @@
     "test:real": "node tests/real/full-script.cjs",
     "test:real:reinstall": "node tests/real/reinstall.cjs",
     "test:real:multi": "node tests/real/multi-connection.cjs",
+    "soak": "node tests/soak.cjs 30",
+    "soak:multi": "node tests/soak-multi.cjs 30",
     "test:all": "node tools/test-all.cjs"
   },
   "dependencies": {
