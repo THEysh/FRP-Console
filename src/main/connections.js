@@ -18,8 +18,8 @@ const crypto = require('node:crypto');
 /* 第一次迁移造出来的那条连接固定用这个 id：它是「老用户原本那一份配置」，
  * 之后新增的连接都拿随机 id。id 永不复用（删了再加不会捡回旧状态）。 */
 const DEFAULT_CONNECTION_ID = 'c-default';
-/* 上限只是防御手改配置：真到 8 条以上，界面与健康检查都该先重新设计。 */
-const MAX_CONNECTIONS = 8;
+/* 上限只是防御手改配置。1.2.192 起一条连接 = 一台服务器，8 台不够用，放到 16。 */
+const MAX_CONNECTIONS = 16;
 
 function newConnectionId() {
   return `c-${crypto.randomBytes(4).toString('hex')}`;
@@ -48,6 +48,12 @@ function normalizeConnection(input = {}) {
     id: /^[A-Za-z0-9_-]{1,40}$/.test(id) ? id : newConnectionId(),
     serverId: String(input.serverId || '').trim(),
     name: String(input.name || '').trim().slice(0, 60) || '新连接',
+    /* SSH 事实（1.2.192）：以前存在「服务器档案」里，档案与连接是两套东西；
+     * 现在连接自己记住「我连的是哪台机器的 SSH」，档案退化成它的历史来源。
+     * frps 的 serverAddr / token 不在这里——那是 frpc.toml 的事。 */
+    host: String(input.host || '').trim(),
+    port: Number(input.port) >= 1 && Number(input.port) <= 65535 ? Number(input.port) : 22,
+    username: String(input.username || '').trim() || 'root',
     configPath: String(input.configPath || '').trim(),
     logPath: String(input.logPath || '').trim(),
     adminPort: clampPort(input.adminPort, 7400),
@@ -152,6 +158,29 @@ function migrateConnections(raw = {}) {
 
   const conn = legacyConnection(source);
   return { connections: [conn], activeConnectionId: conn.id, changed: true };
+}
+
+/* 老数据迁移（1.2.192）：连接过去只记 serverId，SSH 地址在「服务器档案」里。
+ * 现在连接自己该记住它连的是哪台机器，所以启动时按 serverId 把 host/port/username
+ * 抄过来；没有 serverId 的（手写 settings 或新建连接）保持空，连接时会用配置里的
+ * serverAddr 兜底并回写。纯函数，不写盘。 */
+function backfillConnectionHosts(connections, profiles) {
+  const list = Array.isArray(connections) ? connections : [];
+  const pool = Array.isArray(profiles) ? profiles : [];
+  let changed = false;
+  const out = list.map((conn) => {
+    if (!conn || String(conn.host || '').trim()) return conn;
+    const p = pool.find((x) => x && x.id && x.id === conn.serverId) || null;
+    if (!p || !String(p.host || '').trim()) return conn;
+    changed = true;
+    return {
+      ...conn,
+      host: String(p.host || '').trim(),
+      port: Number(p.port) || 22,
+      username: String(p.username || '').trim() || 'root',
+    };
+  });
+  return { connections: out, changed };
 }
 
 function findConnection(connections, id) {
@@ -265,6 +294,7 @@ function traySummary(runtime, others = {}) {
 }
 
 module.exports = {
+  backfillConnectionHosts,
   traySummary,
   upstreamPortForDomain,
   publishProxyForDomain,

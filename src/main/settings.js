@@ -309,7 +309,11 @@ function load() {
   const migrated = connections.migrateConnections(cached);
   cached.connections = migrated.connections;
   cached.activeConnectionId = migrated.activeConnectionId;
-  migrationPending = migrated.changed;
+  /* 1.2.192：连接自己带 SSH 事实。老数据里它只记 serverId，这里按档案把
+   * host/port/username 抄过来；抄完才算迁移完（和上一步共用一个 pending 标记）。 */
+  const hosts = connections.backfillConnectionHosts(cached.connections, cached.servers);
+  cached.connections = hosts.connections;
+  migrationPending = migrated.changed || hosts.changed;
   /* 投影：阶段 1 的运行期代码仍然只读顶层这三个字段，所以让它们跟着“当前连接”走。
    * 等到进程层多实例化完成后，这份投影就只用于兼容旧代码，不再是真相。 */
   const activeConn = connections.findConnection(cached.connections, cached.activeConnectionId);

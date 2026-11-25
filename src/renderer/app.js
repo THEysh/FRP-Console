@@ -1230,7 +1230,8 @@ function filteredLogs() {
 function logSourceSeg() {
   const connected = !!S.server.connected;
   const host = connected ? String(S.server.host || '') : '';
-  const serverLabel = connected ? `服务器 frps${host ? ` · ${esc(host)}` : ''}` : '服务器 frps（未连接）';
+  const connName = (activeConnectionInfo() || {}).name || '';
+  const serverLabel = connected ? `服务器 frps${host ? ` · ${esc(host)}` : ''}${connName ? `（${esc(connName)}）` : ''}` : '服务器 frps（未连接）';
   return `<div class="seg log-src-seg">
     <button type="button" data-act="logs.source" data-source="local" class="${S.logSource === 'local' ? 'active' : ''}">本机 frpc</button>
     <button type="button" data-act="logs.source" data-source="server" class="${S.logSource === 'server' ? 'active' : ''}${connected ? '' : ' is-off'}"${connected ? '' : ' title="先连上服务器才能读它的 frps 日志"'}>${serverLabel}</button>
@@ -2839,7 +2840,8 @@ function serverConnBar() {
     const rt = c.runtime || {};
     const dot = rt.connected ? 'ok' : (rt.running ? 'warn' : 'idle');
     const counts = c.counts ? `${c.counts.online}/${c.counts.total}` : '';
-    return '<button class="chip' + (c.id === activeId ? ' on' : '') + '" type="button" data-act="server.conn.switch" data-conn="' + esc(c.id) + '">' +
+    const tip = c.host ? ` title="SSH ${esc(c.username || 'root')}@${esc(c.host)}:${esc(c.port || 22)}"` : '';
+    return '<button class="chip' + (c.id === activeId ? ' on' : '') + '" type="button"' + tip + ' data-act="server.conn.switch" data-conn="' + esc(c.id) + '">' +
       '<span class="schip-dot ' + dot + '"></span>' + esc(c.name || c.id) +
       (counts ? '<span class="chip-count">' + esc(counts) + '</span>' : '') + '</button>';
   }).join('');
@@ -3506,14 +3508,21 @@ function updateConnectHostNote() {
   }
 }
 
+/* 界面拿「当前连接」：它自己记着要连哪台机器（1.2.192）。 */
+function activeConnectionInfo() {
+  const st = S.state || {};
+  return (st.connections || []).find((c) => c.id === st.activeConnectionId) || null;
+}
+
 function connectedFormMarkup() {
   const s = S.server;
   const saved = s.saved || {};
   const state = S.state || {};
   const active = (s.profiles || []).find((p) => p.id === s.activeServerId) || null;
-  const defaultHost = (active && active.host) || saved.host || (state.config && state.config.serverAddr) || '';
-  const defaultUser = (active && active.username) || saved.username || 'root';
-  const defaultPort = (active && active.port) || saved.port || 22;
+  const connNow = activeConnectionInfo();
+  const defaultHost = (connNow && connNow.host) || (active && active.host) || saved.host || (state.config && state.config.serverAddr) || '';
+  const defaultUser = (connNow && connNow.username) || (active && active.username) || saved.username || 'root';
+  const defaultPort = (connNow && connNow.port) || (active && active.port) || saved.port || 22;
   return `
     <div class="view">
       <div class="page-head">
@@ -4704,8 +4713,9 @@ function renderCerts(force = false) {
   const expanded = w.expanded === undefined ? !(hasToken && certs.length) : w.expanded;
   // 证书按服务器显示：顶部标注当前连接的服务器，每张证书的部署徽标带服务器名。
   const serverHost = S.server.connected ? String(S.server.host || '') : '';
+  const connName = (activeConnectionInfo() || {}).name || '';
   const serverCtx = serverHost
-    ? `<span class="badge">当前服务器 ${esc(serverHost)}</span>`
+    ? `<span class="badge">当前服务器 ${esc(serverHost)}${connName ? ` · ${esc(connName)}` : ''}</span>`
     : '<span class="badge amber">未连接服务器</span>';
 
   /* 30 天内到期的那张证书 —— 自动续期只有配了 DNS 渠道才跑得动，没配就得明说。 */
@@ -5277,6 +5287,8 @@ async function handleAction(act, dataset, btn) {
         }
         const res = await FRP.connectionActive(id).catch(() => null);
         if (!res || !res.ok) { toast('error', '切换失败', (res && res.error) || '请稍后再试'); break; }
+        /* 先刷全量状态：chips 高亮读的是 S.state.activeConnectionId，只拉 serverState 不会更新它。 */
+        await reloadAfterConnectionChange();
         /* 换了当前连接，SSH 会话与服务器快照都属于上一台的，先清干净再读。 */
         S.server = { ...S.server, connected: false, info: null, summary: null, configPath: '', config: '', nginx: null, firewall: null, selftest: null, nginxHealth: null };
         S.lastKeys.server = '';

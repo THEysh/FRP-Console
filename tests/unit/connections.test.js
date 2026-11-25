@@ -156,3 +156,25 @@ test('traySummary：托盘要反映所有连接，而不是只看当前这条', 
   const e = conn.traySummary({ loggedIn: true }, { running: 0, total: 1 });
   assert.equal(e.label, '隧道在线');
 });
+
+test('backfillConnectionHosts：按 serverId 从档案补 SSH 三件套（1.2.192）', () => {
+  const profiles = [{ id: 'srv-1', host: '1.2.3.4', port: 2202, username: 'ubuntu' }];
+  const conns = [{ id: 'c-a', serverId: 'srv-1', name: 'A', configPath: '', logPath: '', adminPort: 7401 }];
+  const out = conn.backfillConnectionHosts(conns, profiles);
+  assert.equal(out.changed, true);
+  assert.equal(out.connections[0].host, '1.2.3.4');
+  assert.equal(out.connections[0].port, 2202);
+  assert.equal(out.connections[0].username, 'ubuntu');
+});
+
+test('backfillConnectionHosts：已有 host 不覆盖、无档案保持原样', () => {
+  const profiles = [{ id: 'srv-1', host: '1.2.3.4', port: 22, username: 'root' }];
+  const conns = [
+    { id: 'c-a', serverId: 'srv-1', host: '9.9.9.9', port: 22, username: 'root' },
+    { id: 'c-b', serverId: 'srv-gone', host: '', port: 22, username: 'root' },
+  ];
+  const out = conn.backfillConnectionHosts(conns, profiles);
+  assert.equal(out.changed, false);
+  assert.equal(out.connections[0].host, '9.9.9.9');
+  assert.equal(out.connections[1].host, '');
+});

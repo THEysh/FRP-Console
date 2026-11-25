@@ -21,6 +21,12 @@ module.exports = {
     try {
       const probe = await ctx.eval(`(async () => { const r = await FRP.probeTcp('::1', ${port}); return r.data; })()`);
       ctx.check('本机 ::1 端口可达', probe && probe.ok === true, JSON.stringify(probe));
+      /* 有些环境（含部分沙箱/安全软件）直接禁止连 IPv6 回环，connect 会立刻 EACCES：
+       * 那是环境能力问题，不是产品缺陷，跳过并写明原因。 */
+      if (probe && probe.ok === false && /EACCES|EPERM|EAFNOSUPPORT|ENETUNREACH/i.test(String(probe.error || ''))) {
+        ctx.skip('这个环境不允许连 IPv6 回环（' + String(probe.error || '').slice(0, 40) + '），跳过');
+        return;
+      }
 
       await ctx.eval(`(async () => {
         await FRP.saveConfig({ serverAddr: '127.0.0.1', serverPort: ${ctx.frps.bindPort}, auth: { method: 'token', token: ${JSON.stringify(ctx.frps.token)} } });

@@ -18,11 +18,11 @@ module.exports = {
       const base = await list();
       ctx.check('起步至少有 1 条连接', Array.isArray(base) && base.length >= 1, `len=${(base || []).length}`);
 
-      /* 1) 一直加到被拒，确认上限是 8 且错误可读 */
+      /* 1) 一直加到被拒，确认上限（1.2.192 起 16）且错误可读 */
       const addUntilFail = await inst.eval(`(async () => {
         const added = [];
         let last = null;
-        for (let i = 0; i < 12; i += 1) {
+        for (let i = 0; i < 20; i += 1) {
           const r = await FRP.connectionAdd({ name: 'edge-' + i });
           if (r && r.ok) added.push(i); else { last = { i, error: (r && r.error) || '' }; break; }
         }
@@ -30,9 +30,9 @@ module.exports = {
         const arr = (all.data && all.data.connections) || all.data || [];
         return { addedCount: added.length, failed: last, total: arr.length };
       })()`);
-      ctx.check('加满后拒绝第 9 条', addUntilFail.failed !== null, JSON.stringify(addUntilFail.failed || {}));
-      ctx.check('连接总数不超过 8', Number(addUntilFail.total) <= 8, `total=${addUntilFail.total}`);
-      ctx.check('上限错误有中文说明', /最多|上限|8/.test((addUntilFail.failed || {}).error || ''), (addUntilFail.failed || {}).error);
+      ctx.check('加满后拒绝下一条（1.2.192 起上限 16）', addUntilFail.failed !== null, JSON.stringify(addUntilFail.failed || {}));
+      ctx.check('连接总数不超过 16', Number(addUntilFail.total) <= 16, `total=${addUntilFail.total}`);
+      ctx.check('上限错误有中文说明', /最多|上限|16/.test((addUntilFail.failed || {}).error || ''), (addUntilFail.failed || {}).error);
 
       const all = await list();
       const ids = (all || []).map((c) => c.id);

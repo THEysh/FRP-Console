@@ -1382,6 +1382,24 @@ function connectionById(connId) {
 }
 
 /* 每条连接自己的那三样路径。frpcPath 全局共用（同一个可执行文件）。 */
+/* 连接记住「要连哪台机器的 SSH」（1.2.192）。只在真的连上之后调用，
+ * 免得把输错的地址写进配置；同一个地址就不写盘，避免无谓的设置文件抖动。 */
+function rememberConnectionTarget(connId, target) {
+  const id = String(connId || '').trim();
+  if (!id || !target) return;
+  const list = Array.isArray(settings.connections) ? settings.connections : [];
+  const idx = list.findIndex((c) => c && c.id === id);
+  if (idx < 0) return;
+  const host = String(target.host || '').trim();
+  const port = Number(target.port) || 22;
+  const username = String(target.username || '').trim() || 'root';
+  const cur = list[idx];
+  if (cur.host === host && Number(cur.port) === port && cur.username === username) return;
+  const next = list.slice();
+  next[idx] = { ...cur, host, port, username };
+  settings = settingsModule.save({ connections: next });
+}
+
 function connectionPaths(conn) {
   return {
     frpcPath: paths.frpcPath,
@@ -1603,6 +1621,9 @@ function connectionSummary(conn) {
     id: conn.id,
     name: conn.name,
     serverId: conn.serverId,
+    host: conn.host || '',
+    port: conn.port || 22,
+    username: conn.username || 'root',
     /* 界面「目标服务器」下拉要标出哪条还没配地址（`未配置`）。
      * 取的是这条连接自己 frpc.toml 里的 serverAddr，不是当前会话那台。 */
     serverAddr: (() => {
@@ -4048,6 +4069,14 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '' } = {})
       if (clash) return fail(`管理端口 ${port} 已经被另一条连接占用（每条连接必须用不同端口）`);
       patch.adminPort = port;
     }
+    /* 1.2.192：SSH 目标也归连接管（以前是「服务器档案」的字段）。 */
+    if (payload.host !== undefined) patch.host = String(payload.host || '').trim();
+    if (payload.port !== undefined) {
+      const sshPort = Number(payload.port);
+      if (!Number.isInteger(sshPort) || sshPort < 1 || sshPort > 65535) return fail('SSH 端口无效');
+      patch.port = sshPort;
+    }
+    if (payload.username !== undefined) patch.username = String(payload.username || '').trim() || 'root';
     if (payload.enabled !== undefined) patch.enabled = payload.enabled !== false;
     if (!Object.keys(patch).length) return ok({ connection: connectionSummary(conn), changed: false });
     if (patch.configPath !== undefined) invalidateConnectionModel(conn.id);
@@ -4662,9 +4691,12 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '' } = {})
 
   ipcMain.handle('server:connect', async (event, payload = {}) => {
     const requested = findServerProfile(payload.serverId || settings.activeServerId);
-    const host = String(payload.host || (requested && requested.host) || '').trim();
-    const username = String(payload.username || (requested && requested.username) || '').trim();
-    const port = Number(payload.port) || (requested && requested.port) || 22;
+    /* 1.2.192：连接自己记着要连哪台机器。表单没填地址时先看连接，再看档案，
+     * 这样「一条连接 = 一台服务器」对用户成立，档案只是历史来源。 */
+    const connNow = connectionById(String(payload.connectionId || '').trim() || (settings && settings.activeConnectionId) || '');
+    const host = String(payload.host || (connNow && connNow.host) || (requested && requested.host) || '').trim();
+    const username = String(payload.username || (connNow && connNow.username) || (requested && requested.username) || '').trim();
+    const port = Number(payload.port) || (connNow && connNow.port) || (requested && requested.port) || 22;
     let password = String(payload.password || '');
     if (!host) return fail('请输入服务器 IP 或域名');
     if (!username) return fail('请输入 SSH 用户名');
@@ -4726,6 +4758,9 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '' } = {})
       return fail(sshConnectHint(result.error), { state: serverState() });
     }
     profile = upsertServerProfile({ ...profile, host, port, username }, { activate: true });
+    /* 1.2.192：把「这台连接连的是哪台机器的 SSH」记到连接自己身上。
+     * 有了它，服务器页的连接标签、自动连接、证书页的上下文都不必再依赖档案。 */
+    rememberConnectionTarget(connNow ? connNow.id : (settings && settings.activeConnectionId), { host, port, username });
     if (payload.remember) {
       const saved = settingsModule.saveServerSecret(profile.id, password);
       if (!saved.ok) return fail(saved.error, { state: serverState() });
