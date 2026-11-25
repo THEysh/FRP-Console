@@ -50,3 +50,51 @@ test('removeLocal：目录不存在时明确回 removed:false，不再假装删�
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
+
+test('staleDeployments：续期后没重新部署到服务器的证书能被找出来', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'frp-acme-stale-'));
+  try {
+    const dir = path.join(tmp, 'certs', 'a.example.com');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'fullchain.pem'), 'x');
+    const meta = {
+      domains: ['a.example.com'],
+      notBefore: '2026-01-01T00:00:00Z',
+      notAfter: '2027-01-01T00:00:00Z',
+      nginx: { ok: true, serverHost: '1.2.3.4', notAfter: '2026-06-01T00:00:00Z' },
+    };
+    fs.writeFileSync(path.join(dir, 'metadata.json'), JSON.stringify(meta));
+    const mgr = new acme.AcmeManager({ userDataDir: tmp });
+    const stale = mgr.staleDeployments('1.2.3.4');
+    assert.equal(stale.length, 1);
+    assert.equal(stale[0].domain, 'a.example.com');
+    assert.equal(mgr.staleDeployments('9.9.9.9').length, 0, '换了服务器就不该再补部署到旧机');
+
+    meta.nginx.notAfter = meta.notAfter;
+    fs.writeFileSync(path.join(dir, 'metadata.json'), JSON.stringify(meta));
+    assert.equal(mgr.staleDeployments('1.2.3.4').length, 0, '已同步的证书不该反复重传');
+
+    delete meta.nginx.notAfter;
+    fs.writeFileSync(path.join(dir, 'metadata.json'), JSON.stringify(meta));
+    assert.equal(mgr.staleDeployments('1.2.3.4').length, 0, '老记录没有 notAfter 时跳过，避免每次连上都重传');
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('issue/renew 串行执行：并发调用不会互相踩', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'frp-acme-lock-'));
+  try {
+    const mgr = new acme.AcmeManager({ userDataDir: tmp });
+    const order = [];
+    let running = 0;
+    let maxRunning = 0;
+    mgr._issue = async (a) => { running += 1; maxRunning = Math.max(maxRunning, running); order.push('issue:' + a.domains[0]); await new Promise((r) => setTimeout(r, 30)); running -= 1; return { ok: true }; };
+    mgr._renew = async (d) => { running += 1; maxRunning = Math.max(maxRunning, running); order.push('renew:' + d); await new Promise((r) => setTimeout(r, 30)); running -= 1; return { ok: true }; };
+    await Promise.all([mgr.issue({ domains: ['a.test'] }), mgr.renew('b.test'), mgr.issue({ domains: ['c.test'] })]);
+    assert.equal(maxRunning, 1, '同一时刻只应有一个签发在跑');
+    assert.deepEqual(order, ['issue:a.test', 'renew:b.test', 'issue:c.test'], '按调用顺序排队');
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});

@@ -4593,6 +4593,9 @@ function crossConnectionPortClash(proxy, { excludeName = '' } = {}) {
       return fail('连接期间服务器档案已变更，本次连接已取消', { stale: true, state: serverState() });
     }
     send('server:session-changed', { connected: true, host: serverSession.host || host });
+    /* 续期多半发生在「没连服务器」的时候，连上来的第一时间把落后的证书补部署。
+     * 不阻塞这次连接的结果：部署失败只发通知，界面照常可用。 */
+    redeployStaleCerts().catch(() => {});
     return ok({
       ...serverState(),
       adoptProfile: changed && payload.adoptProfile === true,
@@ -5585,7 +5588,7 @@ function domainOwners(domain) {
     /* 这个域名在这条连接里是哪种代理？决定 nginx 该把流量推给谁：
      * http/https/tcpmux → frps 的 vhost HTTP 端口；tcp → 它自己的 remotePort。
      * 真机取证：广州的 jellyfin/finder 都是 tcp 代理，写死 8080 时 https 永远 404。 */
-    const connNow = activeConnection();
+    const connNow = connectionById((settings && settings.activeConnectionId) || '') || null;
     const upstreamProxies = (((connNow && connectionModel(connNow)) || model || {}).proxies) || [];
     const certDomains = (cert.domains && cert.domains.length ? cert.domains : [cert.domain]).filter(Boolean);
     const directPort = (d) => connectionsModule.upstreamPortForDomain(upstreamProxies, d, 0);
@@ -5636,12 +5639,34 @@ function domainOwners(domain) {
       certDir: upload.dir,
       frpsHttpPort,
       vhost,
+      notAfter: cert.notAfter || '',
       owner: owner || null,
       wrongServer: !!(owner && owner.serverAddr && owner.serverAddr !== serverHost),
       ...(warning ? { warning } : {}),
     };
     acmeManager.markNginx(cert.domain, r, serverHost);
     return r;
+  }
+
+  /* 续期是在后台跑的，很可能当时没连服务器 —— 于是本机证书是新的、服务器上还是旧的。
+   * 一旦连上服务器，这里把「部署记录里的 notAfter 与当前证书不一致」的都补部署一次。 */
+  async function redeployStaleCerts() {
+    if (!serverSession.connected) return 0;
+    const host = serverSession.host || '';
+    let stale = [];
+    try { stale = acmeManager.staleDeployments(host); } catch { stale = []; }
+    if (!stale.length) return 0;
+    let done = 0;
+    for (const cert of stale) {
+      try {
+        const r = await syncCertToServerNginx(cert, {});
+        if (r && r.ok) {
+          done += 1;
+          notify('info', '证书已重新部署到服务器', `${cert.domain}：本机已续期，已把新证书同步到这台服务器`);
+        }
+      } catch { /* 单张失败不影响其它证书 */ }
+    }
+    return done;
   }
 
   /* ---- HTTPS 证书（Let's Encrypt / DNS-01）---- */

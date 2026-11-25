@@ -91,6 +91,17 @@ class AcmeManager {
     this.userDataDir = userDataDir;
     this.certsDir = path.join(userDataDir, 'certs');
     this.accountFile = path.join(userDataDir, 'acme-account.json');
+    /* 签发/续期串行化：后台自动续期和用户在界面上点「签发」很可能同时发生，
+     * 两边都去动同一个 ACME 账户、同一批 DNS 记录 —— 真机上出现过一次手动签发
+     * 直接失败（自动续期几秒后成功）。排队比加锁简单，也不会把失败的请求丢掉。 */
+    this._issueChain = Promise.resolve();
+  }
+
+  /* 把 issue / renew 排进同一条队列，前一个结束（不管成功失败）再跑下一个。 */
+  _serialized(fn) {
+    const run = this._issueChain.then(fn, fn);
+    this._issueChain = run.then(() => {}, () => {});
+    return run;
   }
 
   /* ---------------- 账户 ---------------- */
@@ -142,7 +153,11 @@ class AcmeManager {
    * domains 至少一项，第一项作为 CSR 的 commonName，其余进 altNames。
    * 返回 { ok, domain, notAfter, crtPath, keyPath, fullchainPath }。
    */
-  async issue({ domains, email = '', dns, onProgress = null }) {
+  issue(args) {
+    return this._serialized(() => this._issue(args));
+  }
+
+  async _issue({ domains, email = '', dns, onProgress = null }) {
     const prog = (label, percent) => {
       if (typeof onProgress === 'function') {
         try { onProgress({ label, percent }); } catch { /* 进度回调异常不影响签发 */ }
@@ -383,6 +398,22 @@ class AcmeManager {
   /* 记录一张证书最近一次「部署到服务器 nginx」的结果（成功或失败都记），
    * 供证书列表/域名向导显示「已部署 / 未部署」，避免签了证书但没部署到 nginx
    * 时界面还显示一切就绪、浏览器访问 https://域名 却被拒绝。 */
+  /* 哪些证书「续期后还没重新部署到这台服务器」：
+   * 判据是部署记录里保存的 notAfter 与当前证书不一致。老记录没有 notAfter 时跳过，
+   * 免得每次连服务器都重传一遍。 */
+  staleDeployments(serverHost = '') {
+    const host = String(serverHost || '').trim();
+    const out = [];
+    for (const cert of this.list()) {
+      const nginx = cert && cert.nginx;
+      if (!cert || !nginx || !nginx.ok) continue;
+      if (String(nginx.serverHost || '') !== host) continue;
+      if (!nginx.notAfter || !cert.notAfter) continue;
+      if (String(nginx.notAfter) !== String(cert.notAfter)) out.push(cert);
+    }
+    return out;
+  }
+
   markNginx(domain, nginxResult, serverHost = '') {
     const cert = this.get(String(domain || '').trim());
     if (!cert) return false;
@@ -396,7 +427,11 @@ class AcmeManager {
   }
 
   /* 续期：对同一批域名重新走一次签发。 */
-  async renew(domain, { email = '', dns, onProgress = null } = {}) {
+  renew(domain, args) {
+    return this._serialized(() => this._renew(domain, args));
+  }
+
+  async _renew(domain, { email = '', dns, onProgress = null } = {}) {
     const existing = this.get(domain);
     if (!existing) return { ok: false, error: `本地没有 ${domain} 的证书，请直接签发` };
     return this.issue({ domains: existing.domains, email: email || existing.email, dns, onProgress });
