@@ -1374,6 +1374,7 @@ function connectionPaths(conn) {
  * 否则健康检查还按旧端口/旧代理列表判，界面会显示上一次的状态。 */
 function invalidateConnectionModel(connId) {
   if (multiConnection && multiConnection.parkedModels) multiConnection.parkedModels.delete(connId);
+  if (multiConnection && multiConnection.parkedStamps) multiConnection.parkedStamps.delete(connId);
 }
 
 /* 连接自己的配置模型：当前连接用全局 model，其它连接按需读自己的 frpc.toml。
@@ -1382,7 +1383,24 @@ function connectionModel(conn) {
   if (!conn) return null;
   if (conn.id === settings.activeConnectionId) return model;
   const cache = multiConnection && multiConnection.parkedModels;
-  if (cache && cache.has(conn.id)) return cache.get(conn.id);
+  const stamps = multiConnection && multiConnection.parkedStamps;
+  const stampOf = () => {
+    try {
+      const st = fs.statSync(conn.configPath);
+      return { mtimeMs: st.mtimeMs, size: st.size };
+    } catch {
+      return null;
+    }
+  };
+  if (cache && cache.has(conn.id)) {
+    const now = stampOf();
+    const before = stamps ? stamps.get(conn.id) : null;
+    if (now && before && now.mtimeMs === before.mtimeMs && now.size === before.size) return cache.get(conn.id);
+    if (!now && before === null) return cache.get(conn.id);
+    /* 指纹变了（或被删了）：丢掉旧缓存，往下重读。 */
+    cache.delete(conn.id);
+    if (stamps) stamps.delete(conn.id);
+  }
   let parsedModel = null;
   try {
     /* 用 configModule.readConfig：它负责读文件 + 解析 + 保留原文（BOM 也在别处统一处理），
@@ -1392,6 +1410,7 @@ function connectionModel(conn) {
     parsedModel = null;
   }
   if (cache) cache.set(conn.id, parsedModel);
+  if (stamps) stamps.set(conn.id, stampOf());
   return parsedModel;
 }
 
@@ -6217,12 +6236,14 @@ async function bootstrap() {
    */
   const extraManagers = new Map();
   const parkedModels = new Map();
+  /* 每条非当前连接的配置指纹（mtime+size），用来判断缓存是否过期。 */
+  const parkedStamps = new Map();
   const guards = new Map();
   /* 每条连接最后一次「用户要求停止」的时刻。frpc 的 stopping 标记在
    * stop→start 的边界上不可靠（探针里被外面杀掉的进程仍报 intentional:true），
    * 所以额外用时间窗兜一层：刚点过停止就别再当成意外退出。 */
   const stopRequests = new Map();
-  multiConnection = { extraManagers, parkedModels, guards, stopRequests };
+  multiConnection = { extraManagers, parkedModels, parkedStamps, guards, stopRequests };
   ensureClientServerProfile();
   migrateLegacyServerSecret();
   /* 老数据里同一个 IP 可能堆着十几条档案（连接表单每连一次就新建一条）。
