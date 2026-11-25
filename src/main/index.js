@@ -161,6 +161,9 @@ let supervisor = null;
 /* 多连接运行期状态（bootstrap 里初始化；null 表示还没起来）。 */
 let multiConnection = null;
 const acmeManager = new AcmeManager({ userDataDir: settingsModule.dataDir() });
+/* syncCertToServerNginx 定义在 registerIpc() 里（要用到 serverSession 等闭包），
+ * 但模块作用域的自动续期也要用它 —— 通过这个变量间接调用，避免又出现「调了不存在的函数」。 */
+let deployCertToServer = null;
 
 /* 当前 DNS 验证渠道（现阶段只有 Cloudflare）。证书签发 / 自动续期共用。 */
 function currentDnsProvider() {
@@ -5685,6 +5688,8 @@ function domainOwners(domain) {
     }
     return done;
   }
+  /* 暴露给模块作用域（自动续期用） */
+  deployCertToServer = syncCertToServerNginx;
 
   /* ---- HTTPS 证书（Let's Encrypt / DNS-01）---- */
 
@@ -6260,7 +6265,11 @@ async function autoRenewExpiringCerts() {
         }
         try {
           const fresh = acmeManager.get(item.domain) || prev;
-          const r = await syncCertToServerNginx(fresh);
+          if (!deployCertToServer) {
+            skipped.push(`${item.domain}：部署通道还没就绪（没有连接服务器）`);
+            continue;
+          }
+          const r = await deployCertToServer(fresh, {});
           if (r && r.ok) deployed.push(item.domain);
           else skipped.push(`${item.domain}：${(r && r.error) || '部署失败'}`);
         } catch (e) {
@@ -6737,7 +6746,8 @@ async function prepareUpdateInstall() {
       } catch {
         /* 停不掉交给下面的 taskkill 兜底 */
       }
-      log('warn', `升级前已停止连接 ${id}`);
+      // eslint-disable-next-line no-console
+      console.log(`[update] 升级前已停止连接 ${id}`);
     }
   }
   // 记录更新前隧道是否由控制台托管（用于更新后自动接回）

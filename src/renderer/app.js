@@ -83,7 +83,6 @@ const ICON_PATHS = {
   box: '<path d="M3.5 8.5 12 4l8.5 4.5v7L12 20l-8.5-4.5z"/><path d="m3.5 8.5 8.5 4.5 8.5-4.5M12 13v7"/>',
   terminal: '<rect x="3.5" y="5" width="17" height="14" rx="2.5"/><path d="m7.5 9.5 3 2.5-3 2.5M13 15h3.5"/>',
   power: '<path d="M12 3.8v7.4"/><path d="M7.6 6.6a7.6 7.6 0 1 0 8.8 0"/>',
-  server: '<rect x="3.5" y="4" width="17" height="6.5" rx="2"/><rect x="3.5" y="13.5" width="17" height="6.5" rx="2"/><circle cx="7.5" cy="7.2" r="1"/><circle cx="7.5" cy="16.7" r="1"/>',
   gear: '<circle cx="12" cy="12" r="3.2"/><path d="M19.4 13.6a7.6 7.6 0 0 0 .1-3.2l2-1.5-2-3.4-2.4 1a7.6 7.6 0 0 0-2.7-1.6L14 2.4h-4l-.4 2.5A7.6 7.6 0 0 0 6.9 6.5l-2.4-1-2 3.4 2 1.5a7.6 7.6 0 0 0-.1 3.2l-2 1.5 2 3.4 2.4-1a7.6 7.6 0 0 0 2.7 1.6l.4 2.4h4l.4-2.4a7.6 7.6 0 0 0 2.7-1.6l2.4 1 2-3.4-2-1.5z"/>',
   play: '<path d="M8 5.5v13l11-6.5z"/>',
   stop: '<rect x="6" y="6" width="12" height="12" rx="2"/>',
@@ -5013,6 +5012,16 @@ async function refreshUpdateState() {
 
 /* ---------------------------- 操作处理 ---------------------------- */
 
+/* 连接类操作改的是 settings.connections：拉一次最新状态并重绘当前视图。
+ * 原来这里写的是不存在的 loadStateAndRender()，一点「＋」就抛 ReferenceError，
+ * IPC 明明成功了却既没提示也不刷新（只能等 3 秒一次的 state:update）。 */
+async function reloadAfterConnectionChange() {
+  const res = await FRP.refresh().catch(() => null);
+  if (res && res.ok && res.data) S.state = res.data;
+  updateChrome();
+  renderCurrent({ force: true });
+}
+
 async function handleAction(act, dataset, btn) {
   try {
     switch (act) {
@@ -5031,12 +5040,12 @@ async function handleAction(act, dataset, btn) {
       if (!name || !String(name).trim()) return;
       const res = await FRP.connectionAdd({ name: String(name).trim() }).catch(() => null);
       if (!res || !res.ok) { toast('error', '创建失败', (res && res.error) || '请稍后再试'); return; }
-      await loadStateAndRender();
+      await reloadAfterConnectionChange();
       toast('success', '已创建连接', `${String(name).trim()} · 用左下角的连接切换器选它`);
       return;
     }
     case 'conn.toggle': {
-      const id = actionEl && actionEl.dataset ? actionEl.dataset.id : '';
+      const id = dataset && dataset.id ? dataset.id : '';
       const conn = connList().find((c) => c.id === id);
       if (!conn) return;
       const isRunning = !!(conn.runtime && conn.runtime.connected);
@@ -5045,12 +5054,12 @@ async function handleAction(act, dataset, btn) {
         ? await FRP.connectionStop(id).catch(() => null)
         : await FRP.connectionStart(id).catch(() => null);
       if (!res || !res.ok) { toast('error', isRunning ? '停止失败' : '启动失败', (res && res.error) || '请稍后再试'); return; }
-      await loadStateAndRender();
+      await reloadAfterConnectionChange();
       toast('success', isRunning ? '已停止' : '已启动', conn.name || id);
       return;
     }
     case 'conn.switch': {
-      const id = (actionEl && actionEl.dataset && actionEl.dataset.id) || '';
+      const id = (dataset && dataset.id) || '';
       const target = connList().find((c) => c.id === id);
       if (!target) return;
       const anyRunning = connList().some((c) => c.runtime && c.runtime.connected);
@@ -5065,7 +5074,7 @@ async function handleAction(act, dataset, btn) {
       }
       const res = await FRP.connectionActive(id).catch(() => null);
       if (!res || !res.ok) { toast('error', '切换失败', (res && res.error) || '请稍后再试'); return; }
-      await loadStateAndRender();
+      await reloadAfterConnectionChange();
       toast('success', '已切换当前连接', target.name || id);
       return;
     }

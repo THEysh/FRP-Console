@@ -12,14 +12,19 @@ const path = require('node:path');
 
 const steps = [
   ['语法检查', 'check-syntax.cjs'],
+  /* 语法查不出「调用了不存在的函数」（1.2.183 的 activeConnection、渲染层的 loadStateAndRender
+   * 都是这类），交给 eslint 的 no-undef。直接调 bin，避免 npm 在 MSYS 下 exit 126。 */
+  ['静态检查（eslint）', path.join(__dirname, '..', 'node_modules', 'eslint', 'bin', 'eslint.js'),
+    ['src/main', 'src/renderer', 'tools', 'tests', '--quiet']],
   ['单元测试', 'run-unit.cjs'],
   ['机密扫描', 'check-secrets.cjs'],
 ];
 
 let failed = 0;
-for (const [label, script] of steps) {
+for (const [label, script, extraArgs] of steps) {
   const started = Date.now();
-  const res = spawnSync(process.execPath, [path.join(__dirname, script)], { stdio: 'inherit' });
+  const args = [path.isAbsolute(script) ? script : path.join(__dirname, script), ...(extraArgs || [])];
+  const res = spawnSync(process.execPath, args, { stdio: 'inherit' });
   const ms = Date.now() - started;
   if (res.status !== 0) {
     failed += 1;
