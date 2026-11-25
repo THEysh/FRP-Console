@@ -917,7 +917,10 @@ function proxiesKey() {
     orph: s.binding && s.binding.unarchived ? `${s.binding.addr}:${s.binding.port}` : '',
     // 「另有 N 条连接」这行提示要跟着连接状态变，否则切了连接它还挂着
     conn: (s.connections || []).map((c) => [c.id, !!(c.runtime && c.runtime.connected)].join(':')).join('|') + (s.activeConnectionId || ''),
-    list: (s.proxies || []).map((p) => [p.name, p.type, p.status, p.statusError, p.publicAddress, p.localPort, p.health && p.health.ok, p.health && p.health.ms, p.health && p.health.reason]),
+    /* 全量视图（1.2.190）：别的连接的代理变化也要触发重绘，所以 key 里带上
+     * connectionId 与连接筛选。 */
+    flt: S.proxyConnFilter || '',
+    list: ((Array.isArray(s.proxiesAll) && s.proxiesAll.length ? s.proxiesAll : (s.proxies || []))).map((p) => [p.connectionId || '', p.name, p.type, p.status, p.statusError, p.publicAddress, p.localPort, p.health && p.health.ok, p.health && p.health.ms, p.health && p.health.reason]),
   });
 }
 
@@ -929,10 +932,14 @@ function renderProxies(force = false) {
   if (!force && S.lastKeys.proxies === key) return;
   S.lastKeys.proxies = key;
   const state = S.state || {};
-  const all = state.proxies || [];
-  const list = all.filter((p) => {
+  /* 全量视图：主进程把每条连接的代理拍平后给 proxiesAll（1.2.190）。
+   * 拿不到（老主进程/启动早期）时退回当前连接那一份，界面不至于空白。 */
+  const all = Array.isArray(state.proxiesAll) && state.proxiesAll.length ? state.proxiesAll : (state.proxies || []);
+  const connFilter = S.proxyConnFilter || '';
+  const scoped = connFilter ? all.filter((p) => p.connectionId === connFilter) : all;
+  const list = scoped.filter((p) => {
     if (!q) return true;
-    const text = `${p.name} ${p.type} ${p.localPort} ${p.publicAddress}`.toLowerCase();
+    const text = `${p.name} ${p.type} ${p.localPort} ${p.publicAddress} ${p.connectionName || ''}`.toLowerCase();
     return text.includes(q.toLowerCase());
   });
 
@@ -944,7 +951,7 @@ function renderProxies(force = false) {
       <div class="page-head">
         <div class="page-title">
           <h1>代理映射</h1>
-          <p>把本机服务发布到公网。${all.length ? `共 ${all.length} 条，${all.filter((p) => p.status === 'running').length} 条在线。` : '还没有代理，先新增一条吧。'}</p>
+          <p>把本机服务发布到公网。${all.length ? `${all.length ? `共 ${all.length} 条，${all.filter((p) => p.status === 'running').length} 条在线` : ''}${proxyConnCount() > 1 ? `（分布在 ${proxyConnCount()} 台服务器上）` : ''}。` : '还没有代理，先新增一条吧。'}</p>
         </div>
         <div class="page-actions">
           <button class="btn" type="button" data-act="tunnel.reload">${icon('reload')}<span>热重载</span></button>
@@ -965,6 +972,7 @@ function renderProxies(force = false) {
           </div>
           <span class="muted" style="font-size:11px">${esc(list.length)} 条结果</span>
         </div>
+        ${proxyConnChips(all, connFilter)}
         ${empty
           ? `<div class="empty" style="padding:44px 20px">
               <div class="empty-illustration">${icon('link')}</div>
@@ -974,9 +982,9 @@ function renderProxies(force = false) {
             </div>`
           : `<table class="proxy-table">
               <thead><tr>
-                <th>名称 / 类型</th><th>本地服务</th><th>公网地址</th><th>状态</th><th style="text-align:right">操作</th>
+                <th>名称 / 类型</th><th>服务器</th><th>本地服务</th><th>公网地址</th><th>状态</th><th style="text-align:right">操作</th>
               </tr></thead>
-              <tbody>${rows || `<tr><td colspan="5"><div class="empty" style="padding:26px"><p>没有匹配「${esc(q)}」的代理</p></div></td></tr>`}</tbody>
+              <tbody>${rows || `<tr><td colspan="6"><div class="empty" style="padding:26px"><p>没有匹配「${esc(q)}」的代理</p></div></td></tr>`}</tbody>
             </table>`}
       </section>
     </div>`;
@@ -1002,6 +1010,39 @@ function openableLink(link) {
   /* 只有 http(s) 才谈得上「打开」：tcpmux 的地址是 http-connect://域名，
    * 交给浏览器只会弹一个没反应的标签页。复制按钮不受影响。 */
   return /^https?:\/\//i.test(text) ? text : '';
+}
+
+/* 顶部「服务器」筛选条：全部 + 每条连接（带条数）。只有一条连接时不显示，
+ * 免得给单服务器用户增加一排没用的按钮。 */
+function proxyConnCount() {
+  const all = (S.state && Array.isArray(S.state.proxiesAll)) ? S.state.proxiesAll : null;
+  if (!all) return 1;
+  const ids = new Set(all.map((p) => p.connectionId || ''));
+  return ids.size || 1;
+}
+
+function proxyConnChips(all, current) {
+  const map = new Map();
+  for (const p of all) {
+    const id = p.connectionId || '';
+    if (!map.has(id)) map.set(id, { id, name: p.connectionName || '' , count: 0 });
+    map.get(id).count += 1;
+  }
+  if (map.size <= 1) return '';
+  const chip = (id, label, count) => `<button class="chip${id === current ? ' on' : ''}" type="button" data-act="proxy.filter.conn" data-conn="${esc(id)}">${esc(label)}<span class="chip-count">${count}</span></button>`;
+  const parts = [chip('', '全部', all.length)];
+  for (const item of map.values()) parts.push(chip(item.id, item.name || '未命名连接', item.count));
+  return `<div class="chips">${parts.join('')}</div>`;
+}
+
+/* 行内的服务器单元格：名字 + 地址，非当前连接标一个淡一点的徽标（那些代理
+ * 的健康检查、编辑都发生在它们自己的连接里）。 */
+function proxyConnCell(p) {
+  const name = p.connectionName || '';
+  if (!name) return '<span class="muted">—</span>';
+  const addr = p.connectionAddr ? `<div class="muted mono" style="font-size:10.5px">${esc(p.connectionAddr)}</div>` : '';
+  const tag = p.connectionActive ? '' : '<span class="badge muted" style="font-size:9.5px;padding:1px 6px">非当前</span>';
+  return `<div><span class="conn-name">${esc(name)}</span> ${tag}</div>${addr}`;
 }
 
 function proxyRowHtml(p) {
@@ -1061,6 +1102,9 @@ function proxyRowHtml(p) {
         </div>
       </td>
       <td>
+        ${proxyConnCell(p)}
+      </td>
+      <td>
         <div class="mono">${esc(p.localIP || '127.0.0.1')}:${esc(p.localPort)}</div>
         ${health}
         ${dnsHint}
@@ -1074,8 +1118,8 @@ function proxyRowHtml(p) {
           ${link ? `<button class="icon-btn" type="button" data-act="copy" data-text="${esc(link)}" title="复制公网地址">${icon('copy')}</button>` : ''}
           ${openableLink(link) && ['http', 'https', 'tcp', 'tcpmux'].includes(p.type)
             ? `<button class="icon-btn" type="button" data-act="open" data-url="${esc(openableLink(link))}" title="打开公网地址">${icon('external')}</button>` : ''}
-          <button class="icon-btn" type="button" data-act="proxy.edit" data-name="${esc(p.name)}" title="编辑">${icon('edit')}</button>
-          <button class="icon-btn danger" type="button" data-act="proxy.delete" data-name="${esc(p.name)}" title="删除">${icon('trash')}</button>
+          <button class="icon-btn" type="button" data-act="proxy.edit" data-name="${esc(p.name)}" data-conn="${esc(p.connectionId || '')}" title="编辑">${icon('edit')}</button>
+          <button class="icon-btn danger" type="button" data-act="proxy.delete" data-name="${esc(p.name)}" data-conn="${esc(p.connectionId || '')}" title="删除">${icon('trash')}</button>
         </div>
       </td>
     </tr>`;
@@ -5119,7 +5163,12 @@ async function handleAction(act, dataset, btn) {
         break;
       }
       case 'proxy.delete':
-        confirmDeleteProxy(dataset.name);
+        confirmDeleteProxy(dataset.name, dataset.conn || '');
+        break;
+      case 'proxy.filter.conn':
+        S.proxyConnFilter = dataset.conn || '';
+        S.lastKeys.proxies = '';
+        renderProxies(true);
         break;
       case 'proxy.test-local': {
         btn.disabled = true;
@@ -6895,7 +6944,9 @@ function confirmFrpsPortConflict(details = []) {
   });
 }
 
-function confirmDeleteProxy(name) {
+function confirmDeleteProxy(name, connId = '') {
+  const conn = (S.state && Array.isArray(S.state.connections)) ? S.state.connections.find((c) => c.id === connId) : null;
+  const whereText = conn ? `（属于「${conn.name || conn.id}」这条连接）` : '';
   openModal(`
     <div class="modal" style="width:440px">
       <div class="modal-head">
@@ -6904,7 +6955,7 @@ function confirmDeleteProxy(name) {
         <button class="icon-btn modal-close" type="button" data-act="modal.close">${icon('x')}</button>
       </div>
       <div class="modal-body">
-        <div class="note warn">${icon('alert')}<div>确定要删除代理 <strong>${esc(name)}</strong> 吗？删除后公网地址会立即失效。</div></div>
+        <div class="note warn">${icon('alert')}<div>确定要删除代理 <strong>${esc(name)}</strong>${esc(whereText)} 吗？删除后公网地址会立即失效。</div></div>
       </div>
       <div class="modal-foot">
         <span class="mf-left"></span>
@@ -6916,7 +6967,7 @@ function confirmDeleteProxy(name) {
   if (btn) {
     btn.addEventListener('click', async () => {
       btn.disabled = true;
-      const res = await FRP.deleteProxy(name);
+      const res = await FRP.deleteProxy(name, connId);
       if (res && res.ok) {
         if (res.data && res.data.state) S.state = res.data.state;
         closeModal();

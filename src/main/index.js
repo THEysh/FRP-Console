@@ -1943,6 +1943,56 @@ function adminWeakness() {
   return { weak: reasons.length > 0, reasons, user, length: pass.length };
 }
 
+/* 代理页要「一眼看全所有服务器」：把每条启用连接里的代理拍平成一个列表。
+ * 非当前连接的 vhost / nginx 事实属于服务器侧（要 SSH 才有），这里按该连接自己的
+ * 配置 + 通用默认值算地址；想要精确值仍然是切到那条连接看服务器页。 */
+function allConnectionProxies() {
+  const out = [];
+  if (!settings || !Array.isArray(settings.connections) || !settings.connections.length) return out;
+  for (const conn of settings.connections) {
+    if (!conn || !conn.enabled) continue;
+    const isCur = conn.id === settings.activeConnectionId;
+    let m = null;
+    try { m = connectionModel(conn); } catch { m = null; }
+    if (!m) continue;
+    const mm = isCur ? manager : (multiConnection && multiConnection.extraManagers.get(conn.id));
+    const snap = mm && mm.snapshot ? mm.snapshot() : null;
+    const live = !!(snap && snap.connected);
+    for (const proxy of (m.proxies || [])) {
+      const st = live && mm.proxyStatus ? mm.proxyStatus.get(proxy.name) || null : null;
+      const health = healthCache.get(connectionsModule.keyOf(conn.id, proxy.name)) || null;
+      const openPath = proxyOpenPath(proxy.name, conn.id);
+      let publicAddress = '';
+      try {
+        publicAddress = configModule.publicAddressFor(m, proxy, { ...settings, nginxProxyEnabled: false, subDomainHost: '' });
+      } catch { publicAddress = ''; }
+      const openUrl = (() => {
+        const ty = String(proxy.type || '').toLowerCase();
+        if (['udp', 'sudp', 'xtcp', 'stcp'].includes(ty)) return '';
+        if (!publicAddress || /^subdomain:/i.test(publicAddress)) return '';
+        const base = /^[a-z][a-z0-9+.-]*:\/\//i.test(publicAddress) ? publicAddress : `http://${publicAddress}`;
+        return openPath ? `${base.replace(/\/+$/, '')}${openPath}` : base;
+      })();
+      out.push({
+        ...proxy,
+        publicAddress,
+        openPath,
+        openUrl,
+        status: st && st.status ? st.status : (live ? 'pending' : 'unknown'),
+        statusError: (st && st.err) || '',
+        health,
+        startExcluded: false,
+        connectionId: conn.id,
+        connectionName: conn.name || conn.id,
+        connectionAddr: String(m.serverAddr || ''),
+        connectionActive: isCur,
+        connectionLive: live,
+      });
+    }
+  }
+  return out;
+}
+
 function buildState() {
   if (!manager) {
     return {
@@ -1956,6 +2006,7 @@ function buildState() {
       runtime: { mode: 'stopped', running: false, connected: false },
       service: serviceCache,
       proxies: [],
+      proxiesAll: [],
       /* 提前返回也必须带上连接信息：运行期容器还没建好时界面照样要能列出连接，
        * 否则启动那一两秒里侧栏连接选择器是空的，看起来像「连接都没了」。 */
       connections: [],
@@ -2004,6 +2055,8 @@ function buildState() {
     };
   });
   return {
+    /* 代理页的全量视图：每条启用连接的代理拍平（当前连接在列表里也在）。 */
+    proxiesAll: allConnectionProxies(),
     app: {
       version: app.getVersion(),
       frpcVersion,
@@ -3682,30 +3735,50 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '' } = {})
     });
   });
 
-  ipcMain.handle('proxy:delete', async (event, name) => {
+  ipcMain.handle('proxy:delete', async (event, payload) => {
     if (!model) return fail('配置尚未载入');
+    /* 代理页现在是全量视图：删一条「别的连接」的代理时要把连接一起带过来，
+     * 否则会去当前连接的配置里找同名代理——要么删错，要么报「没有这条」。 */
+    const name = String((typeof payload === 'string' ? payload : (payload && payload.name)) || '').trim();
+    if (!name) return fail('缺少代理名称');
+    const activeId = (settings && settings.activeConnectionId) || '';
+    const wantConnId = String((payload && typeof payload === 'object' && payload.connectionId) || '').trim();
+    const targetConn = wantConnId && wantConnId !== activeId ? connectionById(wantConnId) : null;
+    if (wantConnId && wantConnId !== activeId && !targetConn) return fail('这条连接已经不存在了（可能被删掉）');
+    const targetId = targetConn ? targetConn.id : activeId;
+    const isCurrent = !targetConn;
+    const srcModel = isCurrent ? model : connectionModel(targetConn);
+    if (!srcModel) return fail('这条连接的配置文件读不到：' + String((targetConn && targetConn.configPath) || ''));
+    if (!(srcModel.proxies || []).some((p) => p.name === name)) {
+      return fail(`「${targetConn ? targetConn.name : '当前连接'}」里没有叫「${name}」的代理`);
+    }
     const next = configModule.normalize({
-      ...model._extra,
-      serverAddr: model.serverAddr,
-      serverPort: model.serverPort,
-      loginFailExit: model.loginFailExit,
-      auth: model.auth,
-      log: model.log,
-      transport: model.transport,
-      webServer: model.webServer,
-      proxies: model.proxies.filter((p) => p.name !== name),
-      visitors: model.visitors,
-    }, { nginxProxyEnabled: yModeEnabled() });
-    healthCache.delete(name);
-    dropProxyOpenPath(name);
+      ...srcModel._extra,
+      serverAddr: srcModel.serverAddr,
+      serverPort: srcModel.serverPort,
+      loginFailExit: srcModel.loginFailExit,
+      auth: srcModel.auth,
+      log: srcModel.log,
+      transport: srcModel.transport,
+      webServer: srcModel.webServer,
+      proxies: srcModel.proxies.filter((p) => p.name !== name),
+      visitors: srcModel.visitors,
+    }, { nginxProxyEnabled: isCurrent ? yModeEnabled() : false });
+    /* 健康缓存的键是 `<connId>::<name>`：按裸名删不掉，会留下一条永不刷新的旧记录。 */
+    {
+      const prefix = connectionsModule.keyOf(targetId, name);
+      healthCache.delete(prefix);
+    }
+    dropProxyOpenPath(name, targetId);
     /* 删掉的代理还留在 start 名单里是无害的（frpc 忽略不存在的名字），
      * 但会越积越脏，顺手清掉；名单本身不动其它条目。 */
     const startPatch = startListPatch(next, { remove: name });
     if (startPatch) next._extra = { ...(next._extra || {}), start: startPatch.list };
-    const result = await applyAndMaybeReload(next);
+    /* 当前连接走原路（带回滚与全量状态刷新）；别的连接写它自己的文件并重载它自己的 frpc。 */
+    const result = isCurrent ? await applyAndMaybeReload(next) : await applyToParkedConnection(targetConn, next);
     if (!result.ok) return result;
     pushState();
-    return ok({ state: result.state, reloaded: result.reloaded });
+    return ok({ state: result.state, reloaded: result.reloaded, connectionId: targetId });
   });
 
   /* 端口建议/随机：找不到时必须说清原因。以前只回 {port:null}，

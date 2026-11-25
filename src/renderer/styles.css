@@ -1713,3 +1713,36 @@ label .icon-btn svg { width: 13px; height: 13px; }
 .conn-row.active { border-color: rgba(90, 209, 255, 0.35); background: rgba(90, 209, 255, 0.06); }
 .conn-row .cr-name { font-weight: 600; font-size: 12.5px; }
 .conn-row .cr-meta { font-size: 11px; color: var(--muted); margin-top: 2px; }
+
+/* 代理页顶部的「服务器」筛选条（1.2.190）。 */
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 0 0 12px;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 11px;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  background: rgba(148, 163, 184, 0.08);
+  color: var(--text-dim);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.chip:hover { color: var(--text); border-color: rgba(90, 209, 255, 0.4); }
+
+.chip.on {
+  color: var(--text);
+  border-color: rgba(90, 209, 255, 0.55);
+  background: rgba(90, 209, 255, 0.14);
+}
+
+.chip-count { opacity: 0.6; font-variant-numeric: tabular-nums; }
+
+.conn-name { font-size: 12px; color: var(--text); }
