@@ -145,6 +145,8 @@ async function main() {
     waitFor,
     sleep,
     reload: () => cdp.reloadPage(CDP_PORT),
+    /* 把视口模拟成指定尺寸（测最小窗口布局）；传空则恢复 */
+    emulate: (w, h) => cdp.emulateViewport(CDP_PORT, w, h),
     /* 等某个选择器出现：单独跑某一个场景时界面可能还没画完，
      * 直接 querySelector(...).click() 会拿到 null。 */
     waitUi: (selector, label = '界面元素') =>

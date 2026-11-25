@@ -88,4 +88,23 @@ async function reloadPage(port) {
   return true;
 }
 
-module.exports = { evalIn, waitReady, httpJson, reloadPage };
+/* 把渲染进程的视口模拟成指定尺寸（用来测最小窗口下的布局，不改真实窗口）。 */
+async function emulateViewport(port, width, height) {
+  const list = await httpJson(port, '/json/list');
+  const page = pickPage(list);
+  if (!page) throw new Error('no page target');
+  const ws = new WebSocket(page.webSocketDebuggerUrl);
+  await new Promise((r, j) => { ws.onopen = r; ws.onerror = j; });
+  const send = (id, method, params) => new Promise((res) => {
+    const onMsg = (e) => { const d = JSON.parse(e.data); if (d.id === id) { ws.removeEventListener('message', onMsg); res(d); } };
+    ws.addEventListener('message', onMsg);
+    ws.send(JSON.stringify({ id, method, params }));
+  });
+  if (width && height) await send(1, 'Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false });
+  else await send(1, 'Emulation.clearDeviceMetricsOverride', {});
+  await new Promise((r) => setTimeout(r, 400));
+  ws.close();
+  return true;
+}
+
+module.exports = { evalIn, waitReady, httpJson, reloadPage, emulateViewport };
