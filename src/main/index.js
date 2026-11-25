@@ -1558,8 +1558,27 @@ function connectionSummary(conn) {
     const m = connectionModel(conn);
     return m && Array.isArray(m.proxies) ? m.proxies.length : 0;
   })();
-  const registeredCount = snap && Array.isArray(snap.proxies) ? snap.proxies.length : 0;
+  /* 只数「status === running」的：frps 挂掉后 frpc 仍会把代理列在 /api/status 里
+   * （状态是 start error / waiting），按条数算就会一直显示「已连接」。 */
+  const registeredCount =
+    snap && Array.isArray(snap.proxies)
+      ? snap.proxies.filter((p) => String((p && p.status) || '') === 'running').length
+      : 0;
   const notRegistered = declaredCount > 0 && registeredCount === 0;
+  /* frpc 断线后仍会把自己的代理报成 running，所以再看一眼健康检查：
+   * 这条连接里任何一条代理的「隧道层」失败 → 隧道没通。 */
+  let tunnelUnhealthy = false;
+  try {
+    const prefix = connectionsModule.keyOf(conn.id, '');
+    for (const [key, value] of healthCache) {
+      if (!String(key).startsWith(prefix)) continue;
+      const layer = value && value.layers && value.layers.tunnel;
+      if (layer && layer.ok === false) { tunnelUnhealthy = true; break; }
+    }
+  } catch {
+    tunnelUnhealthy = false;
+  }
+  const tunnelOk = snap && snap.connected && !notRegistered && !tunnelUnhealthy;
   return {
     id: conn.id,
     name: conn.name,
@@ -1574,8 +1593,12 @@ function connectionSummary(conn) {
       ? {
         mode: snap.mode,
         running: snap.running,
-        connected: snap.connected && !notRegistered,
-        tunnelDown: !!(snap.connected && notRegistered),
+        connected: tunnelOk,
+        tunnelDown: !!(snap.connected && (notRegistered || tunnelUnhealthy)),
+        /* declared = 配置里的代理数；running = frpc 报「running」的条数。
+         * 两个数一起看就能判断「是配置读不到，还是真的没连上」。 */
+        declared: declaredCount,
+        runningProxies: registeredCount,
         foreign: snap.foreign,
         pid: snap.pid,
         proxyCount: (snap.proxies || []).length,
@@ -1689,7 +1712,12 @@ function runtimeView(runtime) {
    *   2) 配置里明明有代理，但 /api/status 里一个都没注册上——这条比日志更可靠，
    *      因为登录失败时 frpc 可能根本不建日志文件（loginFailExit=true 直接退出），
    *      或者用户把 log.to 指到了别处，此时只剩这一条线索。 */
-  const notRegistered = declared > 0 && registered === 0;
+  /* 同上：只数真正 running 的代理，避免 frps 掉线时被「列着但没起」的条目骗过去。 */
+  const registeredRunning =
+    runtime && Array.isArray(runtime.proxies)
+      ? runtime.proxies.filter((p) => String((p && p.status) || '') === 'running').length
+      : registered;
+  const notRegistered = declared > 0 && registeredRunning === 0;
   // 刚拉起的一两秒内代理还没注册，别急着报错，否则启动瞬间会闪一下红色。
   const settled = !runtime.childStartedAt || Date.now() - runtime.childStartedAt > 6000;
   const loginFailed = apiOk && notRegistered && (!!problem || settled);
@@ -3971,8 +3999,10 @@ function crossConnectionPortClash(proxy, { excludeName = '' } = {}) {
     try {
       const snapAfter = manager ? manager.snapshot() : null;
       const ours = !!(manager && manager.isChildAlive);
-      if (snapAfter && snapAfter.mode === 'external' && !ours) {
-        const port = Number(snapAfter.adminPort) || Number(settings.adminPort) || 0;
+      /* 不再要求 mode 恰好是 external：切换瞬间它可能是 starting，
+       * 只要「不是我们拉起的子进程」+「端口上确有 frpc 在听」就值得清。 */
+      if (!ours) {
+        const port = Number(snapAfter && snapAfter.adminPort) || Number(settings.adminPort) || 0;
         if (port && killFrpcOnPort(port)) {
           // eslint-disable-next-line no-console
           console.log(`[conn] 切换连接时清掉了管理端口 ${port} 上的残留 frpc`);
