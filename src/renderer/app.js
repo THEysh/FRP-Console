@@ -2882,8 +2882,11 @@ function serverConnBar() {
   const chips = list.map((c) => {
     const rt = c.runtime || {};
     const dot = rt.connected ? 'ok' : (rt.running ? 'warn' : 'idle');
-    const counts = c.counts ? `${c.counts.online}/${c.counts.total}` : '';
-    const tip = c.host ? ` title="SSH ${esc(c.username || 'root')}@${esc(c.host)}:${esc(c.port || 22)}"` : '';
+    /* 只写「0/1」读不出是在线数还是连接数（1.2.208）：补「在线」，没有代理时说「暂无代理」。 */
+    const counts = c.counts ? (c.counts.total ? `在线 ${c.counts.online}/${c.counts.total}` : '暂无代理') : '';
+    const stateText = rt.connected ? '隧道已连接' : (rt.running ? '隧道运行中（还没连上）' : '隧道未运行');
+    const tipText = [c.host ? `SSH ${c.username || 'root'}@${c.host}:${c.port || 22}` : '还没填 SSH 地址', stateText, c.counts && c.counts.total ? `在线 ${c.counts.online}/${c.counts.total}` : '暂无代理'].join(' · ');
+    const tip = ` title="${esc(tipText)}"`;
     return '<button class="chip' + (c.id === activeId ? ' on' : '') + '" type="button"' + tip + ' data-act="server.conn.switch" data-conn="' + esc(c.id) + '">' +
       '<span class="schip-dot ' + dot + '"></span>' + esc(c.name || c.id) +
       (counts ? '<span class="chip-count">' + esc(counts) + '</span>' : '') + '</button>';
