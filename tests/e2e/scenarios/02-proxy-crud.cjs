@@ -78,6 +78,14 @@ module.exports = {
     })()`);
     check('空名称提交不会静默通过', formGuard.ok && formGuard.stillOpen && /名称/.test(formGuard.hint || ''), JSON.stringify(formGuard).slice(0, 200));
 
+    /* 协议类型胶囊的副标题别再重复一遍小写类型名（1.2.203：原来是「TCP tcp」）。 */
+    const chipHints = await ctx.eval(`(function(){
+      const chips = [...document.querySelectorAll('#pf-types [data-type]')];
+      return chips.map((c) => ({ type: c.dataset.type, sub: (c.querySelector('small') || {}).textContent || '' }));
+    })()`);
+    const dup = (chipHints || []).filter((c) => c.sub.trim().toLowerCase() === c.type);
+    check('类型胶囊副标题是说明而不是重复类型名', (chipHints || []).length >= 4 && dup.length === 0, JSON.stringify(chipHints));
+
     const removed = await ctx.eval(`(async () => {
       const esc = document.querySelector('[data-act="proxy.close"], .modal-close, [data-act="dialog.cancel"]');
       if (esc) esc.click();

@@ -153,6 +153,17 @@ function modeLabel(mode) {
 
 const TYPE_LABEL = { tcp: 'TCP', udp: 'UDP', http: 'HTTP', https: 'HTTPS', stcp: 'STCP', sudp: 'SUDP', xtcp: 'XTCP', tcpmux: 'TCPMUX' };
 const SCOPE_LABEL = { loopback: '回环', all: '全网', docker: 'Docker', lan: '内网', public: '公网', other: '其它' };
+/* 类型胶囊的副标题：一句人话，比把小写 type 名再写一遍有用（1.2.203）。 */
+const TYPE_HINT = {
+  tcp: '任意 TCP 端口',
+  udp: 'UDP 端口',
+  http: '按域名转发 HTTP',
+  https: '按域名转发 HTTPS',
+  stcp: '安全的点对点',
+  sudp: '安全的 UDP',
+  xtcp: 'P2P 直连（打洞）',
+  tcpmux: '端口复用',
+};
 
 /* 通配符覆盖判定（渲染层副本，主进程 acme.js 里还有一份）。 */
 function coversDomain(pattern, host) {
@@ -6577,7 +6588,7 @@ function openProxyEditor({ mode, proxy = null, preset = null }) {
             <label>协议类型</label>
             <input type="hidden" id="pf-type" name="type" value="${esc(initial.type)}" />
             <div class="type-chips" id="pf-types">
-              ${types.map((t) => `<button class="type-chip" type="button" data-act="proxyform.type" data-type="${t}" data-label="${esc(TYPE_LABEL[t])}">${esc(TYPE_LABEL[t])}<small>${t}</small></button>`).join('')}
+              ${types.map((t) => `<button class="type-chip" type="button" data-act="proxyform.type" data-type="${t}" data-label="${esc(TYPE_LABEL[t])}">${esc(TYPE_LABEL[t])}<small>${esc(TYPE_HINT[t] || '')}</small></button>`).join('')}
             </div>
           </div>
           <div class="field">
