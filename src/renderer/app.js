@@ -5014,10 +5014,12 @@ function renderSettings(force = false) {
             </div>
             <div class="field span-2">
               <div class="stack" style="gap:0">
+                ${formSubhead('隧道', 'frpc 连上与断开之后怎么办')}
                 ${switchRow('自动热重载', '检测到配置文件被外部修改后自动调用管理 API 重载', 'autoReload', settings.autoReload !== false)}
                 ${switchRow('断线自动重连', 'frpc 进程被杀、管理接口卡死或睡眠唤醒后连接假死时自动重连；第 10 次之后每 5 分钟试一次', 'autoReconnect', settings.autoReconnect !== false)}
-                ${switchRow('关闭窗口时最小化到托盘', '退出请使用托盘菜单中的“退出”', 'closeToTray', settings.closeToTray !== false)}
                 ${switchRow('启动时自动启动隧道', '控制台启动后立即建立 frpc 连接', 'launchTunnelOnStart', !!settings.launchTunnelOnStart)}
+                ${formSubhead('窗口与开机', '控制台自己怎么运行')}
+                ${switchRow('关闭窗口时最小化到托盘', '退出请使用托盘菜单中的“退出”', 'closeToTray', settings.closeToTray !== false)}
                 ${switchRow('开机自动启动', '登录 Windows 后自动运行控制台（写当前用户的启动项，不需要管理员权限）', 'launchAtLogin', !!settings.launchAtLogin)}
                 <div class="field-hint">
                   <button class="btn sm" type="button" data-act="settings.openstartup">${icon('folder')}<span>打开启动文件夹</span></button>
@@ -5092,6 +5094,11 @@ function pathRow(label, value, exists, kind) {
     </div>
     <button class="btn small" type="button" data-act="settings.pick" data-kind="${esc(kind)}">选择</button>
   </div>`;
+}
+
+/* 表单里的小分组标题：把一长串开关切成「隧道」「窗口与开机」两段（1.2.198）。 */
+function formSubhead(title, hint) {
+  return `<div class="form-subhead"><strong>${esc(title)}</strong><span>${esc(hint || '')}</span></div>`;
 }
 
 function switchRow(label, desc, field, on) {
