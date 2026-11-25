@@ -2653,11 +2653,13 @@ function renderServer(force = false) {
           <p>${esc(s.username)}@${esc(s.host)}:${esc(s.port)} · SSH 已连接 · ${esc(osText)}</p>
         </div>
         <div class="page-actions">
+          ${localTunnelBtn()}
           <button class="btn" type="button" data-act="server.refresh">${icon('reload')}<span>刷新</span></button>
-          <button class="btn ghost" type="button" data-act="server.disconnect">${icon('x')}<span>断开</span></button>
+          <button class="btn ghost" type="button" data-act="server.disconnect">${icon('x')}<span>断开 SSH</span></button>
         </div>
       </div>
 
+      ${serverConnBar()}
       ${profileBarMarkup()}
 
       ${terminalCardMarkup()}
@@ -2825,6 +2827,39 @@ function tunnelDiff(active, tunnel) {
   return rows;
 }
 
+/* 服务器页顶部的「连接」chips：一条连接 = 一台服务器（自己的 frpc.toml、管理端口、日志）。
+ * 点标签 = 切换「当前连接」；切换会先停掉正在跑的隧道（每条连接各自一个 frpc，带着旧隧道
+ * 换目标会让配置、健康检查、日志都错位），所以有隧道在跑时先确认一次。 */
+function serverConnBar() {
+  const state = S.state || {};
+  const list = Array.isArray(state.connections) ? state.connections : [];
+  if (list.length <= 1) return '';
+  const activeId = state.activeConnectionId || '';
+  const chips = list.map((c) => {
+    const rt = c.runtime || {};
+    const dot = rt.connected ? 'ok' : (rt.running ? 'warn' : 'idle');
+    const counts = c.counts ? `${c.counts.online}/${c.counts.total}` : '';
+    return '<button class="chip' + (c.id === activeId ? ' on' : '') + '" type="button" data-act="server.conn.switch" data-conn="' + esc(c.id) + '">' +
+      '<span class="schip-dot ' + dot + '"></span>' + esc(c.name || c.id) +
+      (counts ? '<span class="chip-count">' + esc(counts) + '</span>' : '') + '</button>';
+  }).join('');
+  const cur = list.find((c) => c.id === activeId) || null;
+  const ssh = S.server && S.server.connected ? `SSH 已连接 ${esc(S.server.host || '')}` : 'SSH 未连接';
+  return `<div class="chips server-chips">${chips}</div>
+    <div class="field-hint" style="margin:-6px 0 14px">当前查看：${esc(cur ? (cur.name || cur.id) : '—')} · ${ssh}。切换标签会先停掉正在跑的隧道。</div>`;
+}
+
+/* 当前连接的隧道启停：服务器页也能直接操作，不用回概览。 */
+function localTunnelBtn() {
+  const st = S.state || {};
+  const id = st.activeConnectionId || '';
+  const c = (st.connections || []).find((x) => x.id === id);
+  if (!c) return '';
+  const running = !!(c.runtime && (c.runtime.running || c.runtime.connected));
+  const label = running ? '停止隧道' : '启动隧道';
+  return `<button class="btn ${running ? 'ghost' : 'primary'}" type="button" data-act="conn.toggle" data-id="${esc(id)}">${icon(running ? 'stop' : 'play')}<span>${label}</span></button>`;
+}
+
 function profileBarMarkup(options = {}) {
   const showDiff = options.showDiff !== false;
   const s = S.server;
@@ -2895,16 +2930,13 @@ function profileBarMarkup(options = {}) {
         <div class="profile-diff">
           <div class="pd-head">
             <div class="pd-title">${icon('alert')}<span>${boundToActive ? '这个档案改过，但本机隧道仍在用旧参数' : (tunnel && tunnel.unarchived ? '本机隧道还没有归属到任何档案' : '当前查看的档案不是本机隧道目标')}</span></div>
-            <div class="pd-actions">
-              <button class="btn ghost small" type="button" data-act="server.apply.keep">${icon('eye')}<span>仅查看</span></button>
-              <button class="btn ${active.hasToken ? 'primary' : ''} small" type="button" data-act="server.apply" ${active.hasToken ? '' : 'disabled'}>${icon('link')}<span>切换隧道并重启</span></button>
-            </div>
+            <div class="pd-actions"><span class="badge muted"><span class="bdot"></span>仅提示，不会自动改隧道</span></div>
           </div>
           ${rows.length ? `<div class="pd-rows">
             <div class="pd-row pd-head-row"><span>项目</span><span>当前档案</span><span>本机 frpc</span></div>
             ${rows.map((r) => `<div class="pd-row"><span>${esc(r.label)}</span><span class="mono">${esc(r.want)}</span><span class="mono bad">${esc(r.got)}</span></div>`).join('')}
           </div>` : ''}
-          <p class="pd-note">${rows.length ? '' : '参数与本机 frpc 完全一致，只是绑定关系没有指向这个档案。'}${clientLine}。切换会改写 frpc.toml 并重启 frpc，所有代理会短暂重连（约 3–10 秒）。${active.hasToken ? '' : ' 此档案还没有 Token，请先编辑档案填写。'}</p>
+          <p class="pd-note">${rows.length ? '' : '参数与本机 frpc 完全一致，只是绑定关系没有指向这个档案。'}${clientLine}。想换隧道目标请改<b>这条连接</b>的 frpc.toml（配置卡或「从零初始化」），不会影响其它连接。${active.hasToken ? '' : ' 此档案还没有 Token，请先编辑档案填写。'}</p>
         </div>` : ''}
     </section>`;
 }
@@ -3385,50 +3417,6 @@ function confirmSwitchUnreachable(active, info) {
   }
 }
 
-/* 切换隧道是本页影响面最大的动作：会改写 frpc.toml 并重启 frpc，
- * 所有代理掉线重连，所以必须二次确认并把差异摆出来。 */
-function confirmApplyProfile() {
-  const active = activeServerProfile();
-  if (!active) return;
-  if (!active.hasToken) return toast('error', '该档案还没有 Token', '请先编辑档案填写，或连接服务器完成初始化');
-  const tunnel = S.server.tunnel || {};
-  const rows = tunnelDiff(active, tunnel);
-  openModal(`
-    <div class="modal" style="width:540px">
-      <div class="modal-head">
-        <div class="mh-icon" style="color:var(--amber)">${icon('link')}</div>
-        <div class="grow"><h3>切换本机隧道</h3><p>把 frpc.toml 改为指向「${esc(active.name)}」，然后重启 frpc。</p></div>
-        <button class="icon-btn modal-close" type="button" data-act="modal.close">${icon('x')}</button>
-      </div>
-      <div class="modal-body">
-        <div class="pd-rows" style="margin:0">
-          <div class="pd-row pd-head-row"><span>项目</span><span>当前</span><span>切换后</span></div>
-          <div class="pd-row"><span>服务器地址</span><span class="mono">${esc(tunnel.addr || '未配置')}</span><span class="mono good">${esc(active.host)}</span></div>
-          <div class="pd-row"><span>frps 端口</span><span class="mono">${esc(tunnel.port || '—')}</span><span class="mono good">${esc(active.clientPort)}</span></div>
-          <div class="pd-row"><span>Token</span><span class="mono">${tunnel.tokenSet ? '已配置' : '未配置'}</span><span class="mono good">档案 Token</span></div>
-        </div>
-        <div class="note warn" style="margin-top:12px">${icon('alert')}<div>重启期间所有代理会短暂中断（约 3–10 秒）；若隧道以 Windows 服务方式运行，可能需要 UAC 授权。${rows.length ? ' 当前档案与本机配置存在差异，切换后这些差异会被覆盖。' : ''}</div></div>
-      </div>
-      <div class="modal-foot">
-        <span class="mf-left"></span>
-        <button class="btn" type="button" data-act="modal.close">取消</button>
-        <button class="btn primary" type="button" id="apply-profile-confirm">${icon('restart')}<span>切换并重启</span></button>
-      </div>
-    </div>`);
-  const confirm = $('#apply-profile-confirm');
-  if (confirm) {
-    confirm.addEventListener('click', async () => {
-      confirm.disabled = true;
-      closeModal();
-      await applyServerProfile(confirm);
-    });
-  }
-}
-
-function keepViewingOnly() {
-  const active = activeServerProfile();
-  toast('info', '未改动本机隧道', active ? `当前只是查看「${active.name}」，frpc.toml 保持不变` : '');
-}
 
 function confirmDeleteServerProfile() {
   const active = activeServerProfile();
@@ -3533,7 +3521,9 @@ function connectedFormMarkup() {
           <h1>服务器</h1>
           <p>通过 SSH 登录自己的服务器，把 frps 装好、配置好、跑起来。</p>
         </div>
+        <div class="page-actions">${localTunnelBtn()}</div>
       </div>
+      ${serverConnBar()}
       ${profileBarMarkup({ showDiff: false })}
       <section class="card">
         <div class="card-head">
@@ -5270,12 +5260,30 @@ async function handleAction(act, dataset, btn) {
       case 'server.profile.modal.save':
         await saveServerProfileModal(btn);
         break;
-      case 'server.apply':
-        confirmApplyProfile();
+      case 'server.conn.switch': {
+        const id = dataset.conn || '';
+        const cur = (S.state && S.state.activeConnectionId) || '';
+        if (!id || id === cur) break;
+        const list = connList();
+        const target = list.find((c) => c.id === id);
+        const agg = (S.state && S.state.connectionsAgg) || {};
+        if (Number(agg.running) > 0) {
+          const okGo = await confirmDialog({
+            title: '切换查看的服务器',
+            body: `切换会先把正在跑的 ${Number(agg.running)} 条隧道停掉（每条连接各自一个 frpc），然后切到「${esc(target ? target.name || target.id : id)}」。想保持两条都跑就别切换。`,
+            confirmText: '切换',
+          });
+          if (!okGo) break;
+        }
+        const res = await FRP.connectionActive(id).catch(() => null);
+        if (!res || !res.ok) { toast('error', '切换失败', (res && res.error) || '请稍后再试'); break; }
+        /* 换了当前连接，SSH 会话与服务器快照都属于上一台的，先清干净再读。 */
+        S.server = { ...S.server, connected: false, info: null, summary: null, configPath: '', config: '', nginx: null, firewall: null, selftest: null, nginxHealth: null };
+        S.lastKeys.server = '';
+        await loadServerState();
+        renderServer(true);
         break;
-      case 'server.apply.keep':
-        keepViewingOnly();
-        break;
+      }
       case 'server.connect':
         await connectServer(btn);
         break;
