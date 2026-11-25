@@ -569,18 +569,35 @@ const TRAY_ICON = {
   error: 'tray-error.png',
 };
 
+/* 除当前连接之外，还有几条连接真的在线（frpc 活着 + 至少一条代理被 frps 认下）。
+ * 托盘只看当前连接会误导人：当前那条停了、另外几条在跑时，托盘不该写「隧道未运行」。 */
+function otherConnectionsOnline() {
+  const list = Array.isArray(settings.connections) ? settings.connections : [];
+  if (!multiConnection || list.length <= 1) return { running: 0, total: list.length };
+  let running = 0;
+  for (const conn of list) {
+    if (conn.id === settings.activeConnectionId) continue;
+    if (conn.enabled === false) continue;
+    const mm = multiConnection.extraManagers.get(conn.id);
+    if (!mm) continue;
+    const snap = mm.snapshot();
+    if (!snap || !snap.connected || snap.foreign) continue;
+    const connModel = connectionModel(conn);
+    const declared = (connModel && Array.isArray(connModel.proxies)) ? connModel.proxies.length : 0;
+    const registered = (snap.proxies || []).filter((p) => p.status === 'running').length;
+    if (declared === 0 || registered > 0) running += 1;
+  }
+  return { running, total: list.length };
+}
+
 function trayTone(runtime) {
-  if (runtime.loginFailed || runtime.connectFailed) return 'error';
-  if (runtime.loggedIn) return 'online';
-  return 'idle';
+  return connectionsModule.traySummary(runtime, otherConnectionsOnline()).tone;
 }
 
 function trayStatusLine(runtime) {
-  if (runtime.loginFailed || runtime.connectFailed) return { label: '连不上服务器', tip: '连不上服务器' };
-  if (runtime.loggedIn) return { label: '隧道在线', tip: `已连接 ${model ? `${model.serverAddr}:${model.serverPort}` : ''}`.trim() };
-  if (runtime.mode === 'starting' || runtime.pending) return { label: '正在连接', tip: '正在连接服务器' };
-  if (runtime.running) return { label: '隧道运行中（未登录）', tip: '隧道进程在跑，但还没登录上 frps' };
-  return { label: '隧道未运行', tip: '未连接' };
+  const summary = connectionsModule.traySummary(runtime, otherConnectionsOnline());
+  const tip = runtime.loggedIn && model ? `已连接 ${model.serverAddr}:${model.serverPort}` : summary.tip;
+  return { label: summary.label, tip };
 }
 
 function showMainWindow() {

@@ -129,3 +129,30 @@ test('upstreamPortForDomain：tcp 代理用它自己的 remotePort，http 走 vh
   assert.equal(conn.publishProxyForDomain(proxies, 'site.example.com').name, 'site');
   assert.equal(conn.publishProxyForDomain(proxies, 'jellyfin.example.com'), null);
 });
+
+test('traySummary：托盘要反映所有连接，而不是只看当前这条', () => {
+  const conn = require('../../src/main/connections.js');
+  /* 当前连接没在跑、另外两条连接在线 —— 托盘不能说「隧道未运行」 */
+  const a = conn.traySummary({ running: false, loggedIn: false }, { running: 2, total: 3 });
+  assert.equal(a.tone, 'online');
+  assert.match(a.label, /另有 2 条在线/);
+
+  /* 当前连接在线 + 另一条也在线 */
+  const b = conn.traySummary({ loggedIn: true }, { running: 1, total: 2 });
+  assert.equal(b.tone, 'online');
+  assert.match(b.label, /共 2 条/);
+
+  /* 当前连接连不上，但别的连接在线：tone 仍是 error，但要把「另有 N 条」说出来 */
+  const c = conn.traySummary({ connectFailed: true }, { running: 1, total: 2 });
+  assert.equal(c.tone, 'error');
+  assert.match(c.label, /另有 1 条在线/);
+
+  /* 只有一条连接、也没在跑：保持原样 */
+  const d = conn.traySummary({ running: false }, { running: 0, total: 1 });
+  assert.equal(d.tone, 'idle');
+  assert.equal(d.label, '隧道未运行');
+
+  /* 单连接在线 */
+  const e = conn.traySummary({ loggedIn: true }, { running: 0, total: 1 });
+  assert.equal(e.label, '隧道在线');
+});

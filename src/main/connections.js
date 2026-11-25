@@ -236,7 +236,36 @@ function publishProxyForDomain(proxies, domain) {
   return list.find((p) => proxyPublishesDomain(p, want)) || null;
 }
 
+/* 托盘文案：必须反映「所有连接」，不能只看当前这一条。
+ * 当前连接停了、另外几条在跑时，若托盘仍写「隧道未运行」，用户会以为整个程序挂了。
+ * others 由调用方算好（不含当前连接）：{ running: 已连上的条数, total: 全部条数 }。 */
+function traySummary(runtime, others = {}) {
+  const rt = runtime || {};
+  const otherRunning = Math.max(0, Number(others.running) || 0);
+  const total = Math.max(1, Number(others.total) || 1);
+  const currentOk = !!rt.loggedIn;
+  if (rt.loginFailed || rt.connectFailed) {
+    return otherRunning > 0
+      ? { label: `连不上服务器（另有 ${otherRunning} 条在线）`, tip: `当前连接连不上；另有 ${otherRunning} 条连接在线`, tone: 'error' }
+      : { label: '连不上服务器', tip: '连不上服务器', tone: 'error' };
+  }
+  if (currentOk) {
+    return otherRunning > 0
+      ? { label: `隧道在线（共 ${otherRunning + 1} 条）`, tip: `当前连接在线；另有 ${otherRunning} 条连接在线`, tone: 'online' }
+      : { label: '隧道在线', tip: '已连接', tone: 'online' };
+  }
+  if (rt.mode === 'starting' || rt.pending) return { label: '正在连接', tip: '正在连接服务器', tone: 'idle' };
+  if (otherRunning > 0) {
+    return total > 1
+      ? { label: `当前连接未运行（另有 ${otherRunning} 条在线）`, tip: `当前这条连接没在跑；另外 ${otherRunning} 条连接在线`, tone: 'online' }
+      : { label: `隧道在线（共 ${otherRunning} 条）`, tip: `${otherRunning} 条连接在线`, tone: 'online' };
+  }
+  if (rt.running) return { label: '隧道运行中（未登录）', tip: '隧道进程在跑，但还没登录上 frps', tone: 'idle' };
+  return { label: '隧道未运行', tip: '未连接', tone: 'idle' };
+}
+
 module.exports = {
+  traySummary,
   upstreamPortForDomain,
   publishProxyForDomain,
   DEFAULT_CONNECTION_ID,
