@@ -944,6 +944,23 @@ function proxiesKey() {
   });
 }
 
+/* 当前连接的隧道没在跑时，代理页要说清楚「保存了也不会生效」，并给一个启动入口（1.2.207）。
+ * 其它连接在跑不算数：这里列的是所有连接的代理，但只有当前连接能一键启动。 */
+function tunnelIdleNote(all) {
+  if (!all || !all.length) return '';
+  const st = S.state || {};
+  const cur = (st.connections || []).find((c) => c.id === st.activeConnectionId) || null;
+  if (!cur) return '';
+  const rt = cur.runtime || {};
+  if (rt.running || rt.connected) return '';
+  const name = esc(cur.name || cur.id);
+  return `<div class="note warn" style="margin-bottom:14px">${icon('alert')}<div>
+    <strong>当前连接「${name}」的隧道没有在运行</strong><br>
+    下面这些代理只是写进了 frpc.toml，还没注册到服务器，公网访问不到。启动隧道之后才会生效。
+    <div style="margin-top:8px"><button class="btn small primary" type="button" data-act="conn.toggle" data-id="${esc(cur.id)}">${icon('play')}<span>启动隧道</span></button></div>
+  </div></div>`;
+}
+
 function renderProxies(force = false) {
   const key = proxiesKey();
   const q = S.proxyQuery;
@@ -982,6 +999,7 @@ function renderProxies(force = false) {
       ${orphanTunnelNote()}
       ${state.configError ? `<div class="note error" style="margin-bottom:14px">${icon('alert')}<div>${esc(state.configError)}</div></div>` : ''}
       ${state.configVerifyError ? `<div class="note error" style="margin-bottom:14px">${icon('alert')}<div>${esc(state.configVerifyError)}<br><span style="opacity:.75">隧道仍在用上一次的配置运行；把 frpc.toml 改对后会自动重新载入。</span></div></div>` : ''}
+      ${tunnelIdleNote(all)}
 
       <section class="card table-card">
         <div class="toolbar">
