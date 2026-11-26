@@ -379,6 +379,15 @@ function connRuntimeLabel(conn) {
   if (rt.mode === 'external') return '外部 frpc 在跑';
   return '未启动';
 }
+/* 下拉里每条连接的状态短文案（1.2.215）：切换前就能看出哪条在跑、几个代理在线。 */
+function connOptionState(c) {
+  const rt = (c && c.runtime) || {};
+  const counts = (c && c.counts) || {};
+  if (rt.connected) return `在线 ${Number(counts.online || 0)}/${Number(counts.total || 0)}`;
+  if (rt.running) return `连接中 ${Number(counts.online || 0)}/${Number(counts.total || 0)}`;
+  return '未启动';
+}
+
 function renderConnectionSwitch() {
   const box = $('#conn-switch');
   if (!box) return;
@@ -399,7 +408,7 @@ function renderConnectionSwitch() {
       <button class="icon-btn" type="button" data-act="conn.add" title="再加一条连接（连另一台 frps）">${icon('plus')}</button>
     </div>
     <select class="cs-select" id="conn-select" title="切换当前连接（会先停掉正在跑的隧道）">
-      ${list.map((c) => `<option value="${esc(c.id)}"${c.id === activeId ? ' selected' : ''}>${esc(c.name || c.id)}${c.runtime && c.runtime.connected ? ' · 在线' : ''}</option>`).join('')}
+      ${list.map((c) => `<option value="${esc(c.id)}"${c.id === activeId ? ' selected' : ''}>${esc(c.name || c.id)} · ${esc(connOptionState(c))}</option>`).join('')}
     </select>
     <div class="cs-row">
       ${running
