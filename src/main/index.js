@@ -1400,6 +1400,19 @@ function rememberConnectionTarget(connId, target) {
   settings = settingsModule.save({ connections: next });
 }
 
+/* 同一台机器（IP + SSH 端口）只允许一条连接：两条连接指向同一台机器只会互相踩管理端口、
+   * 抢同一批 remotePort，而且用户也分不清哪条是真的。 */
+  function connectionHostClash(host, port, exceptId) {
+    const wantedHost = String(host || '').trim().toLowerCase();
+    const wantedPort = Number(port) || 22;
+    if (!wantedHost) return null;
+    return (settings.connections || []).find(
+      (item) => item.id !== exceptId
+        && String(item.host || '').trim().toLowerCase() === wantedHost
+        && (Number(item.port) || 22) === wantedPort,
+    ) || null;
+  }
+
 function connectionPaths(conn) {
   return {
     frpcPath: paths.frpcPath,
@@ -4093,7 +4106,14 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '' } = {})
       patch.adminPort = port;
     }
     /* 1.2.192：SSH 目标也归连接管（以前是「服务器档案」的字段）。 */
-    if (payload.host !== undefined) patch.host = String(payload.host || '').trim();
+    if (payload.host !== undefined) {
+      const nextHost = String(payload.host || '').trim();
+      if (nextHost) {
+        const clash = connectionHostClash(nextHost, payload.port !== undefined ? payload.port : conn.port, conn.id);
+        if (clash) return fail(`这台机器（${nextHost}）已经是连接「${clash.name}」了（同一台机器只保留一条连接）`);
+      }
+      patch.host = nextHost;
+    }
     if (payload.port !== undefined) {
       const sshPort = Number(payload.port);
       if (!Number.isInteger(sshPort) || sshPort < 1 || sshPort > 65535) return fail('SSH 端口无效');
@@ -4188,6 +4208,21 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '' } = {})
       }
     }
     healthCache.clear();
+    /* 1.2.227：切换当前连接 = 切换「当前查看的服务器」。
+     * SSH 会话如果还连着上一台机器，必须断开——否则页面会把 A 的运行状态挂到 B 的名字下面。 */
+    let droppedHost = '';
+    if (serverSession.connected) {
+      const sessionHost = String(serverSession.host || '').toLowerCase();
+      const nextHost = String(conn.host || '').toLowerCase();
+      if (!nextHost || sessionHost !== nextHost) {
+        droppedHost = serverSession.host || sessionHost;
+        serverSession.disconnect();
+        sessionServerId = '';
+        serverConfig = { path: '', content: '', summary: null, error: '' };
+        bumpSessionEpoch();
+        send('server:session-changed', { connected: false });
+      }
+    }
     settings = settingsModule.save({
       activeConnectionId: conn.id,
       configPath: conn.configPath,
@@ -4225,7 +4260,7 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '' } = {})
       /* 兜底清理失败不影响切换本身 */
     }
     pushState();
-    return ok({ changed: true, stopped, connections: connectionList(), state: buildState() });
+    return ok({ changed: true, stopped, sshDropped: droppedHost, connections: connectionList(), state: buildState() });
   });
   ipcMain.handle('listen:scan', async () => {
     const result = await netport.listListeners();
@@ -4725,34 +4760,31 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '' } = {})
     if (!username) return fail('请输入 SSH 用户名');
     if (!Number.isInteger(port) || port < 1 || port > 65535) return fail('SSH 端口无效');
 
-    let profile = requested;
-    // 表单里的地址 / 端口 / 用户名被改过时，必须明确是“更新这个档案”还是“另存为新档案”，
-    // 否则会出现“拿档案 A 的密码去连 B、然后 A 的地址被偷偷改写”的状态错乱。
-    const changed = !!(profile
-      && (profile.host.toLowerCase() !== host.toLowerCase() || Number(profile.port) !== port || profile.username !== username));
-    if (changed) {
-      if (payload.adoptProfile === true) {
-        settingsModule.clearServerSecret(profile.id); // 旧密码属于旧主机，不能沿用
-      } else if (payload.adoptProfile === false) {
-        profile = null;
-      } else {
-        return fail('输入的地址与所选档案不一致', {
-          needsDecision: 'host-mismatch',
-          profile: serverProfileView(profile),
-          input: { host, port, username },
-          state: serverState(),
-        });
+    /* 1.2.227：不再有「档案」这层决策。
+     * 表单里填了和这条连接记录不同的地址 = 把这条连接改成指向那台机器（旧机器的一切随连接一起清掉，
+     * 新机器占用连接原来的位置）。旧密码属于旧机器，不能沿用；这次没带密码就当场要一次。 */
+    const hostChanged = !!(connNow && connNow.host && String(connNow.host).toLowerCase() !== host.toLowerCase());
+    if (hostChanged) {
+      const clash = connectionHostClash(host, port, connNow.id);
+      if (clash) {
+        return fail(`这台机器（${host}:${port}）已经是连接「${clash.name}」了，直接切过去就好`, { state: serverState() });
       }
     }
+    let profile = findServerProfileByKey({ host, port });
     /* 表单连接没带档案时，先看是不是连「同一台机器」——有就复用，别每次新建一条同名档案。
      * 复用后仍会走下面的 upsert 更新地址/端口，并把 activeServerId 指过去。 */
     if (!profile) profile = findServerProfileByKey({ host, port });
     const wasNew = !profile;
     if (!profile) profile = upsertServerProfile({ host, port, username, name: host });
     /* 1.2.193：密码按连接存；老数据仍在档案键下，所以依次回退。 */
-    if (!password && connNow) password = settingsModule.readConnectionSecret(connNow.id);
-    if (!password) password = settingsModule.readServerSecret(profile.id);
-    if (!password) return fail(changed ? '档案地址已变更，请重新输入 SSH 密码' : '请输入密码', { needsPassword: true, state: serverState() });
+    if (!password && connNow && !hostChanged) password = settingsModule.readConnectionSecret(connNow.id);
+    if (!password && !hostChanged) password = settingsModule.readServerSecret(profile.id);
+    if (!password) {
+      return fail(
+        hostChanged ? `这条连接原来的地址是 ${connNow.host}，现在改成 ${host}：请补上这台机器的 SSH 密码` : '请输入密码',
+        { needsPassword: true, state: serverState() },
+      );
+    }
 
     // 会话即将变更：让所有在途的读请求结果失效，防止旧档案的数据回写到新页面。
     bumpSessionEpoch();
@@ -4786,6 +4818,7 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '' } = {})
     /* 1.2.192：把「这台连接连的是哪台机器的 SSH」记到连接自己身上。
      * 有了它，服务器页的连接标签、自动连接、证书页的上下文都不必再依赖档案。 */
     rememberConnectionTarget(connNow ? connNow.id : (settings && settings.activeConnectionId), { host, port, username });
+    if (hostChanged && connNow) settingsModule.clearConnectionSecret(connNow.id);
     if (payload.remember) {
       const saved = settingsModule.saveServerSecret(profile.id, password);
       if (!saved.ok) return fail(saved.error, { state: serverState() });
@@ -4818,7 +4851,7 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '' } = {})
     redeployStaleCerts().catch(() => {});
     return ok({
       ...serverState(),
-      adoptProfile: changed && payload.adoptProfile === true,
+      repointed: hostChanged,
       inspectError: inspected.ok ? '' : inspected.error,
     });
   });

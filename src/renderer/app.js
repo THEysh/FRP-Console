@@ -2750,6 +2750,18 @@ function renderServer(force = false) {
     return;
   }
 
+  /* 1.2.227：硬约束 —— 会话连着 A、当前查看的是 B 时不渲染 A 的详情。
+   * 切换连接/外部改动都可能让两者短暂错位，一旦错位就会把 A 的运行状态显示在 B 的名字下面。 */
+  {
+    const connNow = activeConnectionInfo();
+    const sessionHost = String(s.host || '').toLowerCase();
+    const connHost = String((connNow && connNow.host) || '').toLowerCase();
+    if (sessionHost && connHost && sessionHost !== connHost) {
+      $('#view').innerHTML = sessionMismatchMarkup(connNow, s);
+      return;
+    }
+  }
+
   const info = s.info || {};
   const summary = s.summary || {};
   const status = serverStatusLabel(info);
@@ -3261,38 +3273,6 @@ function profileBarMarkup(options = {}) {
 
 /* 地址对不上时的决策弹窗：更新这个档案，还是另存为新档案。
  * 这一步必须显式选择，否则“换了 IP”会静默改写原档案，导致密码与地址错配。 */
-function askProfileMismatch(mismatch, onDecide) {
-  const p = (mismatch && mismatch.profile) || {};
-  const input = (mismatch && mismatch.input) || {};
-  openModal(`
-    <div class="modal" style="width:560px">
-      <div class="modal-head">
-        <div class="mh-icon" style="color:var(--amber)">${icon('alert')}</div>
-        <div class="grow"><h3>地址与档案不一致</h3><p>你输入的连接信息与档案「${esc(p.name || p.host || '')}」不同。</p></div>
-        <button class="icon-btn modal-close" type="button" data-act="modal.close">${icon('x')}</button>
-      </div>
-      <div class="modal-body">
-        <div class="pd-rows" style="margin:0">
-          <div class="pd-row pd-head-row"><span>项目</span><span>档案里</span><span>你输入的</span></div>
-          <div class="pd-row"><span>地址</span><span class="mono">${esc(p.host || '—')}</span><span class="mono">${esc(input.host || '—')}</span></div>
-          <div class="pd-row"><span>SSH 端口</span><span class="mono">${esc(p.port || 22)}</span><span class="mono">${esc(input.port || 22)}</span></div>
-          <div class="pd-row"><span>用户名</span><span class="mono">${esc(p.username || 'root')}</span><span class="mono">${esc(input.username || 'root')}</span></div>
-        </div>
-        <div class="note" style="margin-top:12px">${icon('shield')}<div>更新档案会清空该档案里保存的旧密码（旧密码属于旧主机），需要重新输入一次。另存为新档案则保留原档案不动。</div></div>
-      </div>
-      <div class="modal-foot">
-        <span class="mf-left"></span>
-        <button class="btn" type="button" data-act="modal.close">取消</button>
-        <button class="btn" type="button" id="mismatch-new">${icon('plus')}<span>另存为新档案</span></button>
-        <button class="btn primary" type="button" id="mismatch-adopt">${icon('check')}<span>更新该档案并连接</span></button>
-      </div>
-    </div>`);
-  const adopt = $('#mismatch-adopt');
-  const create = $('#mismatch-new');
-  if (adopt) adopt.addEventListener('click', () => { closeModal(); onDecide(true); });
-  if (create) create.addEventListener('click', () => { closeModal(); onDecide(false); });
-}
-
 function openServerProfileModal(mode = 'new') {
   const s = S.server;
   const p = mode === 'edit' ? activeServerProfile() : null;
@@ -3830,6 +3810,31 @@ function activeConnectionInfo() {
   return (st.connections || []).find((c) => c.id === st.activeConnectionId) || null;
 }
 
+/* 会话与当前连接不是同一台机器时的兜底页面：不显示任何属于那台机器的数据。 */
+function sessionMismatchMarkup(connNow, s) {
+  const connName = (connNow && (connNow.name || connNow.id)) || '当前连接';
+  const sessionHost = s.host || '';
+  return [
+    '<div class="view">',
+    '  <div class="page-head"><div class="page-title"><h1>服务器</h1>',
+    '    <p>这台机器的会话和当前查看的连接对不上，先对齐再看状态。</p></div>',
+    '    <div class="page-actions">' + localTunnelBtn() + '<button class="btn primary" type="button" data-act="conn.add">' + icon('plus') + '<span>再连一台</span></button></div></div>',
+    '  ' + serverConnBar(),
+    '  <div class="server-layout">' + serverListMarkup() + '<div class="server-main">' + connCardMarkup(),
+    '    <section class="card">',
+    '      <div class="card-head">',
+    '        <div class="ch-icon" style="color:var(--amber)">' + icon('alert') + '</div>',
+    '        <div class="grow"><h3>SSH 正连着 <span class="mono">' + esc(sessionHost) + '</span>，但当前查看的是「' + esc(connName) + '」</h3>',
+    '          <p>为了不把上一台的状态显示在这台名下，这里先不展示运行状态、端口、面板与配置。</p></div></div>',
+    '      <div class="card-actions">',
+    '        <button class="btn primary" type="button" data-act="server.disconnect">' + icon('x') + '<span>断开这条 SSH</span></button>',
+    '        <span class="field-hint">断开后填入「' + esc(connName) + '」的地址再连接；或者切回连着的那条连接。</span>',
+    '      </div>',
+    '    </section>',
+    '  </div></div></div>',
+  ].join('');
+}
+
 function connectedFormMarkup() {
   const s = S.server;
   const saved = s.saved || {};
@@ -3865,7 +3870,9 @@ function connectedFormMarkup() {
           <div class="field span-2">
             <label>服务器 IP / 域名 <span class="req">*</span></label>
             <input class="input" name="host" value="${esc(defaultHost)}" placeholder="例如 frps.example.com" spellcheck="false">
-            <div class="field-hint" id="cf-host-note">连过的机器会记住地址与密码（密码用 Windows DPAPI 加密保存），下次直接点「连接并获取状态」即可。</div>
+            <div class="field-hint" id="cf-host-note">${connNow && connNow.host
+              ? '这条连接现在指向 <b class="mono">' + esc(connNow.host) + '</b>：填别的地址就会把这条连接改成那台机器（原来保存的密码会被清掉，需要重新输入一次）。'
+              : '连过的机器会记住地址与密码（密码用 Windows DPAPI 加密保存），下次直接点「连接并获取状态」即可。'}</div>
           </div>
           <div class="field">
             <label>SSH 端口</label>
@@ -3939,21 +3946,14 @@ async function connectServer(btn, options = undefined) {
   if (!Number.isInteger(port) || port < 1 || port > 65535) return toast('error', 'SSH 端口无效');
   if (!password && !S.server.savedCredential) return toast('error', '请输入密码');
 
-  const payload = { host, port, username, password, remember, serverId: S.server.activeServerId };
-  if (options && options.adoptProfile !== undefined) payload.adoptProfile = options.adoptProfile;
+  /* 1.2.227：地址由「这条连接」决定，不再传档案 id —— 传了反而会拿旧档案的地址去比对。 */
+  const payload = { host, port, username, password, remember, connectionId: (S.state && S.state.activeConnectionId) || '' };
 
   await withBusy(btn, async () => {
     const seq = serverSeq();
     const res = await FRP.serverConnect(payload);
     if (serverSeqStale(seq)) return;
     if (!res || !res.ok) {
-      // 地址与所选档案不一致：先让用户决定是更新档案还是另存新档，再重连。
-      if (res && res.needsDecision === 'host-mismatch') {
-        askProfileMismatch(res, (adopt) => {
-          connectServer(null, { adoptProfile: adopt }).catch((error) => toast('error', '连接失败', String((error && error.message) || error)));
-        });
-        return;
-      }
       if (res && res.needsTrustHost) {
         const info = res.needsTrustHost;
         askTrustHost(info, async () => {
@@ -3966,12 +3966,14 @@ async function connectServer(btn, options = undefined) {
         return;
       }
       if (res && res.needsPassword) {
+        const changedAddr = !!(res.error && res.error.indexOf('原来的地址') >= 0);
         const input = $('#server-password');
         if (input) {
           input.value = '';
           input.focus();
-          input.placeholder = '档案地址已变更，请重新输入密码';
+          input.placeholder = changedAddr ? '地址变了，请重新输入这台机器的密码' : '请输入 SSH 密码';
         }
+        if (res.error) toast('warn', changedAddr ? '地址变了，密码需要重新输入' : '请输入密码', res.error);
       }
       toastResult(res);
       return;
@@ -5707,6 +5709,10 @@ async function handleAction(act, dataset, btn) {
         }
         const res = await FRP.connectionActive(id).catch(() => null);
         if (!res || !res.ok) { toast('error', '切换失败', (res && res.error) || '请稍后再试'); break; }
+        const dropped = res.data && res.data.sshDropped;
+        if (dropped) {
+          toast('info', '已断开上一台的 SSH', 'SSH 之前连着 ' + dropped + '，切换连接时已经断开，正在查看「' + (target ? target.name : id) + '」。');
+        }
         /* 先刷全量状态：chips 高亮读的是 S.state.activeConnectionId，只拉 serverState 不会更新它。 */
         await reloadAfterConnectionChange();
         /* 换了当前连接，SSH 会话与服务器快照都属于上一台的，先清干净再读。 */
