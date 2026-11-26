@@ -4823,6 +4823,48 @@ async function dnsBadgeInfo(domain) {
 
 /* 把「配置渠道 → DNS 解析 → 签发证书 → 填进代理」做成可交互四步，
  * 每步内联对应表单，小白不用懂 DNS/TXT/ACME：从上到下一条流水线。 */
+/* 证书页按钮的就绪状态（1.2.220）：三个动作在输入不齐时点下去只会报错，
+ * 这里按输入框的**当前值**实时开关，并给 title 说明原因。
+ * 注意判断的是输入框，不是「检测过一次」的状态 —— 后者要用户先点一次才会更新。 */
+let wizardBtnInputBound = false;
+function refreshWizardButtons() {
+  const dwInput = document.getElementById('dw-domain');
+  const dwValue = dwInput ? String(dwInput.value || '').trim() : '';
+  document.querySelectorAll('[data-act="dw.check"]').forEach((btn) => {
+    if (btn.dataset.busy === '1') return;
+    btn.disabled = !dwValue;
+    btn.title = dwValue
+      ? '对上面填的域名做一次解析检测（本机 / 公共 DNS / Cloudflare 三路对比）'
+      : '先在上面填写域名，再点这里检测';
+  });
+
+  const issueBtn = document.querySelector('[data-act="certs.issue"]');
+  if (issueBtn) {
+    const dv = document.getElementById('cert-domains');
+    const issued = dv ? String(dv.value || '').trim() : '';
+    if (!S.certs.issuing) {
+      issueBtn.disabled = !issued;
+      issueBtn.title = issued ? '' : '先在左边填要签发的域名（如 app.example.com 或 *.example.com）';
+    }
+  }
+
+  const verifyBtn = document.querySelector('[data-act="certs.dns.verify"]');
+  if (verifyBtn) {
+    const tk = document.getElementById('cert-dns-token');
+    const typed = tk ? String(tk.value || '').trim() : '';
+    const saved = !!(S.certs.dns && S.certs.dns.hasToken);
+    verifyBtn.disabled = !typed && !saved;
+    verifyBtn.title = verifyBtn.disabled ? '先粘贴 Cloudflare API Token（或填入已保存过的凭证）再验证' : '';
+  }
+
+  if (!wizardBtnInputBound) {
+    wizardBtnInputBound = true;
+    document.addEventListener('input', (ev) => {
+      const id = ev.target && ev.target.id;
+      if (id === 'dw-domain' || id === 'cert-domains' || id === 'cert-dns-token') refreshWizardButtons();
+    });
+  }
+}
 function domainWizardHtml() {
   const w = S.certs.wizard || {};
   const dns = w.dns || null;
@@ -5025,6 +5067,8 @@ function renderCerts(force = false) {
   // 连上服务器才扫描；进页面自动扫一次（60 秒内主进程有缓存，不会反复 SSH）。
   const srvSt = S.certs.server;
   if (S.server.connected && !srvSt.loaded && !srvSt.loading) loadServerCerts();
+  /* 渲染完再按输入框的当前值校正一次按钮状态（1.2.220） */
+  refreshWizardButtons();
 }
 
 /* ----------------------------- 设置 ------------------------------ */
