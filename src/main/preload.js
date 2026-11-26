@@ -134,7 +134,7 @@ contextBridge.exposeInMainWorld('FRP', {
   serverControl: (action) => invoke('server:control', { action }),
   serverSaveConfig: (content, restart, resolve) => invoke('server:save-config', { content, restart, resolve }),
   serverRotateWebPassword: () => invoke('server:rotate-web-password'),
-  serverLogs: (lines) => invoke('server:logs', { lines }),
+  serverLogs: (lines, opts) => invoke('server:logs', typeof lines === 'object' && lines ? lines : { lines, ...(opts || {}) }),
   probeTcp: (host, port, timeout) => invoke('probe:tcp', { host, port, timeout }),
   getLogs: (limit, since) => invoke('logs:get', { limit, since }),
   clearLogs: () => invoke('logs:clear'),

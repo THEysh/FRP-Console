@@ -1424,59 +1424,179 @@ function filteredLogs() {
   return S.logs.filter((l) => String(l.level || '').toLowerCase() === S.logLevel);
 }
 
-/* 日志来源切换：本机 frpc（文件/进程输出）与服务器 frps（SSH + journalctl）。
- * 两者都是日志，放在同一页更符合直觉，也省得在服务器页里再开一块。 */
+/* 日志来源切换（1.2.234）：
+ * 直接把「本机 frpc」与全部已配置服务器（服务器 A / 服务器 B…）列在同一排，
+ * 无需先启动隧道、也不必先去服务器页连 SSH，点击任意服务器即可按需拉取其 frps 日志。 */
+function configuredServerConns() {
+  return connList().filter((c) => String(c.host || c.serverAddr || '').trim());
+}
+
 function logSourceSeg() {
-  const connected = !!S.server.connected;
-  const host = connected ? String(S.server.host || '') : '';
-  const connName = (activeConnectionInfo() || {}).name || '';
-  const serverLabel = connected ? `服务器 frps${host ? ` · ${esc(host)}` : ''}${connName ? `（${esc(connName)}）` : ''}` : '服务器 frps（未连接）';
+  const servers = configuredServerConns();
+  const activeRemoteId = (S.remoteLogs && S.remoteLogs.connId) || '';
+  const localActive = S.logSource !== 'server';
+  const serverBtns = servers.length
+    ? servers.map((c) => {
+      const on = S.logSource === 'server' && activeRemoteId === c.id;
+      const label = `${c.name || c.host || c.id} (frps)`;
+      return `<button type="button" data-act="logs.source" data-source="server" data-conn="${esc(c.id)}" class="${on ? 'active' : ''}" title="按需读取「${esc(c.name || c.id)}」的 frps 服务端日志（无需先启动隧道）">${esc(label)}</button>`;
+    }).join('')
+    : `<button type="button" data-act="logs.source" data-source="server" class="${S.logSource === 'server' ? 'active' : ''}" title="配置服务器地址后即可直接读取 frps 日志">服务器 frps</button>`;
   return `<div class="seg log-src-seg">
-    <button type="button" data-act="logs.source" data-source="local" class="${S.logSource === 'local' ? 'active' : ''}">本机 frpc</button>
-    <button type="button" data-act="logs.source" data-source="server" class="${S.logSource === 'server' ? 'active' : ''}${connected ? '' : ' is-off'}"${connected ? '' : ' title="先连上服务器才能读它的 frps 日志"'}>${serverLabel}</button>
+    <button type="button" data-act="logs.source" data-source="local" class="${localActive ? 'active' : ''}">本机 frpc</button>
+    ${serverBtns}
   </div>`;
 }
 
+function remoteLogsMarkup(st) {
+  if (st.loading && !st.content) {
+    return `<div class="log-empty"><span class="spinner-sm"></span><span style="margin-top:8px">正在通过 SSH 读取 ${esc(st.name || st.host || '服务器')} 的 frps 日志…</span></div>`;
+  }
+  if (st.needsPassword) {
+    return `<div class="log-empty">
+      <span>「${esc(st.name || st.host || '该服务器')}」尚未保存 SSH 密码</span>
+      <p class="muted" style="margin-top:4px">输入一次 SSH 密码即可直接读取它的 frps 日志（无需先启动隧道或离开日志页）。</p>
+      <div style="display:flex;gap:8px;align-items:center;margin-top:12px;flex-wrap:wrap;justify-content:center">
+        <input class="input" id="logs-ssh-pass" type="password" placeholder="SSH 密码（${esc(st.username || 'root')}@${esc(st.host || '')}）" style="width:240px" autocomplete="new-password" />
+        <label class="check-inline"><input type="checkbox" id="logs-ssh-remember" checked /> 记住密码</label>
+        <button class="btn primary small" type="button" data-act="logs.server.auth" data-conn="${esc(st.connId)}">${icon('check')}<span>读取日志</span></button>
+      </div>
+    </div>`;
+  }
+  if (st.error) {
+    return `<div class="log-empty">
+      <span>读取失败：${esc(st.error)}</span>
+      <div style="margin-top:10px;display:flex;gap:8px">
+        <button class="btn small" type="button" data-act="logs.server.refresh">${icon('reload')}<span>重试</span></button>
+        <button class="btn small ghost" type="button" data-act="goto.server">${icon('server')}<span>去服务器页检查</span></button>
+      </div>
+    </div>`;
+  }
+  if (!st.content) {
+    return `<div class="log-empty"><span>暂无 frps 日志</span><p class="muted">点右上角「刷新」重新拉取。</p></div>`;
+  }
+  const parsed = parseServerLogs(st.content);
+  const items = st.errorsOnly ? parsed.items.filter((x) => x.level === 'error' || x.level === 'warn') : parsed.items;
+  const shown = st.expanded ? items : items.slice(-120);
+  if (!shown.length) {
+    return `<div class="log-empty"><span>${st.errorsOnly ? '没有警告或错误级别的日志' : '日志为空'}</span></div>`;
+  }
+  return `<div class="log-body" id="log-body">${shown.map((item) => `<div class="log-line ${esc(item.level || 'info')}">
+    <span class="lt">${esc(item.time || '')}</span>
+    <span class="lv">${esc((item.level || 'info').slice(0, 3).toUpperCase())}</span>
+    <span class="ltx" title="${esc(item.raw || item.text || '')}">${esc(item.text || item.raw || '')}</span>
+  </div>`).join('')}</div>`;
+}
+
 function renderServerLogsView() {
-  const connected = !!S.server.connected;
-  const host = String(S.server.host || '');
-  const source = S.server.logsSource || 'journalctl -u frps';
-  const parsed = S.server.logs ? parseServerLogs(S.server.logs) : { items: [], stats: { start: '', logins: 0, errors: 0 } };
+  const servers = configuredServerConns();
+  if (!S.remoteLogs) S.remoteLogs = { connId: '', content: '', source: '', host: '', name: '', username: 'root', error: '', needsPassword: false, loading: false, errorsOnly: false, expanded: false };
+  const st = S.remoteLogs;
+  if (!st.connId || !servers.some((c) => c.id === st.connId)) {
+    const pick = servers.find((c) => c.id === activeConnId()) || servers[0] || null;
+    if (pick) {
+      st.connId = pick.id;
+      st.name = pick.name || pick.id;
+      st.host = pick.host || pick.serverAddr || '';
+      st.username = pick.username || 'root';
+    } else {
+      st.connId = '';
+    }
+  }
+  const targetConn = servers.find((c) => c.id === st.connId) || null;
+  const parsed = st.content ? parseServerLogs(st.content) : { items: [], stats: { start: '', logins: 0, errors: 0 } };
   const total = parsed.items.length;
+  const titleName = targetConn ? (targetConn.name || targetConn.host || targetConn.id) : '服务器';
+  const hostText = st.host || (targetConn && (targetConn.host || targetConn.serverAddr)) || '';
   $('#view').innerHTML = `
     <div class="view">
       <div class="page-head">
         <div class="page-title">
           <h1>实时日志</h1>
-          <p>${connected ? `${esc(host)} · ${esc(source)} · 最近 ${total} 行` : '还没有连上服务器：连上之后这里直接读 frps 的日志。'}</p>
+          <p>${targetConn ? `${esc(titleName)}${hostText ? `（${esc(hostText)}）` : ''} · ${esc(st.source || 'frps 服务端日志')} · 最近 ${total} 行（无需启动隧道即可查看）` : '还没有配置任何服务器地址：先去「服务器」页填上地址即可直接看 frps 日志。'}</p>
         </div>
         <div class="page-actions">
           ${logSourceSeg()}
-          ${connected ? `<button class="btn" type="button" data-act="logs.server.refresh">${icon('reload')}<span>刷新</span></button>` : ''}
+          ${targetConn ? `<button class="btn" type="button" data-act="logs.server.refresh" ${st.loading ? 'disabled' : ''}>${icon('reload')}<span>${st.loading ? '读取中…' : '刷新'}</span></button>` : ''}
         </div>
       </div>
 
       <section class="card log-panel">
         <div class="log-head">
           <div class="log-dots"><i></i><i></i><i></i></div>
-          <span class="lh-title" title="${esc(source)}">${esc(connected ? `frps · ${host}` : 'frps 日志')}</span>
+          <span class="lh-title" title="${esc(st.source || '')}">${esc(targetConn ? `frps · ${titleName}${hostText ? ` (${hostText})` : ''}` : 'frps 日志')}</span>
           <div class="lh-right">
-            ${connected ? `<button class="btn ghost small" type="button" data-act="logs.server.errors">${icon('alert')}<span>${S.server.logErrorsOnly ? '显示全部' : '只看错误'}</span></button>
-              <button class="btn ghost small" type="button" data-act="logs.server.expand">${icon('download')}<span>${S.server.logExpanded ? '收起' : '展开全部'}</span></button>` : ''}
-            <span>${connected ? `共 ${total} 行` : '未连接'}</span>
+            ${targetConn && st.content ? `<button class="btn ghost small" type="button" data-act="logs.server.errors">${icon('alert')}<span>${st.errorsOnly ? '显示全部' : '只看错误'}</span></button>
+              <button class="btn ghost small" type="button" data-act="logs.server.expand">${icon('download')}<span>${st.expanded ? '收起' : '展开全部'}</span></button>` : ''}
+            <span>${st.loading ? '读取中…' : (total ? `共 ${total} 行` : (targetConn ? '待读取' : '未配置'))}</span>
           </div>
         </div>
-        ${connected ? serverLogsMarkup() : `<div class="log-empty"><span>还没有连上服务器</span><p class="muted">到「服务器」页连上之后，这里会显示 journalctl -u frps 的内容。</p><div style="margin-top:10px"><button class="btn" type="button" data-act="goto.server">${icon('external')}<span>去服务器页</span></button></div></div>`}
+        ${targetConn
+          ? remoteLogsMarkup(st)
+          : `<div class="log-empty"><span>还没有已配置的服务器</span><p class="muted">先到「服务器」页添加或连接服务器，之后在这里可以直接切换查看每台服务器的 frps 日志。</p><div style="margin-top:10px"><button class="btn" type="button" data-act="goto.server">${icon('external')}<span>去服务器页</span></button></div></div>`}
       </section>
     </div>`;
-  /* 刚连上（或连上后界面还没跟上）时，这里先把连接状态对齐再拉日志：
-   * 否则用户会看到「还没有连上服务器」，其实主进程那头已经连着。 */
-  if (!connected) { syncServerSession().catch(() => {}); return; }
-  /* 空日志自动拉取：带 3 秒节流，失败过也会再试（不然一个陈旧的 logsError 就能让它永远不重试）。 */
-  if (!S.server.logs && Date.now() - Number(S.server.logsAutoAt || 0) > 3000) {
-    S.server.logsAutoAt = Date.now();
-    loadServerLogs().catch(() => {});
+  const body = $('#log-body');
+  if (body && S.follow) body.scrollTop = body.scrollHeight;
+  if (targetConn && !st.content && !st.loading && !st.needsPassword && !st.error && Date.now() - Number(st.autoAt || 0) > 3000) {
+    st.autoAt = Date.now();
+    loadRemoteServerLogs(targetConn.id).catch(() => {});
   }
+}
+
+async function loadRemoteServerLogs(connId, { force = false, password = '', remember = true } = {}) {
+  const target = connList().find((c) => c.id === connId);
+  if (!target) return;
+  if (!S.remoteLogCache) S.remoteLogCache = {};
+  const cached = !force && !password ? S.remoteLogCache[connId] : null;
+  if (cached && Date.now() - cached.at < 20000) {
+    S.remoteLogs = {
+      ...(S.remoteLogs || {}),
+      connId,
+      name: target.name || target.id,
+      host: cached.host || target.host || target.serverAddr || '',
+      username: target.username || 'root',
+      content: cached.content,
+      source: cached.source,
+      error: '',
+      needsPassword: false,
+      loading: false,
+    };
+    if (S.view === 'logs' && S.logSource === 'server') renderLogs(true);
+    return;
+  }
+  const reqId = (S.remoteLogsReq = (S.remoteLogsReq || 0) + 1);
+  S.remoteLogs = {
+    ...(S.remoteLogs || {}),
+    connId,
+    name: target.name || target.id,
+    host: target.host || target.serverAddr || '',
+    username: target.username || 'root',
+    error: '',
+    needsPassword: false,
+    loading: true,
+  };
+  if (S.view === 'logs' && S.logSource === 'server') renderLogs(true);
+  const res = await FRP.serverLogs({ lines: 250, connectionId: connId, password, remember }).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+  if (reqId !== S.remoteLogsReq) return;
+  S.remoteLogs.loading = false;
+  if (res && res.ok && res.data) {
+    S.remoteLogs.content = res.data.content || '';
+    S.remoteLogs.source = res.data.source || 'journalctl -u frps';
+    S.remoteLogs.host = res.data.host || S.remoteLogs.host;
+    S.remoteLogs.error = '';
+    S.remoteLogs.needsPassword = false;
+    S.remoteLogCache[connId] = { at: Date.now(), content: S.remoteLogs.content, source: S.remoteLogs.source, host: S.remoteLogs.host };
+    if (password && remember) {
+      const ref = await FRP.refresh().catch(() => null);
+      if (ref && ref.ok && ref.data) S.state = ref.data;
+    }
+  } else {
+    S.remoteLogs.content = '';
+    S.remoteLogs.needsPassword = !!(res && res.needsPassword);
+    S.remoteLogs.error = S.remoteLogs.needsPassword ? '' : ((res && res.error) || '读取服务器日志失败');
+  }
+  if (S.view === 'logs' && S.logSource === 'server') renderLogs(true);
 }
 
 function renderLogs(force = false) {
@@ -6161,11 +6281,13 @@ async function handleAction(act, dataset, btn) {
         break;
       case 'server.openlogs':
       case 'goto.logs.server': {
+        const activeId = activeConnId();
         S.logSource = 'server';
+        S.remoteLogs = { ...(S.remoteLogs || {}), connId: activeId, content: '', error: '', needsPassword: false };
         setView('logs');
         S.lastKeys.logs = '';
         renderLogs(true);
-        if (S.server.connected) await loadServerLogs();
+        if (activeId) await loadRemoteServerLogs(activeId);
         break;
       }
       case 'goto.server':
@@ -6173,27 +6295,61 @@ async function handleAction(act, dataset, btn) {
         break;
       case 'logs.source': {
         const src = btn.dataset.source === 'server' ? 'server' : 'local';
-        if (src === 'server' && !S.server.connected) {
-          toast('warn', '先连上服务器', '服务器还没连上，读不到它的 frps 日志；连上之后这里会自动出现。');
+        const connId = String((btn.dataset && btn.dataset.conn) || '').trim();
+        if (src === 'local') {
+          if (S.logSource === 'local') break;
+          S.logSource = 'local';
+          S.lastKeys.logs = '';
+          renderLogs(true);
           break;
         }
-        if (src === S.logSource) break;
-        S.logSource = src;
-        S.lastKeys.logs = '';
-        renderLogs(true);
-        if (src === 'server' && S.server.connected && !S.server.logs) await loadServerLogs();
+        const servers = configuredServerConns();
+        const pick = (connId && servers.find((c) => c.id === connId)) || servers.find((c) => c.id === activeConnId()) || servers[0] || null;
+        S.logSource = 'server';
+        if (pick) {
+          const changed = !S.remoteLogs || S.remoteLogs.connId !== pick.id;
+          S.remoteLogs = {
+            ...(S.remoteLogs || {}),
+            connId: pick.id,
+            name: pick.name || pick.id,
+            host: pick.host || pick.serverAddr || '',
+            username: pick.username || 'root',
+            ...(changed ? { content: '', source: '', error: '', needsPassword: false } : {}),
+          };
+          S.lastKeys.logs = '';
+          renderLogs(true);
+          await loadRemoteServerLogs(pick.id);
+        } else {
+          S.lastKeys.logs = '';
+          renderLogs(true);
+        }
         break;
       }
-      case 'logs.server.refresh':
-        await loadServerLogs();
+      case 'logs.server.auth': {
+        const connId = String((dataset && dataset.conn) || (S.remoteLogs && S.remoteLogs.connId) || '').trim();
+        const pwInput = $('#logs-ssh-pass');
+        const pw = pwInput ? String(pwInput.value || '') : '';
+        const rememberEl = $('#logs-ssh-remember');
+        const remember = rememberEl ? !!rememberEl.checked : true;
+        if (!pw) { toast('warn', '请输入 SSH 密码'); if (pwInput) pwInput.focus(); break; }
+        await loadRemoteServerLogs(connId, { force: true, password: pw, remember });
         break;
+      }
+      case 'logs.server.refresh': {
+        const connId = (S.remoteLogs && S.remoteLogs.connId) || activeConnId();
+        if (connId) await loadRemoteServerLogs(connId, { force: true });
+        else await loadServerLogs();
+        break;
+      }
       case 'logs.server.errors': {
-        S.server.logErrorsOnly = !S.server.logErrorsOnly;
+        if (!S.remoteLogs) S.remoteLogs = {};
+        S.remoteLogs.errorsOnly = !S.remoteLogs.errorsOnly;
         renderLogs(true);
         break;
       }
       case 'logs.server.expand': {
-        S.server.logExpanded = !S.server.logExpanded;
+        if (!S.remoteLogs) S.remoteLogs = {};
+        S.remoteLogs.expanded = !S.remoteLogs.expanded;
         renderLogs(true);
         break;
       }

@@ -6139,9 +6139,86 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '', exclud
     }
   });
 
+  /* 按需对指定连接执行一次性 SSH 操作：
+   *   - 若目标刚好是当前已连的 serverSession，直接复用，不重复握手；
+   *   - 否则用该连接已存的 SSH 密码建立独立短期会话，用完即断，不打断服务器页会话，
+   *     也不要求隧道启动。供实时日志页直读多台 frps、证书页汇总扫描全部服务器共用。 */
+  async function withConnectionSsh(connId, fn, { password = '', remember = false } = {}) {
+    const conn = connectionById(String(connId || '').trim());
+    if (!conn) return fail('服务器连接不存在');
+    let fallbackAddr = '';
+    try {
+      const m = conn.id === settings.activeConnectionId ? model : connectionModel(conn);
+      fallbackAddr = String((m && m.serverAddr) || '').trim();
+    } catch { fallbackAddr = ''; }
+    const host = String(conn.host || fallbackAddr || '').trim();
+    const port = Number(conn.port) || 22;
+    const username = String(conn.username || 'root').trim() || 'root';
+    if (!host) return fail(`「${conn.name || conn.id}」还没有配置服务器地址`);
+
+    const sameAsActive = serverSession.connected
+      && String(serverSession.host || '').toLowerCase() === host.toLowerCase()
+      && Number(serverSession.port || 22) === port;
+    if (sameAsActive) {
+      return fn(serverSession, { conn, host, port, username, reused: true });
+    }
+
+    const prof = findServerProfileByKey({ host, port }) || (conn.serverId ? findServerProfile(conn.serverId) : null);
+    let secret = String(password || '');
+    if (!secret) secret = settingsModule.readConnectionSecret(conn.id);
+    if (!secret && prof) secret = settingsModule.readServerSecret(prof.id);
+    if (!secret) {
+      return fail(`「${conn.name || host}」尚未保存 SSH 密码`, {
+        needsPassword: true,
+        connectionId: conn.id,
+        connectionName: conn.name || host,
+        host,
+        port,
+        username,
+      });
+    }
+
+    const tmp = new ServerSession();
+    const res = await tmp.connect({ host, port, username, password: secret, onHostKey: hostKeyGuard });
+    if (!res.ok) {
+      if (res.needsTrustHost) {
+        return fail(res.error, { needsTrustHost: res.needsTrustHost, connectionId: conn.id, host, port });
+      }
+      return fail(sshConnectHint(res.error), { connectionId: conn.id, host, port });
+    }
+    if (password && remember) {
+      settingsModule.saveConnectionSecret(conn.id, password);
+      if (prof) settingsModule.saveServerSecret(prof.id, password);
+    }
+    try {
+      return await fn(tmp, { conn, host, port, username, reused: false });
+    } finally {
+      try { tmp.disconnect(); } catch { /* ignore */ }
+    }
+  }
+
   ipcMain.handle('server:logs', async (event, payload = {}) => {
+    const lines = payload.lines || 250;
+    const connId = String((payload && payload.connectionId) || '').trim();
+    if (connId) {
+      return withConnectionSsh(
+        connId,
+        async (sess, meta) => {
+          const result = await sess.logs(lines);
+          if (!result.ok) return fail(result.error, { connectionId: meta.conn.id, host: meta.host });
+          return ok({
+            source: result.source,
+            content: result.content,
+            connectionId: meta.conn.id,
+            connectionName: meta.conn.name || meta.host,
+            host: meta.host,
+          });
+        },
+        { password: payload.password || '', remember: !!payload.remember },
+      );
+    }
     const epoch = sessionEpoch;
-    const result = await serverSession.logs(payload.lines || 200);
+    const result = await serverSession.logs(lines);
     if (epoch !== sessionEpoch) return staleFail();
     if (!result.ok) return fail(result.error);
     return ok({ source: result.source, content: result.content, serverId: sessionServerId });
