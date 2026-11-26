@@ -120,33 +120,38 @@ module.exports = {
         (v) => !!v,
         { timeout: 40000, label: 'B 机进入 managed' },
       );
-      ctx.check('B 机确实跑起来了', pick(running, /B 机/).mode === 'managed', JSON.stringify(pick(running, /B 机/)));
+      const pidBefore = pick(running, /B 机/).pid;
+      ctx.check('B 机确实跑起来了', pick(running, /B 机/).mode === 'managed' && !!pidBefore, JSON.stringify(pick(running, /B 机/)));
 
-      /* ② 切到 B 机为当前连接：所有隧道都该停掉 */
-      const switched = await inst.eval(`(async () => { const r = await FRP.connectionActive('c-tg2'); return { ok: !!(r && r.ok), stopped: (r && r.data && r.data.stopped) || [] }; })()`);
+      /* ② 切到 B 机为当前连接（1.2.229 起切换只换视图，不碰任何进程）：
+       *    B 机必须保持运行且 pid 不变，A 机仍保持停止。 */
+      const switched = await inst.eval(`(async () => { const r = await FRP.connectionActive('c-tg2'); return { ok: !!(r && r.ok), hasStopped: !!(r && r.data && 'stopped' in r.data) }; })()`);
       ctx.check('切换当前连接成功', switched.ok === true, JSON.stringify(switched));
+      ctx.check('切换结果里不再带 stopped 字段', switched.hasStopped === false, JSON.stringify(switched));
 
       const after = await ctx.waitFor(
         async () => {
           const r = await read();
-          const allStopped = (r.list || []).every((c) => c.mode === 'stopped' || c.mode === 'external' || c.mode === 'service');
-          return allStopped && r.active === 'c-tg2' ? r : null;
+          return r.active === 'c-tg2' ? r : null;
         },
         (v) => !!v,
-        { timeout: 45000, label: '两条隧道都停下来' },
+        { timeout: 15000, label: '当前连接切到 B 机' },
       );
       ctx.check('当前连接切到 B 机', after.active === 'c-tg2', JSON.stringify(after.active));
-      ctx.check('A 机已停止', pick(after, /A 机/).mode === 'stopped', JSON.stringify(pick(after, /A 机/)));
-      ctx.check('B 机也停下来了（不是继续跑旧配置）', pick(after, /B 机/).mode === 'stopped', JSON.stringify(pick(after, /B 机/)));
+      ctx.check('A 机保持停止（不会被顺手拉起）', pick(after, /A 机/).mode === 'stopped', JSON.stringify(pick(after, /A 机/)));
+      ctx.check('B 机仍在跑且 pid 不变（切换不停隧道）', pick(after, /B 机/).mode === 'managed' && pick(after, /B 机/).pid === pidBefore, JSON.stringify({ before: pidBefore, after: pick(after, /B 机/) }));
 
-      /* 管理端口都不再有人监听（确认进程真退了，不是只改了状态字段） */
+      /* ③ 显式停止 B 机之后，管理端口必须真正释放 */
+      const stoppedB = await inst.eval(`(async () => { const r = await FRP.connectionStop('c-tg2'); return { ok: !!(r && r.ok), err: (r && r.error) || '' }; })()`);
+      ctx.check('显式停止 B 机成功', stoppedB.ok === true, JSON.stringify(stoppedB));
+
       let free = false;
       for (let i = 0; i < 20; i += 1) {
         await ctx.sleep(500);
         free = !portListening(7481) && !portListening(7482);
         if (free) break;
       }
-      ctx.check('两条连接的管理端口都已释放', free, JSON.stringify({ l7481: portOwners(7481), l7482: portOwners(7482) }));
+      ctx.check('显式停止后两条连接的管理端口都已释放', free, JSON.stringify({ l7481: portOwners(7481), l7482: portOwners(7482) }));
     } finally {
       try { await inst.eval(`(async () => { const r = await FRP.connections(); const d = r.data || r; const arr = d.connections || d || []; for (const c of arr) { try { await FRP.connectionStop(c.id); } catch (e) {} } return 1; })()`); } catch { /* 忽略 */ }
       inst.stop();

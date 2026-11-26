@@ -367,8 +367,8 @@ function updateNavBadge() {
 
 /* ===== 多连接：侧栏切换器 =====
  * 只在「连接 >1 条」时出现；单连接用户界面与以前完全一致。
- * 切换会停掉正在跑的隧道（主进程如此设计：全局 manager 的配置上下文是一个），
- * 所以按钮文案直接把后果写出来，别让人以为是点击无反应。 */
+ * 切换只改变「当前查看」的连接，不会停止任何正在运行的隧道：
+ * 每条连接各自一个 frpc 进程与管理端口，启停只由启动/停止按钮控制。 */
 function connList() {
   const state = S.state || {};
   return Array.isArray(state.connections) ? state.connections : [];
@@ -412,7 +412,7 @@ function renderConnectionSwitch() {
       <span class="grow">隧道连接 · ${list.length}</span>
       <button class="icon-btn" type="button" data-act="conn.add" title="再加一条连接（连另一台 frps）">${icon('plus')}</button>
     </div>
-    <select class="cs-select" id="conn-select" title="切换当前连接（会先停掉正在跑的隧道）">
+    <select class="cs-select" id="conn-select" title="切换当前查看的连接（不会停止任何正在运行的隧道）">
       ${list.map((c) => `<option value="${esc(c.id)}"${c.id === activeId ? ' selected' : ''}>${esc(c.name || c.id)} · ${esc(connOptionState(c))}</option>`).join('')}
     </select>
     <div class="cs-row">
@@ -445,7 +445,7 @@ function connectionsSection() {
           : `<button class="btn small primary" type="button" data-act="conn.toggle" data-id="${esc(c.id)}">${icon('play')}<span>启动</span></button>`}
         ${isActive
           ? ''
-          : `<button class="btn small ghost" type="button" data-act="conn.switch" data-id="${esc(c.id)}" title="切换当前连接（会先停掉所有在跑的隧道；只想让两条同时跑就别切换，直接点左侧的启动）">设为当前</button>`}
+          : `<button class="btn small ghost" type="button" data-act="conn.switch" data-id="${esc(c.id)}" title="切换当前查看的连接（不会停止任何正在运行的隧道）">设为当前</button>`}
       </div>`;
   }).join('');
   return `
@@ -454,7 +454,7 @@ function connectionsSection() {
         <div class="section-title">
           <strong>隧道连接</strong>
           <span>${esc(String(agg.connections || list.length))} 条 · ${esc(String(agg.running || 0))} 条已连上 · 合计在线代理 ${esc(String(agg.online || 0))} / ${esc(String(agg.total || 0))}</span>
-          <span class="field-hint" style="margin:0">每条连接一份 frpc.toml、各自一条隧道；想让两条同时在线就分别点「启动」，不需要来回切换。</span>
+          <span class="field-hint" style="margin:0">每条连接一份 frpc.toml、各自一条隧道；切换只改变当前查看的连接，不会停止任何正在运行的隧道。</span>
         </div>
         <button class="btn ghost small" type="button" data-act="conn.add">${icon('plus')}再连一台</button>
       </div>
@@ -3025,8 +3025,8 @@ function serverListMarkup() {
   return `<aside class="server-list">${rows}${addBtn}</aside>`;
 }
 /* 服务器页顶部的「连接」chips：一条连接 = 一台服务器（自己的 frpc.toml、管理端口、日志）。
- * 点标签 = 切换「当前连接」；切换会先停掉正在跑的隧道（每条连接各自一个 frpc，带着旧隧道
- * 换目标会让配置、健康检查、日志都错位），所以有隧道在跑时先确认一次。 */
+ * 点标签 = 切换「当前查看」的连接。每条连接各自一个 frpc 进程，切换只是换视图，
+ * 不会碰任何正在运行的隧道。 */
 function serverConnBar() {
   const state = S.state || {};
   const list = Array.isArray(state.connections) ? state.connections : [];
@@ -3050,7 +3050,7 @@ function serverConnBar() {
   const ssh = S.server && S.server.connected ? `SSH 已连接 ${esc(S.server.host || '')}` : 'SSH 未连接';
   const addChip = '<button class="chip add" type="button" data-act="conn.add" title="再加一台服务器（连另一台 frps）">' + '＋ 再连一台' + '</button>';
   return `<div class="chips server-chips">${chips}${addChip}</div>
-    <div class="field-hint" style="margin:-6px 0 14px">当前查看：${esc(cur ? (cur.name || cur.id) : '—')} · ${ssh}。切换标签会先停掉正在跑的隧道。</div>`;
+    <div class="field-hint" style="margin:-6px 0 14px">当前查看：${esc(cur ? (cur.name || cur.id) : '—')} · ${ssh}。切换标签只换视图，不会停掉任何隧道。</div>`;
 }
 
 /* 当前连接的隧道启停：服务器页也能直接操作，不用回概览。
@@ -5502,16 +5502,6 @@ async function handleAction(act, dataset, btn) {
       const id = (dataset && dataset.id) || '';
       const target = connList().find((c) => c.id === id);
       if (!target) return;
-      const anyRunning = connList().some((c) => c.runtime && c.runtime.connected);
-      if (anyRunning) {
-        const yes = await confirmDialog({
-          title: '切换连接会停掉正在跑的隧道',
-          body: '每条连接用的是自己那份 frpc.toml，切换时旧隧道必须先停（否则改配置、健康检查、日志会错位）。切过去之后点「启动」重新连。',
-          confirmText: '切换并停止',
-          danger: true,
-        });
-        if (!yes) return;
-      }
       const res = await FRP.connectionActive(id).catch(() => null);
       if (!res || !res.ok) { toast('error', '切换失败', (res && res.error) || '请稍后再试'); return; }
       await reloadAfterConnectionChange();
@@ -5698,15 +5688,6 @@ async function handleAction(act, dataset, btn) {
         if (!id || id === cur) break;
         const list = connList();
         const target = list.find((c) => c.id === id);
-        const agg = (S.state && S.state.connectionsAgg) || {};
-        if (Number(agg.running) > 0) {
-          const okGo = await confirmDialog({
-            title: '切换查看的服务器',
-            body: `切换会先把正在跑的 ${Number(agg.running)} 条隧道停掉（每条连接各自一个 frpc），然后切到「${esc(target ? target.name || target.id : id)}」。想保持两条都跑就别切换。`,
-            confirmText: '切换',
-          });
-          if (!okGo) break;
-        }
         const res = await FRP.connectionActive(id).catch(() => null);
         if (!res || !res.ok) { toast('error', '切换失败', (res && res.error) || '请稍后再试'); break; }
         const dropped = res.data && res.data.sshDropped;

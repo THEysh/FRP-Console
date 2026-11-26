@@ -87,6 +87,7 @@ const browserProbe = require('./netprobe');
 const { execFileP, powershell, tcpCheck, httpProbe, hashText, randomToken, formatDuration, proxyEnvKeys, parseSocketHolder } = require('./util');
 const { probePort, probeUdp, sshConnectHint, outboundHint } = require('./portprobe');
 const { parseRuleSpec, judgePortRow, buildPortMatrix, summarizeMatrix, buildRuleTexts } = require('./portmatrix');
+const { createConnectionRuntime, dispatchEnsureAdmin } = require('./conn-runtime');
 
 /* 出站失败（证书签发 / DNS API / 下载 frps / 检查更新）补一句本机网络排查方向。
  * 这类请求都是从本机往 443 连，跟服务器防火墙无关，混在一起说会把用户引到错的方向。 */
@@ -972,37 +973,73 @@ function trayMenuSpec(runtime) {
     'win.show': () => showMainWindow(),
     'win.hide': () => hideMainWindow(),
     'tun.start': async () => {
-      const result = await manager.start({ runMode: settings.runMode });
+      const startEpoch = connectionEpoch;
+      const targetId = settings.activeConnectionId;
+      const mm = managerForConnection(targetId);
+      if (!mm) return;
+      clearStopQuiet(targetId);
+      const result = await mm.start({ runMode: settings.runMode });
       if (result.ok) {
-        tunnelDesired = true;
-        if (supervisor) supervisor.cancel('');
+        setDesired(targetId, true);
+        const guard = multiConnection && multiConnection.guards.get(targetId);
+        if (guard) guard.cancel('');
+        if (startEpoch === connectionEpoch) startedFingerprint = configModule.connFingerprint(model);
       }
-      notify(result.ok ? 'info' : 'error', result.ok ? '隧道已启动' : '启动失败', result.error || '');
-      if (manager) await manager.refresh().catch(() => {});
+      if (startEpoch === connectionEpoch) {
+        notify(result.ok ? 'info' : 'error', result.ok ? '隧道已启动' : '启动失败', result.error || '');
+      }
+      await mm.refresh().catch(() => {});
       pushState();
       refreshTray();
     },
     'tun.stop': async () => {
-      suppressExitUntil = Date.now() + 12000;
-      tunnelDesired = false;
-      if (supervisor) supervisor.cancel('用户停止了隧道');
-      const result = await manager.stop({ runMode: settings.runMode });
-      notify(result.ok ? 'info' : 'error', result.ok ? '隧道已停止' : '停止失败', result.error || '');
-      if (manager) await manager.refresh().catch(() => {});
+      const stopEpoch = connectionEpoch;
+      const targetId = settings.activeConnectionId;
+      const mm = managerForConnection(targetId);
+      if (!mm) return;
+      markStopQuiet(targetId, 12000);
+      setDesired(targetId, false);
+      if (stopEpoch === connectionEpoch) startedFingerprint = '';
+      const guard = multiConnection && multiConnection.guards.get(targetId);
+      if (guard) guard.cancel('用户停止了隧道');
+      const result = await mm.stop({ runMode: settings.runMode });
+      if (stopEpoch === connectionEpoch) {
+        notify(result.ok ? 'info' : 'error', result.ok ? '隧道已停止' : '停止失败', result.error || '');
+      }
+      await mm.refresh().catch(() => {});
       pushState();
       refreshTray();
     },
     'tun.restart': async () => {
-      suppressExitUntil = Date.now() + 15000;
-      const result = await manager.restart({ runMode: settings.runMode });
-      notify(result.ok ? 'info' : 'error', result.ok ? '隧道已重启' : '重启失败', result.error || '');
-      if (manager) await manager.refresh().catch(() => {});
+      const restartEpoch = connectionEpoch;
+      const targetId = settings.activeConnectionId;
+      const mm = managerForConnection(targetId);
+      if (!mm) return;
+      markStopQuiet(targetId, 15000);
+      const result = await mm.restart({ runMode: settings.runMode });
+      clearStopQuiet(targetId);
+      if (result.ok) {
+        setDesired(targetId, true);
+        const guard = multiConnection && multiConnection.guards.get(targetId);
+        if (guard) guard.cancel('');
+        if (restartEpoch === connectionEpoch) startedFingerprint = configModule.connFingerprint(model);
+      }
+      if (restartEpoch === connectionEpoch) {
+        notify(result.ok ? 'info' : 'error', result.ok ? '隧道已重启' : '重启失败', result.error || '');
+      }
+      await mm.refresh().catch(() => {});
       pushState();
       refreshTray();
     },
     'tun.reload': async () => {
-      const result = await manager.reload().catch((e) => ({ ok: false, error: e.message }));
-      notify(result && result.ok ? 'info' : 'error', result && result.ok ? '配置已重载' : '重载失败', (result && result.error) || '');
+      const reloadEpoch = connectionEpoch;
+      const targetId = settings.activeConnectionId;
+      const mm = managerForConnection(targetId);
+      if (!mm) return;
+      const result = await mm.reload().catch((e) => ({ ok: false, error: e.message }));
+      if (reloadEpoch === connectionEpoch) {
+        notify(result && result.ok ? 'info' : 'error', result && result.ok ? '配置已重载' : '重载失败', (result && result.error) || '');
+      }
       refreshTray();
     },
     'open.dashboard': () => shell.openExternal(dashboardUrl()),
@@ -1413,6 +1450,48 @@ function rememberConnectionTarget(connId, target) {
     ) || null;
   }
 
+/* I6：切换连接时递增，跨切换的异步结果（启动/停止的返回值）一律作废。 */
+let connectionEpoch = 0;
+function bumpConnectionEpoch() {
+  connectionEpoch = multiConnection ? multiConnection.bumpEpoch() : (connectionEpoch + 1);
+  return connectionEpoch;
+}
+
+/* I3：启动意图按连接存；顶层的 tunnelDesired 只是「当前连接」的派生镜像。
+ * 写入一律走 setDesired()，否则两处状态会漂移（切换后按旧意图自动拉起隧道）。 */
+function setDesired(connId, value) {
+  const on = !!value;
+  const id = String(connId || (settings && settings.activeConnectionId) || '');
+  if (id && multiConnection) multiConnection.setDesired(id, on);
+  if (!id || id === ((settings && settings.activeConnectionId) || '')) tunnelDesired = on;
+}
+
+function desiredFor(connId) {
+  const id = String(connId || (settings && settings.activeConnectionId) || '');
+  if (multiConnection) return multiConnection.isDesired(id);
+  return !!tunnelDesired;
+}
+
+/* 主动停止/重启的静音期按连接存（deadline 时间戳）。
+ * 同步更新 suppressExitUntil 仅用于兼容尚未迁移的旧判断；C4 统一删掉后者。 */
+function markStopQuiet(connId, ms = 12000) {
+  const id = String(connId || (settings && settings.activeConnectionId) || '');
+  const until = multiConnection ? multiConnection.markStopQuiet(id, ms) : (Date.now() + ms);
+  if (!id || id === ((settings && settings.activeConnectionId) || '')) {
+    suppressExitUntil = Math.max(suppressExitUntil, until);
+  }
+}
+
+function clearStopQuiet(connId) {
+  const id = String(connId || (settings && settings.activeConnectionId) || '');
+  if (id && multiConnection) multiConnection.clearStopQuiet(id);
+}
+
+function isStopQuiet(connId) {
+  const id = String(connId || (settings && settings.activeConnectionId) || '');
+  return !!(multiConnection && multiConnection.isStopQuiet(id));
+}
+
 /* I1：managers 是「每条连接一个 FrpcManager」的唯一真相，当前连接也在表里。
  * 顶层的 `manager` 只是「当前连接」这个指针，不再拥有生命周期语义。 */
 function managersMap() {
@@ -1471,88 +1550,215 @@ function connectionModel(conn) {
   return parsedModel;
 }
 
-/* 非当前连接启动前也要保证它自己的 frpc.toml 里有管理端口与口令，
- * 否则 frpc 会用默认 7400/admin 起来，和多连接抢占同一个端口。 */
+/* 启动前保证连接自己的 frpc.toml 里有管理端口与口令，
+ * 否则 frpc 会用默认 7400/admin 起来，和多连接抢占同一个端口。
+ * active / parked 统一从这里分派，不再在 bootstrap() 里写死一套。 */
 function ensureAdminForConnection(conn) {
-  if (!conn || !conn.configPath) return { ok: false, error: '这条连接还没有配置文件' };
-  const connModel = connectionModel(conn);
-  if (!connModel) return { ok: false, error: `读不到配置文件：${conn.configPath}` };
-  /* 用「这条连接自己的」管理端口/口令，不能拿全局 settings：
-   * 全局那份描述的是当前连接，写进别的连接会让两条隧道抢同一个端口。 */
-  const connSettings = {
-    ...settings,
-    adminPort: Number(conn.adminPort) || settings.adminPort,
-  };
-  const changed = configModule.ensureAdmin(connModel, connSettings);
-  if (!changed) return { ok: true };
-  const write = configModule.writeConfig(conn.configPath, connModel);
-  if (write.ok === false) return { ok: false, error: write.error };
-  invalidateConnectionModel(conn.id);
-  return { ok: true };
+  return dispatchEnsureAdmin({
+    conn,
+    activeConnectionId: settings.activeConnectionId,
+    ensureActive: () => {
+      /* 先用磁盘上的内容覆盖内存模型：否则「文件里没有 webServer」这种情况
+       * 会被内存里的旧值挡住，什么也不写，frpc 就用默认 7400/admin 起来。 */
+      syncModelFromDiskIfChanged();
+      const changed = configModule.ensureAdmin(model, settings);
+      if (changed) {
+        const saved = persistModel(model, { reload: false });
+        if (!saved.ok) {
+          /* 校验失败时 persistModel 返回的是 {errors}，没有 error 字段——
+           * 直接兜底成「无法写入管理 API 配置」会把真正原因（域名/端口冲突）吃掉。 */
+          const first = (saved.errors || [])[0];
+          const detail = first ? String(first.message || first) : (saved.error || '无法写入管理 API 配置');
+          return { ok: false, error: `配置有问题，启动前先改掉：${detail}` };
+        }
+      }
+      return { ok: true, changed };
+    },
+    ensureParked: (target) => {
+      if (!target.configPath) return { ok: false, error: '这条连接还没有配置文件' };
+      const connModel = connectionModel(target);
+      if (!connModel) return { ok: false, error: `读不到配置文件：${target.configPath}` };
+      /* 用「这条连接自己的」管理端口/口令，不能拿全局 settings：
+       * 全局那份描述的是当前连接，写进别的连接会让两条隧道抢同一个端口。 */
+      const connSettings = {
+        ...settings,
+        adminPort: Number(target.adminPort) || settings.adminPort,
+      };
+      const changed = configModule.ensureAdmin(connModel, connSettings);
+      if (!changed) return { ok: true };
+      const write = configModule.writeConfig(target.configPath, connModel);
+      if (write.ok === false) return { ok: false, error: write.error };
+      invalidateConnectionModel(target.id);
+      return { ok: true };
+    },
+  });
 }
 
-/* 拿一条连接的管理器；懒创建。当前连接直接用全局 manager，保证既有代码都走同一条路径。 */
+/* I2：工厂内所有 getter 全部按 connId 动态查，禁止闭包全局 settings/paths/model。
+ * 这样切换连接之后，旧 active 的 FrpcManager 仍旧读取它自己的端口、路径和配置模型。 */
+function createManagerFor(connId) {
+  return new FrpcManager({
+    getSettings: () => {
+      const c = connectionById(connId);
+      if (!c || c.id === settings.activeConnectionId) return settings;
+      return { ...settings, adminPort: Number(c.adminPort) || settings.adminPort };
+    },
+    getPaths: () => {
+      const c = connectionById(connId);
+      if (!c || c.id === settings.activeConnectionId) return paths;
+      return connectionPaths(c);
+    },
+    getConfig: () => {
+      const c = connectionById(connId);
+      return c ? connectionModel(c) : null;
+    },
+    ensureAdminConfig: async () => {
+      const c = connectionById(connId);
+      return ensureAdminForConnection(c);
+    },
+    /* 服务模式只支持单连接且为当前连接：多出来的连接一律托管进程，
+     * 这样也不会去 sc start 一个和别的连接同名的服务。 */
+    startService: async () => {
+      if ((settings.connections || []).length > 1 || connId !== settings.activeConnectionId) {
+        return { ok: false, error: '多连接只支持「应用托管进程」' };
+      }
+      const r = await service.startService(settings.serviceName);
+      return r.ok ? { ok: true } : { ok: false, error: r.error };
+    },
+    stopService: async () => {
+      if ((settings.connections || []).length > 1 || connId !== settings.activeConnectionId) {
+        return { ok: false, error: '多连接只支持「应用托管进程」' };
+      }
+      const r = await service.stopService(settings.serviceName);
+      return r.ok ? { ok: true } : { ok: false, error: r.error };
+    },
+  });
+}
+
+/* 统一绑定 exit / output / guard：active 与 parked 共用同一套语义，不再在 bootstrap() 里另写一份。 */
+function wireManager(mm, connId) {
+  const guard = new ReconnectSupervisor({
+    restart: async () => {
+      const isActive = connId === settings.activeConnectionId;
+      const runMode = isActive ? settings.runMode : 'managed';
+      markStopQuiet(connId, 12000);
+      /* 进程已被杀掉时用 start(force:true)（清掉过期 apiOk）；若进程还活着但管理 API 卡死，用 restart 先停再起。 */
+      const result = mm.isChildAlive
+        ? await mm.restart({ runMode })
+        : await mm.start({ runMode, force: true });
+      clearStopQuiet(connId);
+      await mm.refresh().catch(() => {});
+      if (result && result.ok && connId === settings.activeConnectionId) {
+        /* 用当前配置起来的，记下指纹：否则界面会一直挂着“配置变了，重启隧道才生效”。 */
+        startedFingerprint = configModule.connFingerprint(model);
+      }
+      healthCache.clear();
+      scheduleHealth(1500);
+      pushState();
+      return result;
+    },
+    canRestart: () => {
+      if (connId === settings.activeConnectionId) {
+        const why = supervisorBlockReason();
+        if (why) {
+          // 只在“本来想重连但被挡住”时说一句，便于现场排查（正常停止不会走到这里）。
+          console.warn(`[reconnect] 跳过自动重连：${why}`);
+          return false;
+        }
+        return true;
+      }
+      const c = connectionById(connId);
+      if (!c || c.enabled === false) return false;
+      if (settings.autoReconnect === false || updatingNow || isQuitting) return false;
+      if (!desiredFor(connId)) return false;
+      if (mm.snapshot().foreign) return false;
+      return true;
+    },
+    onChange: () => {
+      pushState();
+      refreshTray();
+    },
+    log: (message, level) => {
+      const c = connectionById(connId);
+      const isActive = connId === settings.activeConnectionId;
+      const prefix = isActive ? '' : `[${(c && c.name) || connId}] `;
+      const line = `${new Date().toISOString().slice(0, 19).replace('T', ' ')} ${level === 'error' ? 'ERR' : 'WRN'} ${prefix}${message}`;
+      if (process.env.FRP_CONSOLE_DEBUG) console.log('[guard]', connId, message);
+      try {
+        follower.appendLines(line);
+      } catch { /* 日志失败不影响重连 */ }
+    },
+  });
+
+  mm.on('exit', (info) => {
+    if (process.env.FRP_CONSOLE_DEBUG) console.log('[guard-exit]', connId, JSON.stringify(info));
+    mm.refresh().catch(() => {});
+    invalidateConnectionModel(connId);
+    pushState();
+    refreshTray();
+    const quiet = isStopQuiet(connId);
+    const isActive = connId === settings.activeConnectionId;
+    /* 「意外」= 不是用户让停的。taskkill 掉的 frpc 可能以 0 退出、error 为空，
+     * 或在 stop→start 边界偶发 intentional:true，因此用 stopRequests 时间窗 + desiredFor 双重兜底。 */
+    const unexpected = !!(info && info.intentional !== true);
+    const shouldReconnect = !quiet && !isQuitting && !updatingNow && desiredFor(connId)
+      && (unexpected || !isActive);
+    if (shouldReconnect) {
+      const why = String((info && info.error) || 'frpc 意外退出').slice(0, 120);
+      console.warn(`[reconnect] ${connId} frpc 意外退出，排队重连：${why}`);
+      guard.arm(why);
+    }
+    if (!quiet && !isQuitting && isActive && Date.now() > suppressExitUntil) {
+      send('notify', {
+        kind: unexpected ? 'error' : 'info',
+        title: unexpected ? '隧道意外停止' : '隧道已停止',
+        message: (info && info.error) || 'frpc 已退出',
+      });
+    }
+  });
+
+  /* frpc 自己的输出（stdout/stderr）：按流各留半行缓冲，按行塞进日志缓冲。 */
+  const outputPartial = { stdout: '', stderr: '' };
+  mm.on('output', (chunk, stream) => {
+    const key = stream === 'stderr' ? 'stderr' : 'stdout';
+    const buf = (outputPartial[key] || '') + chunk;
+    const parts = buf.split(/\r?\n/);
+    outputPartial[key] = parts.pop() || '';
+    const text = parts.join('\n');
+    if (text.trim() && connId === settings.activeConnectionId) {
+      follower.appendLines(text);
+    }
+  });
+
+  mm.on('error', (e) => {
+    if (process.env.FRP_CONSOLE_DEBUG) console.warn('[connections] manager error', connId, e && e.message);
+  });
+
+  if (multiConnection) multiConnection.guards.set(connId, guard);
+  return guard;
+}
+
+/* 拿一条连接的管理器；懒创建，所有连接（含当前连接）统一走这里。 */
 function managerForConnection(connId) {
   const conn = connectionById(connId);
   if (!conn) return null;
   /* 运行期容器还没建好（极早期 IPC）：宁可回答「没准备好」，
    * 也不要在临时表里造一个没人接管的管理器。 */
   if (!multiConnection) return null;
-  /* 先查表：当前连接的管理器也在表里，命中就直接返回，
-   * 不再有「active 走全局变量、其它走 Map」两套路径。 */
-  const store = managersMap();
-  const hit = store.get(conn.id);
-  if (hit) return hit;
-  const created = new FrpcManager({
-    getSettings: () => ({ ...settings, adminPort: Number(conn.adminPort) || settings.adminPort }),
-    getPaths: () => connectionPaths(conn),
-    getConfig: () => connectionModel(conn),
-    ensureAdminConfig: async () => ensureAdminForConnection(conn),
-    /* 服务模式只支持一台（README 里写明）：多出来的连接一律托管进程，
-     * 这样也不会去 sc start 一个和别的连接同名的服务。 */
-    stopService: async () => ({ ok: false, error: '多连接只支持「应用托管进程」' }),
+  return multiConnection.getOrCreateManager(conn.id, (id) => {
+    const created = createManagerFor(id);
+    wireManager(created, id);
+    return created;
   });
-  /* 非当前连接也要能自己回来：它和当前连接一样会遇到「frpc 被外面杀掉 / 睡眠后假死」。
-   * 每条连接一个守护，互不影响（当前连接的守护在 bootstrap 里建，逻辑不变）。 */
-  const guard = new ReconnectSupervisor({
-    restart: async () => {
-      suppressExitUntil = Date.now() + 8000;
-      /* force：进程是被外面杀掉的，apiOk 还是旧值，不 force 会误判『已经在跑』。 */
-      const result = await created.start({ runMode: 'managed', force: true });
-      await created.refresh().catch(() => {});
-      pushState();
-      return result;
-    },
-    canRestart: () => settings.autoReconnect !== false && conn.enabled !== false,
-    onChange: () => pushState(),
-    log: (message, level) => {
-      const line = `${new Date().toISOString().slice(0, 19).replace('T', ' ')} ${level === 'error' ? 'ERR' : 'WRN'} [${conn.name}] ${message}`;
-      if (process.env.FRP_CONSOLE_DEBUG) console.log('[guard]', conn.id, message);
-      try {
-        follower.appendLines(line);
-      } catch { /* 日志失败不影响重连 */ }
-    },
-  });
-  created.on('exit', (info) => {
-    if (process.env.FRP_CONSOLE_DEBUG) console.log('[guard-exit]', conn.id, JSON.stringify(info));
-    invalidateConnectionModel(conn.id);
-    pushState();
-    refreshTray();
-    const stoppedAt = (multiConnection && multiConnection.stopRequests.get(conn.id)) || 0;
-    const justStoppedByUs = Date.now() - stoppedAt < 3000;
-    if (process.env.FRP_CONSOLE_DEBUG) console.log('[guard-window]', conn.id, 'sinceStop=', Date.now() - stoppedAt, 'skip=', justStoppedByUs);
-    /* 不再看 info.intentional：frpc 的 stopping 标记在 stop→start 边界上不可靠
-     *（探针里被 taskkill 掉的进程仍报 intentional:true），只信时间窗。 */
-    if (info && !justStoppedByUs) {
-      guard.arm(String(info.error || '连接意外退出').slice(0, 120));
-    }
-  });
-  if (multiConnection) multiConnection.guards.set(conn.id, guard);
-  created.on('error', (e) => {
-    if (process.env.FRP_CONSOLE_DEBUG) console.warn('[connections] manager error', e && e.message);
-  });
-  store.set(conn.id, created);
-  return created;
+}
+
+/* 切换「当前连接」视图指针的唯一入口：只改指针，不碰任何进程生命周期。 */
+function setActiveManager(connId) {
+  const mm = managerForConnection(connId);
+  manager = mm;
+  supervisor = (mm && multiConnection && multiConnection.guards.get(connId)) || null;
+  tunnelDesired = desiredFor(connId);
+  return mm;
 }
 
 /* 连接列表（含运行时与计数），给界面与托盘用。 */
@@ -2299,6 +2505,7 @@ function persistModel(nextModel, { reload = true } = {}) {
   const write = configModule.writeConfig(paths.configPath, nextModel);
   if (write.ok === false) return { ok: false, error: write.error };
   model = nextModel;
+  if (settings && settings.activeConnectionId) invalidateConnectionModel(settings.activeConnectionId);
   configError = null;
   configHash = hashText(write.text);
   try {
@@ -3904,29 +4111,51 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '' } = {})
     await refreshService({ detect: true });
     /* 用户点了启动 = 希望隧道是开着的；就算这次失败，也该由守护继续试，
      * 而不是让他每隔几秒回来点一次。 */
-    tunnelDesired = true;
-    const result = await manager.start({ runMode: settings.runMode });
-    if (manager) await manager.refresh().catch(() => {});
+    const startEpoch = connectionEpoch;
+    const targetId = settings.activeConnectionId;
+    clearStopQuiet(targetId);
+    setDesired(targetId, true);
+    const mm = managerForConnection(targetId);
+    const result = await mm.start({ runMode: settings.runMode });
+    await mm.refresh().catch(() => {});
+    /* await 期间用户可能已经切到别的连接：这次结果不属于「当前」，别写回界面与指纹。 */
+    if (startEpoch !== connectionEpoch) {
+      pushState();
+      refreshTray();
+      return ok({ stale: true, state: buildState() });
+    }
     healthCache.clear();
     scheduleHealth(1500);
     pushState();
     if (!result.ok) {
-      if (supervisor) supervisor.arm(result.error || '启动失败');
+      const guard = multiConnection && multiConnection.guards.get(targetId);
+      if (guard) guard.arm(result.error || '启动失败');
       return fail(result.error, { state: buildState() });
     }
     startedFingerprint = configModule.connFingerprint(model);
-    if (supervisor) supervisor.cancel('');
+    const guard = multiConnection && multiConnection.guards.get(targetId);
+    if (guard) guard.cancel('');
     return ok({ state: buildState(), mode: result.mode, adminNote: adminNote || '' });
   });
 
   ipcMain.handle('tunnel:stop', async () => {
-    suppressExitUntil = Date.now() + 12000;
+    const stopEpoch = connectionEpoch;
+    const targetId = settings.activeConnectionId;
+    const mm = managerForConnection(targetId);
+    if (!mm) return fail('隧道管理器还没准备好', { state: buildState() });
+    markStopQuiet(targetId, 12000);
     startedFingerprint = '';
-    tunnelDesired = false;
-    if (supervisor) supervisor.cancel('用户停止了隧道');
+    setDesired(targetId, false);
+    const guard = multiConnection && multiConnection.guards.get(targetId);
+    if (guard) guard.cancel('用户停止了隧道');
     await refreshService({ detect: false });
-    const result = await manager.stop({ runMode: settings.runMode });
-    if (manager) await manager.refresh().catch(() => {});
+    const result = await mm.stop({ runMode: settings.runMode });
+    await mm.refresh().catch(() => {});
+    if (stopEpoch !== connectionEpoch) {
+      pushState();
+      refreshTray();
+      return ok({ stale: true, state: buildState() });
+    }
     pushState();
     if (!result.ok) return fail(result.error, { state: buildState() });
     return ok({ state: buildState(), mode: result.mode });
@@ -3936,24 +4165,46 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '' } = {})
     const certProblem = pluginCertProblemError();
     if (certProblem) return fail(certProblem, { state: buildState() });
     await refreshService({ detect: false });
-    suppressExitUntil = Date.now() + 15000;
-    const result = await manager.restart({ runMode: settings.runMode });
-    if (manager) await manager.refresh().catch(() => {});
+    const restartEpoch = connectionEpoch;
+    const targetId = settings.activeConnectionId;
+    const mm = managerForConnection(targetId);
+    if (!mm) return fail('隧道管理器还没准备好', { state: buildState() });
+    markStopQuiet(targetId, 15000);
+    const result = await mm.restart({ runMode: settings.runMode });
+    clearStopQuiet(targetId);
+    await mm.refresh().catch(() => {});
+    /* 重启期间切走了：结果不属于当前连接，直接丢弃（进程已在目标连接上重启完成）。 */
+    if (restartEpoch !== connectionEpoch) {
+      if (result.ok) setDesired(targetId, true);
+      pushState();
+      refreshTray();
+      return ok({ stale: true, state: buildState() });
+    }
     pushState();
     if (!result.ok) return fail(result.error, { state: buildState() });
-    tunnelDesired = true;
-    if (supervisor) supervisor.cancel('');
+    setDesired(targetId, true);
+    startedFingerprint = configModule.connFingerprint(model);
+    const guard = multiConnection && multiConnection.guards.get(targetId);
+    if (guard) guard.cancel('');
     return ok({ state: buildState(), mode: result.mode });
   });
 
   ipcMain.handle('tunnel:reload', async () => {
     /* 隧道没在跑时“热重载”本来就没对象：以前统一报“管理 API 未启动”，
      * 用户会以为是管理 API 坏了。直接把真正的状态说清楚。 */
-    if (!manager.snapshot().running) {
+    const reloadEpoch = connectionEpoch;
+    const targetId = settings.activeConnectionId;
+    const mm = managerForConnection(targetId);
+    if (!mm || !mm.snapshot().running) {
       return fail('隧道没有在运行，不需要热重载（配置已保存，下次启动即生效）', { state: buildState() });
     }
-    const result = await manager.reload();
-    if (manager) await manager.refresh().catch(() => {});
+    const result = await mm.reload();
+    await mm.refresh().catch(() => {});
+    if (reloadEpoch !== connectionEpoch) {
+      pushState();
+      refreshTray();
+      return ok({ stale: true, state: buildState() });
+    }
     healthCache.clear();
     scheduleHealth(900);
     pushState();
@@ -3974,27 +4225,28 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '' } = {})
     if (!conn) return fail('连接不存在（可能已被删除）');
     if (!conn.configPath) return fail('这条连接还没有配置文件：先给它选一个 frpc.toml');
     if (!conn.enabled) return fail('这条连接被设为不启用');
-    if (conn.id === settings.activeConnectionId) {
-      /* 当前连接走原路径：它还要处理服务模式、端口冲突提示、插件证书校验等。 */
-      if (!(await waitForManager())) return fail('应用还在启动：隧道管理器没就绪，请稍等一两秒再试。');
-      const result = await manager.start({ runMode: settings.runMode });
-      if (manager) await manager.refresh().catch(() => {});
-      if (result.ok) {
-        tunnelDesired = true;
-        startedFingerprint = configModule.connFingerprint(model);
-        if (supervisor) supervisor.cancel('');
-      }
-      pushState();
-      return result.ok ? ok({ connection: connectionSummary(conn) }) : fail(result.error, { connection: connectionSummary(conn) });
+    const isActive = conn.id === settings.activeConnectionId;
+    if (isActive && !(await waitForManager())) {
+      return fail('应用还在启动：隧道管理器没就绪，请稍等一两秒再试。');
     }
-    /* 外部可能刚改过这份配置：启动前必须重新读，否则用旧模型补齐 webServer/做健康检查。 */
-    invalidateConnectionModel(conn.id);
+    /* 外部可能刚改过这份配置：启动前清掉非当前缓存，否则用旧模型补齐 webServer/做健康检查。 */
+    if (!isActive) invalidateConnectionModel(conn.id);
     const mm = managerForConnection(conn.id);
     if (!mm) return fail('多连接运行期还没准备好（应用刚启动时可能还要一两秒，请稍后再点）');
-    /* 非当前连接一律托管进程：服务模式只能有一台（否则要处理 nssm 多实例与 UAC）。 */
-    const result = await mm.start({ runMode: 'managed' });
+    const runMode = isActive ? settings.runMode : 'managed';
+    clearStopQuiet(conn.id);
+    const result = await mm.start({ runMode });
     await mm.refresh().catch(() => {});
+    if (result.ok) {
+      setDesired(conn.id, true);
+      if (conn.id === settings.activeConnectionId) {
+        startedFingerprint = configModule.connFingerprint(model);
+      }
+      const guard = multiConnection && multiConnection.guards.get(conn.id);
+      if (guard) guard.cancel('');
+    }
     pushState();
+    refreshTray();
     if (!result.ok) return fail(result.error, { connection: connectionSummary(conn) });
     return ok({ connection: connectionSummary(conn), mode: result.mode });
   });
@@ -4002,24 +4254,19 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '' } = {})
   ipcMain.handle('connections:stop', async (event, connId) => {
     const conn = connectionById(String(connId || ''));
     if (!conn) return fail('连接不存在（可能已被删除）');
-    if (conn.id === settings.activeConnectionId) {
-      suppressExitUntil = Date.now() + 12000;
-      tunnelDesired = false;
-      startedFingerprint = '';
-      if (supervisor) supervisor.cancel('用户停止了隧道');
-      const result = await manager.stop({ runMode: settings.runMode });
-      if (manager) await manager.refresh().catch(() => {});
-      pushState();
-      return result.ok ? ok({ connection: connectionSummary(conn) }) : fail(result.error, { connection: connectionSummary(conn) });
-    }
     const mm = managerForConnection(conn.id);
     if (!mm) return fail('多连接运行期还没准备好（应用刚启动时可能还要一两秒，请稍后再点）');
+    const isActive = conn.id === settings.activeConnectionId;
+    const runMode = isActive ? settings.runMode : 'managed';
+    markStopQuiet(conn.id, 12000);
+    setDesired(conn.id, false);
+    if (isActive) startedFingerprint = '';
     const guard = multiConnection && multiConnection.guards.get(conn.id);
     if (guard) guard.cancel('用户停止了这条连接');
-    if (multiConnection) multiConnection.stopRequests.set(conn.id, Date.now());
-    const result = await mm.stop({ runMode: 'managed' });
+    const result = await mm.stop({ runMode });
     await mm.refresh().catch(() => {});
     pushState();
+    refreshTray();
     return result.ok ? ok({ connection: connectionSummary(conn) }) : fail(result.error, { connection: connectionSummary(conn) });
   });
 
@@ -4134,7 +4381,11 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '' } = {})
     if (!Object.keys(patch).length) return ok({ connection: connectionSummary(conn), changed: false });
     if (patch.configPath !== undefined) invalidateConnectionModel(conn.id);
     if (patch.adminPort !== undefined && patch.adminPort !== conn.adminPort) {
-      /* 端口变了，正在跑的进程会 mismatch：先停，避免“配置写进去了但还在用旧端口”。 */
+      /* 端口变了，正在跑的进程会 mismatch：先取消守护再停，避免停完被重连拉回旧端口。 */
+      const guard = multiConnection && multiConnection.guards.get(conn.id);
+      if (guard) guard.cancel('管理端口已更改');
+      markStopQuiet(conn.id, 8000);
+      setDesired(conn.id, false);
       const mm = managerForConnection(conn.id);
       if (mm && mm.snapshot().running) await mm.stop({ runMode: conn.id === settings.activeConnectionId ? settings.runMode : 'managed' }).catch(() => {});
     }
@@ -4164,13 +4415,16 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '' } = {})
     if (!conn) return fail('连接不存在（可能已被删除）');
     if (conn.id === settings.activeConnectionId) return fail('这是当前连接：先切到另一条连接，再删它');
     const mm = managersMap().get(conn.id);
-    if (mm && mm.snapshot().running) await mm.stop({ runMode: 'managed' }).catch(() => {});
     const guard = multiConnection && multiConnection.guards.get(conn.id);
     if (guard) guard.cancel('连接被删除');
+    markStopQuiet(conn.id, 8000);
+    setDesired(conn.id, false);
+    if (mm && mm.snapshot().running) await mm.stop({ runMode: 'managed' }).catch(() => {});
     if (multiConnection) {
       managersMap().delete(conn.id);
       multiConnection.guards.delete(conn.id);
       multiConnection.stopRequests.delete(conn.id);
+      multiConnection.desired.delete(conn.id);
       invalidateConnectionModel(conn.id);
     }
     settings = settingsModule.save({
@@ -4180,46 +4434,15 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '' } = {})
     return ok({ removed: true, configPath: conn.configPath, connections: connectionList() });
   });
 
-  /* 切换当前连接：先停掉正在跑的隧道，再换投影。
-   * 之所以要停：全局 manager 的 ctx 读的是全局 model，切过去而进程还活着，
-   * 两边就会各说各话（改配置、健康检查、日志跟随全部错位）。 */
+  /* 切换当前连接 = 换「视图指针」，不碰任何 frpc 进程。
+   * 每条连接本来就是独立进程 + 独立管理端口，生命周期只由「启动 / 停止」控制；
+   * 切换影响的是：当前编辑目标、日志文件、健康检查窗口、SSH 会话。 */
   ipcMain.handle('connections:active', async (event, connId) => {
     const conn = connectionById(String(connId || ''));
     if (!conn) return fail('连接不存在（可能已被删除）');
     if (conn.id === settings.activeConnectionId) return ok({ changed: false, connections: connectionList() });
-    /* 无条件先关掉「用户希望隧道在跑」的意图与重连守护：
-     * 否则上一次的火会留着，切换完几秒后按新连接的配置又把隧道拉起来。 */
-    tunnelDesired = false;
-    if (supervisor) supervisor.cancel('切换连接');
-    const stopped = [];
-    if (manager && manager.snapshot().running) {
-      await manager.stop({ runMode: settings.runMode }).catch(() => {});
-      if (manager) await manager.refresh().catch(() => {});
-      stopped.push(settings.activeConnectionId);
-    }
-    for (const [id, mm] of managersMap()) {
-      /* 当前连接上面已经停过了，这里只管其它连接。 */
-      if (id === settings.activeConnectionId) continue;
-      if (!mm || !mm.snapshot().running) continue;
-      const guard = multiConnection.guards.get(id);
-      if (guard) guard.cancel('切换连接');
-      await mm.stop({ runMode: 'managed' }).catch(() => {});
-      await mm.refresh().catch(() => {});
-      stopped.push(id);
-    }
-    /* 停完之后确认旧连接的管理端口真的空了：frpc 有时「收到 stop 但还活着」，
-     * 那样它会以 external 的身份继续按旧配置跑，界面上看着像「切换没生效」。 */
-    for (const id of stopped) {
-      const old = connectionById(id);
-      if (!old) continue;
-      const port = Number(old.adminPort) || 0;
-      if (!port) continue;
-      for (let i = 0; i < 6; i += 1) {
-        if (!killFrpcOnPort(port)) break;
-        await new Promise((resolve) => setTimeout(resolve, 500));
-      }
-    }
-    healthCache.clear();
+    /* 跨越切换的异步（启动/停止）结果一律作废，别写进新连接的界面与状态。 */
+    bumpConnectionEpoch();
     /* 1.2.227：切换当前连接 = 切换「当前查看的服务器」。
      * SSH 会话如果还连着上一台机器，必须断开——否则页面会把 A 的运行状态挂到 B 的名字下面。 */
     let droppedHost = '';
@@ -4242,37 +4465,18 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '' } = {})
       logPath: conn.logPath || settingsModule.logPathFromConfig(connectionModel(conn), conn.configPath) || '',
     });
     paths = { ...paths, configPath: settings.configPath, adminPort: settings.adminPort, logPath: settings.logPath };
-    startedFingerprint = '';
     invalidateConnectionModel(conn.id);
     loadConfigFromDisk();
     updateLogFile();
+    /* 指针切换：只换引用。进程该跑还跑，A/B 两条隧道可以同时在线。 */
+    setActiveManager(conn.id);
+    startedFingerprint = '';
+    apiDownSince = 0;
+    netChangedAt = 0;
     if (manager) await manager.refresh().catch(() => {});
-    /* 守护可能在上面的 await 期间又把它拉起来：这里等一小会儿再确认一次。 */
-    await new Promise((resolve) => setTimeout(resolve, 1500));
-    if (manager && manager.isChildAlive && !tunnelDesired) {
-      await manager.stop({ runMode: settings.runMode }).catch(() => {});
-      await manager.refresh().catch(() => {});
-    }
-    /* 收尾检查：新当前连接的管理端口上如果还挂着一条「不是自己拉起的」frpc，
-     * 说明上一条连接没停干净 —— 它占着端口，用户点启动会一直被当成 external。 */
-    try {
-      const snapAfter = manager ? manager.snapshot() : null;
-      const ours = !!(manager && manager.isChildAlive);
-      /* 不再要求 mode 恰好是 external：切换瞬间它可能是 starting，
-       * 只要「不是我们拉起的子进程」+「端口上确有 frpc 在听」就值得清。 */
-      if (!ours) {
-        const port = Number(snapAfter && snapAfter.adminPort) || Number(settings.adminPort) || 0;
-        if (port && killFrpcOnPort(port)) {
-          // eslint-disable-next-line no-console
-          console.log(`[conn] 切换连接时清掉了管理端口 ${port} 上的残留 frpc`);
-          if (manager) await manager.refresh().catch(() => {});
-        }
-      }
-    } catch {
-      /* 兜底清理失败不影响切换本身 */
-    }
     pushState();
-    return ok({ changed: true, stopped, sshDropped: droppedHost, connections: connectionList(), state: buildState() });
+    refreshTray();
+    return ok({ changed: true, sshDropped: droppedHost, connections: connectionList(), state: buildState() });
   });
   ipcMain.handle('listen:scan', async () => {
     const result = await netport.listListeners();
@@ -6638,100 +6842,12 @@ async function bootstrap() {
   ensureStarterConfig();
   loadConfigFromDisk();
   /* 运行期容器尽早建好：后面的 refreshPaths() 要 spawn `frpc -v`，被杀软拖慢时
-   * 能卡十几秒，这段时间界面不该是「什么都没有 + 启动隧道点不动」。 */
-  /* 一连接一 manager：表先建好，当前连接建完立刻登记，
-   * 这样「建表之前」的空窗期也不会让 managerForConnection 拿到 null。 */
-  const managers = new Map();
-  manager = new FrpcManager({
-    getSettings: () => settings,
-    getPaths: () => paths,
-    getConfig: () => model,
-    ensureAdminConfig: async () => {
-      /* 先用磁盘上的内容覆盖内存模型：否则「文件里没有 webServer」这种情况
-       * 会被内存里的旧值挡住，什么也不写，frpc 就用默认 7400/admin 起来。 */
-      syncModelFromDiskIfChanged();
-      const changed = configModule.ensureAdmin(model, settings);
-      if (changed) {
-        const saved = persistModel(model, { reload: false });
-        if (!saved.ok) {
-          /* 校验失败时 persistModel 返回的是 {errors}，没有 error 字段——
-           * 直接兜底成「无法写入管理 API 配置」会把真正原因（域名/端口冲突）吃掉。 */
-          const first = (saved.errors || [])[0];
-          const detail = first ? String(first.message || first) : (saved.error || '无法写入管理 API 配置');
-          return { ok: false, error: `配置有问题，启动前先改掉：${detail}` };
-        }
-      }
-      return { ok: true, changed };
-    },
-    startService: async () => {
-      const r = await service.startService(settings.serviceName);
-      return r.ok ? { ok: true } : { ok: false, error: r.error };
-    },
-    stopService: async () => {
-      const r = await service.stopService(settings.serviceName);
-      return r.ok ? { ok: true } : { ok: false, error: r.error };
-    },
-  });
-  manager.on('exit', (info) => {
-    manager.refresh().catch(() => {});
-    pushState();
-    refreshTray();
-    /* 判“意外”看的是有没有错误文本，而不是退出码：
-     * 用户主动停止时 frpc 可能返回 1（停止时代理还没登录上），那不是故障。 */
-    /* 「意外」= 不是用户让停的。以前看 info.error，而 taskkill 掉的 frpc 可能以 0 退出、
-     * error 为空 → 被当成正常停止，自动重连不触发（多连接阶段 3 的探针抓到的）。 */
-    const unexpected = !!(info && info.intentional !== true);
-    /* 自动重连不受 suppressExitUntil 影响 —— 那个窗口只是“别弹通知”的静音期
-     *（用户刚点过停止/重启时不要把正常退出报成故障）。以前把重连也塞在窗口里，
-     * 结果「停止后 12 秒内又启动、然后进程被杀」这类真实场景不会重连。 */
-    if (unexpected && supervisor && tunnelDesired) {
-      const why = String(info.error || '').slice(0, 120);
-      console.warn(`[reconnect] frpc 意外退出，排队重连：${why}`);
-      supervisor.arm(why || 'frpc 意外退出');
-    }
-    if (Date.now() > suppressExitUntil) {
-      send('notify', {
-        kind: unexpected ? 'error' : 'info',
-        title: unexpected ? '隧道意外停止' : '隧道已停止',
-        message: (info && info.error) || 'frpc 已退出',
-      });
-    }
-  });
-  /* frpc 自己的输出（stdout/stderr）：log.to = "console" 或用户把日志指到别处时，
-   * 日志文件里什么都不会有，只跟随文件会让日志页看起来冻住了。进程输出按行补齐后
-   * 塞进同一个缓冲（分块可能把一行切开，所以按流各留一个半行缓冲）。 */
-  const outputPartial = { stdout: '', stderr: '' };
-  manager.on('output', (chunk, stream) => {
-    const key = stream === 'stderr' ? 'stderr' : 'stdout';
-    const buf = (outputPartial[key] || '') + chunk;
-    const parts = buf.split(/\r?\n/);
-    outputPartial[key] = parts.pop() || '';
-    const text = parts.join('\n');
-    if (text.trim()) follower.appendLines(text);
-  });
+   * 能卡十几秒，这段时间界面不该是「什么都没有 + 启动隧道点不动」。
+   * I1/I2：先建 multiConnection，再通过 setActiveManager 经统一工厂创建当前连接的
+   * FrpcManager 与 ReconnectSupervisor，彻底消除闭包全局 settings/paths/model 的旧路径。 */
+  multiConnection = createConnectionRuntime();
+  setActiveManager(settings.activeConnectionId);
   follower.start();
-  managers.set(settings.activeConnectionId, manager);
-  /* ===== 多连接运行期（阶段 2）=====
-   * 一条连接 = 一个 FrpcManager。「当前选中」的那条继续用上面的 manager
-   *（大量既有代码都通过它工作，包括 IPC、健康检查、托盘），其它连接用
-   * managers 惰性创建，互不干扰。
-   *
-   * 关键点：非当前连接没有全局 model，所以它们的 ctx 各自从自己的 frpc.toml
-   * 读一份模型（只读缓存），绝不复用当前连接的 model —— 否则两条隧道会拿
-   * 对方的代理列表和 token 去连（1.2.138 那类“配置与会话对不上”的翻版）。
-   */
-  const parkedModels = new Map();
-  /* 每条非当前连接的配置指纹（mtime+size），用来判断缓存是否过期。 */
-  const parkedStamps = new Map();
-  /* 已经让 frpc 应用过的配置指纹（每条非当前连接），用来决定要不要 reload。 */
-  const appliedStamps = new Map();
-  const guards = new Map();
-  /* 每条连接最后一次「用户要求停止」的时刻。frpc 的 stopping 标记在
-   * stop→start 的边界上不可靠（探针里被外面杀掉的进程仍报 intentional:true），
-   * 所以额外用时间窗兜一层：刚点过停止就别再当成意外退出。 */
-  const stopRequests = new Map();
-  multiConnection = { managers, parkedModels, parkedStamps, appliedStamps, guards, stopRequests };
-  if (manager) managers.set(settings.activeConnectionId, manager);
   ensureClientServerProfile();
   migrateLegacyServerSecret();
   /* 老数据里同一个 IP 可能堆着十几条档案（连接表单每连一次就新建一条）。
@@ -6748,45 +6864,6 @@ async function bootstrap() {
   }
   follower.maxLines = Math.min(2000, Math.max(100, Number(settings.logBuffer) || 600));
   updateLogFile();
-  /* 隧道守护：只决定“什么时候再试一次”，真正拉起的动作在 restart 回调里。
-   * 依赖 manager（在下面创建），所以回调里用惰性引用。 */
-  supervisor = new ReconnectSupervisor({
-    restart: async () => {
-      if (!manager) return { ok: false, error: '管理器还没准备好' };
-      suppressExitUntil = Date.now() + 12000;
-      /* force：同上，避免『apiOk 还是旧值 ⇒ already』把重连吞掉。 */
-      const result = await manager.start({ runMode: settings.runMode, force: true });
-      if (manager) await manager.refresh().catch(() => {});
-      if (result && result.ok) {
-        /* 用当前配置起来的，记下指纹：否则界面会一直挂着“配置变了，重启隧道才生效”。 */
-        startedFingerprint = configModule.connFingerprint(model);
-      }
-      healthCache.clear();
-      scheduleHealth(1500);
-      return result;
-    },
-    canRestart: () => {
-      const why = supervisorBlockReason();
-      if (why) {
-        // 只在“本来想重连但被挡住”时说一句，便于现场排查（正常停止不会走到这里）。
-        console.warn(`[reconnect] 跳过自动重连：${why}`);
-        return false;
-      }
-      return true;
-    },
-    onChange: () => {
-      pushState();
-      refreshTray();
-    },
-    log: (message, level) => {
-      const line = `${new Date().toISOString().slice(0, 19).replace('T', ' ')} ${level === 'error' ? 'ERR' : 'WRN'} ${message}`;
-      try {
-        follower.appendLines(line);
-      } catch (e) {
-        /* 日志失败不影响重连 */
-      }
-    },
-  });
   /* 这几步拿的都是"锦上添花"的信息，读不到不该让整个启动失败。
    * sc.exe 被安全软件拉黑 / 权限不足的机器上，原来会在 refreshService 直接抛出，
    * 连轮询都起不来，界面从此定格在初始状态。 */
@@ -6824,13 +6901,15 @@ async function quitApp({ source = 'user' } = {}) {
   if (quitFlowStarted) return; // 正在退，别重复
   quitFlowStarted = true;
   isQuitting = true;
-  /* 退出时把自动重连彻底关掉：否则守护的定时器可能在退出过程中把 frpc 又拉起来。 */
+  /* 退出时把所有连接的自动重连彻底关掉：否则守护的定时器可能在退出过程中把 frpc 又拉起来。 */
   tunnelDesired = false;
-  if (supervisor) supervisor.cancel('退出应用');
   if (multiConnection) {
+    if (multiConnection.desired) {
+      for (const id of multiConnection.desired.keys()) multiConnection.desired.set(id, false);
+    }
     for (const guard of multiConnection.guards.values()) guard.cancel('退出应用');
-    multiConnection.stopRequests.clear();
   }
+  if (supervisor) supervisor.cancel('退出应用');
 
   const hardExit = setTimeout(() => {
     // eslint-disable-next-line no-console
@@ -6844,38 +6923,25 @@ async function quitApp({ source = 'user' } = {}) {
     follower.stop();
   } catch { /* ignore */ }
 
-  try {
-    /* 只停“控制台自己拉起来的” frpc。系统服务模式下去停服务是越权行为：
-     * 那是用户单独安装的常驻隧道，关掉控制台不该把它带下来。 */
-    if (manager && manager.isChildAlive) {
-      await Promise.race([
-        manager.stop({ runMode: settings.runMode }).catch(() => ({ ok: false })),
-        new Promise((resolve) => setTimeout(resolve, 5000)),
-      ]);
-    }
-  } catch { /* ignore */ }
-
-  if (manager && manager.isChildAlive) {
-    try { manager.child.kill(); } catch { /* ignore */ }
-    await new Promise((resolve) => setTimeout(resolve, 400));
-  }
-
-  /* 非当前连接的 frpc 也要一起停：它们由 extraManagers 管，上面那段只处理 manager，
-   * 漏掉就会留下孤儿进程继续占着管理端口和公网端口（双连接退出时实测复现）。 */
+  /* 统一遍历 managers：只停“控制台自己拉起来的”托管进程（系统服务模式不去越权停服务）。 */
   try {
     if (managersMap().size) {
       const jobs = [];
       for (const [id, mm] of managersMap().entries()) {
-        if (id === settings.activeConnectionId) continue;
+        if (!mm) continue;
+        const isActive = id === settings.activeConnectionId;
+        if (!mm.isChildAlive) continue;
+        const runMode = isActive ? settings.runMode : 'managed';
         jobs.push((async () => {
           try {
-            multiConnection.stopRequests.set(id, Date.now());
+            markStopQuiet(id, 12000);
             await Promise.race([
-              mm.stop({ runMode: 'managed' }).catch(() => ({ ok: false })),
-              new Promise((resolve) => setTimeout(resolve, 4000)),
+              mm.stop({ runMode }).catch(() => ({ ok: false })),
+              new Promise((resolve) => setTimeout(resolve, 4500)),
             ]);
             if (mm.isChildAlive && mm.child) {
               try { mm.child.kill(); } catch { /* ignore */ }
+              await new Promise((resolve) => setTimeout(resolve, 300));
             }
           } catch { /* ignore */ }
         })());
@@ -6986,30 +7052,22 @@ async function prepareUpdateInstall() {
   if (multiConnection) {
     for (const guard of multiConnection.guards.values()) guard.cancel('正在安装更新');
   }
-  /* 其它连接（多开）也要停：它们各自的 frpc.exe 同样锁着安装目录里的
-   * resources/frpc/frpc.exe，只停当前连接会让安装器 Rename 失败（1.2.163 修的就是这个）。 */
-  if (multiConnection) {
-    for (const [id, mm] of managersMap()) {
-      if (id === settings.activeConnectionId) continue;
-      if (!mm || !mm.snapshot().running) continue;
-      try {
-        await mm.stop({ runMode: 'managed' });
-      } catch {
-        /* 停不掉交给下面的 taskkill 兜底 */
-      }
-      // eslint-disable-next-line no-console
-      console.log(`[update] 升级前已停止连接 ${id}`);
-    }
-  }
-  // 记录更新前隧道是否由控制台托管（用于更新后自动接回）
+  // 记录更新前当前连接的隧道是否由控制台托管（用于更新后自动接回）
   const wasManaged = !!(manager && manager.isChildAlive);
-  // 1) 优雅停掉控制台托管的 frpc（如果还在跑）
-  if (wasManaged) {
+  /* 所有连接（含当前连接）的 frpc 都要停：每个 frpc.exe 都锁着安装目录里的
+   * resources/frpc/frpc.exe，漏掉任意一条都会让安装器 Rename 失败。 */
+  for (const [id, mm] of managersMap()) {
+    if (!mm || (!mm.isChildAlive && !mm.snapshot().running)) continue;
+    const isActive = id === settings.activeConnectionId;
+    if (isActive && !mm.isChildAlive) continue;
+    markStopQuiet(id, 15000);
     try {
-      await manager.stop({ runMode: settings.runMode });
+      await mm.stop({ runMode: isActive ? settings.runMode : 'managed' });
     } catch {
-      /* 停不掉也继续：下面 taskkill 兜底 */
+      /* 停不掉交给下面的 taskkill 兜底 */
     }
+    // eslint-disable-next-line no-console
+    console.log(`[update] 升级前已停止连接 ${id}`);
   }
   // 2) 兜底：更新时绝不能留任何 frpc.exe 进程在跑。它会锁住安装目录里的
   //    内置 frpc.exe（resources/frpc），导致 NSIS 卸载旧文件时 Rename 失败，
@@ -7092,10 +7150,17 @@ function startApp() {
     // bootstrap() 第一句就同步载入 settings，这里可以安全读取启动偏好。
     if (settings.launchTunnelOnStart || restoreTunnel) {
       bootstrapReady
-        .then(() => manager.start({ runMode: settings.runMode }))
         .then(() => {
-          tunnelDesired = true;
-          return manager.refresh();
+          const id = settings.activeConnectionId;
+          clearStopQuiet(id);
+          const mm = managerForConnection(id);
+          return mm ? mm.start({ runMode: settings.runMode }) : null;
+        })
+        .then((res) => {
+          const id = settings.activeConnectionId;
+          if (res && res.ok) setDesired(id, true);
+          const mm = managerForConnection(id);
+          return mm ? mm.refresh() : null;
         })
         .then(() => pushState())
         .catch(() => {});
