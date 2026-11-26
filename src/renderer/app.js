@@ -6250,6 +6250,7 @@ async function handleAction(act, dataset, btn) {
 
       /* 从代理表单跳过来签发：把域名带进向导、切页、展开并自动检测一次（1.2.205） */
       case 'cert.goto.issue': {
+        captureProxyDraft();
         const domain = String(btn.dataset.domain || '').trim();
         const w = S.certs.wizard;
         if (domain) w.domain = domain;
@@ -6622,6 +6623,31 @@ function targetServerFieldHtml(selectedId, locked) {
   return '<div class="input-group">' + ctrl + '</div><div class="field-hint" id="pf-target-hint">' + esc(hint) + '</div>' + lockNote + guide;
 }
 
+/* 把当前「新增代理」表单里的值收成一个草稿：只在跳去签发证书时用（1.2.216）。 */
+function captureProxyDraft() {
+  const val = (id) => {
+    const el = document.getElementById(id);
+    return el ? String(el.value || "") : "";
+  };
+  const draft = {
+    name: val('pf-name').trim(),
+    type: val('pf-type') || 'tcp',
+    localIP: val('pf-localip').trim(),
+    localPort: val('pf-localport').trim(),
+    remotePort: val('pf-remote').trim(),
+    customDomains: val('pf-domains').trim(),
+    subdomain: val('pf-subdomain').trim(),
+    openPath: val('pf-openpath').trim(),
+    pluginType: currentProxyPlugin(),
+    pluginCrtPath: val('pf-plugin-crt').trim(),
+    pluginKeyPath: val('pf-plugin-key').trim(),
+    pluginHostHeaderRewrite: val('pf-plugin-host').trim(),
+  };
+  const empty = !draft.name && !draft.customDomains && !draft.localPort && !draft.pluginCrtPath;
+  S.proxyDraft = empty ? null : draft;
+  return S.proxyDraft;
+}
+
 function openProxyEditor({ mode, proxy = null, preset = null }) {
   const current = proxy || {};
   const initial = {
@@ -6641,6 +6667,21 @@ function openProxyEditor({ mode, proxy = null, preset = null }) {
     openPath: current.openPath || '',
     target: (S.state && S.state.activeConnectionId) || '',
   };
+  const draft = mode === 'add' && S.proxyDraft ? S.proxyDraft : null;
+  if (draft) {
+    if (!initial.name) initial.name = draft.name || '';
+    if (!initial.customDomains) initial.customDomains = draft.customDomains || '';
+    if (!initial.subdomain) initial.subdomain = draft.subdomain || '';
+    if (!initial.localPort) initial.localPort = draft.localPort || '';
+    if (!initial.localIP) initial.localIP = draft.localIP || '';
+    if (!initial.remotePort) initial.remotePort = draft.remotePort || '';
+    if (!initial.openPath) initial.openPath = draft.openPath || '';
+    if (!initial.pluginType) initial.pluginType = draft.pluginType || '';
+    if (!initial.pluginCrtPath) initial.pluginCrtPath = draft.pluginCrtPath || '';
+    if (!initial.pluginKeyPath) initial.pluginKeyPath = draft.pluginKeyPath || '';
+    if (!initial.pluginHostHeaderRewrite) initial.pluginHostHeaderRewrite = draft.pluginHostHeaderRewrite || '';
+    if (draft.type) initial.type = draft.type;
+  }
   S.proxyEdit = { mode, originalName: current.name || '' };
   const types = ['tcp', 'udp', 'http', 'https'];
   if (!types.includes(initial.type)) types.push(initial.type);
@@ -6657,6 +6698,7 @@ function openProxyEditor({ mode, proxy = null, preset = null }) {
       </div>
       <form id="proxy-form" class="modal-body" autocomplete="off">
         <div class="form-grid">
+          ${draft ? `<div class="field span-2"><div class="note ok" id="pf-draft-note">已恢复你上一步填的内容（去签发证书之前）。签好证书回到这里，选一下证书就能保存。</div></div>` : ''}
           <div class="field span-2">
             <label>名称 <span class="req">*</span></label>
             <input class="input" id="pf-name" name="name" value="${esc(initial.name)}" placeholder="例如 jellyfin、web、rdp" />
@@ -7057,6 +7099,7 @@ async function submitProxyForm(form, mode) {
     return;
   }
   if (res.data && res.data.state) S.state = res.data.state;
+  S.proxyDraft = null;
   closeModal();
   // 隧道没运行时不会真的热重载（没有管理 API），别在这种时候说“已热重载”。
   const reloaded = !!(res.data && res.data.reloaded);
