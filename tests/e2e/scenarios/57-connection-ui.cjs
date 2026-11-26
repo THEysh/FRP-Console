@@ -45,35 +45,43 @@ module.exports = {
 
       const multi = await ev(`(() => {
         const box = document.getElementById('conn-switch');
-        const sel = document.getElementById('conn-select');
+        const items = [...document.querySelectorAll('#conn-switch .cs-item')];
         const rows = [...document.querySelectorAll('.conn-row')];
         const titles = [...document.querySelectorAll('.section-title')].map((e) => e.textContent.replace(/\\s+/g, ' ').trim());
         return {
           hidden: box ? box.hidden : null,
-          options: sel ? [...sel.options].map((o) => o.textContent) : [],
+          items: items.map((x) => ({
+            id: x.dataset.connId,
+            name: (x.querySelector('.cs-name') || {}).textContent || '',
+            state: (x.querySelector('.cs-state') || {}).textContent || '',
+            hasToggle: !!x.querySelector('[data-act="conn.toggle"]'),
+          })),
           rows: rows.length,
           agg: titles.find((t) => t.includes('隧道连接')) || '',
         };
       })()`);
-      check('切换器出现且列出两条', multi.hidden === false && multi.options.length === 2, JSON.stringify(multi.options));
+      check('侧栏服务器列表出现且列出两条（各有独立启停按钮）', multi.hidden === false && multi.items.length === 2 && multi.items.every((x) => x.hasToggle), JSON.stringify(multi.items));
       check('概览出现「隧道连接」卡片', multi.rows === 2 && /隧道连接/.test(multi.agg), multi.agg);
 
-      /* 非当前连接也必须能直接启动：每条连接各自启停，与是否切换当前视图解耦。 */
-      const otherRow = await ev(`(() => {
-        const row = [...document.querySelectorAll('.conn-row')].find((r) => !r.classList.contains('active'));
+      /* 概览每行平等提供独立启停、管理、删除，不再出现令人困惑的「设为当前」按钮。 */
+      const secondRow = await ev(`(() => {
+        const row = [...document.querySelectorAll('.conn-row')][1];
         if (!row) return { missing: true };
         const acts = [...row.querySelectorAll('button')].map((b) => ({ act: b.dataset.act, label: (b.textContent || '').trim(), id: b.dataset.id }));
         return { acts };
       })()`);
       check(
-        '非当前连接可以直接启动（conn.toggle）',
-        !!otherRow && Array.isArray(otherRow.acts) && otherRow.acts.some((a) => a.act === 'conn.toggle' && a.id),
-        JSON.stringify(otherRow).slice(0, 200),
+        '每台服务器都可以直接启停（conn.toggle）',
+        !!secondRow && Array.isArray(secondRow.acts) && secondRow.acts.some((a) => a.act === 'conn.toggle' && a.id),
+        JSON.stringify(secondRow).slice(0, 200),
       );
       check(
-        '同时仍能「切到它」（切换是独立动作）',
-        !!otherRow && Array.isArray(otherRow.acts) && otherRow.acts.some((a) => a.act === 'conn.switch'),
-        JSON.stringify(otherRow).slice(0, 200),
+        '概览行提供「管理」与「删除」入口，不再有「设为当前」',
+        !!secondRow && Array.isArray(secondRow.acts)
+          && secondRow.acts.some((a) => a.act === 'conn.manage')
+          && secondRow.acts.some((a) => a.act === 'conn.remove')
+          && !secondRow.acts.some((a) => a.act === 'conn.switch'),
+        JSON.stringify(secondRow).slice(0, 200),
       );
 
       const proxies = await ev(`(async () => {
@@ -106,23 +114,25 @@ module.exports = {
       check('「＋」弹出自绘输入框', /再连一台/.test(viaDialog.title || ''), viaDialog.title);
       check('通过界面创建出第三条连接', (viaDialog.names || []).includes('第三台'), JSON.stringify(viaDialog.names));
 
-      /* 切当前连接：下拉与「当前」标记都要跟上（靠状态里的 activeConnectionId） */
+      /* 切当前查看的服务器：侧栏列表的高亮行跟着走（靠状态里的 activeConnectionId） */
       const switched = await ev(`(async () => {
         const list = (await FRP.connections()).data;
         const target = list.connections.find((c) => c.name === '第二台');
         const r = await FRP.connectionActive(target.id);
-        let sel = document.getElementById('conn-select');
+        let activeItem = null;
         for (let i = 0; i < 20; i += 1) {
           await new Promise((res) => setTimeout(res, 400));
-          sel = document.getElementById('conn-select');
-          if (sel && sel.value === target.id) break;
+          activeItem = document.querySelector('#conn-switch .cs-item.active');
+          if (activeItem && activeItem.dataset.connId === target.id) break;
         }
-        const rows = [...document.querySelectorAll('.conn-row')].map((x) => x.textContent.replace(/\\s+/g, ' ').trim());
-        /* 「设为当前」按钮文字里也有「当前」，先排除掉，只找真正被标成当前的那一行 */
-        return { ok: r.ok, selected: sel ? sel.value : '', expect: target.id, activeRow: rows.filter((t) => !t.includes('设为当前')).find((t) => t.includes('当前')) || '' };
+        return {
+          ok: r.ok,
+          activeId: activeItem ? activeItem.dataset.connId : '',
+          activeName: activeItem ? ((activeItem.querySelector('.cs-name') || {}).textContent || '').trim() : '',
+          expect: target.id,
+        };
       })()`);
-      check('切换后下拉选中新连接', switched.ok === true && switched.selected === switched.expect, JSON.stringify(switched.selected));
-      check('切换后概览「当前」标记跟着走', /第二台/.test(switched.activeRow || ''), switched.activeRow);
+      check('切换后侧栏列表高亮新服务器', switched.ok === true && switched.activeId === switched.expect && /第二台/.test(switched.activeName), JSON.stringify(switched));
     } finally {
       try { await inst.stop(); } catch { /* ignore */ }
     }

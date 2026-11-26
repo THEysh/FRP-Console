@@ -87,7 +87,7 @@ const browserProbe = require('./netprobe');
 const { execFileP, powershell, tcpCheck, httpProbe, hashText, randomToken, formatDuration, proxyEnvKeys, parseSocketHolder } = require('./util');
 const { probePort, probeUdp, sshConnectHint, outboundHint } = require('./portprobe');
 const { parseRuleSpec, judgePortRow, buildPortMatrix, summarizeMatrix, buildRuleTexts } = require('./portmatrix');
-const { createConnectionRuntime, dispatchEnsureAdmin, evalSupervisorBlockReason, shouldNotifyExit, stepApiDownWindow } = require('./conn-runtime');
+const { createConnectionRuntime, dispatchEnsureAdmin, evalSupervisorBlockReason, shouldNotifyExit, stepApiDownWindow, computeAutoAdoptPatch } = require('./conn-runtime');
 
 /* 出站失败（证书签发 / DNS API / 下载 frps / 检查更新）补一句本机网络排查方向。
  * 这类请求都是从本机往 443 连，跟服务器防火墙无关，混在一起说会把用户引到错的方向。 */
@@ -3882,7 +3882,7 @@ function registerIpc() {
 
 /* 跨连接端口冲突：同一个 frps 上两条 frpc 抢同一个 remotePort，frps 只回
  * "port already used"，界面看不出是谁占的。这里在保存时就挡住并点名。 */
-function crossConnectionPortClash(proxy, { excludeName = '', connId = '' } = {}) {
+function crossConnectionPortClash(proxy, { excludeName = '', connId = '', excludeConnId = '' } = {}) {
   const type = proxy && proxy.type;
   if (!['tcp', 'udp'].includes(type)) return '';
   const port = Number(proxy.remotePort);
@@ -3906,7 +3906,10 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '' } = {})
     if (String(other.serverAddr || '').trim().toLowerCase() !== myAddr) continue;
     /* 同一台机器上可以跑两个 frps（不同 bindPort）：端口各自独立，别误报冲突。 */
     if (myPort && Number(other.serverPort || 0) !== myPort) continue;
-    const hit = (other.proxies || []).find((p) => p.type === type && Number(p.remotePort) === port && p.name !== excludeName);
+    const hit = (other.proxies || []).find(
+      (p) => p.type === type && Number(p.remotePort) === port
+        && !(excludeName && p.name === excludeName && (!excludeConnId || conn.id === excludeConnId)),
+    );
     if (hit) {
       return `公网端口 ${port}/${type} 已经被「${conn.name || conn.id}」这条连接里的代理「${hit.name}」占用（两条 frpc 连的是同一台 frps ${myAddr}:${myPort || ''}）`;
     }
@@ -3926,6 +3929,16 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '' } = {})
     if (wantConnId && wantConnId !== activeId && !targetConn) return fail('这条连接已经不存在了（可能被删掉）');
     const targetId = targetConn ? targetConn.id : activeId;
     const isCurrent = !targetConn;
+    const rawSourceId = String((payload && payload.originalConnectionId) || '').trim();
+    const sourceId = mode === 'edit' && rawSourceId ? rawSourceId : targetId;
+    const isMove = mode === 'edit' && !!sourceId && sourceId !== targetId;
+    const sourceConn = isMove ? connectionById(sourceId) : null;
+    if (isMove && !sourceConn) return fail('原代理所在的服务器已不存在，无法迁移');
+    const sourceModel = isMove ? (sourceId === activeId ? model : connectionModel(sourceConn)) : null;
+    const sourceProxy = isMove && sourceModel
+      ? (sourceModel.proxies || []).find((p) => p.name === originalName) || null
+      : null;
+
     const targetModel = isCurrent ? model : connectionModel(targetConn);
     if (!targetModel) return fail('这条连接的配置文件读不到：' + String((targetConn && targetConn.configPath) || ''));
     if (!isCurrent && !String(targetModel.serverAddr || '').trim()) {
@@ -3950,6 +3963,10 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '' } = {})
      * 免得把 https 代理悄悄改成 http。 */
     const yMode = isCurrent ? yModeEnabled() : false;
     const proxy = configModule.makeProxy(input, { nginxProxyEnabled: yMode });
+    if (isMove && sourceProxy && sourceProxy.secretKey && !proxy.secretKey) {
+      proxy.secretKey = sourceProxy.secretKey;
+    }
+    const targetMode = isMove ? 'add' : mode;
     const next = configModule.normalize({
       ...base._extra,
       serverAddr: base.serverAddr,
@@ -3959,19 +3976,22 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '' } = {})
       log: base.log,
       transport: base.transport,
       webServer: base.webServer,
-      proxies: mode === 'edit'
+      proxies: targetMode === 'edit'
         ? targetModel.proxies.map((p) => (p.name === originalName ? { ...proxy, ...(p.secretKey && !proxy.secretKey ? { secretKey: p.secretKey } : {}) } : p))
         : [...targetModel.proxies, proxy],
       visitors: targetModel.visitors,
     }, { nginxProxyEnabled: yMode });
-    if (mode === 'add' && targetModel.proxies.some((p) => p.name === proxy.name)) {
-      return { ok: false, error: `代理名称「${proxy.name}」已存在`, validation: configModule.validate(next, { allowPorts }) };
+    if (targetMode === 'add' && targetModel.proxies.some((p) => p.name === proxy.name)) {
+      return { ok: false, error: `目标服务器里代理名称「${proxy.name}」已存在`, validation: configModule.validate(next, { allowPorts }) };
     }
     /* 跨连接的公网端口冲突：只有当两条 frpc 连的是**同一台** frps 才成立
-     * （不同服务器上用同一个端口是完全合法的）。以前只比当前配置里的代理，
-     * 多开连接后用户会在第二台上撞出 "port already used"，而错误来自 frps、看不出是谁占的。 */
+     * （不同服务器上用同一个端口是完全合法的）。编辑并迁移时排除原连接上的旧代理，避免自己撞自己。 */
     if (typeof crossConnectionPortClash === 'function') {
-      const clash = crossConnectionPortClash(proxy, { excludeName: mode === 'edit' ? originalName : '', connId: targetId });
+      const clash = crossConnectionPortClash(proxy, {
+        excludeName: mode === 'edit' ? originalName : '',
+        connId: targetId,
+        excludeConnId: isMove ? sourceId : '',
+      });
       if (clash) return { ok: false, error: clash };
     }
     /* frpc 顶层 start = [...] 是「只启动列表里的代理」的白名单（手改配置时常见）。
@@ -3979,7 +3999,7 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '' } = {})
      * 「隧道未建立」。这里把它补进名单，并把这件事说出来，而不是让配置偷偷失效。 */
     const startPatch = startListPatch(next, {
       add: proxy.name,
-      remove: mode === 'edit' && originalName && originalName !== proxy.name ? originalName : '',
+      remove: targetMode === 'edit' && originalName && originalName !== proxy.name ? originalName : '',
     });
     if (startPatch) next._extra = { ...(next._extra || {}), start: startPatch.list };
     const validation = configModule.validate(next, { allowPorts });
@@ -4045,21 +4065,46 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '' } = {})
     }
     const result = isCurrent ? await applyAndMaybeReload(next) : await applyToParkedConnection(targetConn, next);
     if (!result.ok) return result;
+    /* 跨服务器迁移：目标已经成功写入后，再从原服务器移除旧代理并热重载原服务器。 */
+    if (isMove && sourceModel && originalName) {
+      const srcIsCurrent = sourceId === activeId;
+      const srcNext = configModule.normalize({
+        ...sourceModel._extra,
+        serverAddr: sourceModel.serverAddr,
+        serverPort: sourceModel.serverPort,
+        loginFailExit: sourceModel.loginFailExit,
+        auth: sourceModel.auth,
+        log: sourceModel.log,
+        transport: sourceModel.transport,
+        webServer: sourceModel.webServer,
+        proxies: (sourceModel.proxies || []).filter((p) => p.name !== originalName),
+        visitors: sourceModel.visitors,
+      }, { nginxProxyEnabled: srcIsCurrent ? yModeEnabled() : false });
+      const srcStartPatch = startListPatch(srcNext, { remove: originalName });
+      if (srcStartPatch) srcNext._extra = { ...(srcNext._extra || {}), start: srcStartPatch.list };
+      healthCache.delete(connectionsModule.keyOf(sourceId, originalName));
+      dropProxyOpenPath(originalName, sourceId);
+      const srcRes = srcIsCurrent ? await applyAndMaybeReload(srcNext) : await applyToParkedConnection(sourceConn, srcNext);
+      if (!srcRes || !srcRes.ok) {
+        proxyWarnings.push(`已写入目标服务器，但从原服务器「${(sourceConn && sourceConn.name) || sourceId}」删除旧条目失败：${(srcRes && srcRes.error) || '未知错误'}`);
+      }
+    }
     /* 访问路径存在我们这边（frpc.toml 不认这个字段）。改名时把旧名下的记录搬过来，
      * 免得「改个名访问路径就丢了」。 */
-    if (mode === 'edit' && originalName && originalName !== proxy.name) dropProxyOpenPath(originalName, targetId);
+    if (!isMove && mode === 'edit' && originalName && originalName !== proxy.name) dropProxyOpenPath(originalName, targetId);
     setProxyOpenPath(proxy.name, openPath, targetId);
     // 地址是这次现填的：顺手把「本机隧道目标」记到这个档案上，概览和服务器页才不会
     // 出现「本机隧道还没有归属到任何档案」。
     if (seed) settings = settingsModule.save({ clientServerId: seed.id });
     pushState();
     return ok({
-      state: result.state,
+      state: buildState(),
       reloaded: result.reloaded,
       reloadError: result.reloadError || '',
       proxy,
       connectionId: targetId,
-      connectionName: targetConn ? targetConn.name : '',
+      connectionName: targetConn ? targetConn.name : ((connectionById(targetId) || {}).name || ''),
+      migratedFrom: isMove && sourceConn ? (sourceConn.name || sourceConn.id) : '',
       seededFrom: seed ? seed.name : '',
       warnings: proxyWarnings,
     });
@@ -4120,17 +4165,25 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '' } = {})
     return '10000–64999 之间没找到空闲端口（代理数量太多？）';
   };
 
-  ipcMain.handle('proxy:suggest-port', async (event, type) => {
-    if (!model) return ok({ port: 10000 });
-    const allowPorts = (serverConfig.summary && serverConfig.summary.allowPorts) || [];
-    const port = configModule.suggestRemotePort(model, type, { allowPorts });
+  ipcMain.handle('proxy:suggest-port', async (event, arg) => {
+    const type = typeof arg === 'object' && arg ? arg.type : arg;
+    const connId = typeof arg === 'object' && arg ? String(arg.connectionId || '').trim() : '';
+    const isCur = !connId || connId === (settings && settings.activeConnectionId);
+    const targetModel = isCur ? model : connectionModel(connectionById(connId));
+    if (!targetModel) return ok({ port: 10000 });
+    const allowPorts = isCur ? ((serverConfig.summary && serverConfig.summary.allowPorts) || []) : [];
+    const port = configModule.suggestRemotePort(targetModel, type, { allowPorts });
     return ok(port ? { port } : { port: null, reason: noPortReason(allowPorts) });
   });
 
-  ipcMain.handle('proxy:random-port', async (event, type) => {
-    if (!model) return ok({ port: 10000 });
-    const allowPorts = (serverConfig.summary && serverConfig.summary.allowPorts) || [];
-    const port = configModule.randomRemotePort(model, type, { allowPorts });
+  ipcMain.handle('proxy:random-port', async (event, arg) => {
+    const type = typeof arg === 'object' && arg ? arg.type : arg;
+    const connId = typeof arg === 'object' && arg ? String(arg.connectionId || '').trim() : '';
+    const isCur = !connId || connId === (settings && settings.activeConnectionId);
+    const targetModel = isCur ? model : connectionModel(connectionById(connId));
+    if (!targetModel) return ok({ port: 10000 });
+    const allowPorts = isCur ? ((serverConfig.summary && serverConfig.summary.allowPorts) || []) : [];
+    const port = configModule.randomRemotePort(targetModel, type, { allowPorts });
     return ok(port ? { port } : { port: null, reason: noPortReason(allowPorts) });
   });
 
@@ -4501,6 +4554,7 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '' } = {})
     if (multiConnection) {
       multiConnection.removeConnection(conn.id);
     }
+    settingsModule.clearConnectionSecret(conn.id);
     settings = settingsModule.save({
       connections: (settings.connections || []).filter((item) => item.id !== conn.id),
     });
@@ -4602,20 +4656,19 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '' } = {})
       upsertServerProfile({ id: owner.id, clientToken: nextToken, clientPort: nextPort, configPath: nextPath });
     }
 
-    if (!model || !model.serverAddr) return { tokenSynced: false };
-    const sameTarget = String(model.serverAddr).toLowerCase() === String(owner.host).toLowerCase()
-      && Number(model.serverPort) === nextPort;
-    if (!sameTarget) return { tokenSynced: false };
-    const localToken = String((model.auth && model.auth.token) || '');
-    if (localToken === nextToken) return { tokenSynced: false };
+    const patch = computeAutoAdoptPatch({ model, owner, summary });
+    if (!patch) return { tokenSynced: false };
     const next = structuredClone(model);
-    next.auth = { ...(next.auth || {}), method: 'token', token: nextToken };
+    next.serverAddr = patch.serverAddr;
+    next.serverPort = patch.serverPort;
+    next.auth = { ...(next.auth || {}), method: 'token', token: patch.token };
     const saved = persistModel(next, { reload: false });
     if (!saved.ok) return { tokenSynced: false, error: saved.error || '写入本机 frpc 配置失败' };
     /* 地址 + 端口 + Token 都对上了，本机这份配置就是这台服务器的：顺手把「隧道目标」
-     * 记到它头上，服务器页才不会一边用着它、一边说「本机隧道还没归属到任何档案」。 */
+     * 记到它头上，服务器页与新增代理下拉立刻就能识别它已配置就绪。 */
     if (settings.clientServerId !== owner.id) settings = settingsModule.save({ clientServerId: owner.id });
-    return { tokenSynced: true };
+    pushState();
+    return { tokenSynced: true, seeded: patch.kind === 'seed' };
   }
 
   async function loadServerSnapshot({ inspect = false, epoch = sessionEpoch } = {}) {

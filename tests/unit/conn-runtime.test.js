@@ -20,6 +20,7 @@ const {
   evalSupervisorBlockReason,
   shouldNotifyExit,
   stepApiDownWindow,
+  computeAutoAdoptPatch,
 } = require('../../src/main/conn-runtime');
 const { LogFollower } = require('../../src/main/log');
 const { FrpcManager } = require('../../src/main/frpc');
@@ -337,4 +338,51 @@ test('C3 startedFingerprints 与 per-connection LogFollower：来回切换各自
   fB.appendLines('2026-11-26 10:00:02 [I] beta-line-2');
   assert.equal(pushed.length, 2);
   assert.equal(pushed[1][0], 'c-b');
+});
+
+test('computeAutoAdoptPatch：新建连接空 frpc.toml 连上已有 frps 后自动补全地址/端口/Token，不覆盖已有不同服务器', () => {
+  const owner = { host: '8.148.198.61', clientPort: 7000 };
+  const summary = { bindPort: 7000, authEnabled: true, token: 'tok-gz-123' };
+
+  /* 空 serverAddr → 自动 seed */
+  const seeded = computeAutoAdoptPatch({
+    model: { serverAddr: '', serverPort: 7000, auth: { token: '' } },
+    owner,
+    summary,
+  });
+  assert.deepEqual(seeded, {
+    kind: 'seed',
+    serverAddr: '8.148.198.61',
+    serverPort: 7000,
+    token: 'tok-gz-123',
+  });
+
+  /* 同一台服务器但 token 不同 → 同步 token */
+  const synced = computeAutoAdoptPatch({
+    model: { serverAddr: '8.148.198.61', serverPort: 7000, auth: { token: 'old-tok' } },
+    owner,
+    summary,
+  });
+  assert.deepEqual(synced, {
+    kind: 'token',
+    serverAddr: '8.148.198.61',
+    serverPort: 7000,
+    token: 'tok-gz-123',
+  });
+
+  /* 已配另一台服务器 → 绝不覆盖 */
+  const untouched = computeAutoAdoptPatch({
+    model: { serverAddr: '154.36.178.154', serverPort: 7000, auth: { token: 'jp-tok' } },
+    owner,
+    summary,
+  });
+  assert.equal(untouched, null);
+
+  /* 已完全一致 → 无需重复写盘 */
+  const same = computeAutoAdoptPatch({
+    model: { serverAddr: '8.148.198.61', serverPort: 7000, auth: { token: 'tok-gz-123' } },
+    owner,
+    summary,
+  });
+  assert.equal(same, null);
 });

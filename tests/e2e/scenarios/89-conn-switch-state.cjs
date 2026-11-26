@@ -41,29 +41,35 @@ module.exports = {
 
     try {
       await ctx.waitFor(
-        () => inst.eval(`document.querySelectorAll('#conn-select option').length`),
+        () => inst.eval(`document.querySelectorAll('#conn-switch .cs-item').length`),
         (v) => Number(v) >= 2,
-        { timeout: 20000, label: '侧栏连接下拉渲染' },
+        { timeout: 20000, label: '侧栏服务器列表渲染' },
       );
 
       const opts = JSON.parse(
         await inst.eval(`(function() {
-          const sel = document.querySelector('#conn-select');
+          const items = [...document.querySelectorAll('#conn-switch .cs-item')];
+          const active = document.querySelector('#conn-switch .cs-item.active');
           return JSON.stringify({
             hidden: document.querySelector('#conn-switch').hidden,
-            options: [...sel.options].map((o) => o.textContent.trim()),
-            selected: sel.selectedOptions[0] ? sel.selectedOptions[0].textContent.trim() : '',
+            items: items.map((el) => ({
+              name: ((el.querySelector('.cs-name') || {}).textContent || '').trim(),
+              state: ((el.querySelector('.cs-state') || {}).textContent || '').trim(),
+              toggle: ((el.querySelector('.cs-toggle') || {}).textContent || '').trim(),
+            })),
+            activeName: active ? ((active.querySelector('.cs-name') || {}).textContent || '').trim() : '',
+            activeState: active ? ((active.querySelector('.cs-state') || {}).textContent || '').trim() : '',
           });
         })()`),
       );
 
-      ctx.check('侧栏连接切换器可见', opts.hidden === false, String(opts.hidden));
-      ctx.check('下拉里两条连接都在', opts.options.length === 2, JSON.stringify(opts.options));
+      ctx.check('侧栏服务器列表可见', opts.hidden === false, String(opts.hidden));
+      ctx.check('列表里两条服务器都在且各有独立启停按钮', opts.items.length === 2 && opts.items.every((x) => x.toggle === '启动' || x.toggle === '停止'), JSON.stringify(opts.items));
 
-      const stateless = opts.options.filter((t) => !/·\s*(未启动|连接中\s*\d+\/\d+|在线\s*\d+\/\d+)$/.test(t));
-      ctx.check('每个选项都带状态（未启动 / 连接中 x/y / 在线 x/y）', stateless.length === 0, JSON.stringify(opts.options));
+      const stateless = opts.items.filter((x) => !/^(未启动|连接中\s*\d+\/\d+|在线\s*\d+\/\d+)$/.test(x.state));
+      ctx.check('每条服务器都带状态（未启动 / 连接中 x/y / 在线 x/y）', stateless.length === 0, JSON.stringify(opts.items));
 
-      ctx.check('当前选中的是默认连接且标为未启动', /日本 · 未启动/.test(opts.selected), opts.selected);
+      ctx.check('默认高亮第一台服务器且标为未启动', opts.activeName === '日本' && opts.activeState === '未启动', JSON.stringify(opts));
     } finally {
       inst.stop();
     }

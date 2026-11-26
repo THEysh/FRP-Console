@@ -206,6 +206,38 @@ function stepApiDownWindow(runtime, connId, { eligible, connected, now = Date.no
   return false;
 }
 
+/* SSH 连上已有 frps 服务器并读到 frps.toml 后，计算是否需要自动补全本机 frpc.toml：
+ *   - 若本机连接的 frpc.toml 还是空地址（新建连接常见情况），自动写入 serverAddr / serverPort / auth.token，
+ *     让这条连接立刻就绪（无需手动改配置或重新初始化，新增代理下拉立即可选）；
+ *   - 若已配置同一台服务器但 token 不一致，仅同步 token；
+ *   - 若已配置的是另一台不同服务器，绝不悄悄覆盖。 */
+function computeAutoAdoptPatch({ model, owner, summary } = {}) {
+  if (!model || !owner || !summary) return null;
+  const host = String(owner.host || '').trim();
+  if (!host) return null;
+  const nextToken = summary.authEnabled ? String(summary.token || '') : '';
+  const nextPort = Number(summary.bindPort) || Number(owner.clientPort) || 7000;
+  const curAddr = String(model.serverAddr || '').trim();
+  if (!curAddr) {
+    return {
+      kind: 'seed',
+      serverAddr: host,
+      serverPort: nextPort,
+      token: nextToken,
+    };
+  }
+  const sameTarget = curAddr.toLowerCase() === host.toLowerCase() && Number(model.serverPort) === nextPort;
+  if (!sameTarget) return null;
+  const localToken = String((model.auth && model.auth.token) || '');
+  if (localToken === nextToken) return null;
+  return {
+    kind: 'token',
+    serverAddr: curAddr,
+    serverPort: nextPort,
+    token: nextToken,
+  };
+}
+
 module.exports = {
   createConnectionRuntime,
   dispatchEnsureAdmin,
@@ -213,4 +245,5 @@ module.exports = {
   evalSupervisorBlockReason,
   shouldNotifyExit,
   stepApiDownWindow,
+  computeAutoAdoptPatch,
 };

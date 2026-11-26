@@ -393,6 +393,14 @@ function connOptionState(c) {
   return '未启动';
 }
 
+/* 侧栏底部紧凑服务器列表（方案 A，1.2.232）：
+ * 每台服务器各自一行，直接显示状态圆点 + 名称 + 独立「启动/停止」按钮；
+ * 点击名称只用于切换查看该服务器的详情或日志，绝不停任何隧道。 */
+function connIsRunning(c) {
+  const rt = (c && c.runtime) || {};
+  return !!(rt.running || rt.connected);
+}
+
 function renderConnectionSwitch() {
   const box = $('#conn-switch');
   if (!box) return;
@@ -404,48 +412,65 @@ function renderConnectionSwitch() {
   }
   box.hidden = false;
   const activeId = activeConnId();
-  const active = list.find((c) => c.id === activeId) || list[0];
-  const running = !!(active && active.runtime && active.runtime.connected);
+  const runningCount = list.filter(connIsRunning).length;
+  const items = list.map((c) => {
+    const rt = c.runtime || {};
+    const isRunning = connIsRunning(c);
+    const isActive = c.id === activeId;
+    const dotCls = rt.connected ? 'on' : (rt.running ? 'warn' : '');
+    const stateText = connOptionState(c);
+    return `
+      <div class="cs-item${isActive ? ' active' : ''}" data-conn-id="${esc(c.id)}">
+        <button class="cs-pick" type="button" data-act="conn.switch" data-id="${esc(c.id)}" title="查看「${esc(c.name || c.id)}」的日志与服务器详情（不会停止任何隧道）">
+          <span class="cs-dot ${dotCls}"></span>
+          <span class="cs-info">
+            <span class="cs-name">${esc(c.name || c.id)}</span>
+            <span class="cs-state">${esc(stateText)}</span>
+          </span>
+        </button>
+        ${isRunning
+          ? `<button class="btn danger cs-toggle" type="button" data-act="conn.toggle" data-id="${esc(c.id)}" title="停止「${esc(c.name || c.id)}」的隧道">停止</button>`
+          : `<button class="btn primary cs-toggle" type="button" data-act="conn.toggle" data-id="${esc(c.id)}" title="启动「${esc(c.name || c.id)}」的隧道">启动</button>`}
+      </div>`;
+  }).join('');
   box.innerHTML = `
     <div class="cs-head">
-      <span class="cs-dot ${running ? 'on' : ''}"></span>
-      <span class="grow">隧道连接 · ${list.length}</span>
-      <button class="icon-btn" type="button" data-act="conn.add" title="再加一条连接（连另一台 frps）">${icon('plus')}</button>
+      <span class="cs-dot ${runningCount > 0 ? 'on' : ''}"></span>
+      <span class="grow">服务器 · ${runningCount}/${list.length} 运行</span>
+      <button class="icon-btn" type="button" data-act="conn.add" title="再加一台服务器（连另一台 frps）">${icon('plus')}</button>
     </div>
-    <select class="cs-select" id="conn-select" title="切换当前查看的连接（不会停止任何正在运行的隧道）">
-      ${list.map((c) => `<option value="${esc(c.id)}"${c.id === activeId ? ' selected' : ''}>${esc(c.name || c.id)} · ${esc(connOptionState(c))}</option>`).join('')}
-    </select>
-    <div class="cs-row">
-      ${running
-        ? `<button class="btn small danger" type="button" data-act="conn.toggle" data-id="${esc(activeId)}">${icon('stop')}<span>停止</span></button>`
-        : `<button class="btn small primary" type="button" data-act="conn.toggle" data-id="${esc(activeId)}">${icon('play')}<span>启动</span></button>`}
-      <button class="btn small" type="button" data-act="nav" data-view="proxies">${icon('link')}<span>代理</span></button>
-    </div>`;
+    <div class="cs-list">${items}</div>`;
 }
 
-/* 概览里的「连接」卡片：多于一条时才有意义。 */
+/* 概览里的「隧道连接」卡片：多于一条时展示全部服务器，独立启停/管理/删除，去掉令人困惑的「设为当前」。 */
 function connectionsSection() {
   const list = connList();
   if (list.length <= 1) return '';
-  const activeId = activeConnId();
   const agg = (S.state && S.state.connectionsAgg) || {};
+  const canDelete = list.length > 1;
   const rows = list.map((c) => {
     const rt = c.runtime || {};
     const counts = c.counts || {};
-    const isActive = c.id === activeId;
+    const isRunning = connIsRunning(c);
+    const addr = String(c.serverAddr || c.host || '').trim();
+    const dotCls = rt.connected ? 'on' : (rt.running ? 'warn' : '');
     return `
-      <div class="conn-row${isActive ? ' active' : ''}">
-        <span class="cs-dot ${rt.connected ? 'on' : (rt.mode === 'starting' ? 'warn' : '')}"></span>
+      <div class="conn-row" data-conn-id="${esc(c.id)}">
+        <span class="cs-dot ${dotCls}"></span>
         <div class="grow">
-          <div class="cr-name">${esc(c.name || c.id)}${isActive ? ' <span class="tag ok">当前</span>' : ''}</div>
+          <div class="cr-name">
+            <span>${esc(c.name || c.id)}</span>
+            <span class="cr-addr mono">${esc(addr || '未配置地址')}</span>
+          </div>
           <div class="cr-meta">${esc(connRuntimeLabel(c))} · 在线 ${esc(String(counts.online || 0))} / ${esc(String(counts.total || 0))}</div>
         </div>
-        ${rt.connected
-          ? `<button class="btn small danger" type="button" data-act="conn.toggle" data-id="${esc(c.id)}">${icon('stop')}<span>停止</span></button>`
-          : `<button class="btn small primary" type="button" data-act="conn.toggle" data-id="${esc(c.id)}">${icon('play')}<span>启动</span></button>`}
-        ${isActive
-          ? ''
-          : `<button class="btn small ghost" type="button" data-act="conn.switch" data-id="${esc(c.id)}" title="切换当前查看的连接（不会停止任何正在运行的隧道）">设为当前</button>`}
+        <div class="cr-actions">
+          ${isRunning
+            ? `<button class="btn small danger" type="button" data-act="conn.toggle" data-id="${esc(c.id)}">${icon('stop')}<span>停止</span></button>`
+            : `<button class="btn small primary" type="button" data-act="conn.toggle" data-id="${esc(c.id)}">${icon('play')}<span>启动</span></button>`}
+          <button class="btn small ghost" type="button" data-act="conn.manage" data-id="${esc(c.id)}" title="去「服务器」页查看和管理这台服务器">${icon('server')}<span>管理</span></button>
+          ${canDelete ? `<button class="icon-btn danger" type="button" data-act="conn.remove" data-id="${esc(c.id)}" title="删除这台服务器（会先停止其隧道，保留磁盘配置文件）">${icon('trash')}</button>` : ''}
+        </div>
       </div>`;
   }).join('');
   return `
@@ -453,8 +478,8 @@ function connectionsSection() {
       <div class="section-head">
         <div class="section-title">
           <strong>隧道连接</strong>
-          <span>${esc(String(agg.connections || list.length))} 条 · ${esc(String(agg.running || 0))} 条已连上 · 合计在线代理 ${esc(String(agg.online || 0))} / ${esc(String(agg.total || 0))}</span>
-          <span class="field-hint" style="margin:0">每条连接一份 frpc.toml、各自一条隧道；切换只改变当前查看的连接，不会停止任何正在运行的隧道。</span>
+          <span>${esc(String(agg.connections || list.length))} 台服务器 · ${esc(String(agg.running || 0))} 台已连上 · 合计在线代理 ${esc(String(agg.online || 0))} / ${esc(String(agg.total || 0))}</span>
+          <span class="field-hint" style="margin:0">每台服务器独立配置、独立启停，可以同时在线；在「代理映射」新增或编辑代理时可自由选择任意一台已配置的服务器。</span>
         </div>
         <button class="btn ghost small" type="button" data-act="conn.add">${icon('plus')}再连一台</button>
       </div>
@@ -990,16 +1015,16 @@ function curTunnelRunning() {
 
 function tunnelIdleNote(all) {
   if (!all || !all.length) return '';
-  const st = S.state || {};
-  const cur = (st.connections || []).find((c) => c.id === st.activeConnectionId) || null;
-  if (!cur) return '';
-  const rt = cur.runtime || {};
-  if (rt.running || rt.connected) return '';
-  const name = esc(cur.name || cur.id);
+  const list = connList();
+  /* 找出「确实挂着代理、但隧道还没运行」的服务器：多服务器下每台平等，各自给一键启动。 */
+  const idle = list.filter((c) => !connIsRunning(c) && all.some((p) => p.connectionId === c.id));
+  if (!idle.length) return '';
+  const names = idle.map((c) => `「${esc(c.name || c.id)}」`).join('、');
+  const btns = idle.map((c) => `<button class="btn small primary" type="button" data-act="conn.toggle" data-id="${esc(c.id)}">${icon('play')}<span>启动 ${esc(c.name || c.id)}</span></button>`).join('');
   return `<div class="note warn" style="margin-bottom:14px">${icon('alert')}<div>
-    <strong>当前连接「${name}」的隧道没有在运行</strong><br>
-    下面这些代理只是写进了 frpc.toml，还没注册到服务器，公网访问不到。启动隧道之后才会生效。
-    <div style="margin-top:8px"><button class="btn small primary" type="button" data-act="conn.toggle" data-id="${esc(cur.id)}">${icon('play')}<span>启动隧道</span></button></div>
+    <strong>${names} 的隧道没有在运行</strong><br>
+    对应服务器上的代理只是写进了 frpc.toml，还没注册到服务端，公网暂时访问不到。启动对应隧道后立即生效。
+    <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">${btns}</div>
   </div></div>`;
 }
 
@@ -1143,14 +1168,12 @@ function proxyConnChips(all, current) {
   return `<div class="chips">${parts.join('')}</div>`;
 }
 
-/* 行内的服务器单元格：名字 + 地址，非当前连接标一个淡一点的徽标（那些代理
- * 的健康检查、编辑都发生在它们自己的连接里）。 */
+/* 行内的服务器单元格：平等显示所属服务器名称与地址，不再贴令人困惑的「非当前」徽标。 */
 function proxyConnCell(p) {
   const name = p.connectionName || '';
   if (!name) return '<span class="muted">—</span>';
   const addr = p.connectionAddr ? `<div class="muted mono" style="font-size:10.5px">${esc(p.connectionAddr)}</div>` : '';
-  const tag = p.connectionActive ? '' : '<span class="badge muted" style="font-size:9.5px;padding:1px 6px">非当前</span>';
-  return `<div><span class="conn-name">${esc(name)}</span> ${tag}</div>${addr}`;
+  return `<div><span class="conn-name">${esc(name)}</span></div>${addr}`;
 }
 
 function proxyRowHtml(p) {
@@ -1437,6 +1460,15 @@ function renderLogs(force = false) {
   if (S.logSource === 'server') { renderServerLogsView(); return; }
   const lines = filteredLogs();
   const pathText = (S.state && S.state.paths && S.state.paths.logPath) || '';
+  const conns = connList();
+  const curId = activeConnId();
+  const logConnChips = conns.length > 1
+    ? `<div class="chips" style="margin-bottom:10px">${conns.map((c) => {
+      const rt = c.runtime || {};
+      const dot = rt.connected ? 'ok' : (rt.running ? 'warn' : 'idle');
+      return `<button class="chip${c.id === curId ? ' on' : ''}" type="button" data-act="conn.switch" data-id="${esc(c.id)}" title="查看「${esc(c.name || c.id)}」的 frpc 日志（不会停止任何隧道）"><span class="schip-dot ${dot}"></span>${esc(c.name || c.id)}</button>`;
+    }).join('')}</div>`
+    : '';
   $('#view').innerHTML = `
     <div class="view">
       <div class="page-head">
@@ -1451,6 +1483,8 @@ function renderLogs(force = false) {
           <button class="btn" type="button" data-act="logs.refresh">${icon('reload')}<span>刷新</span></button>
         </div>
       </div>
+
+      ${logConnChips}
 
       <section class="card log-panel">
         <div class="log-head">
@@ -3106,6 +3140,7 @@ function connCardMarkup() {
       <div class="conn-actions">
         <button class="btn" type="button" data-act="conn.edit">${icon('edit')}<span>编辑连接</span></button>
         ${S.server.connected ? `<button class="btn ghost" type="button" data-act="server.disconnect">${icon('x')}<span>断开 SSH</span></button>` : ''}
+        ${connList().length > 1 ? `<button class="btn ghost danger" type="button" data-act="conn.remove" data-id="${esc(conn.id)}" title="删除这台服务器（会先停止它的隧道，保留磁盘配置文件）">${icon('trash')}<span>删除</span></button>` : ''}
       </div>
     </div>
   </section>`;
@@ -3153,11 +3188,18 @@ function openConnectionEditor() {
         <div class="field-hint" id="conn-edit-hint">密码用 Windows DPAPI 加密保存在本机，不会写进 frpc.toml，也不会进日志。</div>
       </form>
       <div class="modal-foot">
-        <span class="mf-left"></span>
+        <span class="mf-left">${connList().length > 1 ? `<button class="btn ghost danger" type="button" id="conn-edit-remove">${icon('trash')}<span>删除服务器</span></button>` : ''}</span>
         <button class="btn" type="button" data-act="modal.close">取消</button>
         <button class="btn primary" type="button" id="conn-edit-save">${icon('check')}<span>保存</span></button>
       </div>
     </div>`);
+  const rmBtn = $('#conn-edit-remove');
+  if (rmBtn) {
+    rmBtn.addEventListener('click', () => {
+      closeModal();
+      handleAction('conn.remove', { id: conn.id }).catch(() => {});
+    });
+  }
   const btn = $('#conn-edit-save');
   if (!btn) return;
   btn.addEventListener('click', async () => {
@@ -5485,7 +5527,7 @@ async function handleAction(act, dataset, btn) {
       const id = dataset && dataset.id ? dataset.id : '';
       const conn = connList().find((c) => c.id === id);
       if (!conn) return;
-      const isRunning = !!(conn.runtime && conn.runtime.connected);
+      const isRunning = connIsRunning(conn);
       /* withBusy 的第一个参数必须是按钮元素且会吞掉返回值，这里直接用 IPC 结果。 */
       const res = isRunning
         ? await FRP.connectionStop(id).catch(() => null)
@@ -5498,14 +5540,62 @@ async function handleAction(act, dataset, btn) {
     case 'conn.edit':
       openConnectionEditor();
       return;
+    case 'conn.manage': {
+      const id = (dataset && dataset.id) || '';
+      const target = connList().find((c) => c.id === id);
+      if (!target) return;
+      if (target.id !== activeConnId()) {
+        const res = await FRP.connectionActive(id).catch(() => null);
+        if (!res || !res.ok) { toast('error', '打开服务器失败', (res && res.error) || '请稍后再试'); return; }
+        await reloadAfterConnectionChange();
+      }
+      setView('server');
+      return;
+    }
+    case 'conn.remove': {
+      const id = (dataset && dataset.id) || '';
+      const list = connList();
+      const target = list.find((c) => c.id === id);
+      if (!target) return;
+      if (list.length <= 1) {
+        toast('warn', '至少保留一台服务器', '只有一台服务器时不能删除；可以在配置文件中清空地址');
+        return;
+      }
+      const proxyCount = Number((target.counts && target.counts.total) || 0);
+      const isRunning = connIsRunning(target);
+      const yes = await confirmDialog({
+        title: `删除服务器「${target.name || target.id}」？`,
+        body: [
+          `<p>将移除「<b>${esc(target.name || target.id)}</b>」的连接记录${isRunning ? '，并立即停止它正在运行的隧道' : ''}。</p>`,
+          proxyCount > 0 ? `<p style="margin-top:6px">该服务器下的 ${proxyCount} 条代理将不再出现在列表里。</p>` : '',
+          '<p style="margin-top:6px;color:var(--muted)">磁盘上的 <code>frpc.toml</code> 文件会保留，服务器上的 <code>frps</code> 与其他正在运行的隧道不受影响。</p>',
+        ].join(''),
+        confirmText: '确认删除',
+        danger: true,
+      });
+      if (!yes) return;
+      /* 后端禁止直接删 active（保留 I5 约束）：删当前查看的那台时，先自动把视图切到另一台。 */
+      if (target.id === activeConnId()) {
+        const fallback = list.find((c) => c.id !== target.id);
+        if (!fallback) return;
+        const sw = await FRP.connectionActive(fallback.id).catch(() => null);
+        if (!sw || !sw.ok) { toast('error', '删除失败', (sw && sw.error) || '无法切换查看目标'); return; }
+      }
+      const res = await FRP.connectionRemove(target.id).catch(() => null);
+      if (!res || !res.ok) { toast('error', '删除失败', (res && res.error) || '请稍后再试'); return; }
+      if (S.proxyConnFilter === target.id) S.proxyConnFilter = '';
+      await reloadAfterConnectionChange();
+      toast('success', '已删除服务器', `${target.name || target.id}（磁盘配置文件已保留）`);
+      return;
+    }
     case 'conn.switch': {
       const id = (dataset && dataset.id) || '';
       const target = connList().find((c) => c.id === id);
       if (!target) return;
+      if (target.id === activeConnId()) return;
       const res = await FRP.connectionActive(id).catch(() => null);
       if (!res || !res.ok) { toast('error', '切换失败', (res && res.error) || '请稍后再试'); return; }
       await reloadAfterConnectionChange();
-      toast('success', '已切换当前连接', target.name || id);
       return;
     }
     case 'tunnel.start': {
@@ -5544,7 +5634,13 @@ async function handleAction(act, dataset, btn) {
         openProxyEditor({ mode: 'add' });
         break;
       case 'proxy.edit': {
-        const proxy = ((S.state && S.state.proxies) || []).find((p) => p.name === dataset.name);
+        const all = (S.state && Array.isArray(S.state.proxiesAll) && S.state.proxiesAll.length)
+          ? S.state.proxiesAll
+          : ((S.state && S.state.proxies) || []);
+        const wantConn = String(dataset.conn || '');
+        const proxy = (wantConn
+          ? all.find((p) => p.name === dataset.name && p.connectionId === wantConn)
+          : null) || all.find((p) => p.name === dataset.name);
         if (proxy) openProxyEditor({ mode: 'edit', proxy });
         break;
       }
@@ -6265,7 +6361,8 @@ async function handleAction(act, dataset, btn) {
         break;
       }
       case 'proxyform.random': {
-        const res = await FRP.randomPort($('#pf-type') ? $('#pf-type').value : 'tcp');
+        const connId = ($('#pf-target') ? $('#pf-target').value : '') || '';
+        const res = await FRP.randomPort($('#pf-type') ? $('#pf-type').value : 'tcp', connId);
         const input = $('#pf-remote');
         if (res && res.ok && res.data.port) {
           if (input) input.value = res.data.port;
@@ -6760,9 +6857,8 @@ function uniqueName(base) {
 }
 
 /* 「目标服务器」= 这条代理要写进哪一条连接的 frpc.toml。数据源是**全部连接**
- * （含已停止、未配置），未配置的选项置灰并说明先去配置；一条连接都没有时给引导。
- * 编辑时锁定：代理存在某条连接的配置文件里，换服务器等于搬走它，先不做。 */
-function targetServerFieldHtml(selectedId, locked) {
+ * （含已停止、未配置），未配置的选项置灰并说明先去配置；新增与编辑均支持自由选择或迁移目标服务器。 */
+function targetServerFieldHtml(selectedId, isEdit) {
   const list = S.state && Array.isArray(S.state.connections) ? S.state.connections : [];
   if (!list.length) {
     return [
@@ -6775,22 +6871,19 @@ function targetServerFieldHtml(selectedId, locked) {
     const configured = !!String(c.serverAddr || '').trim();
     const rt = c.runtime || {};
     const status = !configured ? '未配置' : (rt.connected ? '在线' : (rt.running ? '已启动 · 未连上' : '已停止'));
-    const label = (c.name || c.id) + ' · ' + (configured ? c.serverAddr : '还没有服务器地址') + ' · ' + status + (c.active ? '（当前）' : '');
-    return '<option value="' + esc(c.id) + '"' + (c.id === pick ? ' selected' : '') + (configured ? '' : ' disabled') + '>' + esc(label) + '</option>';
+    const label = (c.name || c.id) + ' · ' + (configured ? c.serverAddr : '还没有服务器地址') + ' · ' + status;
+    return '<option value="' + esc(c.id) + '"' + (c.id === pick ? ' selected' : '') + (configured || c.id === pick ? '' : ' disabled') + '>' + esc(label) + '</option>';
   }).join('');
   const chosen = list.find((c) => c.id === pick) || null;
   const chosenConfigured = !!(chosen && String(chosen.serverAddr || '').trim());
   const hint = chosenConfigured
-    ? '代理会写进这条连接的 frpc.toml；同一台服务器上不能重名。'
-    : '这条连接还没有服务器地址：先在「服务器」页把它连上并配好 frps，再回来加代理。';
-  const ctrl = locked
-    ? '<select class="input" id="pf-target" disabled>' + opts + '</select><input type="hidden" id="pf-target-locked" value="' + esc(pick) + '" />'
-    : '<select class="input" id="pf-target">' + opts + '</select>';
+    ? (isEdit ? '可更换目标服务器：改选后保存会自动把代理迁移到新服务器的 frpc.toml。' : '代理会写进所选服务器的 frpc.toml；同一台服务器上不能重名。')
+    : '这台服务器还没有 frps 地址：先在「服务器」页连上它，程序会自动同步地址与 Token。';
+  const ctrl = '<select class="input" id="pf-target">' + opts + '</select>';
   const guide = list.some((c) => String(c.serverAddr || '').trim())
     ? ''
     : '<div class="page-actions"><button class="btn" type="button" data-act="proxyform.goto.server">' + icon('server') + '<span>前往连接服务器</span></button></div>';
-  const lockNote = locked ? '<div class="field-hint">编辑时不能换服务器；要换请在目标服务器上重新创建这条代理。</div>' : '';
-  return '<div class="input-group">' + ctrl + '</div><div class="field-hint" id="pf-target-hint">' + esc(hint) + '</div>' + lockNote + guide;
+  return '<div class="input-group">' + ctrl + '</div><div class="field-hint" id="pf-target-hint">' + esc(hint) + '</div>' + guide;
 }
 
 /* 把当前「新增代理」表单里的值收成一个草稿：只在跳去签发证书时用（1.2.216）。 */
@@ -6835,7 +6928,15 @@ function openProxyEditor({ mode, proxy = null, preset = null }) {
     pluginKeyPath: current.plugin ? current.plugin.keyPath || '' : '',
     pluginHostHeaderRewrite: current.plugin ? current.plugin.hostHeaderRewrite || '' : '',
     openPath: current.openPath || '',
-    target: (S.state && S.state.activeConnectionId) || '',
+    target: (() => {
+      if (mode === 'edit' && current.connectionId) return current.connectionId;
+      const list = connList();
+      const activeId = (S.state && S.state.activeConnectionId) || '';
+      const activeConn = list.find((c) => c.id === activeId);
+      if (activeConn && String(activeConn.serverAddr || '').trim()) return activeConn.id;
+      const firstConfigured = list.find((c) => String(c.serverAddr || '').trim());
+      return (firstConfigured && firstConfigured.id) || activeId;
+    })(),
   };
   const draft = mode === 'add' && S.proxyDraft ? S.proxyDraft : null;
   if (draft) {
@@ -6852,7 +6953,7 @@ function openProxyEditor({ mode, proxy = null, preset = null }) {
     if (!initial.pluginHostHeaderRewrite) initial.pluginHostHeaderRewrite = draft.pluginHostHeaderRewrite || '';
     if (draft.type) initial.type = draft.type;
   }
-  S.proxyEdit = { mode, originalName: current.name || '' };
+  S.proxyEdit = { mode, originalName: current.name || '', originalConnectionId: mode === 'edit' ? (current.connectionId || initial.target) : '' };
   const types = ['tcp', 'udp', 'http', 'https'];
   if (!types.includes(initial.type)) types.push(initial.type);
 
@@ -6976,6 +7077,24 @@ function openProxyEditor({ mode, proxy = null, preset = null }) {
       suggestRemotePort(initial.type);
     }
   }
+  const targetSelect = $('#pf-target');
+  if (targetSelect) {
+    targetSelect.addEventListener('change', () => {
+      const hintEl = $('#pf-target-hint');
+      if (!hintEl) return;
+      const picked = connList().find((c) => c.id === targetSelect.value) || null;
+      const configured = !!(picked && String(picked.serverAddr || '').trim());
+      if (!configured) {
+        hintEl.textContent = '这台服务器还没有 frps 地址：先在「服务器」页连上它，程序会自动同步地址与 Token。';
+      } else if (mode === 'edit' && S.proxyEdit.originalConnectionId && targetSelect.value !== S.proxyEdit.originalConnectionId) {
+        hintEl.textContent = `保存后会把这条代理迁移到「${picked.name || picked.id}」的 frpc.toml，并从原服务器移除。`;
+      } else {
+        hintEl.textContent = mode === 'edit'
+          ? '可更换目标服务器：改选后保存会自动把代理迁移到新服务器的 frpc.toml。'
+          : '代理会写进所选服务器的 frpc.toml；同一台服务器上不能重名。';
+      }
+    });
+  }
   const domainsInput = $('#pf-domains');
   if (domainsInput) {
     let readyTimer = null;
@@ -7002,7 +7121,8 @@ async function refreshServerSummarySilently() {
 }
 
 async function suggestRemotePort(type) {
-  const res = await FRP.suggestPort(type);
+  const connId = ($('#pf-target') ? $('#pf-target').value : '') || '';
+  const res = await FRP.suggestPort(type, connId);
   const input = $('#pf-remote');
   if (res && res.ok && res.data.port) {
     if (input && !input.value) input.value = res.data.port;
@@ -7208,9 +7328,9 @@ async function submitProxyForm(form, mode) {
   const pluginKeyPath = ($('#pf-plugin-key') ? $('#pf-plugin-key').value : '').trim();
   const pluginHostHeaderRewrite = ($('#pf-plugin-host') ? $('#pf-plugin-host').value : '').trim();
   const openPathRaw = ($('#pf-openpath') ? $('#pf-openpath').value : '').trim();
-  /* 目标连接：编辑时用锁定值（隐藏域），新增时读下拉。空串 = 当前连接。 */
-  const targetLockedEl = $('#pf-target-locked');
-  const connectionId = targetLockedEl ? targetLockedEl.value : ($('#pf-target') ? $('#pf-target').value : '');
+  /* 目标连接：新增与编辑均可直接从下拉选择目标服务器；编辑时带原连接 id 以支持跨服务器迁移。 */
+  const connectionId = $('#pf-target') ? $('#pf-target').value : '';
+  const originalConnectionId = mode === 'edit' ? (S.proxyEdit.originalConnectionId || '') : '';
 
   if (!name) return showError('请填写代理名称');
   if (!/^[A-Za-z0-9_.-]+$/.test(name)) return showError('名称建议只包含字母、数字、点、下划线或短横线');
@@ -7249,7 +7369,7 @@ async function submitProxyForm(form, mode) {
   }
   let res;
   try {
-    res = await FRP.saveProxy(mode, mode === 'edit' ? S.proxyEdit.originalName : '', input, connectionId);
+    res = await FRP.saveProxy(mode, mode === 'edit' ? S.proxyEdit.originalName : '', input, connectionId, originalConnectionId);
   } catch (error) {
     /* IPC 直接把异常抛过来时（比如写盘失败、主进程崩溃），
      * 以前这里会静默 reject：按钮一直转、界面毫无反应。 */
@@ -7273,10 +7393,14 @@ async function submitProxyForm(form, mode) {
   closeModal();
   // 隧道没运行时不会真的热重载（没有管理 API），别在这种时候说“已热重载”。
   const reloaded = !!(res.data && res.data.reloaded);
+  const migratedFrom = (res.data && res.data.migratedFrom) || '';
+  const targetName = (res.data && res.data.connectionName) || '';
   toast(
     'success',
-    mode === 'edit' ? '代理已更新' : '代理已创建',
-    `${name} · 配置已写入${res.data && res.data.connectionName ? '「' + res.data.connectionName + '」' : ''}${reloaded ? '并已热重载' : '，隧道启动后生效'}`,
+    migratedFrom ? '代理已迁移并保存' : (mode === 'edit' ? '代理已更新' : '代理已创建'),
+    migratedFrom
+      ? `${name} · 已从「${migratedFrom}」迁移到「${targetName}」${reloaded ? '并已热重载' : '，隧道启动后生效'}`
+      : `${name} · 配置已写入${targetName ? '「' + targetName + '」' : ''}${reloaded ? '并已热重载' : '，隧道启动后生效'}`,
   );
   const warnings = (res.data && res.data.warnings) || [];
   if (warnings.length) toast('warn', '代理已保存，但请注意', warnings[0]);
@@ -7757,17 +7881,6 @@ function bindStaticEvents() {
   }
 }
 
-
-/* 侧栏连接下拉：change 不走 data-act（select 不是按钮） */
-document.addEventListener('change', (ev) => {
-  const el = ev.target;
-  if (!el || el.id !== 'conn-select') return;
-  const id = String(el.value || '');
-  if (!id) return;
-  const target = connList().find((c) => c.id === id);
-  if (!target || target.id === activeConnId()) return;
-  handleAction('conn.switch', { dataset: { id } }).catch(() => {});
-});
 
 async function boot() {
   bindStaticEvents();
