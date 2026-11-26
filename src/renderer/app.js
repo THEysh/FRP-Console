@@ -1466,7 +1466,8 @@ function remoteLogsMarkup(st) {
   if (st.error) {
     return `<div class="log-empty">
       <span>读取失败：${esc(st.error)}</span>
-      <div style="margin-top:10px;display:flex;gap:8px">
+      <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;justify-content:center">
+        ${st.needsTrustHost ? `<button class="btn primary small" type="button" data-act="logs.server.trust" data-conn="${esc(st.connId)}">${icon('shield')}<span>信任新指纹</span></button>` : ''}
         <button class="btn small" type="button" data-act="logs.server.refresh">${icon('reload')}<span>重试</span></button>
         <button class="btn small ghost" type="button" data-act="goto.server">${icon('server')}<span>去服务器页检查</span></button>
       </div>
@@ -1570,6 +1571,7 @@ async function loadRemoteServerLogs(connId, { force = false, password = '', reme
       source: cached.source,
       error: '',
       needsPassword: false,
+      needsTrustHost: null,
       loading: false,
     };
     if (S.view === 'logs' && S.logSource === 'server') renderLogs(true);
@@ -1584,6 +1586,7 @@ async function loadRemoteServerLogs(connId, { force = false, password = '', reme
     username: target.username || 'root',
     error: '',
     needsPassword: false,
+    needsTrustHost: null,
     loading: true,
   };
   if (S.view === 'logs' && S.logSource === 'server') renderLogs(true);
@@ -1596,6 +1599,7 @@ async function loadRemoteServerLogs(connId, { force = false, password = '', reme
     S.remoteLogs.host = res.data.host || S.remoteLogs.host;
     S.remoteLogs.error = '';
     S.remoteLogs.needsPassword = false;
+    S.remoteLogs.needsTrustHost = null;
     S.remoteLogCache[connId] = { at: Date.now(), content: S.remoteLogs.content, source: S.remoteLogs.source, host: S.remoteLogs.host };
     if (password && remember) {
       const ref = await FRP.refresh().catch(() => null);
@@ -1604,6 +1608,7 @@ async function loadRemoteServerLogs(connId, { force = false, password = '', reme
   } else {
     S.remoteLogs.content = '';
     S.remoteLogs.needsPassword = !!(res && res.needsPassword);
+    S.remoteLogs.needsTrustHost = (res && res.needsTrustHost) || null;
     S.remoteLogs.error = S.remoteLogs.needsPassword ? '' : ((res && res.error) || '读取服务器日志失败');
   }
   if (S.view === 'logs' && S.logSource === 'server') renderLogs(true);
@@ -3684,8 +3689,8 @@ async function autoConnectActiveProfile() {
         serverId: active.id,
       });
       if (res && res.ok) break;
-      // 需要人工介入（密码失效 / 地址与档案不一致）的错误重试也没意义
-      if (res && (res.needsPassword || res.needsDecision)) break;
+      // 需要人工介入（密码失效 / 地址与档案不一致 / 主机指纹变化）的错误重试也没意义
+      if (res && (res.needsPassword || res.needsDecision || res.needsTrustHost)) break;
       // 开机那几秒 SSH 偶尔会失败一次（网络栈还没起来 / sshd 还在加载），等 1.5 秒再来一遍
       if (attempt === 0) await new Promise((r) => setTimeout(r, 1500));
     }
@@ -3698,6 +3703,16 @@ async function autoConnectActiveProfile() {
       return;
     }
     if (!res || !res.ok) {
+      if (res && res.needsTrustHost) {
+        const info = res.needsTrustHost;
+        askTrustHost(info, async () => {
+          const trusted = await FRP.serverTrustHost({ host: info.host, port: info.port, fingerprint: info.fingerprint });
+          if (!trusted || !trusted.ok) { toastResult(trusted); return; }
+          toast('success', '已信任新指纹', `${info.host}:${info.port || 22}`);
+          autoConnectActiveProfile().catch(() => {});
+        });
+        return;
+      }
       // 保存的密码失效（服务器改过密码）时退回表单，让用户补一次。
       if (res && res.needsPassword) toast('info', '需要手动输入密码', `「${active.name}」保存的密码已不可用`);
       else toastResult(res);
@@ -4106,28 +4121,28 @@ function connectedFormMarkup() {
 
 /* 主机指纹变了：把「上次 / 现在」两个指纹摊给用户，让他自己决定要不要信任。
  * 这一步不能自动放行 —— 换机器是正常情况，中间人劫持也是这个表现。 */
-function askTrustHost(info, onTrust) {
+async function askTrustHost(info, onTrust) {
   const body = [
-    `这台机器（${esc(info.host)}:${esc(String(info.port || 22))}）出示的主机密钥和上次记录的不一样。`,
+    `这台机器（<code>${esc(info.host)}:${esc(String(info.port || 22))}</code>）出示的主机密钥和上次记录的不一样。`,
     '',
-    `上次：${esc(info.previous || '（无记录）')}`,
-    `现在：${esc(info.fingerprint)}`,
+    `上次：<code>${esc(info.previous || '（无记录）')}</code>`,
+    `现在：<code>${esc(info.fingerprint)}</code>`,
     '',
-    '换系统、重装 SSH、换机器都会导致这个变化；也可能是有人劫持了这台机器的 SSH 端口（中间人）。',
+    '换系统、重装 SSH、换机器都会导致这个变化；但也可能是有人劫持了这台机器的 SSH 端口（中间人）。',
     '确认是你自己的改动之后再信任，否则先别连。',
     '',
-    '怎么核对（在你自己能确认身份的地方执行，不要用这个连不上的机器）：',
-    `① 在服务器本机：ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub（或 ssh_host_rsa_key.pub）`,
-    '② 或在另一台已信任它的机器上：ssh-keyscan -t ed25519 <这台机器的地址> | ssh-keygen -lf -',
-    '两条输出都是 SHA256:… 的形式，必须和上面「现在」那一串一字不差。',
-  ].join('\n');
-  confirmDialog({
+    '怎么核对（在你自己能确认身份的地方执行）：',
+    '① 在服务器本机：<code>ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub</code>（或 <code>ssh_host_rsa_key.pub</code>）',
+    '② 或在另一台已信任它的机器上：<code>ssh-keyscan -t ed25519 &lt;地址&gt; | ssh-keygen -lf -</code>',
+    '输出的 <code>SHA256:…</code> 必须和上面「现在」那一串一字不差。',
+  ].join('<br>');
+  const okTrust = await confirmDialog({
     title: '主机密钥变了',
     body,
-    confirmText: '信任新指纹并连接',
+    confirmText: '信任新指纹并继续',
     danger: true,
-    onConfirm: () => onTrust(),
   });
+  if (okTrust && typeof onTrust === 'function') await onTrust();
 }
 
 async function connectServer(btn, options = undefined) {
@@ -4910,8 +4925,10 @@ function certOverviewHtml() {
           <span>本机库</span><span class="chip-count">${local.length}</span>
         </button>
         ${chipList.map((s) => {
-          const dotCls = s.ok ? 'ok' : (s.needsPassword || s.error ? 'warn' : 'idle');
-          const countText = s.ok ? String((s.certs || []).length) : (s.needsPassword ? '需密码' : (s.error ? '失败' : '…'));
+          const dotCls = s.ok ? 'ok' : (s.needsPassword || s.needsTrustHost || s.error ? 'warn' : 'idle');
+          const countText = s.ok
+            ? String((s.certs || []).length)
+            : (s.needsTrustHost ? '指纹变了' : (s.needsPassword ? '需密码' : (s.error ? '失败' : '…')));
           const tip = s.ok
             ? `${s.name}（${s.host}）：${(s.certs || []).length} 张证书${s.cached ? '（60 秒缓存）' : ''}`
             : (s.error || `${s.name}（${s.host}）扫描中`);
@@ -4924,7 +4941,7 @@ function certOverviewHtml() {
       </div>`
     : '';
 
-  /* 扫描摘要与非阻塞提示（未存密码或扫描失败的服务器，就地补输入密码或重试） */
+  /* 扫描摘要与非阻塞提示（未存密码、指纹变更或扫描失败的服务器，就地补操作或重试） */
   const okServers = servers.filter((s) => s.ok);
   const failedServers = servers.filter((s) => !s.ok && !s.skipped);
   const scanLine = !configured.length
@@ -4947,9 +4964,14 @@ function certOverviewHtml() {
             <div style="flex:1;min-width:0">
               <strong>${esc(s.name || s.host)}</strong>${s.host ? ` <span class="mono" style="opacity:.75">(${esc(s.host)})</span>` : ''}：${esc(s.error || '扫描失败')}
             </div>
-            ${s.needsPassword
-              ? `<button class="btn small" type="button" data-act="certs.server.auth.open" data-conn="${esc(s.connectionId)}">${icon('shield')}<span>输入密码扫描</span></button>`
-              : `<button class="btn small" type="button" data-act="certs.server.retry" data-conn="${esc(s.connectionId)}">${icon('reload')}<span>重试</span></button>`}
+            <div style="display:flex;gap:6px;flex-shrink:0">
+              ${s.needsTrustHost
+                ? `<button class="btn primary small" type="button" data-act="certs.server.trust" data-conn="${esc(s.connectionId)}">${icon('shield')}<span>信任新指纹</span></button>`
+                : ''}
+              ${s.needsPassword
+                ? `<button class="btn small" type="button" data-act="certs.server.auth.open" data-conn="${esc(s.connectionId)}">${icon('shield')}<span>输入密码扫描</span></button>`
+                : `<button class="btn small" type="button" data-act="certs.server.retry" data-conn="${esc(s.connectionId)}">${icon('reload')}<span>重试</span></button>`}
+            </div>
           </div>`).join('')}
       </div>`
     : '';
@@ -6476,6 +6498,18 @@ async function handleAction(act, dataset, btn) {
         await loadRemoteServerLogs(connId, { force: true, password: pw, remember });
         break;
       }
+      case 'logs.server.trust': {
+        const connId = String((dataset && dataset.conn) || (S.remoteLogs && S.remoteLogs.connId) || '').trim();
+        const info = S.remoteLogs && S.remoteLogs.needsTrustHost;
+        if (!info || !info.fingerprint) { toast('warn', '缺少指纹信息', '请点「重试」重新获取'); break; }
+        await askTrustHost(info, async () => {
+          const trusted = await FRP.serverTrustHost({ host: info.host, port: info.port, fingerprint: info.fingerprint });
+          if (!trusted || !trusted.ok) { toastResult(trusted); return; }
+          toast('success', '已信任新指纹', `${info.host}:${info.port || 22}`);
+          await loadRemoteServerLogs(connId, { force: true });
+        });
+        break;
+      }
       case 'logs.server.refresh': {
         const connId = (S.remoteLogs && S.remoteLogs.connId) || activeConnId();
         if (connId) await loadRemoteServerLogs(connId, { force: true });
@@ -6827,6 +6861,25 @@ async function handleAction(act, dataset, btn) {
         } else {
           toast('error', '重试失败', (res && res.error) || '扫描失败');
         }
+        break;
+      }
+      case 'certs.server.trust': {
+        const connId = String((dataset && dataset.conn) || '').trim();
+        const srv = (S.certs.server && Array.isArray(S.certs.server.servers) ? S.certs.server.servers : [])
+          .find((s) => s.connectionId === connId);
+        const info = srv && srv.needsTrustHost;
+        if (!info || !info.fingerprint) { toast('warn', '缺少指纹信息', '请点「重试」重新获取'); break; }
+        await askTrustHost(info, async () => {
+          const trusted = await FRP.serverTrustHost({ host: info.host, port: info.port, fingerprint: info.fingerprint });
+          if (!trusted || !trusted.ok) { toastResult(trusted); return; }
+          toast('success', '已信任新指纹', `${info.host}:${info.port || 22}`);
+          const res = await loadServerCerts({ force: true, connectionId: connId });
+          if (res && res.ok) {
+            toast('ok', '扫描完成', `${res.name || res.host} 上找到 ${(res.certs || []).length} 张证书`);
+          } else {
+            toast('error', '扫描失败', (res && res.error) || '扫描失败');
+          }
+        });
         break;
       }
       case 'cert.import': {

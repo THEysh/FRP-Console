@@ -4902,8 +4902,9 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '', exclud
     const port = Number(payload && payload.port) || 22;
     const fingerprint = String((payload && payload.fingerprint) || '').trim();
     if (!host) return fail('缺少主机地址');
-    if (!/^SHA256:[A-Za-z0-9+/]+$/.test(fingerprint)) return fail('指纹格式不对（应为 SHA256:…）');
+    if (!/^SHA256:[A-Za-z0-9+/]+=*$/.test(fingerprint)) return fail('指纹格式不对（应为 SHA256:…）');
     knownHosts.trust(host, port, fingerprint);
+    invalidateCertScanCache(host, port);
     console.log(`[ssh] 用户确认信任 ${host}:${port} 的新指纹 ${fingerprint}`);
     return ok({ host, port, fingerprint, hosts: knownHosts.list() });
   });
