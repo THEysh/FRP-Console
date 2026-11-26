@@ -1191,7 +1191,11 @@ function renderDiscovery(force = false) {
   S.lastKeys.discovery = 'rendered';
   const listeners = S.listeners || [];
   const scopeFilter = S.discoveryScope || '';
-  const visible = scopeFilter ? listeners.filter((l) => (l.scopes || (l.loopbackOnly ? ['loopback'] : [])).includes(scopeFilter)) : listeners;
+  const riskOnly = !!S.discoveryRiskOnly;
+  const byScope = scopeFilter ? listeners.filter((l) => (l.scopes || (l.loopbackOnly ? ['loopback'] : [])).includes(scopeFilter)) : listeners;
+  /* 「只看高危」叠加在分类上：先按分类筛，再按风险筛（1.2.213）。 */
+  const visible = riskOnly ? byScope.filter((l) => l.risk && l.risk.level === 'danger') : byScope;
+  const riskyCount = listeners.filter((l) => l.risk && l.risk.level === 'danger').length;
   const scopeCounts = { loopback: 0, all: 0, docker: 0, lan: 0, public: 0, other: 0 };
   listeners.forEach((l) => {
     const scopes = l.scopes || (l.loopbackOnly ? ['loopback'] : []);
@@ -1218,6 +1222,7 @@ function renderDiscovery(force = false) {
         ${listeners.length
           ? `<div class="seg" id="discovery-scope" style="margin:0 16px 12px">
               ${[['', '全部'], ['loopback', '回环'], ['all', '全网'], ['docker', 'Docker'], ['lan', '内网'], ['public', '公网']].map(([key, label]) => `<button type="button" data-act="listeners.scope" data-scope="${key}" class="${scopeFilter === key ? 'active' : ''}">${label}${key ? ` ${scopeCounts[key] || 0}` : ''}</button>`).join('')}
+              ${riskyCount ? `<button type="button" data-act="listeners.risk" class="${riskOnly ? 'active' : ''}" title="只看高危端口（RPC / NetBIOS / SMB / 远程桌面 / 数据库 / Redis 等）">只看高危 ${riskyCount}</button>` : ''}
             </div>`
           : ''}
         ${S.listenersError && listeners.length ? `<div class="note warn" style="margin:0 16px 12px">${icon('alert')}<div>有一部分端口的进程名读不出来：${esc(S.listenersError)}</div></div>` : ''}
@@ -5408,6 +5413,10 @@ async function handleAction(act, dataset, btn) {
         break;
       case 'listeners.scope':
         S.discoveryScope = dataset.scope || '';
+        renderDiscovery(true);
+        break;
+      case 'listeners.risk':
+        S.discoveryRiskOnly = !S.discoveryRiskOnly;
         renderDiscovery(true);
         break;
       case 'listener.publish': {
