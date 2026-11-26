@@ -1481,11 +1481,21 @@ function remoteLogsMarkup(st) {
   if (!shown.length) {
     return `<div class="log-empty"><span>${st.errorsOnly ? '没有警告或错误级别的日志' : '日志为空'}</span></div>`;
   }
-  return `<div class="log-body" id="log-body">${shown.map((item) => `<div class="log-line ${esc(item.level || 'info')}">
-    <span class="lt">${esc(item.time || '')}</span>
-    <span class="lv">${esc((item.level || 'info').slice(0, 3).toUpperCase())}</span>
-    <span class="ltx" title="${esc(item.raw || item.text || '')}">${esc(item.text || item.raw || '')}</span>
-  </div>`).join('')}</div>`;
+  const lvLabel = { info: 'INFO', warn: 'WARN', error: 'ERR', debug: 'DBG' };
+  return `
+    <div class="log-chips" style="padding:0 14px">
+      <span>${icon('clock')}启动：${esc(parsed.stats.start || '未识别')}</span>
+      <span>${icon('link')}客户端连接：${parsed.stats.logins}</span>
+      <span class="${parsed.stats.errors ? 'bad' : ''}">${icon('alert')}错误：${parsed.stats.errors}</span>
+    </div>
+    <div class="log-rows" style="margin:0 14px 12px;max-height:calc(100vh - 280px)">
+      ${shown.map((item) => `
+        <div class="log-row ${esc(item.level || 'info')}">
+          <span class="lr-time">${esc((item.time || '—').replace(/^\d{4}[-/]\d{2}[-/]\d{2}[ T]/, '').slice(0, 8))}</span>
+          <span class="lr-level">${esc(lvLabel[item.level] || 'INFO')}</span>
+          <span class="lr-body" title="${esc(item.body || '')}">${esc(item.body || '')}</span>
+        </div>`).join('')}
+    </div>`;
 }
 
 function renderServerLogsView() {

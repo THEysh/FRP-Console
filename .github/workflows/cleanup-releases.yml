@@ -1,0 +1,62 @@
+name: cleanup-releases
+
+# 手动触发：清理仓库历史 Release（含已删 tag 留下的草稿 / untagged 记录）与多余旧 tag，仅保留指定版本。
+on:
+  workflow_dispatch:
+    inputs:
+      keep_tag:
+        description: '要保留的唯一版本标签（如 v1.2.236）'
+        required: true
+        default: 'v1.2.236'
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 清理旧 Releases 与 Tags
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const keepTag = String(core.getInput('keep_tag') || '').trim();
+            if (!keepTag) core.setFailed('keep_tag 不能为空');
+
+            const releases = await github.paginate(github.rest.repos.listReleases, {
+              owner,
+              repo,
+              per_page: 100,
+            });
+            const hasKeep = releases.some((r) => r.tag_name === keepTag && !r.draft);
+            if (!hasKeep) {
+              core.setFailed(`未找到已发布的 ${keepTag}，为避免误删全部版本已中止`);
+              return;
+            }
+
+            let deletedReleases = 0;
+            for (const rel of releases) {
+              if (rel.tag_name === keepTag && !rel.draft) continue;
+              await github.rest.repos.deleteRelease({ owner, repo, release_id: rel.id });
+              deletedReleases += 1;
+            }
+
+            const tags = await github.paginate(github.rest.repos.listTags, {
+              owner,
+              repo,
+              per_page: 100,
+            });
+            let deletedTags = 0;
+            for (const t of tags) {
+              if (t.name === keepTag) continue;
+              try {
+                await github.rest.git.deleteRef({ owner, repo, ref: `tags/${t.name}` });
+                deletedTags += 1;
+              } catch (e) {
+                core.warning(`删除 tag ${t.name} 失败：${e.message}`);
+              }
+            }
+
+            core.info(`清理完成：删除 ${deletedReleases} 条旧 Release，删除 ${deletedTags} 个旧 Tag，仅保留 ${keepTag}`);
