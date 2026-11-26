@@ -1855,3 +1855,62 @@ label .icon-btn svg { width: 13px; height: 13px; }
   display: flex;
   gap: 8px;
 }
+
+/* 服务器页两栏（1.2.226）：左栏常驻服务器列表，右栏详情。
+ * 宽屏隐藏顶部 chips 行（它的「当前查看：…」提示保留），窄屏隐藏左栏、退回 chips。 */
+.server-layout {
+  display: grid;
+  grid-template-columns: 236px minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+.server-list {
+  position: sticky;
+  top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px;
+  border-radius: 12px;
+  background: rgba(15, 23, 36, 0.6);
+  border: 1px solid rgba(148, 163, 184, 0.16);
+}
+.sl-item {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  width: 100%;
+  text-align: left;
+  padding: 8px 10px;
+  border-radius: 9px;
+  background: transparent;
+  border: 1px solid transparent;
+  color: inherit;
+  cursor: pointer;
+}
+.sl-item:hover { background: rgba(90, 209, 255, 0.08); }
+.sl-item.on { background: rgba(90, 209, 255, 0.12); border-color: rgba(90, 209, 255, 0.35); }
+.sl-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: rgba(148, 163, 184, 0.5);
+  margin-top: 5px;
+  flex: 0 0 auto;
+}
+.sl-dot.ok { background: #3ddc97; box-shadow: 0 0 6px rgba(61, 220, 151, 0.55); }
+.sl-dot.warn { background: #f5b64a; }
+.sl-body { display: flex; flex-direction: column; min-width: 0; }
+.sl-name { font-size: 13px; color: #e6eef8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sl-addr { font-size: 11px; color: #8fa3ba; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sl-addr.unset { color: #c08a4a; }
+.sl-add { margin-top: 4px; justify-content: center; }
+.sl-empty { font-size: 12px; color: #8fa3ba; padding: 6px 4px; }
+
+@media (max-width: 1180px) {
+  .server-layout { display: block; }
+  .server-list { display: none; }
+}
+@media (min-width: 1181px) {
+  .server-chips { display: none; }
+}

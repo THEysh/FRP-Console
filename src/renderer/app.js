@@ -2812,6 +2812,9 @@ function renderServer(force = false) {
       </div>
 
       ${serverConnBar()}
+      <div class="server-layout">
+        ${serverListMarkup()}
+        <div class="server-main">
       ${connCardMarkup()}
 
       <section class="card server-status-card ${status.key}">
@@ -2891,6 +2894,8 @@ function renderServer(force = false) {
           </div>
           <div class="server-proxy-list" id="server-proxies">${serverProxyRows()}</div>
         </section>
+      </div>
+        </div>
       </div>
     </div>`;
 
@@ -2979,6 +2984,34 @@ function tunnelDiff(active, tunnel) {
   return rows;
 }
 
+/* 服务器页左侧常驻列表（1.2.226）：任何时候都能看到「我有哪几台」，底部就地新增。
+ * 宽屏显示为左栏；窄屏由 CSS 隐藏，退回顶部 chips（serverConnBar）。
+ * 行里只放名字 + 地址 + 状态点：在线数在右侧指标卡里，列表保持干净（用户 1.2.226 定了）。 */
+function serverListMarkup() {
+  const st = S.state || {};
+  const list = Array.isArray(st.connections) ? st.connections : [];
+  const activeId = st.activeConnectionId || '';
+  const addBtn = '<button class="btn small ghost sl-add" type="button" data-act="conn.add" title="再加一台服务器（连另一台 frps）">' + icon('plus') + '<span>再连一台</span></button>';
+  if (!list.length) {
+    return '<aside class="server-list"><div class="sl-empty">还没有连接任何服务器</div>' + addBtn + '</aside>';
+  }
+  const rows = list.map((c) => {
+    const rt = c.runtime || {};
+    const dot = rt.connected ? 'ok' : (rt.running ? 'warn' : 'idle');
+    const host = String(c.host || '');
+    const addr = host ? `${host}:${c.port || 22}` : '未配置';
+    const tip = [
+      host ? `SSH ${c.username || 'root'}@${host}:${c.port || 22}` : '还没填 SSH 地址',
+      rt.connected ? '隧道已连接' : (rt.running ? '隧道运行中（还没连上）' : '隧道未运行'),
+      c.counts && c.counts.total ? `在线 ${c.counts.online}/${c.counts.total}` : '暂无代理',
+    ].join(' · ');
+    return `<button class="sl-item${c.id === activeId ? ' on' : ''}" type="button" data-act="server.conn.switch" data-conn="${esc(c.id)}" title="${esc(tip)}">
+      <span class="sl-dot ${dot}"></span>
+      <span class="sl-body"><span class="sl-name">${esc(c.name || c.id)}</span><span class="sl-addr${host ? '' : ' unset'}">${esc(addr)}</span></span>
+    </button>`;
+  }).join('');
+  return `<aside class="server-list">${rows}${addBtn}</aside>`;
+}
 /* 服务器页顶部的「连接」chips：一条连接 = 一台服务器（自己的 frpc.toml、管理端口、日志）。
  * 点标签 = 切换「当前连接」；切换会先停掉正在跑的隧道（每条连接各自一个 frpc，带着旧隧道
  * 换目标会让配置、健康检查、日志都错位），所以有隧道在跑时先确认一次。 */
@@ -3819,6 +3852,9 @@ function connectedFormMarkup() {
         </div>
       </div>
       ${serverConnBar()}
+      <div class="server-layout">
+        ${serverListMarkup()}
+        <div class="server-main">
       ${connCardMarkup()}
       <section class="card">
         <div class="card-head">
@@ -3859,6 +3895,8 @@ function connectedFormMarkup() {
         </div>
       </section>
       <div class="note">${icon('shield')}<div>连接后按顺序走：检查 frps 是否在跑 → 需要时一键从零初始化 → 保存配置并重启 → 做一次「服务器就绪检查」。都绿了再去代理映射添加隧道。</div></div>
+        </div>
+      </div>
     </div>`;
 }
 

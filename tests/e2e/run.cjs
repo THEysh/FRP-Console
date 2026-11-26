@@ -182,6 +182,8 @@ async function main() {
         cdpPort,
         ready,
         eval: (expr) => cdp.evalIn(cdpPort, expr),
+        /* 独立实例自己的视口模拟（ctx.emulate 只作用于主实例，1.2.226 修）。 */
+        emulate: (w, h) => cdp.emulateViewport(cdpPort, w, h),
         stop: () => inst.stop(),
         log: () => {
           try {
