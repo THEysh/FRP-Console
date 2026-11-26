@@ -581,7 +581,7 @@ function otherConnectionsOnline() {
   for (const conn of list) {
     if (conn.id === settings.activeConnectionId) continue;
     if (conn.enabled === false) continue;
-    const mm = multiConnection.extraManagers.get(conn.id);
+    const mm = managersMap().get(conn.id);
     if (!mm) continue;
     const snap = mm.snapshot();
     if (!snap || !snap.connected || snap.foreign) continue;
@@ -1413,6 +1413,12 @@ function rememberConnectionTarget(connId, target) {
     ) || null;
   }
 
+/* I1：managers 是「每条连接一个 FrpcManager」的唯一真相，当前连接也在表里。
+ * 顶层的 `manager` 只是「当前连接」这个指针，不再拥有生命周期语义。 */
+function managersMap() {
+  return (multiConnection && multiConnection.managers) || new Map();
+}
+
 function connectionPaths(conn) {
   return {
     frpcPath: paths.frpcPath,
@@ -1489,10 +1495,14 @@ function ensureAdminForConnection(conn) {
 function managerForConnection(connId) {
   const conn = connectionById(connId);
   if (!conn) return null;
-  if (conn.id === settings.activeConnectionId) return manager;
-  const store = multiConnection && multiConnection.extraManagers;
-  if (!store) return null;
-  if (store.has(conn.id)) return store.get(conn.id);
+  /* 运行期容器还没建好（极早期 IPC）：宁可回答「没准备好」，
+   * 也不要在临时表里造一个没人接管的管理器。 */
+  if (!multiConnection) return null;
+  /* 先查表：当前连接的管理器也在表里，命中就直接返回，
+   * 不再有「active 走全局变量、其它走 Map」两套路径。 */
+  const store = managersMap();
+  const hit = store.get(conn.id);
+  if (hit) return hit;
   const created = new FrpcManager({
     getSettings: () => ({ ...settings, adminPort: Number(conn.adminPort) || settings.adminPort }),
     getPaths: () => connectionPaths(conn),
@@ -1585,7 +1595,7 @@ function connectionAggregate() {
 function connectionCounts(conn) {
   const isActive = conn.id === settings.activeConnectionId;
   const connModel = isActive ? model : connectionModel(conn);
-  const mm = isActive ? manager : (multiConnection && multiConnection.extraManagers.get(conn.id));
+  const mm = managersMap().get(conn.id);
   const statuses = (mm && mm.proxyStatus) || new Map();
   const list = (connModel && connModel.proxies) || [];
   let online = 0;
@@ -1601,7 +1611,7 @@ function connectionCounts(conn) {
 
 /* 一条连接的对外摘要（给界面/诊断用，不含配置内容与 token）。 */
 function connectionSummary(conn) {
-  const mm = conn.id === settings.activeConnectionId ? manager : (multiConnection && multiConnection.extraManagers.get(conn.id));
+  const mm = managersMap().get(conn.id);
   const snap = mm ? mm.snapshot() : null;
   /* apiOk 只说明「frpc 进程活着、管理 API 能答」；frps 挂掉后它照样是 true。
    * 和当前连接同一套判定：配置里有代理、frpc 却一条都没注册 → 隧道其实没通。 */
@@ -1679,7 +1689,7 @@ async function syncParkedConnectionConfigs() {
   if (!multiConnection || !settings || !Array.isArray(settings.connections)) return;
   for (const conn of settings.connections) {
     if (!conn || conn.id === settings.activeConnectionId || !conn.configPath) continue;
-    const mm = multiConnection.extraManagers.get(conn.id);
+    const mm = managersMap().get(conn.id);
     if (!mm) continue;
     if (!mm.isChildAlive && !mm.apiOk) continue;
     let stamp = null;
@@ -1991,7 +2001,7 @@ function allConnectionProxies() {
     let m = null;
     try { m = connectionModel(conn); } catch { m = null; }
     if (!m) continue;
-    const mm = isCur ? manager : (multiConnection && multiConnection.extraManagers.get(conn.id));
+    const mm = managersMap().get(conn.id);
     const snap = mm && mm.snapshot ? mm.snapshot() : null;
     const live = !!(snap && snap.connected);
     for (const proxy of (m.proxies || [])) {
@@ -2973,7 +2983,7 @@ async function checkConnectionHealth(connId, connModel, mm) {
 
 /* 一轮健康检查：把「所有有 frpc 在跑的连接」都过一遍。
  *
- * 当前连接用全局 model 与 manager；其它连接用各自缓存的模型与 extraManagers。
+ * 每条连接用自己的模型与自己的 manager（当前连接只是 extra= 无，见 managersMap()）。
  * 串行跑（而不是 Promise.all）：SSH/本机探测都是 IO，串行能让总耗时可控，
  * 也避免几十条代理同时打满连接数。 */
 async function checkHealth() {
@@ -2986,7 +2996,7 @@ async function checkHealth() {
   }
   for (const conn of list) {
     const isActive = conn.id === activeId;
-    const mm = isActive ? manager : (multiConnection && multiConnection.extraManagers.get(conn.id));
+    const mm = managersMap().get(conn.id);
     const connModel = isActive ? model : connectionModel(conn);
     /* 未启动的连接不必探测：manager 为 undefined 时 checkConnectionHealth 会清掉它的缓存。 */
     await checkConnectionHealth(conn.id, connModel, mm).catch((e) => {
@@ -4153,12 +4163,12 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '' } = {})
     const conn = connectionById(String(connId || ''));
     if (!conn) return fail('连接不存在（可能已被删除）');
     if (conn.id === settings.activeConnectionId) return fail('这是当前连接：先切到另一条连接，再删它');
-    const mm = multiConnection && multiConnection.extraManagers.get(conn.id);
+    const mm = managersMap().get(conn.id);
     if (mm && mm.snapshot().running) await mm.stop({ runMode: 'managed' }).catch(() => {});
     const guard = multiConnection && multiConnection.guards.get(conn.id);
     if (guard) guard.cancel('连接被删除');
     if (multiConnection) {
-      multiConnection.extraManagers.delete(conn.id);
+      managersMap().delete(conn.id);
       multiConnection.guards.delete(conn.id);
       multiConnection.stopRequests.delete(conn.id);
       invalidateConnectionModel(conn.id);
@@ -4187,7 +4197,9 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '' } = {})
       if (manager) await manager.refresh().catch(() => {});
       stopped.push(settings.activeConnectionId);
     }
-    for (const [id, mm] of (multiConnection ? multiConnection.extraManagers : new Map())) {
+    for (const [id, mm] of managersMap()) {
+      /* 当前连接上面已经停过了，这里只管其它连接。 */
+      if (id === settings.activeConnectionId) continue;
       if (!mm || !mm.snapshot().running) continue;
       const guard = multiConnection.guards.get(id);
       if (guard) guard.cancel('切换连接');
@@ -6627,6 +6639,9 @@ async function bootstrap() {
   loadConfigFromDisk();
   /* 运行期容器尽早建好：后面的 refreshPaths() 要 spawn `frpc -v`，被杀软拖慢时
    * 能卡十几秒，这段时间界面不该是「什么都没有 + 启动隧道点不动」。 */
+  /* 一连接一 manager：表先建好，当前连接建完立刻登记，
+   * 这样「建表之前」的空窗期也不会让 managerForConnection 拿到 null。 */
+  const managers = new Map();
   manager = new FrpcManager({
     getSettings: () => settings,
     getPaths: () => paths,
@@ -6695,16 +6710,16 @@ async function bootstrap() {
     if (text.trim()) follower.appendLines(text);
   });
   follower.start();
+  managers.set(settings.activeConnectionId, manager);
   /* ===== 多连接运行期（阶段 2）=====
    * 一条连接 = 一个 FrpcManager。「当前选中」的那条继续用上面的 manager
    *（大量既有代码都通过它工作，包括 IPC、健康检查、托盘），其它连接用
-   * extraManagers 惰性创建，互不干扰。
+   * managers 惰性创建，互不干扰。
    *
    * 关键点：非当前连接没有全局 model，所以它们的 ctx 各自从自己的 frpc.toml
    * 读一份模型（只读缓存），绝不复用当前连接的 model —— 否则两条隧道会拿
    * 对方的代理列表和 token 去连（1.2.138 那类“配置与会话对不上”的翻版）。
    */
-  const extraManagers = new Map();
   const parkedModels = new Map();
   /* 每条非当前连接的配置指纹（mtime+size），用来判断缓存是否过期。 */
   const parkedStamps = new Map();
@@ -6715,7 +6730,8 @@ async function bootstrap() {
    * stop→start 的边界上不可靠（探针里被外面杀掉的进程仍报 intentional:true），
    * 所以额外用时间窗兜一层：刚点过停止就别再当成意外退出。 */
   const stopRequests = new Map();
-  multiConnection = { extraManagers, parkedModels, parkedStamps, appliedStamps, guards, stopRequests };
+  multiConnection = { managers, parkedModels, parkedStamps, appliedStamps, guards, stopRequests };
+  if (manager) managers.set(settings.activeConnectionId, manager);
   ensureClientServerProfile();
   migrateLegacyServerSecret();
   /* 老数据里同一个 IP 可能堆着十几条档案（连接表单每连一次就新建一条）。
@@ -6847,9 +6863,10 @@ async function quitApp({ source = 'user' } = {}) {
   /* 非当前连接的 frpc 也要一起停：它们由 extraManagers 管，上面那段只处理 manager，
    * 漏掉就会留下孤儿进程继续占着管理端口和公网端口（双连接退出时实测复现）。 */
   try {
-    if (multiConnection && multiConnection.extraManagers && multiConnection.extraManagers.size) {
+    if (managersMap().size) {
       const jobs = [];
-      for (const [id, mm] of multiConnection.extraManagers.entries()) {
+      for (const [id, mm] of managersMap().entries()) {
+        if (id === settings.activeConnectionId) continue;
         jobs.push((async () => {
           try {
             multiConnection.stopRequests.set(id, Date.now());
@@ -6972,7 +6989,8 @@ async function prepareUpdateInstall() {
   /* 其它连接（多开）也要停：它们各自的 frpc.exe 同样锁着安装目录里的
    * resources/frpc/frpc.exe，只停当前连接会让安装器 Rename 失败（1.2.163 修的就是这个）。 */
   if (multiConnection) {
-    for (const [id, mm] of multiConnection.extraManagers) {
+    for (const [id, mm] of managersMap()) {
+      if (id === settings.activeConnectionId) continue;
       if (!mm || !mm.snapshot().running) continue;
       try {
         await mm.stop({ runMode: 'managed' });
