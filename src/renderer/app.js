@@ -922,15 +922,15 @@ function renderOverview(force = false) {
           </div>
             <div class="card-pad" style="padding-top:0">
               <div class="detail-list">
-                ${detailRow('服务器', config.serverAddr ? `${config.serverAddr}:${config.serverPort}` : '未配置')}
+                ${detailRow('隧道目标（frps）', config.serverAddr ? `${config.serverAddr}:${config.serverPort}` : '未配置')}
                 ${detailRow('运行模式', modeLabel(info.r.mode))}
                 ${detailRow('认证方式', `${config.auth && config.auth.method || 'token'}${config.auth && config.auth.token ? ' · 已设置' : ' · 未设置'}`, config.auth && config.auth.token ? 'ok' : 'bad')}
                 ${detailRow('管理 API', info.r.adminPort ? `127.0.0.1:${info.r.adminPort}` : '未启用', info.r.connected ? 'ok' : 'bad')}
-                ${detailRow('系统服务', info.service.installed ? `${info.service.name} · ${serviceStateText(info.service.state)}` : '未安装')}
+                ${info.service.installed ? detailRow('系统服务', `${info.service.name} · ${serviceStateText(info.service.state)}`) : ''}
                 ${detailRow('进程 PID', info.r.pid || '—')}
                 ${detailRow('运行时长', app.uptimeLabel || '—')}
                 ${detailRow('frpc 版本', app.frpcVersion || '—')}
-                ${detailRow('管理员权限', app.elevated ? '已提升' : '普通权限', app.elevated ? 'ok' : '')}
+                ${app.elevated ? '' : detailRow('管理员权限', '普通权限（部分操作需要管理员）', '')}
                 ${detailRow('配置文件', state.paths && state.paths.configPath ? state.paths.configPath : '未设置', state.paths && state.paths.configExists ? 'ok' : 'bad', true)}
               </div>
             </div>
