@@ -2814,8 +2814,6 @@ function renderServer(force = false) {
       ${serverConnBar()}
       ${connCardMarkup()}
 
-      ${terminalCardMarkup()}
-
       <section class="card server-status-card ${status.key}">
         <div class="ss-light ${status.key}"></div>
         <div class="ss-main">
@@ -2862,6 +2860,8 @@ function renderServer(force = false) {
       ${nginxCardMarkup()}
 
       ${firewallCardMarkup()}
+
+      ${terminalCardMarkup()}
 
       <div class="srv-section-title">配置管理</div>
 
