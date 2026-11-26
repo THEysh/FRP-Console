@@ -1239,15 +1239,44 @@ function proxyRowHtml(p) {
 
 /* ---------------------------- 服务发现 ---------------------------- */
 
+/* 服务发现搜索框：输入即筛（1.2.221）。列表最多 200 行，重绘足够快；
+ * 重绘后把焦点和光标位置还给输入框，否则每敲一个字就丢焦点。 */
+let discoverySearchBound = false;
+function bindDiscoverySearch() {
+  if (discoverySearchBound) return;
+  discoverySearchBound = true;
+  document.addEventListener('input', (ev) => {
+    if (!ev.target || ev.target.id !== 'discovery-q') return;
+    S.discoveryQuery = String(ev.target.value || '');
+    renderDiscovery(true);
+    const input = document.getElementById('discovery-q');
+    if (input) {
+      input.focus();
+      const end = input.value.length;
+      try { input.setSelectionRange(end, end); } catch { /* 某些浏览器对 number 输入不支持 */ }
+    }
+  });
+}
 function renderDiscovery(force = false) {
+  bindDiscoverySearch();
   if (!force && S.lastKeys.discovery === 'rendered') return;
   S.lastKeys.discovery = 'rendered';
   const listeners = S.listeners || [];
   const scopeFilter = S.discoveryScope || '';
   const riskOnly = !!S.discoveryRiskOnly;
   const byScope = scopeFilter ? listeners.filter((l) => (l.scopes || (l.loopbackOnly ? ['loopback'] : [])).includes(scopeFilter)) : listeners;
-  /* 「只看高危」叠加在分类上：先按分类筛，再按风险筛（1.2.213）。 */
-  const visible = riskOnly ? byScope.filter((l) => l.risk && l.risk.level === 'danger') : byScope;
+  /* 搜索（1.2.221）：端口 / 监听地址 / 进程名 / PID 都能匹配，叠加在分类之上。 */
+  const query = String(S.discoveryQuery || '').trim().toLowerCase();
+  const byQuery = !query
+    ? byScope
+    : byScope.filter((l) =>
+        [String(l.port || ''), l.process || '', (l.hosts || []).join(' '), String(l.pid || '')]
+          .join(' ')
+          .toLowerCase()
+          .includes(query),
+      );
+  /* 「只看高危」叠加在分类与搜索上：先按分类/搜索筛，再按风险筛（1.2.213）。 */
+  const visible = riskOnly ? byQuery.filter((l) => l.risk && l.risk.level === 'danger') : byQuery;
   const riskyCount = listeners.filter((l) => l.risk && l.risk.level === 'danger').length;
   const scopeCounts = { loopback: 0, all: 0, docker: 0, lan: 0, public: 0, other: 0 };
   listeners.forEach((l) => {
@@ -1270,6 +1299,9 @@ function renderDiscovery(force = false) {
       <section class="card table-card">
         <div class="toolbar">
           <div class="card-title">${icon('server', 'ct-icon')}<span>本机监听端口</span></div>
+          ${listeners.length
+            ? `<input class="input" id="discovery-q" style="max-width:260px" placeholder="搜索端口 / 进程名 / 地址" value="${esc(S.discoveryQuery || '')}" spellcheck="false" />`
+            : ''}
           <span class="muted" style="font-size:11px">${listeners.length ? `${visible.length} / ${listeners.length} 个 TCP 监听` : '尚未扫描'}</span>
         </div>
         ${listeners.length
