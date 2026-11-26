@@ -58,8 +58,7 @@ module.exports = {
       check('切换器出现且列出两条', multi.hidden === false && multi.options.length === 2, JSON.stringify(multi.options));
       check('概览出现「隧道连接」卡片', multi.rows === 2 && /隧道连接/.test(multi.agg), multi.agg);
 
-      /* 非当前连接也必须能直接启动：否则「一个客户端同时连两台 frps」在界面上无路可走
-       * （切换会把所有在跑的隧道停掉）。 */
+      /* 非当前连接也必须能直接启动：每条连接各自启停，与是否切换当前视图解耦。 */
       const otherRow = await ev(`(() => {
         const row = [...document.querySelectorAll('.conn-row')].find((r) => !r.classList.contains('active'));
         if (!row) return { missing: true };

@@ -140,7 +140,6 @@ let frpcVersion = '';
 let elevated = false;
 let bootstrapReady = null;
 let pollTimer = null;
-let suppressExitUntil = 0;
 let tickBusy = false;
 let lastServiceDetect = 0;
 /* 用户希望隧道是“开着”的：成功启动 / 启动时自动连接 / 托盘启动都置 true，
@@ -1472,14 +1471,11 @@ function desiredFor(connId) {
   return !!tunnelDesired;
 }
 
-/* 主动停止/重启的静音期按连接存（deadline 时间戳）。
- * 同步更新 suppressExitUntil 仅用于兼容尚未迁移的旧判断；C4 统一删掉后者。 */
+/* 主动停止/重启的静音期按连接存（deadline 时间戳），避免把计划内退出当成崩溃通知或触发重连。 */
 function markStopQuiet(connId, ms = 12000) {
   const id = String(connId || (settings && settings.activeConnectionId) || '');
-  const until = multiConnection ? multiConnection.markStopQuiet(id, ms) : (Date.now() + ms);
-  if (!id || id === ((settings && settings.activeConnectionId) || '')) {
-    suppressExitUntil = Math.max(suppressExitUntil, until);
-  }
+  if (id && multiConnection) return multiConnection.markStopQuiet(id, ms);
+  return Date.now() + ms;
 }
 
 function clearStopQuiet(connId) {
@@ -1767,7 +1763,7 @@ function wireManager(mm, connId) {
       guard.arm(why);
     }
     /* C3：只有当前查看的连接弹退出通知；后台连接静默重连，由概览与托盘呈现状态。 */
-    if (shouldNotifyExit({ isActive, quiet, isQuitting }) && Date.now() > suppressExitUntil) {
+    if (shouldNotifyExit({ isActive, quiet, isQuitting })) {
       send('notify', {
         kind: unexpected ? 'error' : 'info',
         title: unexpected ? '隧道意外停止' : '隧道已停止',
@@ -1984,38 +1980,6 @@ async function syncParkedConnectionConfigs() {
     } catch {
       /* reload 失败就维持现状，健康检查会显示为未建立 */
     }
-  }
-}
-
-/* 兜底：把某个管理端口上的 frpc 进程强杀掉。
- * 只在 tasklist 确认占用者是 frpc.exe 时才动手 —— 端口是用户可能复用的资源，误杀别的程序代价太大。 */
-function killFrpcOnPort(port) {
-  const target = Number(port);
-  if (!target) return false;
-  try {
-    const out = execFileSync('netstat', ['-ano'], { encoding: 'utf8', windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
-    let killed = false;
-    for (const line of out.split(/\r?\n/)) {
-      if (!line.includes(`:${target} `) || !/LISTENING/i.test(line)) continue;
-      const pid = Number(line.trim().split(/\s+/).pop());
-      if (!Number.isInteger(pid) || pid <= 0) continue;
-      let image = '';
-      try {
-        image = execFileSync('tasklist', ['/FI', `PID eq ${pid}`, '/NH'], { encoding: 'utf8', windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
-      } catch {
-        image = '';
-      }
-      if (!/frpc\.exe/i.test(image)) continue;
-      try {
-        execFileSync('taskkill', ['/F', '/PID', String(pid)], { stdio: 'ignore', windowsHide: true });
-        killed = true;
-      } catch {
-        /* 已经退了 */
-      }
-    }
-    return killed;
-  } catch {
-    return false;
   }
 }
 
@@ -3748,8 +3712,10 @@ function registerIpc() {
       const snap = manager.snapshot();
       if (snap.running) {
         // 正在跑的 frpc 还按旧端口/旧口令监听，重启一次才对得上
+        const targetId = settings.activeConnectionId;
+        markStopQuiet(targetId, 8000);
         if (manager) await manager.restart().catch(() => {});
-        suppressExitUntil = Date.now() + 8000;
+        clearStopQuiet(targetId);
       }
     }
     if (manager) await manager.refresh().catch(() => {});
@@ -3895,10 +3861,13 @@ function registerIpc() {
     let restarted = false;
     let reloadError = null;
     if (restart) {
-      suppressExitUntil = Date.now() + 15000;
+      const targetId = settings.activeConnectionId;
+      markStopQuiet(targetId, 15000);
       const r = await manager.restart({ runMode: settings.runMode });
+      clearStopQuiet(targetId);
       restarted = r && r.ok;
-      if (!restarted) reloadError = (r && r.error) || '重启 frpc 失败';
+      if (restarted) setStartedFingerprint(targetId, configModule.connFingerprint(model));
+      else reloadError = (r && r.error) || '重启 frpc 失败';
     } else if (manager && manager.apiOk) {
       const r = await manager.reload().catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
       if (r && !r.ok) reloadError = r.error;

@@ -1,8 +1,7 @@
 'use strict';
 /* 多连接的开关语义：
  * ① 停用的连接不能启动，错误要说明「已停用」而不是含糊的失败；
- * ② 切换「当前连接」时会把所有在跑的隧道停掉（配置换了，旧隧道不能继续跑），
- *    并且两条 frpc 都要真的退出（管理端口不再有人监听）。 */
+ * ② 切换「当前连接」只换视图不碰任何进程（B 机 pid 保持不变），只有显式停止才释放管理端口。 */
 const { execFileSync } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -37,7 +36,7 @@ function portListening(port) {
 
 module.exports = {
   id: 'conn-toggle',
-  title: '停用的连接不能启动；切换当前连接会把所有隧道停掉',
+  title: '停用的连接不能启动；切换当前连接不停隧道，显式停止才释放端口',
   needs: ['app'],
   async run(ctx) {
     const inst = await ctx.startApp({

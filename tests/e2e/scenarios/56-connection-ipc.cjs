@@ -5,7 +5,7 @@
  *   ① connections:add 建的是**空的**起步配置，不会把当前连接的 serverAddr/token 复制过去；
  *   ② 重名、管理端口撞车、把文件夹当配置文件、删当前连接 —— 都要被明确拦下；
  *   ③ connectionsAgg 是各连接 counts 的和（hero 汇总用）；
- *   ④ 切「当前连接」会先停掉正在跑的隧道，并把全局投影换成新连接的配置。
+ *   ④ 切「当前连接」只换全局投影（不碰任何进程），返回值不再包含已废弃的 stopped 字段。
  */
 const fs = require('node:fs');
 const path = require('node:path');
@@ -105,13 +105,13 @@ module.exports = {
       const removeActive = await ev(`(async () => { const r = await FRP.connectionRemove('c-default'); return { ok: r.ok, err: r.error }; })()`);
       check('不许删当前连接', removeActive.ok === false && /当前连接/.test(removeActive.err || ''), removeActive.err);
 
-      /* 切到 B2：当前没有隧道在跑，所以 stopped 应为空 */
+      /* 切到 B2：只换当前视图投影，返回契约不再包含已废弃的 stopped 字段 */
       const act = await ev(`(async () => {
         const r = await FRP.connectionActive('${added.conn.id}');
         const list = await FRP.connections();
-        return { ok: r.ok, stopped: r.data && r.data.stopped, active: list.data.activeConnectionId, count: list.data.connections.length };
+        return { ok: r.ok, hasStopped: !!(r.data && 'stopped' in r.data), active: list.data.activeConnectionId, count: list.data.connections.length };
       })()`);
-      check('切换当前连接成功', act.ok === true && act.active === added.conn.id, JSON.stringify(act));
+      check('切换当前连接成功且不再返回 stopped 字段', act.ok === true && act.hasStopped === false && act.active === added.conn.id, JSON.stringify(act));
 
       const stAfter = await ev('(async () => { const st = await FRP.refresh(); const s = (st.data || st.state || st); return { cfg: s.paths && s.paths.configPath, agg: s.connectionsAgg }; })()');
       check('切换后全局配置路径跟着换', String(stAfter.cfg || '').includes(added.conn.id), stAfter.cfg);

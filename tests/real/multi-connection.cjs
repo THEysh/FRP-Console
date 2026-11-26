@@ -81,6 +81,23 @@ if (!fs.existsSync(APP)) {
     const pids = (agg.list || []).map((c) => c.pid).filter(Boolean);
     check('两条连接各有一个 frpc 进程', pids.length === 2 && new Set(pids).size === 2, JSON.stringify(pids));
 
+    /* 来回切换当前连接：两条 frpc 的 pid 必须保持不变（C2 切换不停隧道） */
+    const pidMapBefore = Object.fromEntries((agg.list || []).map((c) => [c.name, c.pid]));
+    const firstId = (out.list[0] || {}).id;
+    const secondId = (out.list[1] || {}).id;
+    if (firstId && secondId) {
+      await cdp.evalIn(PORT, `(async () => { await FRP.connectionActive(${JSON.stringify(secondId)}); return 1; })()`);
+      await sleep(1000);
+      await cdp.evalIn(PORT, `(async () => { await FRP.connectionActive(${JSON.stringify(firstId)}); return 1; })()`);
+      await sleep(1000);
+      const afterSwitch = await cdp.evalIn(PORT, `(async () => {
+        const r = await FRP.refresh(); const d = r.data || r;
+        return (d.connections || []).map((c) => ({ name: c.name, pid: c.runtime && c.runtime.pid }));
+      })()`);
+      const pidMapAfter = Object.fromEntries((afterSwitch || []).map((c) => [c.name, c.pid]));
+      check('来回切换连接后两条 frpc 的 pid 均未改变', JSON.stringify(pidMapBefore) === JSON.stringify(pidMapAfter), `${JSON.stringify(pidMapBefore)} -> ${JSON.stringify(pidMapAfter)}`);
+    }
+
     /* 公网各自可达 */
     const pub = await cdp.evalIn(PORT, `(async () => {
       const r = await FRP.refresh(); const d = r.data || r;
