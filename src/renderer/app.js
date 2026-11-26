@@ -5029,7 +5029,7 @@ function renderSettings(force = false) {
               <div class="path-display grow">
                 <span class="p-label">日志文件</span>
                 <span class="p-value mono" title="${esc(paths.logPath || '')}">${esc(paths.logPath || '')}</span>
-                <span class="tag ${paths.logExists ? 'ok' : 'bad'}">${paths.logExists ? '存在' : '不存在'}</span>
+                <span class="tag ${paths.logExists ? 'ok' : 'amber'}" title="${paths.logExists ? 'frpc 已经在往这里写日志' : '日志文件由 frpc 在第一次启动时创建，隧道还没跑过时它本来就不存在'}">${paths.logExists ? '已生成' : '还没生成'}</span>
               </div>
               <button class="btn small" type="button" data-act="reveal.log">${icon('folder')}</button>
             </div>
@@ -5148,7 +5148,7 @@ function pathRow(label, value, exists, kind) {
     <div class="path-display grow">
       <span class="p-label">${esc(label)}</span>
       <span class="p-value mono" title="${esc(value || '')}">${esc(value || '未设置')}</span>
-      <span class="tag ${exists ? 'ok' : 'bad'}">${exists ? '可用' : '缺失'}</span>
+      <span class="tag ${exists ? 'ok' : 'bad'}" title="${exists ? '这个文件在这台机器上找得到' : '这个路径下没有文件：可能被删掉、改名，或换了一台机器'}">${exists ? '可用' : '未找到'}</span>
     </div>
     <button class="btn small" type="button" data-act="settings.pick" data-kind="${esc(kind)}">选择</button>
   </div>`;
