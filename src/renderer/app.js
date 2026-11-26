@@ -1362,7 +1362,7 @@ function renderLogs(force = false) {
         <div class="page-actions">
           ${logSourceSeg()}
           <button class="btn" type="button" data-act="logs.export" ${S.logs.length ? '' : 'disabled'}>${icon('download')}<span>导出</span></button>
-          <button class="btn" type="button" data-act="logs.clear">${icon('trash')}<span>清空显示</span></button>
+          <button class="btn" type="button" data-act="logs.clear" title="只清空这里的显示缓冲；磁盘上的日志文件不会被删除或改动">${icon('trash')}<span>清空显示</span></button>
           <button class="btn" type="button" data-act="logs.refresh">${icon('reload')}<span>刷新</span></button>
         </div>
       </div>
@@ -1384,7 +1384,7 @@ function renderLogs(force = false) {
           ${['', 'info', 'warn', 'error', 'debug'].map((lv) => `<button type="button" data-act="logs.level" data-level="${lv}" class="${S.logLevel === lv ? 'active' : ''}">${lv ? lv.toUpperCase() : '全部'}</button>`).join('')}
         </div>
         <button class="btn small ${S.follow ? 'primary' : ''}" type="button" data-act="logs.follow">${icon('up')}<span>${S.follow ? '自动滚动' : '自动滚动已关闭'}</span></button>
-        <span class="muted" style="font-size:11px">显示 ${lines.length} 条</span>
+        ${lines.length !== S.logs.length ? `<span class="muted" style="font-size:11px">当前显示 ${lines.length} / 共 ${S.logs.length} 条</span>` : ''}
       </div>
     </div>`;
   const body = $('#log-body');
@@ -5451,7 +5451,7 @@ async function handleAction(act, dataset, btn) {
         await FRP.clearLogs();
         S.logs = [];
         renderLogs(true);
-        toast('success', '已清空日志显示');
+        toast('success', '已清空显示缓冲', '磁盘上的日志文件没有改动');
         break;
       case 'logs.refresh': {
         const res = await FRP.getLogs(1000);
