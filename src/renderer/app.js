@@ -471,8 +471,18 @@ function updateChrome() {
   const mini = $('#mini-status');
   if (mini) {
     mini.className = `mini-status ${info.tone === 'online' ? 'online' : info.tone === 'error' ? 'error' : 'warn'}`;
-    mini.querySelector('.mini-title').textContent = info.title;
-    mini.querySelector('.mini-sub').textContent = info.online ? `${S.state.app && S.state.app.uptimeLabel || ''} · ${modeLabel(info.r.mode)}` : info.desc;
+    /* 左下角不再抄 hero 的整句话：它要回答的是「哪条连接、几个代理在线」（1.2.211）。 */
+    const st = S.state || {};
+    const list = st.connections || [];
+    const cur = list.find((c) => c.id === st.activeConnectionId) || null;
+    const counts = (cur && cur.counts) || {};
+    const total = Number(counts.total || 0);
+    const online = Number(counts.online || 0);
+    const namePrefix = list.length > 1 && cur ? `${cur.name || cur.id} · ` : '';
+    mini.querySelector('.mini-title').textContent = `${namePrefix}${info.label}`;
+    mini.querySelector('.mini-sub').textContent = total
+      ? (info.online ? `在线 ${online}/${total} · ${modeLabel(info.r.mode)}` : `在线 ${online}/${total}`)
+      : info.desc;
   }
   const ver = $('#side-version');
   if (ver) ver.textContent = S.state && S.state.app ? `v${S.state.app.version}` : 'FRP 控制台';
