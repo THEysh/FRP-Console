@@ -2807,7 +2807,7 @@ function renderServer(force = false) {
         <div class="page-actions">
           ${localTunnelBtn()}
           <button class="btn" type="button" data-act="server.refresh">${icon('reload')}<span>刷新</span></button>
-          <button class="btn ghost" type="button" data-act="server.disconnect">${icon('x')}<span>断开 SSH</span></button>
+          <button class="btn primary" type="button" data-act="conn.add" title="再加一台服务器（连另一台 frps）">${icon('plus')}<span>再连一台</span></button>
         </div>
       </div>
 
@@ -2985,7 +2985,9 @@ function tunnelDiff(active, tunnel) {
 function serverConnBar() {
   const state = S.state || {};
   const list = Array.isArray(state.connections) ? state.connections : [];
-  if (list.length <= 1) return '';
+  /* 1.2.225：只有「一条连接都没有」时才隐藏。
+   * 以前单连接也隐藏，导致界面上找不到「加第二台服务器」的入口 —— 死路。 */
+  if (!list.length) return '';
   const activeId = state.activeConnectionId || '';
   const chips = list.map((c) => {
     const rt = c.runtime || {};
@@ -3001,7 +3003,8 @@ function serverConnBar() {
   }).join('');
   const cur = list.find((c) => c.id === activeId) || null;
   const ssh = S.server && S.server.connected ? `SSH 已连接 ${esc(S.server.host || '')}` : 'SSH 未连接';
-  return `<div class="chips server-chips">${chips}</div>
+  const addChip = '<button class="chip add" type="button" data-act="conn.add" title="再加一台服务器（连另一台 frps）">' + '＋ 再连一台' + '</button>';
+  return `<div class="chips server-chips">${chips}${addChip}</div>
     <div class="field-hint" style="margin:-6px 0 14px">当前查看：${esc(cur ? (cur.name || cur.id) : '—')} · ${ssh}。切换标签会先停掉正在跑的隧道。</div>`;
 }
 
@@ -3810,7 +3813,10 @@ function connectedFormMarkup() {
           <h1>服务器</h1>
           <p>通过 SSH 登录自己的服务器，把 frps 装好、配置好、跑起来。</p>
         </div>
-        <div class="page-actions">${localTunnelBtn()}</div>
+        <div class="page-actions">
+          ${localTunnelBtn()}
+          <button class="btn primary" type="button" data-act="conn.add" title="再加一台服务器（连另一台 frps）">${icon('plus')}<span>再连一台</span></button>
+        </div>
       </div>
       ${serverConnBar()}
       ${connCardMarkup()}

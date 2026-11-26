@@ -1795,6 +1795,17 @@ label .icon-btn svg { width: 13px; height: 13px; }
   padding: 0 0 6px;
 }
 
+/* 「＋ 再连一台」：虚线样式，和「某台服务器」的 chip 区分开（1.2.225） */
+.chip.add {
+  border-style: dashed;
+  color: #9fb4cc;
+  background: transparent;
+}
+.chip.add:hover {
+  color: var(--accent, #5ad1ff);
+  border-color: rgba(90, 209, 255, 0.5);
+}
+
 .schip-dot {
   width: 7px;
   height: 7px;

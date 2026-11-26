@@ -73,7 +73,7 @@ module.exports = {
       const dom = JSON.parse(await inst.eval(`(async()=>{
         document.querySelector('.nav-item[data-view="server"]').click();
         await new Promise(r=>setTimeout(r,900));
-        const chips = [...document.querySelectorAll('.server-chips .chip')].map(c=>c.textContent.trim());
+        const chips = [...document.querySelectorAll('.server-chips .chip:not(.add)')].map(c=>c.textContent.trim());
         const applyBtn = document.querySelector('[data-act="server.apply"]');
         const applyKeep = document.querySelector('[data-act="server.apply.keep"]');
         const tunnelBtn = document.querySelector('.page-actions [data-act="conn.toggle"]') || document.querySelector('[data-act="conn.toggle"]');
@@ -95,19 +95,19 @@ module.exports = {
 
       /* 点另一个 chip：当前连接切过去 */
       const switched = JSON.parse(await inst.eval(`(async()=>{
-        const chips = [...document.querySelectorAll('.server-chips .chip')];
+        const chips = [...document.querySelectorAll('.server-chips .chip:not(.add)')];
         const target = chips.find(c=>c.textContent.includes('服务器B'));
         if (!target) return JSON.stringify({ err: 'no chip' });
         target.click();
         await new Promise(r=>setTimeout(r,2600));
         const s = await FRP.refresh(); const st = s && s.data ? s.data : s;
-        return JSON.stringify({ active: st.activeConnectionId, xstate: (window.__x||null), onClass: [...document.querySelectorAll('.server-chips .chip')].map(c=>c.classList.contains('on')), texts: [...document.querySelectorAll('.server-chips .chip')].map(c=>c.textContent.trim()) });
+        return JSON.stringify({ active: st.activeConnectionId, xstate: (window.__x||null), onClass: [...document.querySelectorAll('.server-chips .chip:not(.add)')].map(c=>c.classList.contains('on')), texts: [...document.querySelectorAll('.server-chips .chip:not(.add)')].map(c=>c.textContent.trim()) });
       })()`));
       check('点 chip 后当前连接切到服务器B', switched.active === B.conn, JSON.stringify(switched));
       check('选中的 chip 高亮跟着换', Array.isArray(switched.onClass) && switched.onClass[1] === true, JSON.stringify(switched.onClass));
 
     /* 连接标签上的计数要说清是「在线代理数」，只写 0/1 看不出含义（1.2.208）。 */
-    const chipText = await inst.eval(`[...document.querySelectorAll('.server-chips .chip')].map(c=>c.textContent.replace(/\\s+/g,' ').trim()).join(' | ')`)
+    const chipText = await inst.eval(`[...document.querySelectorAll('.server-chips .chip:not(.add)')].map(c=>c.textContent.replace(/\\s+/g,' ').trim()).join(' | ')`)
       .catch(() => '');
     const chipStr = String(chipText || '');
     ctx.check('连接标签的计数写成「在线 x/y」或「暂无代理」', /在线\s*\d+\/\d+|暂无代理/.test(chipStr), chipStr.slice(0, 160));
