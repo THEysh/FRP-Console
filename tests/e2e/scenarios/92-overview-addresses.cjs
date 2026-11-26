@@ -98,12 +98,30 @@ module.exports = {
       ctx.check('副标题说明「含所有连接」', /含所有连接/.test(multi.subtitle), multi.subtitle);
 
       const metrics = JSON.parse(
-        await inst.eval(`JSON.stringify([...document.querySelectorAll('.metric-label')].map((el) => el.textContent.trim()))`),
+        await inst.eval(`(function(){
+          const cards = [...document.querySelectorAll('.metrics .metric')].map((c) => ({
+            label: (c.querySelector('.metric-label') || {}).textContent.trim(),
+            value: (c.querySelector('.metric-value') || {}).textContent.replace(/\s+/g, ' ').trim(),
+            foot: (c.querySelector('.metric-foot span') || {}).textContent.trim(),
+          }));
+          return JSON.stringify(cards);
+        })()`),
       );
       ctx.check(
-        '多连接时指标卡标明「（当前连接）」',
-        metrics.every((m) => m.includes('（当前连接）')),
-        JSON.stringify(metrics),
+        '多连接时指标卡标题不再标「（当前连接）」',
+        metrics.every((m) => !String(m.label || '').includes('（当前连接）')),
+        JSON.stringify(metrics.map((m) => m.label)),
+      );
+      /* 两条连接各一条代理 → 全量口径下「代理总数」是 2（改动前这里只会显示 1） */
+      ctx.check(
+        '多连接时代理总数按所有连接统计',
+        String((metrics[0] || {}).value) === '2',
+        JSON.stringify(metrics[0] || null),
+      );
+      ctx.check(
+        '多连接时脚注写明「含所有连接」',
+        /含所有连接/.test(String((metrics[0] || {}).foot || '')),
+        String((metrics[0] || {}).foot || ''),
       );
     } finally {
       inst.stop();
@@ -152,13 +170,16 @@ module.exports = {
       ctx.check('单连接副标题不提「含所有连接」', !/含所有连接/.test(one.subtitle), one.subtitle);
 
       const singleMetrics = JSON.parse(
-        await single.eval(`JSON.stringify([...document.querySelectorAll('.metric-label')].map((el) => el.textContent.trim()))`),
+        await single.eval(`(function(){
+          const c = document.querySelector('.metrics .metric');
+          return JSON.stringify({
+            value: (c.querySelector('.metric-value') || {}).textContent.trim(),
+            foot: (c.querySelector('.metric-foot span') || {}).textContent.trim(),
+          });
+        })()`),
       );
-      ctx.check(
-        '单连接时指标卡标题保持原样',
-        singleMetrics.every((m) => !m.includes('（当前连接）')),
-        JSON.stringify(singleMetrics),
-      );
+      ctx.check('单连接时代理总数仍是 1', String(singleMetrics.value) === '1', JSON.stringify(singleMetrics));
+      ctx.check('单连接时脚注不提「含所有连接」', !/含所有连接/.test(String(singleMetrics.foot || '')), String(singleMetrics.foot || ''));
     } finally {
       single.stop();
     }

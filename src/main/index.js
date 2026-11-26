@@ -2016,6 +2016,45 @@ function allConnectionProxies() {
   return out;
 }
 
+/* 一套计数口径，当前连接与「所有连接」共用（1.2.219）。
+ * 以前这段写在 buildState 的返回对象里（IIFE），只能对当前连接的 proxies 算一次；
+ * 概览的地址卡改成全量之后，指标卡也要能按同一口径统计所有连接。 */
+function computeCounts(list) {
+      /* 只有“隧道状态 running 且三层检查真的通过”才算在线。
+       * 以前 `!p.health || p.health.ok` 把“还没检查”也当成在线，
+       * 结果是刚启动、或健康检查被卡住时，坏代理照样报绿。 */
+      const fresh = (p) => !!p.health && Date.now() - (p.health.at || 0) < 90000;
+      const verified = list.filter(fresh);
+      const failed = verified.filter((p) => !p.health.ok);
+      // 按失败的层级拆开计数：概览页据此说“是本地服务、隧道还是公网不通”，
+      // 而不是笼统一句“未通过三层检查”，把人骗去查本地端口。
+      const layerFailed = (name) => failed.filter((p) => p.health.layers && p.health.layers[name] && !p.health.layers[name].ok).length;
+      /* 「路径 404」单独成一档：隧道其实是通的，只是根路径（或填的访问路径）在目标服务上不存在。
+       * 混进「连通性异常」会让人去查安全组/隧道，查半天查不出。 */
+      const path404 = failed.filter((p) => p.health.pathMissing).length;
+      /* 公网层失败里，「域名没解析 / 没指向这台服务器」跟「端口不通」是两回事：
+       * 前者要改 DNS 记录，后者要查防火墙。概览分开计数，用户才知道该点哪里。 */
+      const dnsFailed = failed.filter((p) => /^域名/.test(String(p.health.reason || ''))).length;
+      /* 被 start 列表排除的代理：不是"坏了"，是我们压根没让它起来。
+       * 单独一档，否则「N 个隧道未建立」会把人骗去查网络。
+       * 条数按代理自己的标记数（不是 health 缓存）：隧道停着时缓存是空的，
+       * 但「被 start 排除」这个事实来自配置，跟隧道有没有跑无关。 */
+      const startExcluded = list.filter((p) => p.startExcluded).length;
+      const startExcludedFailed = failed.filter((p) => p.health.startExcluded).length;
+      return {
+        total: list.length,
+        online: verified.filter((p) => p.health.ok && p.status === 'running').length,
+        unhealthy: failed.length - path404 - startExcludedFailed,
+        path404,
+        dnsFailed,
+        startExcluded,
+        // 这一轮还没测完（或代理刚加进来）的条数：界面上既不能说在线也不能说异常
+        unchecked: list.length - verified.length,
+        unhealthyLocal: layerFailed('local'),
+        unhealthyTunnel: layerFailed('tunnel'),
+        unhealthyPublic: layerFailed('public'),
+      };
+}
 function buildState() {
   if (!manager) {
     return {
@@ -2045,6 +2084,8 @@ function buildState() {
   /* 配置里有 start = [...] 时，不在这份名单里的代理 frpc 根本不会启动。
    * 让它单独成一档，否则界面会把它报成「隧道未建立」，把人骗去查端口和 token。 */
   const startNames = model ? configModule.startNamesOf(model) : [];
+  /* 所有连接的代理只算一次：地址卡与指标卡都要用（1.2.219） */
+  const allProxies = allConnectionProxies();
   const proxies = (model ? model.proxies : []).map((proxy) => {
     // 管理端口上是别人的 frpc 时，它报的代理状态与本配置无关，一律当作没同步
     const st = runtime.foreign ? null : manager.proxyStatus.get(proxy.name) || null;
@@ -2079,7 +2120,8 @@ function buildState() {
   });
   return {
     /* 代理页的全量视图：每条启用连接的代理拍平（当前连接在列表里也在）。 */
-    proxiesAll: allConnectionProxies(),
+    proxiesAll: allProxies,
+    countsAll: computeCounts(allProxies),
     app: {
       version: app.getVersion(),
       frpcVersion,
@@ -2117,42 +2159,7 @@ function buildState() {
     /* 当前连接 id 必须跟着状态一起下发：界面的切换器/高亮全靠它，
      * 少了它渲染层只能按“第一条”猜（切过去下拉框不动，看起来像没生效）。 */
     activeConnectionId: settings.activeConnectionId || '',
-    counts: (() => {
-      /* 只有“隧道状态 running 且三层检查真的通过”才算在线。
-       * 以前 `!p.health || p.health.ok` 把“还没检查”也当成在线，
-       * 结果是刚启动、或健康检查被卡住时，坏代理照样报绿。 */
-      const fresh = (p) => !!p.health && Date.now() - (p.health.at || 0) < 90000;
-      const verified = proxies.filter(fresh);
-      const failed = verified.filter((p) => !p.health.ok);
-      // 按失败的层级拆开计数：概览页据此说“是本地服务、隧道还是公网不通”，
-      // 而不是笼统一句“未通过三层检查”，把人骗去查本地端口。
-      const layerFailed = (name) => failed.filter((p) => p.health.layers && p.health.layers[name] && !p.health.layers[name].ok).length;
-      /* 「路径 404」单独成一档：隧道其实是通的，只是根路径（或填的访问路径）在目标服务上不存在。
-       * 混进「连通性异常」会让人去查安全组/隧道，查半天查不出。 */
-      const path404 = failed.filter((p) => p.health.pathMissing).length;
-      /* 公网层失败里，「域名没解析 / 没指向这台服务器」跟「端口不通」是两回事：
-       * 前者要改 DNS 记录，后者要查防火墙。概览分开计数，用户才知道该点哪里。 */
-      const dnsFailed = failed.filter((p) => /^域名/.test(String(p.health.reason || ''))).length;
-      /* 被 start 列表排除的代理：不是"坏了"，是我们压根没让它起来。
-       * 单独一档，否则「N 个隧道未建立」会把人骗去查网络。
-       * 条数按代理自己的标记数（不是 health 缓存）：隧道停着时缓存是空的，
-       * 但「被 start 排除」这个事实来自配置，跟隧道有没有跑无关。 */
-      const startExcluded = proxies.filter((p) => p.startExcluded).length;
-      const startExcludedFailed = failed.filter((p) => p.health.startExcluded).length;
-      return {
-        total: proxies.length,
-        online: verified.filter((p) => p.health.ok && p.status === 'running').length,
-        unhealthy: failed.length - path404 - startExcludedFailed,
-        path404,
-        dnsFailed,
-        startExcluded,
-        // 这一轮还没测完（或代理刚加进来）的条数：界面上既不能说在线也不能说异常
-        unchecked: proxies.length - verified.length,
-        unhealthyLocal: layerFailed('local'),
-        unhealthyTunnel: layerFailed('tunnel'),
-        unhealthyPublic: layerFailed('public'),
-      };
-    })(),
+    counts: computeCounts(proxies),
     dashboardUrl: dashboardUrl(),
     /* 本机 frpc.toml 与「隧道目标档案」的绑定情况。渲染层据此识别一种很容易骗人的状态：
      * 隧道确实在跑、三层也确实通（frpc 还在连那台服务器），但这台服务器在本机已经

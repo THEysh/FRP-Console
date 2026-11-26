@@ -718,7 +718,10 @@ function renderOverview(force = false) {
   const allProxies = (Array.isArray(state.proxiesAll) && state.proxiesAll.length) ? state.proxiesAll : proxies;
   const multiConn = (Array.isArray(state.connections) ? state.connections.length : 0) > 1;
   /* 指标卡统计的是当前连接；多连接时把口径写进标题，避免和上面的全量地址卡打架 */
-  const metricScope = multiConn ? '（当前连接）' : '';
+  /* 多连接时指标卡按「所有连接」统计（1.2.219）：地址卡从 1.2.218 起已经是全量，
+   * 同一屏上「地址 2 条」配「代理总数 1」会让人以为掉了代理。 */
+  const mc = multiConn && state.countsAll ? state.countsAll : counts;
+  const metricScope = '';
   const addrList = allProxies.filter((p) => p.publicAddress);
   const onlineCount = addrList.filter((p) => p.status === 'running' && p.health && p.health.ok).length;
   const addresses = addrList
@@ -887,18 +890,18 @@ function renderOverview(force = false) {
       <section class="metrics" style="margin-top:16px">
         <div class="card metric">
           <div class="metric-top"><span class="metric-label">代理总数${metricScope}</span><span class="metric-icon">${icon('link')}</span></div>
-          <div class="metric-value">${esc(counts.total)}</div>
-          <div class="metric-foot"><span>已配置的穿透规则</span></div>
+          <div class="metric-value">${esc(mc.total)}</div>
+          <div class="metric-foot"><span>${multiConn ? '已配置的穿透规则（含所有连接）' : '已配置的穿透规则'}</span></div>
         </div>
         <div class="card metric">
           <div class="metric-top"><span class="metric-label">${term(`在线代理${metricScope}`, '真正通过了「本地服务 → 隧道 → 公网」三层检测的映射；没测完的不算。')}</span><span class="metric-icon">${icon('activity')}</span></div>
-          <div class="metric-value">${esc(counts.online)}<small> / ${esc(counts.total)}</small></div>
-          <div class="metric-foot"><span class="${!config.serverAddr ? '' : (counts.online === counts.total && counts.total ? 'up' : counts.unchecked > 0 ? '' : 'down')}">${!config.serverAddr ? '配置服务器后自动检测' : !counts.total ? '暂无代理' : counts.online === counts.total ? '全部在线' : counts.unchecked > 0 && counts.unhealthy === 0 ? `${counts.unchecked} 条待检测` : `${counts.total - counts.online} 条未通过连通性检查`}</span></div>
+          <div class="metric-value">${esc(mc.online)}<small> / ${esc(mc.total)}</small></div>
+          <div class="metric-foot"><span class="${!config.serverAddr ? '' : (mc.online === mc.total && mc.total ? 'up' : mc.unchecked > 0 ? '' : 'down')}">${!config.serverAddr ? '配置服务器后自动检测' : !mc.total ? '暂无代理' : mc.online === mc.total ? '全部在线' : mc.unchecked > 0 && mc.unhealthy === 0 ? `${mc.unchecked} 条待检测` : `${mc.total - mc.online} 条未通过连通性检查`}</span></div>
         </div>
         <div class="card metric">
           <div class="metric-top"><span class="metric-label">${term(`连通性异常${metricScope}`, '三层（本地服务 → 隧道 → 公网）中至少一层没通的映射数；点击可看是哪条、哪一层。')}</span><span class="metric-icon">${icon('cpu')}</span></div>
-          <div class="metric-value">${config.serverAddr ? esc((counts.unhealthy || 0) + (counts.path404 || 0)) : '—'}</div>
-          <div class="metric-foot"><span class="${!config.serverAddr ? '' : (counts.unhealthy ? 'down' : (counts.path404 || counts.startExcluded ? 'down' : counts.unchecked > 0 ? '' : 'up'))}">${!config.serverAddr ? '尚未开始检测' : counts.unhealthy ? layerFailText(counts) : counts.path404 ? `${counts.path404} 条路径 404（隧道通，改访问路径即可）` : counts.startExcluded ? `${counts.startExcluded} 个被 start 列表排除（frpc 不会启动它们）` : counts.unchecked > 0 ? `${counts.unchecked} 条还没测完` : '全部代理三层全通（本地 → 隧道 → 公网）'}</span></div>
+          <div class="metric-value">${config.serverAddr ? esc((mc.unhealthy || 0) + (mc.path404 || 0)) : '—'}</div>
+          <div class="metric-foot"><span class="${!config.serverAddr ? '' : (mc.unhealthy ? 'down' : (mc.path404 || mc.startExcluded ? 'down' : mc.unchecked > 0 ? '' : 'up'))}">${!config.serverAddr ? '尚未开始检测' : mc.unhealthy ? layerFailText(counts) : mc.path404 ? `${mc.path404} 条路径 404（隧道通，改访问路径即可）` : mc.startExcluded ? `${mc.startExcluded} 个被 start 列表排除（frpc 不会启动它们）` : mc.unchecked > 0 ? `${mc.unchecked} 条还没测完` : '全部代理三层全通（本地 → 隧道 → 公网）'}</span></div>
         </div>
       </section>
 
