@@ -80,6 +80,9 @@ module.exports = {
         `top=${view.guideTop} 视口高=${view.vh}`,
       );
 
+      const reloadBtn = (view.heroBtns || []).find((b) => b.act === 'tunnel.reload');
+      ctx.check('隧道没跑时 hero 不摆「热重载」（点了只会报管理 API 未启动）', !reloadBtn, JSON.stringify(view.heroBtns));
+
       const primary = (view.heroBtns || []).find((b) => b.text === '连接服务器');
       ctx.check('未配置服务器时 hero 主按钮是「连接服务器」', !!primary, JSON.stringify(view.heroBtns));
       ctx.check('这个按钮跳到服务器页', !!primary && primary.view === 'server', JSON.stringify(primary));

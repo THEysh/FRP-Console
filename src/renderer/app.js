@@ -832,7 +832,7 @@ function renderOverview(force = false) {
               : config.serverAddr
                 ? `<button class="btn primary" type="button" data-act="tunnel.start">${icon('play')}<span>启动隧道</span></button>`
                 : `<button class="btn primary" type="button" data-act="nav" data-view="server">${icon('server')}<span>连接服务器</span></button>`}
-            <button class="btn" type="button" data-act="tunnel.reload" title="从磁盘重新载入代理配置，不断开连接">${icon('reload')}<span>热重载</span></button>
+            ${info.running ? `<button class="btn" type="button" data-act="tunnel.reload" title="从磁盘重新载入代理配置，不断开连接">${icon('reload')}<span>热重载</span></button>` : ''}
             ${dashboard ? `<button class="btn" type="button" data-act="open" data-url="${esc(dashboard)}" title="打开 frps 面板">${icon('globe')}<span>服务器面板</span></button>` : ''}
           </div>
           ${tunnelProgressHtml(state)}
@@ -946,6 +946,14 @@ function proxiesKey() {
 
 /* 当前连接的隧道没在跑时，代理页要说清楚「保存了也不会生效」，并给一个启动入口（1.2.207）。
  * 其它连接在跑不算数：这里列的是所有连接的代理，但只有当前连接能一键启动。 */
+/* 当前连接的隧道是否在跑：决定「热重载」这类只对运行中的 frpc 有意义的按钮要不要出现（1.2.209）。 */
+function curTunnelRunning() {
+  const st = S.state || {};
+  const cur = (st.connections || []).find((c) => c.id === st.activeConnectionId) || null;
+  const rt = (cur && cur.runtime) || (st.runtime || {});
+  return !!(rt.running || rt.connected);
+}
+
 function tunnelIdleNote(all) {
   if (!all || !all.length) return '';
   const st = S.state || {};
@@ -991,7 +999,7 @@ function renderProxies(force = false) {
           <p>把本机服务发布到公网。${all.length ? `${all.length ? `共 ${all.length} 条，${all.filter((p) => p.status === 'running').length} 条在线` : ''}${proxyConnCount() > 1 ? `（分布在 ${proxyConnCount()} 台服务器上）` : ''}。` : '还没有代理，先新增一条吧。'}</p>
         </div>
         <div class="page-actions">
-          <button class="btn" type="button" data-act="tunnel.reload">${icon('reload')}<span>热重载</span></button>
+          ${curTunnelRunning() ? `<button class="btn" type="button" data-act="tunnel.reload" title="从磁盘重新载入代理配置，不断开连接">${icon('reload')}<span>热重载</span></button>` : ''}
           <button class="btn primary" type="button" data-act="proxy.add">${icon('plus')}<span>新增代理</span></button>
         </div>
       </div>
