@@ -866,45 +866,70 @@ function renderOverview(force = false) {
     </div></div>`);
   }
 
-  /* 多条连接时，hero 必须点名「这是哪一条」，否则上面列着日本/广州、下面只说一个地址，认不出来。 */
+  /* 多服务器（>1 台）时，概览顶部 Hero 切换为全局汇总视角，彻底消除「顶部说当前未运行、下面却写 2 台在线」的割裂感。 */
   const connListNow = (S.state && S.state.connections) || [];
-  const heroConn = connListNow.length > 1
-    ? (connListNow.find((c) => c.id === S.state.activeConnectionId) || {}).name || ''
-    : '';
+  const aggNow = (S.state && S.state.connectionsAgg) || {};
+  const runningServers = connListNow.filter(connIsRunning).length;
+  const onlineServers = connListNow.filter((c) => c.runtime && c.runtime.connected).length;
+  const configuredServers = connListNow.filter((c) => c.enabled !== false && String(c.serverAddr || '').trim()).length;
+  const canStartAll = connListNow.some((c) => c.enabled !== false && String(c.serverAddr || '').trim() && !connIsRunning(c));
+  const anyOnline = multiConn ? onlineServers > 0 : info.online;
+  const heroTone = multiConn
+    ? (onlineServers > 0 ? 'online' : runningServers > 0 ? 'warn' : 'warn')
+    : (info.tone === 'online' ? 'online' : info.tone === 'error' ? 'error' : 'warn');
+  const heroIcon = multiConn
+    ? (onlineServers > 0 ? 'shield' : runningServers > 0 ? 'clock' : 'alert')
+    : (info.tone === 'online' ? 'shield' : info.starting ? 'clock' : 'alert');
+  const heroTitle = multiConn
+    ? (onlineServers > 0 && onlineServers === configuredServers && configuredServers > 0
+      ? '全部隧道在线'
+      : onlineServers > 0
+        ? `已在线（${onlineServers} / ${connListNow.length} 台服务器）`
+        : runningServers > 0
+          ? `正在连接（${runningServers} 台运行中）`
+          : '隧道未运行')
+    : info.title;
+  const heroSub = multiConn
+    ? `共 ${connListNow.length} 台服务器 · ${runningServers} 台运行中 · 在线代理 ${mc.online} / ${mc.total}`
+    : `${config.serverAddr ? `${config.serverAddr}:${config.serverPort}` : '尚未配置服务器'} · ${info.desc}`;
+  const heroActions = multiConn
+    ? `${canStartAll ? `<button class="btn primary" type="button" data-act="conn.startAll">${icon('play')}<span>全部启动</span></button>` : ''}
+       ${runningServers > 0 ? `<button class="btn danger" type="button" data-act="conn.stopAll">${icon('stop')}<span>全部停止</span></button>` : ''}
+       ${configuredServers === 0 ? `<button class="btn primary" type="button" data-act="nav" data-view="server">${icon('server')}<span>去连接服务器</span></button>` : ''}`
+    : `${info.running
+      ? `<button class="btn" type="button" data-act="tunnel.restart" title="重启 frpc（连不上服务器时先试这个）">${icon('restart')}<span>重启</span></button>
+         <button class="btn danger" type="button" data-act="tunnel.stop">${icon('stop')}<span>停止隧道</span></button>`
+      : config.serverAddr
+        ? `<button class="btn primary" type="button" data-act="tunnel.start">${icon('play')}<span>启动隧道</span></button>`
+        : `<button class="btn primary" type="button" data-act="nav" data-view="server">${icon('server')}<span>连接服务器</span></button>`}
+      ${info.running ? `<button class="btn" type="button" data-act="tunnel.reload" title="从磁盘重新载入代理配置，不断开连接">${icon('reload')}<span>热重载</span></button>` : ''}
+      ${dashboard ? `<button class="btn" type="button" data-act="open" data-url="${esc(dashboard)}" title="打开 frps 面板">${icon('globe')}<span>服务器面板</span></button>` : ''}`;
+
   $('#view').innerHTML = `
     <div class="view">
       <section class="card hero">
         <div class="hero-main">
           <div class="hero-status">
-            <div class="hero-orb ${info.tone === 'online' ? 'online' : info.tone === 'error' ? 'error' : 'warn'}">${icon(info.tone === 'online' ? 'shield' : info.starting ? 'clock' : 'alert')}</div>
+            <div class="hero-orb ${heroTone}">${icon(heroIcon)}</div>
             <div class="hero-titles">
-              <h2>${esc(info.title)}</h2>
-              <p>${heroConn ? `<span class="hero-conn">${esc(heroConn)}</span> · ` : ''}${esc(config.serverAddr ? `${config.serverAddr}:${config.serverPort}` : '尚未配置服务器')} · ${esc(info.desc)}</p>
+              <h2>${esc(heroTitle)}</h2>
+              <p>${esc(heroSub)}</p>
             </div>
           </div>
-          <div class="hero-actions">
-            ${info.running
-              ? `<button class="btn" type="button" data-act="tunnel.restart" title="重启 frpc（连不上服务器时先试这个）">${icon('restart')}<span>重启</span></button>
-                 <button class="btn danger" type="button" data-act="tunnel.stop">${icon('stop')}<span>停止隧道</span></button>`
-              : config.serverAddr
-                ? `<button class="btn primary" type="button" data-act="tunnel.start">${icon('play')}<span>启动隧道</span></button>`
-                : `<button class="btn primary" type="button" data-act="nav" data-view="server">${icon('server')}<span>连接服务器</span></button>`}
-            ${info.running ? `<button class="btn" type="button" data-act="tunnel.reload" title="从磁盘重新载入代理配置，不断开连接">${icon('reload')}<span>热重载</span></button>` : ''}
-            ${dashboard ? `<button class="btn" type="button" data-act="open" data-url="${esc(dashboard)}" title="打开 frps 面板">${icon('globe')}<span>服务器面板</span></button>` : ''}
-          </div>
-          ${tunnelProgressHtml(state)}
+          <div class="hero-actions">${heroActions}</div>
+          ${multiConn ? '' : tunnelProgressHtml(state)}
         </div>
       </section>
 
-      ${onlyMissingServer ? welcomeGuideHtml() : ''}
+      ${onlyMissingServer && !multiConn ? welcomeGuideHtml() : ''}
       ${connectionsSection()}
 
       <section class="card section" style="margin-top:16px">
         <div class="section-head">
-          <div class="section-title"><strong>公网地址</strong><span>${addrList.length ? `${!info.online ? '隧道未运行，下面这些地址暂时打不开' : `在线 ${onlineCount} / 共 ${addrList.length} 条 · 别人通过这些地址访问你的服务`}${multiConn ? ' · 含所有连接' : ''}` : '还没有公网映射'}</span></div>
+          <div class="section-title"><strong>公网地址</strong><span>${addrList.length ? `${!anyOnline ? '隧道未运行，下面这些地址暂时打不开' : `在线 ${onlineCount} / 共 ${addrList.length} 条 · 别人通过这些地址访问你的服务`}${multiConn ? ' · 含所有服务器' : ''}` : '还没有公网映射'}</span></div>
           ${addrList.length ? `<button class="btn ghost small" type="button" data-act="nav" data-view="proxies">管理代理 ${icon('up')}</button>` : ''}
         </div>
-        <div class="addr-list${addrList.length && !info.online ? ' paused' : ''}" style="padding:0 16px 16px">
+        <div class="addr-list${addrList.length && !anyOnline ? ' paused' : ''}" style="padding:0 16px 16px">
           ${addresses || `<div class="empty-hint">
             <span>还没有可用的公网映射</span>
             <button class="btn ghost small" type="button" data-act="proxy.add">${icon('plus')}<span>新建一条代理</span></button>
@@ -5234,70 +5259,56 @@ function renderSettings(force = false) {
   const state = S.state || {};
   const config = state.config || {};
   const settings = state.settings || {};
-  const paths = state.paths || {};
   const app = state.app || {};
-  /* 多连接时这两个文件属于「当前连接」，卡片里要标出来（1.2.222） */
-  const connsAll = Array.isArray(state.connections) ? state.connections : [];
-  const multiConn = connsAll.length > 1;
-  const curConn = connsAll.find((c) => c.id === (state.activeConnectionId || '')) || null;
-  const curConnName = curConn ? String(curConn.name || curConn.id || '') : '';
-  const connNote = multiConn && curConnName
-    ? `<span class="tag" title="这个文件属于当前连接「${esc(curConnName)}」；切换连接会换成它的文件">${esc(curConnName)}</span>`
-    : '';
   const log = config.log || {};
+  const advOpen = !!S.settingsAdvancedOpen;
 
   $('#view').innerHTML = `
     <div class="view">
       <div class="page-head">
         <div class="page-title">
           <h1>设置</h1>
-          <p>本机程序行为、可执行文件路径与版本更新。服务器地址、端口与 Token 全部在「服务器」页管理。</p>
+          <p>本机程序行为、开机与托盘偏好、已知主机指纹及版本更新。各台服务器配置均在「服务器」页管理。</p>
         </div>
       </div>
 
       <div class="settings-grid">
         <section class="card section">
           <div class="section-head">
-            <div class="section-title"><strong>可执行文件与路径</strong><span>${multiConn && curConnName ? `frpc.exe 与各连接的 frpc.toml 位置；下面显示的是当前连接「${esc(curConnName)}」的文件。` : 'frpc.exe 与 frpc.toml 的位置。'}</span></div>
-            <button class="btn" type="button" data-act="settings.reveal">${icon('folder')}<span>打开配置目录</span></button>
+            <div class="section-title"><strong>行为与开机</strong><span>所有开关拨动即自动生效，无需再点保存。</span></div>
           </div>
-          <div class="stack" style="gap:12px">
-            ${pathRow('frpc.exe', paths.frpcPath, paths.frpcExists, 'frpc')}
-            ${pathRow('frpc.toml', paths.configPath, paths.configExists, 'config', connNote)}
-            <div class="path-row">
-              <div class="path-display grow">
-                <span class="p-label">frps 面板地址（可选）</span>
-                <span class="p-value mono" title="${esc(state.dashboardUrl || (config.serverAddr ? `${config.serverAddr}:7500` : '配置服务器后可用'))}">${esc(state.dashboardUrl || (config.serverAddr ? `${config.serverAddr}:7500` : '配置服务器后可用'))}</span>
-                ${S.server && S.server.connected && S.server.host ? `<span class="tag ok" title="端口来自当前服务器 frps 配置里的 webServer.port">跟随 ${esc(S.server.host)}</span>` : ''}
-              </div>
+          <div id="form-behavior" class="stack" style="gap:0">
+            ${formSubhead('隧道', '所有已启用服务器的默认行为')}
+            ${switchRow('断线自动重连', 'frpc 进程被杀、管理接口卡死或睡眠唤醒后连接假死时自动重连；第 10 次之后每 5 分钟试一次', 'autoReconnect', settings.autoReconnect !== false)}
+            ${switchRow('启动时自动启动隧道', '控制台启动后自动拉起全部已配置且已启用的服务器隧道', 'launchTunnelOnStart', !!settings.launchTunnelOnStart)}
+            ${switchRow('自动热重载', '检测到配置文件被外部修改后自动调用管理 API 重载', 'autoReload', settings.autoReload !== false)}
+            ${formSubhead('窗口与开机', '控制台启动与最小化方式')}
+            ${switchRow('关闭窗口时最小化到托盘', '退出请使用托盘菜单中的“退出”', 'closeToTray', settings.closeToTray !== false)}
+            ${switchRow('开机自动启动', '登录 Windows 后自动运行控制台（写当前用户的启动项，不需要管理员权限）', 'launchAtLogin', !!settings.launchAtLogin)}
+            <div class="field-hint">
+              <button class="btn sm" type="button" data-act="settings.openstartup">${icon('folder')}<span>打开启动文件夹</span></button>
+              <span style="margin-left:8px">系统不让程序写启动项时，把程序快捷方式拖进这个文件夹，效果一样</span>
             </div>
-            <div class="path-row">
-              <div class="path-display grow">
-                <span class="p-label">日志文件</span>
-                <span class="p-value mono" title="${esc(paths.logPath || '')}">${esc(paths.logPath || '')}</span>
-                ${connNote}
-                <span class="tag ${paths.logExists ? 'ok' : 'amber'}" title="${paths.logExists ? 'frpc 已经在往这里写日志' : '日志文件由 frpc 在第一次启动时创建，隧道还没跑过时它本来就不存在'}">${paths.logExists ? '已生成' : '还没生成'}</span>
-              </div>
-              <button class="btn small" type="button" data-act="reveal.log">${icon('folder')}</button>
-            </div>
+            ${app.launchAtLoginBlocked ? `<div class="note warn" style="margin:2px 0 10px">${icon('alert')}<div>启动项已被系统「任务管理器 → 启动」禁用，重启后不会运行。要恢复请到那里把「FRP 控制台」设为「已启用」；或者换个办法：把快捷方式放进 <code>shell:startup</code>。</div></div>` : ''}
+            ${settings.launchAtLogin && settings.runMode === 'managed' ? `<div class="note warn" style="margin:2px 0 10px">${icon('alert')}<div>当前是「应用托管进程」模式：开机只会自动打开控制台，隧道要等控制台把 frpc 拉起来才算通；控制台一退隧道就断。</div></div>` : ''}
+            ${switchRow('以最小化状态启动', '启动后直接静默隐藏到右下角托盘，不弹出主窗口', 'startMinimized', !!settings.startMinimized)}
           </div>
         </section>
 
         <section class="card section">
           <div class="section-head">
-            <div class="section-title"><strong>运行模式与行为</strong><span>决定控制台如何启动 frpc 以及界面行为。</span></div>
-            <button class="btn primary" type="button" data-act="settings.save.behavior">${icon('check')}<span>保存行为设置</span></button>
+            <div class="section-title"><strong>高级设置</strong><span>运行模式、刷新间隔、日志级别与本机管理 API 口令（平时不用改）。</span></div>
+            <button class="btn small" type="button" data-act="settings.advanced.toggle">${advOpen ? icon('up') : icon('down')}<span>${advOpen ? '收起' : '展开'}</span></button>
           </div>
-          <form id="form-behavior" class="form-grid" autocomplete="off" onsubmit="return false">
+          ${advOpen ? `
+          <form id="form-advanced" class="form-grid" autocomplete="off" onsubmit="return false">
             <div class="field">
               <label>运行模式</label>
               <select class="select" name="runMode">
-                <option value="auto" ${settings.runMode !== 'managed' ? 'selected' : ''}>自动（本机有 frpc 系统服务就用它，否则由控制台托管）</option>
+                <option value="auto" ${settings.runMode !== 'managed' ? 'selected' : ''}>自动（单连接时若已装系统服务则复用，否则由控制台托管）</option>
                 <option value="managed" ${settings.runMode === 'managed' ? 'selected' : ''}>应用托管进程</option>
               </select>
-              <div class="field-hint">${settings.runMode === 'managed'
-                ? '托管模式下隧道是控制台的子进程：控制台退出即断开，不建议用于无人值守。'
-                : '「自动」会先看本机是否已把 frpc 装成系统服务（那种能开机自启、不依赖控制台）；没有就由控制台直接拉起 frpc.exe。'}</div>
+              <div class="field-hint">多台服务器时自动使用「应用托管进程」（每台各自一个 frpc 进程）。</div>
             </div>
             <div class="field">
               <label>状态刷新间隔（毫秒）</label>
@@ -5308,45 +5319,26 @@ function renderSettings(force = false) {
               <select class="select" name="logLevel">
                 ${['trace', 'debug', 'info', 'warn', 'error'].map((lv) => `<option value="${lv}" ${log.level === lv ? 'selected' : ''}>${lv}</option>`).join('')}
               </select>
-              <div class="field-hint">写入 frpc.toml，保存时会自动备份原配置</div>
+              <div class="field-hint">写入当前连接的 frpc.toml，保存时自动备份</div>
             </div>
             <div class="field">
               <div class="switch-row" style="justify-content:space-between">
                 <div class="sr-text"><strong>loginFailExit</strong><span>登录失败后直接退出，不再反复重试</span></div>
                 <button class="switch ${config.loginFailExit !== false ? 'on' : ''}" type="button" data-act="toggle" data-field="loginFailExit" aria-pressed="${config.loginFailExit !== false}"></button>
               </div>
-              <div class="field-hint">写进 frpc.toml；两者都在「保存行为设置」时一起生效</div>
+              <div class="field-hint">写入当前连接的 frpc.toml</div>
             </div>
             <div class="field span-2">
-              <div class="stack" style="gap:0">
-                ${formSubhead('隧道', 'frpc 连上与断开之后怎么办')}
-                ${switchRow('自动热重载', '检测到配置文件被外部修改后自动调用管理 API 重载', 'autoReload', settings.autoReload !== false)}
-                ${switchRow('断线自动重连', 'frpc 进程被杀、管理接口卡死或睡眠唤醒后连接假死时自动重连；第 10 次之后每 5 分钟试一次', 'autoReconnect', settings.autoReconnect !== false)}
-                ${switchRow('启动时自动启动隧道', '控制台启动后立即建立 frpc 连接', 'launchTunnelOnStart', !!settings.launchTunnelOnStart)}
-                ${formSubhead('窗口与开机', '控制台自己怎么运行')}
-                ${switchRow('关闭窗口时最小化到托盘', '退出请使用托盘菜单中的“退出”', 'closeToTray', settings.closeToTray !== false)}
-                ${switchRow('开机自动启动', '登录 Windows 后自动运行控制台（写当前用户的启动项，不需要管理员权限）', 'launchAtLogin', !!settings.launchAtLogin)}
-                <div class="field-hint">
-                  <button class="btn sm" type="button" data-act="settings.openstartup">${icon('folder')}<span>打开启动文件夹</span></button>
-                  <span style="margin-left:8px">系统不让程序写启动项时，把程序快捷方式拖进这个文件夹，效果一样</span>
-                </div>
-                ${app.launchAtLoginBlocked ? `<div class="note warn" style="margin:2px 0 10px">${icon('alert')}<div>启动项已被系统「任务管理器 → 启动」禁用，重启后不会运行。要恢复请到那里把「FRP 控制台」设为「已启用」；或者换个办法：把快捷方式放进 <code>shell:startup</code>。</div></div>` : ''}
-                ${settings.launchAtLogin && settings.runMode === 'managed' ? `<div class="note warn" style="margin:2px 0 10px">${icon('alert')}<div>当前是「应用托管进程」模式：开机只会自动打开控制台，隧道要等控制台把 frpc 拉起来才算通；控制台一退隧道就断。</div></div>` : ''}
-                ${switchRow('以最小化状态启动', '仅显示托盘图标', 'startMinimized', !!settings.startMinimized)}
-              </div>
-            </div>
-            <div class="field span-2">
-              <div class="section-title" style="margin:4px 0 0"><strong>客户端管理 API</strong><span>frpc 只在本机 127.0.0.1 上开的管理接口，控制台用它读状态、做热重载；口令保护的是 <code>/api/config</code>（里面有 frps 的 auth.token）。</span></div>
+              <div class="section-title" style="margin:4px 0 0"><strong>客户端管理 API</strong><span>frpc 只在本机 127.0.0.1 上开的管理接口，控制台用它读状态、做热重载；口令保护的是 <code>/api/config</code>。</span></div>
             </div>
             <div class="field">
-              <label>管理端口</label>
+              <label>默认管理端口</label>
               <input class="input" name="adminPort" type="number" min="1024" max="65535" step="1" value="${esc(String(settings.adminPort || 7400))}" />
-              <div class="field-hint">如果 7400 被别的程序占了，控制台会自动顺延；也可以在这里固定一个</div>
+              <div class="field-hint">多台服务器会自动顺延分配不同端口</div>
             </div>
             <div class="field">
               <label>管理用户名</label>
               <input class="input" name="adminUser" type="text" autocomplete="off" value="${esc(settings.adminUser || 'admin')}" />
-              <div class="field-hint">写进 frpc.toml 的 <code>[webServer]</code> 段</div>
             </div>
             <div class="field span-2">
               <label>管理口令</label>
@@ -5356,9 +5348,11 @@ function renderSettings(force = false) {
                 <button class="btn small" type="button" data-act="settings.gen.adminpass" title="生成 20 位随机口令">${icon('reload')}<span>随机生成</span></button>
               </div>
               <div id="adminpass-note">${adminWeakNote(settings)}</div>
-              <div class="field-hint">改完点右上角「保存行为设置」；隧道在跑时会带着新口令重启 frpc</div>
             </div>
-          </form>
+            <div class="field span-2" style="display:flex;justify-content:flex-end">
+              <button class="btn primary" type="button" data-act="settings.save.behavior">${icon('check')}<span>保存高级设置</span></button>
+            </div>
+          </form>` : '<div class="field-hint">默认参数已适配绝大多数场景；如需调整管理 API 口令、刷新间隔或日志级别，点右上角「展开」。</div>'}
         </section>
 
         <section class="card section">
@@ -5371,7 +5365,8 @@ function renderSettings(force = false) {
 
         <section class="card section">
           <div class="section-head">
-            <div class="section-title"><strong>关于</strong><span>版本与运行环境。</span></div>
+            <div class="section-title"><strong>关于</strong><span>版本、运行环境与版本更新。</span></div>
+            <button class="btn small ghost" type="button" data-act="settings.reveal-data" title="在资源管理器中打开本地数据目录（排障用）">${icon('folder')}<span>打开数据目录</span></button>
           </div>
           <div class="detail-list">
             ${detailRow('控制台版本', app.version || '1.0.0')}
@@ -5388,18 +5383,6 @@ function renderSettings(force = false) {
   renderUpdateBox();  if (!S.update) refreshUpdateState();
   /* 指纹列表很短，顺手拉一次；失败也只是那一段显示错误文案 */
   loadKnownHosts().catch(() => {});
-}
-
-function pathRow(label, value, exists, kind, note = '') {
-  return `<div class="path-row">
-    <div class="path-display grow">
-      <span class="p-label">${esc(label)}</span>
-      <span class="p-value mono" title="${esc(value || '')}">${esc(value || '未设置')}</span>
-      ${note}
-      <span class="tag ${exists ? 'ok' : 'bad'}" title="${exists ? '这个文件在这台机器上找得到' : '这个路径下没有文件：可能被删掉、改名，或换了一台机器'}">${exists ? '可用' : '未找到'}</span>
-    </div>
-    <button class="btn small" type="button" data-act="settings.pick" data-kind="${esc(kind)}">选择</button>
-  </div>`;
 }
 
 /* 表单里的小分组标题：把一长串开关切成「隧道」「窗口与开机」两段（1.2.198）。 */
@@ -5586,6 +5569,33 @@ async function handleAction(act, dataset, btn) {
       if (S.proxyConnFilter === target.id) S.proxyConnFilter = '';
       await reloadAfterConnectionChange();
       toast('success', '已删除服务器', `${target.name || target.id}（磁盘配置文件已保留）`);
+      return;
+    }
+    case 'conn.startAll': {
+      await withBusy(btn, async () => {
+        const res = await FRP.connectionStartAll().catch(() => null);
+        if (!res || !res.ok) { toast('error', '全部启动失败', (res && res.error) || '请稍后再试'); return; }
+        if (res.data && res.data.state) S.state = res.data.state;
+        updateChrome();
+        renderCurrent({ force: true });
+        const started = (res.data && res.data.started) || [];
+        const failed = (res.data && res.data.failed) || [];
+        if (failed.length) toast('warn', '部分服务器启动失败', `成功 ${started.length} 台，失败 ${failed.length} 台：${failed[0].name}（${failed[0].error}）`);
+        else if (started.length) toast('success', '已启动全部服务器', `共 ${started.length} 台`);
+        else toast('info', '没有可启动的服务器', '先在「服务器」页完成配置');
+      });
+      return;
+    }
+    case 'conn.stopAll': {
+      await withBusy(btn, async () => {
+        const res = await FRP.connectionStopAll().catch(() => null);
+        if (!res || !res.ok) { toast('error', '全部停止失败', (res && res.error) || '请稍后再试'); return; }
+        if (res.data && res.data.state) S.state = res.data.state;
+        updateChrome();
+        renderCurrent({ force: true });
+        const stopped = (res.data && res.data.stopped) || [];
+        toast('success', '已停止全部隧道', `共停止 ${stopped.length} 台`);
+      });
       return;
     }
     case 'conn.switch': {
@@ -6222,15 +6232,6 @@ async function handleAction(act, dataset, btn) {
         btn.innerHTML = icon(show ? 'eyeoff' : 'eye');
         break;
       }
-      case 'settings.pick': {
-        const res = await FRP.pickPath(dataset.kind);
-        if (res && res.ok && res.data && res.data.state) {
-          S.state = res.data.state;
-          S.lastKeys.settings = '';
-          renderSettings(true);
-        } else if (res && !res.ok) toastResult(res);
-        break;
-      }
       case 'known.refresh': {
         await loadKnownHosts(true);
         break;
@@ -6255,11 +6256,12 @@ async function handleAction(act, dataset, btn) {
         toast('ok', `已忘掉 ${host}:${port} 的指纹`);
         break;
       }
-      case 'settings.reveal':
-        FRP.revealPath('config');
+      case 'settings.reveal-data':
+        FRP.revealPath('data');
         break;
-      case 'reveal.log':
-        FRP.revealPath('log');
+      case 'settings.advanced.toggle':
+        S.settingsAdvancedOpen = !S.settingsAdvancedOpen;
+        renderSettings(true);
         break;
       case 'settings.gen.adminpass': {
         const input = $('#in-adminpass');
@@ -6268,7 +6270,7 @@ async function handleAction(act, dataset, btn) {
         input.type = 'text';
         const note = $('#adminpass-note');
         if (note) note.innerHTML = '';
-        toast('success', '已生成 20 位随机口令', '记得点「保存行为设置」才会写进 frpc.toml');
+        toast('success', '已生成 20 位随机口令', '记得点「保存高级设置」才会写进 frpc.toml');
         break;
       }
       case 'settings.eye.adminpass': {
@@ -6288,6 +6290,32 @@ async function handleAction(act, dataset, btn) {
       case 'toggle': {
         const target = btn.classList.toggle('on');
         btn.setAttribute('aria-pressed', String(target));
+        const field = (dataset && dataset.field) || '';
+        const INSTANT_FIELDS = {
+          autoReload: '自动热重载',
+          autoReconnect: '断线自动重连',
+          launchTunnelOnStart: '启动时自动启动隧道',
+          closeToTray: '关闭窗口时最小化到托盘',
+          launchAtLogin: '开机自动启动',
+          startMinimized: '以最小化状态启动',
+        };
+        if (S.view === 'settings' && Object.prototype.hasOwnProperty.call(INSTANT_FIELDS, field)) {
+          btn.disabled = true;
+          const res = await FRP.saveSettings({ [field]: target }).catch(() => null);
+          btn.disabled = false;
+          if (!res || !res.ok) {
+            btn.classList.toggle('on', !target);
+            btn.setAttribute('aria-pressed', String(!target));
+            toastResult(res);
+            renderSettings(true);
+            break;
+          }
+          if (res.data && res.data.state) S.state = res.data.state;
+          const warnings = (res.data && Array.isArray(res.data.warnings) ? res.data.warnings : []).filter(Boolean);
+          if (warnings.length) toast('warn', `${INSTANT_FIELDS[field]}已更新（有提示）`, warnings[0]);
+          else toast('success', `${target ? '已开启' : '已关闭'}「${INSTANT_FIELDS[field]}」`);
+          renderSettings(true);
+        }
         break;
       }
       case 'proxyform.suggest': {
@@ -7709,11 +7737,11 @@ function randomAdminPassword() {
 }
 
 async function saveBehavior(btn) {
-  const form = $('#form-behavior');
+  const form = $('#form-advanced') || $('#form-behavior');
   if (!form) return;
+  const runModeEl = form.querySelector('[name="runMode"]');
+  const pollEl = form.querySelector('[name="pollIntervalMs"]');
   const patch = {
-    runMode: form.querySelector('[name="runMode"]').value,
-    pollIntervalMs: Number(form.querySelector('[name="pollIntervalMs"]').value),
     autoReload: isOn('autoReload'),
     autoReconnect: isOn('autoReconnect'),
     closeToTray: isOn('closeToTray'),
@@ -7721,6 +7749,8 @@ async function saveBehavior(btn) {
     launchAtLogin: isOn('launchAtLogin'),
     startMinimized: isOn('startMinimized'),
   };
+  if (runModeEl) patch.runMode = runModeEl.value;
+  if (pollEl) patch.pollIntervalMs = Number(pollEl.value);
   const adminPortEl = form.querySelector('[name="adminPort"]');
   const adminUserEl = form.querySelector('[name="adminUser"]');
   const adminPassEl = form.querySelector('[name="adminPassword"]');
@@ -7736,7 +7766,8 @@ async function saveBehavior(btn) {
   if (adminUserEl) patch.adminUser = String(adminUserEl.value || '').trim() || 'admin';
   if (adminPassEl) patch.adminPassword = String(adminPassEl.value || '');
   await withBusy(btn, async () => {
-    const level = form.querySelector('[name="logLevel"]').value;
+    const levelEl = form.querySelector('[name="logLevel"]');
+    const level = levelEl ? levelEl.value : '';
     const loginFailExit = isOn('loginFailExit');
     const res = await FRP.saveSettings(patch);
     if (!res || !res.ok) {
@@ -7746,24 +7777,23 @@ async function saveBehavior(btn) {
       return;
     }
     if (res.data && res.data.state) S.state = res.data.state;
-    /* warnings 现在不只来自管理 API：开机自启写不进注册表、退到「启动」文件夹快捷方式时
-     * 也会走这里。标题别再写死「没落到配置文件」，否则文案对不上。 */
     const saveWarnings = (res.data && Array.isArray(res.data.warnings) ? res.data.warnings : []).filter(Boolean);
     if (saveWarnings.length) toast('warn', '设置已保存，但有 1 项没完全生效', saveWarnings[0]);
-    /* 日志级别 / loginFailExit 落在 frpc.toml 里，同一个按钮一起写掉，
-     * 免得用户改完日志级别还要再找一次“保存配置在哪”。 */
-    const cfg = await saveClientLogOptions(level, loginFailExit);
-    if (!cfg || !cfg.ok) {
-      toastResult(cfg);
-      renderSettings(true);
-      return;
+    let cfg = null;
+    if (level) {
+      cfg = await saveClientLogOptions(level, loginFailExit);
+      if (!cfg || !cfg.ok) {
+        toastResult(cfg);
+        renderSettings(true);
+        return;
+      }
     }
     S.lastKeys.settings = '';
-    if (cfg.skipped) {
-      toast('success', '行为设置已保存', '还没有配置服务器，日志级别与 loginFailExit 会在隧道建立后一起写入');
+    if (cfg && cfg.skipped) {
+      toast('success', '设置已保存', '还没有配置服务器，日志级别与 loginFailExit 会在隧道建立后一起写入');
       return;
     }
-    toast('success', '设置已保存', cfg.data && cfg.data.reloaded ? 'frpc 配置已热重载' : '');
+    toast('success', '设置已保存', cfg && cfg.data && cfg.data.reloaded ? 'frpc 配置已热重载' : '');
   });
 }
 

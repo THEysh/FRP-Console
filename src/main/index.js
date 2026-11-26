@@ -934,18 +934,45 @@ function trayMenuSpec(runtime) {
   }).length;
 
   const visible = !!(win && !win.isDestroyed() && win.isVisible());
+  const allConns = Array.isArray(settings && settings.connections) ? settings.connections : [];
+  const multiConn = allConns.length > 1;
+  const connRows = multiConn ? allConns.map(connectionSummary) : [];
+  const runningConns = connRows.filter((c) => c.runtime && (c.runtime.running || c.runtime.connected));
+  const configuredConns = connRows.filter((c) => c.enabled !== false && String(c.serverAddr || '').trim());
+  const canStartAny = configuredConns.some((c) => !(c.runtime && (c.runtime.running || c.runtime.connected)));
+  const canStopAny = runningConns.length > 0;
+  const agg = multiConn ? connectionAggregate() : null;
+
+  const multiTunnelItems = multiConn
+    ? [
+      ...connRows.slice(0, 6).map((c) => {
+        const isOn = !!(c.runtime && (c.runtime.running || c.runtime.connected));
+        const st = c.runtime && c.runtime.connected
+          ? `在线 ${c.counts.online}/${c.counts.total}`
+          : (c.runtime && c.runtime.running ? '连接中' : '未启动');
+        return {
+          id: `conn.toggle:${c.id}`,
+          label: `${c.name || c.id} · ${st}`,
+          checked: isOn,
+          enabled: isOn || !!String(c.serverAddr || '').trim(),
+        };
+      }),
+      { id: 'tun.startAll', label: '全部启动', enabled: canStartAny },
+      { id: 'tun.stopAll', label: '全部停止', enabled: canStopAny },
+    ]
+    : [
+      { id: 'tun.start', label: '启动隧道', enabled: canStart },
+      { id: 'tun.stop', label: '停止隧道', enabled: canStop },
+      { id: 'tun.restart', label: '重启隧道', enabled: !!runtime.running },
+      { id: 'tun.reload', label: '热重载配置', enabled: !!runtime.connected },
+    ];
 
   const sections = [
     [
       { id: 'win.show', label: '显示主界面', enabled: !(visible && !win.isMinimized()) },
       { id: 'win.hide', label: '隐藏到托盘', enabled: visible },
     ],
-    [
-      { id: 'tun.start', label: '启动隧道', enabled: canStart },
-      { id: 'tun.stop', label: '停止隧道', enabled: canStop },
-      { id: 'tun.restart', label: '重启隧道', enabled: !!runtime.running },
-      { id: 'tun.reload', label: '热重载配置', enabled: !!runtime.connected },
-    ],
+    multiTunnelItems,
     [
       { id: 'open.dashboard', label: '打开服务器面板', enabled: !!dashboardUrl() },
       { id: 'open.config', label: '打开 frpc.toml', enabled: !!paths.configPath },
@@ -968,6 +995,14 @@ function trayMenuSpec(runtime) {
   const actions = {
     'win.show': () => showMainWindow(),
     'win.hide': () => hideMainWindow(),
+    'tun.startAll': async () => {
+      const r = await startAllConnections();
+      notify(r.failed.length ? 'warn' : 'info', '已启动全部服务器', r.failed.length ? `成功 ${r.started.length} 台，失败 ${r.failed.length} 台` : `共启动 ${r.started.length} 台`);
+    },
+    'tun.stopAll': async () => {
+      const r = await stopAllConnections();
+      notify('info', '已停止全部服务器', `共停止 ${r.stopped.length} 台`);
+    },
     'tun.start': async () => {
       const startEpoch = connectionEpoch;
       const targetId = settings.activeConnectionId;
@@ -1058,11 +1093,51 @@ function trayMenuSpec(runtime) {
     'app.quit': () => quitApp({ reason: 'tray' }),
   };
 
+  if (multiConn) {
+    for (const c of connRows.slice(0, 6)) {
+      actions[`conn.toggle:${c.id}`] = async () => {
+        const mm = managerForConnection(c.id);
+        if (!mm) return;
+        const isActive = c.id === settings.activeConnectionId;
+        const runMode = isActive ? settings.runMode : 'managed';
+        const isOn = !!(mm.isChildAlive || mm.snapshot().running);
+        if (isOn) {
+          markStopQuiet(c.id, 12000);
+          setDesired(c.id, false);
+          setStartedFingerprint(c.id, '');
+          const guard = multiConnection && multiConnection.guards.get(c.id);
+          if (guard) guard.cancel('用户从托盘停止了隧道');
+          const res = await mm.stop({ runMode });
+          await mm.refresh().catch(() => {});
+          notify(res.ok ? 'info' : 'error', res.ok ? `已停止「${c.name || c.id}」` : `停止「${c.name || c.id}」失败`, res.error || '');
+        } else {
+          if (!isActive) invalidateConnectionModel(c.id);
+          clearStopQuiet(c.id);
+          const res = await mm.start({ runMode });
+          await mm.refresh().catch(() => {});
+          if (res.ok) {
+            setDesired(c.id, true);
+            const connModel = isActive ? model : connectionModel(connectionById(c.id));
+            if (connModel) setStartedFingerprint(c.id, configModule.connFingerprint(connModel));
+            const guard = multiConnection && multiConnection.guards.get(c.id);
+            if (guard) guard.cancel('');
+            logFor(c.id).start();
+          }
+          notify(res.ok ? 'info' : 'error', res.ok ? `已启动「${c.name || c.id}」` : `启动「${c.name || c.id}」失败`, res.error || '');
+        }
+        pushState();
+        refreshTray();
+      };
+    }
+  }
+
   return {
     tone,
     label: status.label,
-    addr,
-    proxyLine: proxies.length ? `${proxies.length} 个代理 · 在线 ${onlineCount}` : '还没有代理',
+    addr: multiConn ? `${runningConns.length} / ${allConns.length} 台服务器运行中` : addr,
+    proxyLine: multiConn && agg
+      ? (agg.total ? `${agg.total} 个代理 · 在线 ${agg.online}` : '还没有代理')
+      : (proxies.length ? `${proxies.length} 个代理 · 在线 ${onlineCount}` : '还没有代理'),
     sections,
     actions,
     mark: runtime.loggedIn ? '●' : runtime.loginFailed || runtime.connectFailed ? '✕' : runtime.mode === 'starting' || runtime.pending ? '◐' : '○',
@@ -1140,34 +1215,18 @@ function revealPathSafe(which) {
   }
 }
 
-// 只有托盘真的可见，才允许把窗口收进去。
+// 只有托盘实例成功创建且未销毁，就允许把窗口收进托盘。
+// 注意：Windows 10/11 下托盘图标默认收进右下角「^」折叠区，或刚开机任务栏尚未完全就绪时，
+// tray.getBounds() 会返回全 0 —— 这是正常的系统行为，绝不能因此误判托盘不可用并把
+// 「以最小化状态启动」的窗口强行弹到桌面（1.2.233 修复）。
 function canHideToTray() {
-  return !!tray && trayUsable;
+  return !!(tray && !tray.isDestroyed());
 }
 
-/* 托盘自检：系统没给图标分配屏幕位置就说明它其实没显示出来。
- * 连续三次（约 9 秒）都拿不到位置才下结论，避免把「图标被折叠进 ^ 溢出面板」误判成故障。
- * 一旦判定不可用，就把已经藏起来的窗口叫回来——绝不能把用户锁在界面外面。 */
 function probeTray() {
   if (!tray || tray.isDestroyed()) return;
-  let shown = true;
-  try {
-    const b = tray.getBounds();
-    shown = !!(b && b.width > 0 && b.height > 0);
-  } catch {
-    shown = true; // 平台不支持 getBounds 时不干预
-  }
-  if (shown) {
-    trayProbeFails = 0;
-    if (!trayUsable) { trayUsable = true; refreshTray(); }
-    return;
-  }
-  trayProbeFails += 1;
-  if (trayProbeFails < 3 || !trayUsable) return;
-  trayUsable = false;
-  console.warn('[tray] 系统未显示托盘图标（getBounds 全 0），关闭窗口将直接退出而不是收进托盘');
-  if (win && !win.isDestroyed() && !win.isVisible()) showMainWindow();
-  refreshTray();
+  trayProbeFails = 0;
+  trayUsable = true;
 }
 
 function refreshTray() {
@@ -3757,16 +3816,20 @@ function registerIpc() {
   });
 
   ipcMain.handle('paths:reveal', async (event, which) => {
-    /* 以前未知类型会静默落回「配置文件」，调用方拿到 ok 但其实打开的是别的东西；
-     * 现在只认这三个，别的一律报错，找不到目标也如实说。 */
-    const known = { log: paths.logPath, frpc: paths.frpcPath, config: paths.configPath };
+    /* 只认白名单路径类型，别的一律报错，找不到目标也如实说。 */
+    const known = { log: paths.logPath, frpc: paths.frpcPath, config: paths.configPath, data: settingsModule.dataDir() };
     if (!Object.prototype.hasOwnProperty.call(known, which)) {
-      return fail(`不认识的路径类型「${which}」，可用：config / frpc / log`);
+      return fail(`不认识的路径类型「${which}」，可用：config / frpc / log / data`);
     }
     const target = known[which];
     if (!target) return fail('路径尚未设置');
     if (!fs.existsSync(target)) return fail(`文件不存在：${target}`);
-    shell.showItemInFolder(target);
+    if (which === 'data') {
+      const err = await shell.openPath(target);
+      if (err) return fail(`打不开数据目录：${err}`);
+    } else {
+      shell.showItemInFolder(target);
+    }
     return ok({ revealed: true, path: target });
   });
 
@@ -4399,6 +4462,17 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '', exclud
     pushState();
     refreshTray();
     return result.ok ? ok({ connection: connectionSummary(conn) }) : fail(result.error, { connection: connectionSummary(conn) });
+  });
+
+  ipcMain.handle('connections:start-all', async () => {
+    if (!(await waitForManager())) return fail('应用还在启动：隧道管理器没就绪，请稍等一两秒再试。');
+    const summary = await startAllConnections();
+    return ok({ ...summary, connections: connectionList(), state: buildState() });
+  });
+
+  ipcMain.handle('connections:stop-all', async () => {
+    const summary = await stopAllConnections();
+    return ok({ ...summary, connections: connectionList(), state: buildState() });
   });
 
   /* 新建一条连接：给它一个独立的配置文件（空的起步配置），不是复制当前连接的内容 ——
@@ -7176,6 +7250,77 @@ function updateFlagPath() {
   }
 }
 
+/* 多连接批量启停：供概览「全部启动/停止」、托盘菜单以及开机自动启动共用（1.2.233）。 */
+async function startAllConnections({ onlyIds = null } = {}) {
+  const list = Array.isArray(settings && settings.connections) ? settings.connections : [];
+  const filter = Array.isArray(onlyIds) && onlyIds.length ? new Set(onlyIds) : null;
+  const started = [];
+  const failed = [];
+  const skipped = [];
+  for (const conn of list) {
+    if (!conn) continue;
+    if (filter && !filter.has(conn.id)) continue;
+    if (conn.enabled === false) { skipped.push({ id: conn.id, name: conn.name, reason: '已停用' }); continue; }
+    const isActive = conn.id === settings.activeConnectionId;
+    if (!isActive) invalidateConnectionModel(conn.id);
+    const connModel = isActive ? model : connectionModel(conn);
+    if (!connModel || !String(connModel.serverAddr || '').trim()) {
+      skipped.push({ id: conn.id, name: conn.name, reason: '未配置服务器地址' });
+      continue;
+    }
+    const mm = managerForConnection(conn.id);
+    if (!mm) { failed.push({ id: conn.id, name: conn.name, error: '管理器未就绪' }); continue; }
+    if (mm.isChildAlive || mm.snapshot().running) {
+      started.push({ id: conn.id, name: conn.name, already: true });
+      continue;
+    }
+    const runMode = isActive && list.length === 1 ? settings.runMode : 'managed';
+    clearStopQuiet(conn.id);
+    const res = await mm.start({ runMode }).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+    await mm.refresh().catch(() => {});
+    if (res && res.ok) {
+      setDesired(conn.id, true);
+      setStartedFingerprint(conn.id, configModule.connFingerprint(connModel));
+      const guard = multiConnection && multiConnection.guards.get(conn.id);
+      if (guard) guard.cancel('');
+      logFor(conn.id).start();
+      started.push({ id: conn.id, name: conn.name });
+    } else {
+      failed.push({ id: conn.id, name: conn.name, error: (res && res.error) || '启动失败' });
+    }
+  }
+  healthCache.clear();
+  scheduleHealth(1500);
+  pushState();
+  refreshTray();
+  return { started, failed, skipped };
+}
+
+async function stopAllConnections() {
+  const list = Array.isArray(settings && settings.connections) ? settings.connections : [];
+  const stopped = [];
+  const failed = [];
+  for (const conn of list) {
+    if (!conn) continue;
+    const mm = managersMap().get(conn.id);
+    if (!mm || (!mm.isChildAlive && !mm.snapshot().running)) continue;
+    const isActive = conn.id === settings.activeConnectionId;
+    const runMode = isActive && list.length === 1 ? settings.runMode : 'managed';
+    markStopQuiet(conn.id, 12000);
+    setDesired(conn.id, false);
+    setStartedFingerprint(conn.id, '');
+    const guard = multiConnection && multiConnection.guards.get(conn.id);
+    if (guard) guard.cancel('用户停止了全部隧道');
+    const res = await mm.stop({ runMode }).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+    await mm.refresh().catch(() => {});
+    if (res && res.ok) stopped.push({ id: conn.id, name: conn.name });
+    else failed.push({ id: conn.id, name: conn.name, error: (res && res.error) || '停止失败' });
+  }
+  pushState();
+  refreshTray();
+  return { stopped, failed };
+}
+
 async function prepareUpdateInstall() {
   /* 更新期间绝不能重连：安装器要覆盖安装目录，抢一个 frpc 会让升级失败。 */
   updatingNow = true;
@@ -7183,8 +7328,12 @@ async function prepareUpdateInstall() {
   if (multiConnection) {
     for (const guard of multiConnection.guards.values()) guard.cancel('正在安装更新');
   }
-  // 记录更新前当前连接的隧道是否由控制台托管（用于更新后自动接回）
-  const wasManaged = !!(manager && manager.isChildAlive);
+  // 记录更新前所有由控制台托管运行的连接（用于更新后自动全部接回）
+  const managedIds = [];
+  for (const [id, mm] of managersMap()) {
+    if (mm && mm.isChildAlive) managedIds.push(id);
+  }
+  const wasManaged = managedIds.length > 0;
   /* 所有连接（含当前连接）的 frpc 都要停：每个 frpc.exe 都锁着安装目录里的
    * resources/frpc/frpc.exe，漏掉任意一条都会让安装器 Rename 失败。 */
   for (const [id, mm] of managersMap()) {
@@ -7236,11 +7385,11 @@ async function prepareUpdateInstall() {
   } catch {
     /* 查询失败不影响更新 */
   }
-  // 3) 写便条：更新后凭它把隧道接回来
+  // 3) 写便条：更新后凭它把更新前在跑的所有隧道接回来
   if (wasManaged) {
     try {
       const file = updateFlagPath();
-      if (file) fs.writeFileSync(file, JSON.stringify({ at: Date.now() }), 'utf8');
+      if (file) fs.writeFileSync(file, JSON.stringify({ at: Date.now(), ids: managedIds }), 'utf8');
     } catch {
       /* 便条写不下去只影响“更新后自动拉起隧道”，不影响更新本身 */
     }
@@ -7249,14 +7398,15 @@ async function prepareUpdateInstall() {
 
 function takeUpdateRestartFlag() {
   const file = updateFlagPath();
-  if (!file) return false;
+  if (!file) return null;
   try {
     const data = JSON.parse(fs.readFileSync(file, 'utf8'));
     fs.unlinkSync(file);
     // 超过 10 分钟就作废：可能是上次更新失败留下的，不该莫名把隧道拉起来
-    return !!(data && data.at && Date.now() - data.at < 10 * 60 * 1000);
+    if (!data || !data.at || Date.now() - data.at >= 10 * 60 * 1000) return null;
+    return { ids: Array.isArray(data.ids) ? data.ids : [] };
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -7276,24 +7426,16 @@ function startApp() {
       onStatus: (payload) => send('update:status', payload),
       beforeInstall: prepareUpdateInstall,
     });
-    // 刚被更新过：上次更新前隧道在跑，这次启动把它接回来（服务模式下不会有这张便条）
-    const restoreTunnel = takeUpdateRestartFlag();
+    // 刚被更新过：上次更新前隧道在跑，这次启动全部接回来（服务模式下不会有这张便条）
+    const restoreFlag = takeUpdateRestartFlag();
     // bootstrap() 第一句就同步载入 settings，这里可以安全读取启动偏好。
-    if (settings.launchTunnelOnStart || restoreTunnel) {
+    if (settings.launchTunnelOnStart) {
       bootstrapReady
-        .then(() => {
-          const id = settings.activeConnectionId;
-          clearStopQuiet(id);
-          const mm = managerForConnection(id);
-          return mm ? mm.start({ runMode: settings.runMode }) : null;
-        })
-        .then((res) => {
-          const id = settings.activeConnectionId;
-          if (res && res.ok) setDesired(id, true);
-          const mm = managerForConnection(id);
-          return mm ? mm.refresh() : null;
-        })
-        .then(() => pushState())
+        .then(() => startAllConnections())
+        .catch(() => {});
+    } else if (restoreFlag) {
+      bootstrapReady
+        .then(() => startAllConnections({ onlyIds: restoreFlag.ids.length ? restoreFlag.ids : [settings.activeConnectionId] }))
         .catch(() => {});
     }
     /* 档 3：系统唤醒 / 解锁之后，每条期望在线的连接各自宽限 20 秒，没恢复就交给它自己的守护重启。 */
