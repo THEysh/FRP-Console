@@ -13,7 +13,15 @@ const fs = require('node:fs');
 const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
-const { createConnectionRuntime, dispatchEnsureAdmin, runWithEpochGuard } = require('../../src/main/conn-runtime');
+const {
+  createConnectionRuntime,
+  dispatchEnsureAdmin,
+  runWithEpochGuard,
+  evalSupervisorBlockReason,
+  shouldNotifyExit,
+  stepApiDownWindow,
+} = require('../../src/main/conn-runtime');
+const { LogFollower } = require('../../src/main/log');
 const { FrpcManager } = require('../../src/main/frpc');
 const configModule = require('../../src/main/config');
 
@@ -244,4 +252,89 @@ test('真进程 I1+I2：双 FrpcManager 动态 ctx 切换 active 指针后，两
     await mmB.stop({ runMode: 'managed' }).catch(() => {});
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
   }
+});
+
+test('C3 evalSupervisorBlockReason：active 与 parked 参数化判定，非当前连接不做 service 判定', () => {
+  const base = {
+    conn: { id: 'c-a', enabled: true, autoReconnect: true },
+    isActive: true,
+    settings: { autoReconnect: true },
+    desired: true,
+    updatingNow: false,
+    isQuitting: false,
+    snapshot: { mode: 'managed', foreign: false },
+    validationErrors: [],
+  };
+  assert.equal(evalSupervisorBlockReason(base), '');
+  assert.match(evalSupervisorBlockReason({ ...base, desired: false }), /用户没让它开/);
+  assert.match(evalSupervisorBlockReason({ ...base, settings: { autoReconnect: false } }), /断线自动重连/);
+  assert.match(evalSupervisorBlockReason({ ...base, conn: { ...base.conn, autoReconnect: false } }), /这条连接关掉了/);
+  assert.match(evalSupervisorBlockReason({ ...base, conn: { ...base.conn, enabled: false } }), /已停用/);
+  assert.match(evalSupervisorBlockReason({ ...base, snapshot: { mode: 'managed', foreign: true } }), /别人的 frpc/);
+  assert.match(evalSupervisorBlockReason({ ...base, validationErrors: [{ message: 'bad' }] }), /配置有 1 处错误/);
+
+  /* active 在 service 模式被挡，parked 永远 managed 不做 service 判定 */
+  assert.match(
+    evalSupervisorBlockReason({ ...base, isActive: true, snapshot: { mode: 'service', foreign: false } }),
+    /系统服务/,
+  );
+  assert.equal(
+    evalSupervisorBlockReason({ ...base, isActive: false, snapshot: { mode: 'service', foreign: false } }),
+    '',
+  );
+});
+
+test('C3 shouldNotifyExit：仅当前查看的连接弹通知，后台连接静默重连', () => {
+  assert.equal(shouldNotifyExit({ isActive: true, quiet: false, isQuitting: false }), true);
+  assert.equal(shouldNotifyExit({ isActive: false, quiet: false, isQuitting: false }), false, '后台连接必须静默');
+  assert.equal(shouldNotifyExit({ isActive: true, quiet: true, isQuitting: false }), false, '主动停止静音期内不弹');
+  assert.equal(shouldNotifyExit({ isActive: true, quiet: false, isQuitting: true }), false, '退出应用时不弹');
+});
+
+test('C3 stepApiDownWindow：两条连接的 15 秒健康窗口完全独立，不串计数', () => {
+  const rt = createConnectionRuntime();
+  const t0 = 100000;
+  /* A 开始无响应，B 仍连通 */
+  assert.equal(stepApiDownWindow(rt, 'c-a', { eligible: true, connected: false, now: t0 }), false);
+  assert.equal(stepApiDownWindow(rt, 'c-b', { eligible: true, connected: true, now: t0 }), false);
+  /* 10 秒后 B 也开始无响应 */
+  assert.equal(stepApiDownWindow(rt, 'c-a', { eligible: true, connected: false, now: t0 + 10000 }), false);
+  assert.equal(stepApiDownWindow(rt, 'c-b', { eligible: true, connected: false, now: t0 + 10000 }), false);
+  /* t0 + 16000：A 超 15 秒触发，B 只过了 6 秒不触发 */
+  assert.equal(stepApiDownWindow(rt, 'c-a', { eligible: true, connected: false, now: t0 + 16000 }), true);
+  assert.equal(stepApiDownWindow(rt, 'c-b', { eligible: true, connected: false, now: t0 + 16000 }), false);
+  /* t0 + 26000：B 超 15 秒触发 */
+  assert.equal(stepApiDownWindow(rt, 'c-b', { eligible: true, connected: false, now: t0 + 26000 }), true);
+});
+
+test('C3 startedFingerprints 与 per-connection LogFollower：来回切换各自状态与日志互不污染', () => {
+  const rt = createConnectionRuntime();
+  rt.setFingerprint('c-a', 'fp-alpha');
+  rt.setFingerprint('c-b', 'fp-beta');
+  assert.equal(rt.getFingerprint('c-a'), 'fp-alpha');
+  assert.equal(rt.getFingerprint('c-b'), 'fp-beta');
+  rt.setFingerprint('c-a', '');
+  assert.equal(rt.getFingerprint('c-a'), '');
+  assert.equal(rt.getFingerprint('c-b'), 'fp-beta');
+
+  const fA = new LogFollower('', { maxLines: 50 });
+  const fB = new LogFollower('', { maxLines: 50 });
+  rt.followers.set('c-a', fA);
+  rt.followers.set('c-b', fB);
+  const pushed = [];
+  let activeId = 'c-a';
+  fA.on('lines', (lines) => { if (activeId === 'c-a') pushed.push(['c-a', ...lines.map((l) => l.text)]); });
+  fB.on('lines', (lines) => { if (activeId === 'c-b') pushed.push(['c-b', ...lines.map((l) => l.text)]); });
+
+  fA.appendLines('2026-11-26 10:00:00 [I] alpha-line-1');
+  fB.appendLines('2026-11-26 10:00:01 [I] beta-line-1');
+  assert.equal(pushed.length, 1, '查看 A 时 B 的日志不推送到渲染层');
+  assert.match(pushed[0][1], /alpha-line-1/);
+
+  activeId = 'c-b';
+  assert.equal(fB.recent(10).length, 1, '切到 B 后能直接看到 B 后台攒下的日志');
+  assert.match(fB.recent(10)[0].text, /beta-line-1/);
+  fB.appendLines('2026-11-26 10:00:02 [I] beta-line-2');
+  assert.equal(pushed.length, 2);
+  assert.equal(pushed[1][0], 'c-b');
 });

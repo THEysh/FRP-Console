@@ -87,7 +87,7 @@ const browserProbe = require('./netprobe');
 const { execFileP, powershell, tcpCheck, httpProbe, hashText, randomToken, formatDuration, proxyEnvKeys, parseSocketHolder } = require('./util');
 const { probePort, probeUdp, sshConnectHint, outboundHint } = require('./portprobe');
 const { parseRuleSpec, judgePortRow, buildPortMatrix, summarizeMatrix, buildRuleTexts } = require('./portmatrix');
-const { createConnectionRuntime, dispatchEnsureAdmin } = require('./conn-runtime');
+const { createConnectionRuntime, dispatchEnsureAdmin, evalSupervisorBlockReason, shouldNotifyExit, stepApiDownWindow } = require('./conn-runtime');
 
 /* 出站失败（证书签发 / DNS API / 下载 frps / 检查更新）补一句本机网络排查方向。
  * 这类请求都是从本机往 443 连，跟服务器防火墙无关，混在一起说会把用户引到错的方向。 */
@@ -149,14 +149,11 @@ let lastServiceDetect = 0;
 let tunnelDesired = false;
 /* 应用内更新期间不能重连：安装器要覆盖文件，抢一个 frpc 只会让升级失败。 */
 let updatingNow = false;
-/* 健康守护：进程还在但管理 API 连续不通的时间起点（0 = 当前是通的）。 */
-let apiDownSince = 0;
 /* 上一次看到的网络接口快照，用来发现“换网/网卡重连”。 */
 let netSnapshot = '';
-/* 发现网络变化的时间点：给 20 秒让 frpc 自己重连，没恢复才交给守护。 */
-let netChangedAt = 0;
 
-const follower = new LogFollower('', { maxLines: 600 });
+/* 当前查看连接的日志跟随器指针（启动前用空实例占位，bootstrap 后由 logFor(activeId) 接管）。 */
+let follower = new LogFollower('', { maxLines: 600 });
 let manager = null;
 let supervisor = null;
 /* 多连接运行期状态（bootstrap 里初始化；null 表示还没起来）。 */
@@ -983,7 +980,8 @@ function trayMenuSpec(runtime) {
         setDesired(targetId, true);
         const guard = multiConnection && multiConnection.guards.get(targetId);
         if (guard) guard.cancel('');
-        if (startEpoch === connectionEpoch) startedFingerprint = configModule.connFingerprint(model);
+        const targetModel = targetId === settings.activeConnectionId ? model : connectionModel(connectionById(targetId));
+        if (targetModel) setStartedFingerprint(targetId, configModule.connFingerprint(targetModel));
       }
       if (startEpoch === connectionEpoch) {
         notify(result.ok ? 'info' : 'error', result.ok ? '隧道已启动' : '启动失败', result.error || '');
@@ -999,7 +997,7 @@ function trayMenuSpec(runtime) {
       if (!mm) return;
       markStopQuiet(targetId, 12000);
       setDesired(targetId, false);
-      if (stopEpoch === connectionEpoch) startedFingerprint = '';
+      setStartedFingerprint(targetId, '');
       const guard = multiConnection && multiConnection.guards.get(targetId);
       if (guard) guard.cancel('用户停止了隧道');
       const result = await mm.stop({ runMode: settings.runMode });
@@ -1022,7 +1020,8 @@ function trayMenuSpec(runtime) {
         setDesired(targetId, true);
         const guard = multiConnection && multiConnection.guards.get(targetId);
         if (guard) guard.cancel('');
-        if (restartEpoch === connectionEpoch) startedFingerprint = configModule.connFingerprint(model);
+        const targetModel = targetId === settings.activeConnectionId ? model : connectionModel(connectionById(targetId));
+        if (targetModel) setStartedFingerprint(targetId, configModule.connFingerprint(targetModel));
       }
       if (restartEpoch === connectionEpoch) {
         notify(result.ok ? 'info' : 'error', result.ok ? '隧道已重启' : '重启失败', result.error || '');
@@ -1369,7 +1368,8 @@ function reachHint(code) {
 }
 
 function lastConnectProblem() {
-  const lines = (follower && follower.lines) || [];
+  const curFollower = activeFollower();
+  const lines = (curFollower && curFollower.lines) || [];
   const floor = Math.max(0, lines.length - 300);
   let fileProblem = null;
   for (let i = lines.length - 1; i >= floor; i -= 1) {
@@ -1490,6 +1490,71 @@ function clearStopQuiet(connId) {
 function isStopQuiet(connId) {
   const id = String(connId || (settings && settings.activeConnectionId) || '');
   return !!(multiConnection && multiConnection.isStopQuiet(id));
+}
+
+/* C3：配置指纹按连接存；顶层的 startedFingerprint 只是当前连接的派生视图。 */
+function setStartedFingerprint(connId, fp) {
+  const id = String(connId || (settings && settings.activeConnectionId) || '');
+  const val = multiConnection ? multiConnection.setFingerprint(id, fp) : String(fp || '');
+  if (!id || id === ((settings && settings.activeConnectionId) || '')) startedFingerprint = val;
+  return val;
+}
+
+function startedFingerprintFor(connId) {
+  const id = String(connId || (settings && settings.activeConnectionId) || '');
+  if (multiConnection) return multiConnection.getFingerprint(id);
+  return startedFingerprint;
+}
+
+/* C3：每条连接独占一个 LogFollower；只有「当前查看」的连接把增量推送给渲染层，
+ * 后台连接的日志留在自己的缓冲里，切过去时立刻就能看到完整上下文。 */
+function logBufferLimit() {
+  return Math.min(2000, Math.max(100, Number((settings && settings.logBuffer) || 600)));
+}
+
+function resolveLogPathFor(conn) {
+  if (!conn) return (paths && paths.logPath) || '';
+  if (settings && conn.id === settings.activeConnectionId) {
+    return settingsModule.logPathFromConfig(model, paths.configPath) || conn.logPath || '';
+  }
+  return conn.logPath || settingsModule.logPathFromConfig(connectionModel(conn), conn.configPath) || '';
+}
+
+function logFor(connId) {
+  const id = String(connId || (settings && settings.activeConnectionId) || '');
+  if (!id || !multiConnection) return follower;
+  let f = multiConnection.followers.get(id);
+  if (!f) {
+    const conn = connectionById(id);
+    const file = resolveLogPathFor(conn);
+    f = new LogFollower(file, { maxLines: logBufferLimit() });
+    f.on('lines', (lines) => {
+      if (settings && id === settings.activeConnectionId) send('logs:append', lines);
+    });
+    f.on('reset', () => {
+      if (settings && id === settings.activeConnectionId) send('logs:reset', { lines: f.recent(300) });
+    });
+    multiConnection.followers.set(id, f);
+    const mm = managersMap().get(id);
+    if ((settings && id === settings.activeConnectionId) || (mm && mm.snapshot().running)) {
+      f.start();
+    }
+  }
+  return f;
+}
+
+function activeFollower() {
+  const id = settings && settings.activeConnectionId;
+  return id && multiConnection ? logFor(id) : follower;
+}
+
+function stopAllFollowers() {
+  if (multiConnection && multiConnection.followers) {
+    for (const f of multiConnection.followers.values()) {
+      try { f.stop(); } catch { /* ignore */ }
+    }
+  }
+  try { follower.stop(); } catch { /* ignore */ }
 }
 
 /* I1：managers 是「每条连接一个 FrpcManager」的唯一真相，当前连接也在表里。
@@ -1648,9 +1713,10 @@ function wireManager(mm, connId) {
         : await mm.start({ runMode, force: true });
       clearStopQuiet(connId);
       await mm.refresh().catch(() => {});
-      if (result && result.ok && connId === settings.activeConnectionId) {
+      if (result && result.ok) {
         /* 用当前配置起来的，记下指纹：否则界面会一直挂着“配置变了，重启隧道才生效”。 */
-        startedFingerprint = configModule.connFingerprint(model);
+        const connModel = connId === settings.activeConnectionId ? model : connectionModel(connectionById(connId));
+        if (connModel) setStartedFingerprint(connId, configModule.connFingerprint(connModel));
       }
       healthCache.clear();
       scheduleHealth(1500);
@@ -1658,20 +1724,12 @@ function wireManager(mm, connId) {
       return result;
     },
     canRestart: () => {
-      if (connId === settings.activeConnectionId) {
-        const why = supervisorBlockReason();
-        if (why) {
-          // 只在“本来想重连但被挡住”时说一句，便于现场排查（正常停止不会走到这里）。
-          console.warn(`[reconnect] 跳过自动重连：${why}`);
-          return false;
-        }
-        return true;
+      const why = supervisorBlockReason(connId);
+      if (why) {
+        // 只在“本来想重连但被挡住”时说一句，便于现场排查（正常停止不会走到这里）。
+        console.warn(`[reconnect] ${connId} 跳过自动重连：${why}`);
+        return false;
       }
-      const c = connectionById(connId);
-      if (!c || c.enabled === false) return false;
-      if (settings.autoReconnect === false || updatingNow || isQuitting) return false;
-      if (!desiredFor(connId)) return false;
-      if (mm.snapshot().foreign) return false;
       return true;
     },
     onChange: () => {
@@ -1685,7 +1743,7 @@ function wireManager(mm, connId) {
       const line = `${new Date().toISOString().slice(0, 19).replace('T', ' ')} ${level === 'error' ? 'ERR' : 'WRN'} ${prefix}${message}`;
       if (process.env.FRP_CONSOLE_DEBUG) console.log('[guard]', connId, message);
       try {
-        follower.appendLines(line);
+        logFor(connId).appendLines(line);
       } catch { /* 日志失败不影响重连 */ }
     },
   });
@@ -1708,7 +1766,8 @@ function wireManager(mm, connId) {
       console.warn(`[reconnect] ${connId} frpc 意外退出，排队重连：${why}`);
       guard.arm(why);
     }
-    if (!quiet && !isQuitting && isActive && Date.now() > suppressExitUntil) {
+    /* C3：只有当前查看的连接弹退出通知；后台连接静默重连，由概览与托盘呈现状态。 */
+    if (shouldNotifyExit({ isActive, quiet, isQuitting }) && Date.now() > suppressExitUntil) {
       send('notify', {
         kind: unexpected ? 'error' : 'info',
         title: unexpected ? '隧道意外停止' : '隧道已停止',
@@ -1717,7 +1776,7 @@ function wireManager(mm, connId) {
     }
   });
 
-  /* frpc 自己的输出（stdout/stderr）：按流各留半行缓冲，按行塞进日志缓冲。 */
+  /* frpc 自己的输出（stdout/stderr）：按流各留半行缓冲，按行写进该连接自己的 LogFollower。 */
   const outputPartial = { stdout: '', stderr: '' };
   mm.on('output', (chunk, stream) => {
     const key = stream === 'stderr' ? 'stderr' : 'stdout';
@@ -1725,8 +1784,8 @@ function wireManager(mm, connId) {
     const parts = buf.split(/\r?\n/);
     outputPartial[key] = parts.pop() || '';
     const text = parts.join('\n');
-    if (text.trim() && connId === settings.activeConnectionId) {
-      follower.appendLines(text);
+    if (text.trim()) {
+      logFor(connId).appendLines(text);
     }
   });
 
@@ -1758,6 +1817,10 @@ function setActiveManager(connId) {
   manager = mm;
   supervisor = (mm && multiConnection && multiConnection.guards.get(connId)) || null;
   tunnelDesired = desiredFor(connId);
+  startedFingerprint = startedFingerprintFor(connId);
+  const f = logFor(connId);
+  follower = f;
+  if (f && !f.started) f.start();
   return mm;
 }
 
@@ -1956,20 +2019,27 @@ function killFrpcOnPort(port) {
   }
 }
 
-/* 返回“现在不该自动重连”的原因；空串表示可以重连。
+/* 返回“现在不该自动重连”的原因；空串表示可以重连（参数化，active/parked 统一走这里）。
  * 抽成函数是为了出问题时有话可说：日志里能看到到底被哪一条挡住。 */
-function supervisorBlockReason() {
-  if (!settings) return '设置还没加载';
-  if (settings.autoReconnect === false) return '用户关掉了「断线自动重连」';
-  if (!tunnelDesired) return '隧道不是程序启动的（用户没让它开）';
-  if (updatingNow) return '正在安装更新';
-  if (!manager) return '管理器还没准备好';
-  if (manager.snapshot().foreign) return '管理端口上是别人的 frpc';
-  const snap = manager.snapshot();
-  if (snap.mode === 'service' || snap.runtimeMode === 'service') return '隧道由系统服务托管，进程不归程序管';
-  const errors = (buildState().validation && buildState().validation.errors) || [];
-  if (errors.length) return `配置有 ${errors.length} 处错误，先改配置`;
-  return '';
+function supervisorBlockReason(connId) {
+  const id = String(connId || (settings && settings.activeConnectionId) || '');
+  const conn = connectionById(id);
+  const isActive = !!(conn && settings && conn.id === settings.activeConnectionId);
+  const mm = conn ? managersMap().get(conn.id) : null;
+  const connModel = conn ? (isActive ? model : connectionModel(conn)) : null;
+  const validation = connModel
+    ? configModule.validate(connModel, { allowPorts: isActive ? serverAllowPorts() : [] })
+    : { errors: [{ message: '配置不可用' }] };
+  return evalSupervisorBlockReason({
+    conn,
+    isActive,
+    settings,
+    desired: desiredFor(id),
+    updatingNow,
+    isQuitting,
+    snapshot: mm ? mm.snapshot() : null,
+    validationErrors: validation.errors || [],
+  });
 }
 
 function runtimeView(runtime) {
@@ -2394,7 +2464,11 @@ function buildState() {
      * 隧道确实在跑、三层也确实通（frpc 还在连那台服务器），但这台服务器在本机已经
      * 没有档案了 —— 概览不能继续报"一切正常"。 */
     binding: tunnelBindingView(),
-    logs: { count: follower.lines.length, last: follower.lines.length ? follower.lines[follower.lines.length - 1].ts : 0 },
+    logs: (() => {
+      const f = activeFollower();
+      const arr = (f && f.lines) || [];
+      return { count: arr.length, last: arr.length ? arr[arr.length - 1].ts : 0 };
+    })(),
   };
 }
 
@@ -2487,11 +2561,12 @@ function loadConfigFromDisk({ initial = false } = {}) {
 function updateLogFile() {
   const file = settingsModule.logPathFromConfig(model, paths.configPath);
   paths.logPath = file;
-  if (file && file !== follower.file) {
-    follower.setFile(file);
-    if (follower.started) follower.start();
+  const f = activeFollower();
+  if (file && file !== f.file) {
+    f.setFile(file);
+    if (f.started) f.start();
   }
-  if (!follower.started) follower.start();
+  if (!f.started) f.start();
 }
 
 function persistModel(nextModel, { reload = true } = {}) {
@@ -2612,7 +2687,15 @@ async function tick({ force = false } = {}) {
     /* 非当前连接的配置被外部改了，frpc 不会自己重读 —— 这里主动 reload 一次。 */
     await tickStep('syncParkedConnectionConfigs', syncParkedConnectionConfigs);
     // 先刷隧道真实状态：它决定了界面"通不通"，优先级高于服务托管信息
-    await tickStep('manager.refresh', () => manager.refresh());
+    await tickStep('manager.refresh', () => (manager ? manager.refresh() : null));
+    /* 非当前但正在跑或期望运行的连接也一起刷新，让各自的健康守护窗口保持新鲜。 */
+    if (multiConnection) {
+      for (const [id, mm] of managersMap()) {
+        if (id === settings.activeConnectionId || !mm) continue;
+        if (!mm.isChildAlive && !desiredFor(id)) continue;
+        await tickStep(`manager.refresh:${id}`, () => mm.refresh());
+      }
+    }
     if (Date.now() - lastServiceCheck > 3800 || force) {
       lastServiceCheck = Date.now();
       await tickStep('refreshService', () => refreshService({ detect: false }));
@@ -2620,39 +2703,51 @@ async function tick({ force = false } = {}) {
     /* 管理端口上跑的是别人的 frpc 时，本配置的隧道根本没在工作：
      * 继续做三层检查只会把每条代理都刷成“隧道未建立”，把真正的原因
      * （端口冲突）淹掉。这时保留上一次结果并停止探测，等端口冲突解决了再查。 */
-    const foreignNow = !!manager.snapshot().foreign;
-    /* 健康守护（档 2）：frpc 进程还活着，但管理 API 连续 15 秒不响应 ——
-     * 这不是“正在连接”，是卡死了（socket 假活 / 进程挂起）。交给守护重启，
-     * 否则界面会一直停在“正在连接服务器”，用户还是只能手动点。 */
-    if (supervisor && tunnelDesired && !foreignNow && !updatingNow && manager.isChildAlive) {
-      if (manager.snapshot().connected) {
-        apiDownSince = 0;
-      } else if (!apiDownSince) {
-        apiDownSince = Date.now();
-      } else if (Date.now() - apiDownSince > 15000 && !supervisor.isWaiting()) {
-        apiDownSince = 0;
-        supervisor.arm('管理 API 连续 15 秒无响应');
+    const foreignNow = !!(manager && manager.snapshot().foreign);
+    /* 健康守护（档 2，C3 按连接隔离）：每条连接各自跟踪管理 API 连续 15 秒无响应窗口，
+     * 切换连接不会清空旧连接的计时，也不会把 A 的计时串到 B 上。 */
+    const now = Date.now();
+    if (multiConnection) {
+      for (const conn of (settings.connections || [])) {
+        const mm = managersMap().get(conn.id);
+        const guard = multiConnection.guards.get(conn.id);
+        const snap = mm ? mm.snapshot() : null;
+        const eligible = !!(mm && guard && desiredFor(conn.id) && snap && !snap.foreign && !updatingNow && mm.isChildAlive);
+        const triggered = stepApiDownWindow(multiConnection, conn.id, {
+          eligible,
+          connected: !!(snap && snap.connected),
+          now,
+        });
+        if (triggered && !guard.isWaiting()) {
+          guard.arm('管理 API 连续 15 秒无响应');
+        }
       }
-    } else {
-      apiDownSince = 0;
     }
     /* 档 3：换网 / 网卡重连 / 睡眠唤醒。frpc 自己会重连，但假活的 socket 不会自己好，
-     * 给 20 秒宽限，仍然没连上就交给守护重启。 */
-    if (Date.now() - (tick.lastNet || 0) > 15000) {
-      tick.lastNet = Date.now();
+     * 给 20 秒宽限，仍然没连上就交给各自连接的守护重启。 */
+    if (now - (tick.lastNet || 0) > 15000) {
+      tick.lastNet = now;
       const snapText = JSON.stringify(
         Object.entries(os.networkInterfaces()).map(([name, list]) => [name, (list || []).map((x) => `${x.address}/${x.netmask}`)])
       );
-      if (netSnapshot && snapText !== netSnapshot) {
-        netChangedAt = Date.now();
+      if (netSnapshot && snapText !== netSnapshot && multiConnection) {
+        for (const conn of (settings.connections || [])) {
+          if (desiredFor(conn.id)) multiConnection.netChangedAt.set(conn.id, now);
+        }
         console.warn('[reconnect] 网络接口发生变化，20 秒后仍未连上就重启隧道');
       }
       netSnapshot = snapText;
     }
-    if (netChangedAt && Date.now() - netChangedAt > 20000) {
-      netChangedAt = 0;
-      if (tunnelDesired && !updatingNow && !foreignNow && supervisor && !supervisor.isWaiting() && !manager.snapshot().connected) {
-        supervisor.arm('网络变化后没能自动恢复');
+    if (multiConnection && multiConnection.netChangedAt.size) {
+      for (const [id, changedAt] of [...multiConnection.netChangedAt.entries()]) {
+        if (now - changedAt <= 20000) continue;
+        multiConnection.netChangedAt.delete(id);
+        const mm = managersMap().get(id);
+        const guard = multiConnection.guards.get(id);
+        const snap = mm ? mm.snapshot() : null;
+        if (desiredFor(id) && !updatingNow && snap && !snap.foreign && guard && !guard.isWaiting() && !snap.connected) {
+          guard.arm('网络变化后没能自动恢复');
+        }
       }
     }
     if (!healthBusy && !foreignNow && Date.now() - (tick.lastHealth || 0) > 14000 && model && model.proxies.length) {
@@ -3442,7 +3537,7 @@ function registerIpc() {
     }
     return ok({
       state: buildState(),
-      logs: follower.recent(400),
+      logs: activeFollower().recent(400),
       app: {
         version: app.getVersion(),
         frpcVersion,
@@ -3569,10 +3664,15 @@ function registerIpc() {
       return fail(`管理 API 端口不能和服务器端口 ${model.serverPort} 相同`);
     }
     if (clean.logBuffer !== undefined) clean.logBuffer = Math.min(2000, Math.max(100, Number(clean.logBuffer) || 600));
-    // 日志缓冲上限要立刻作用到正在跑的 LogFollower，否则要等下次启动才生效。
+    // 日志缓冲上限要立刻作用到所有已建的 LogFollower，否则要等下次启动才生效。
     if (clean.logBuffer) {
-      follower.maxLines = clean.logBuffer;
-      if (follower.lines.length > follower.maxLines) follower.lines.splice(0, follower.lines.length - follower.maxLines);
+      const targets = multiConnection && multiConnection.followers && multiConnection.followers.size
+        ? [...multiConnection.followers.values()]
+        : [follower];
+      for (const f of targets) {
+        f.maxLines = clean.logBuffer;
+        if (f.lines.length > f.maxLines) f.lines.splice(0, f.lines.length - f.maxLines);
+      }
     }
     /* 'service'（Windows 服务模式）已经没有入口了：设置页那张卡删掉了，
      * 也没有“把 frpc 装成服务”的按钮。老客户端传上来就归一到 auto，
@@ -3626,7 +3726,7 @@ function registerIpc() {
       // 版本号读不出来不该让“保存设置”整个失败（以前直接 reject，界面毫无反应）
       frpcVersion = (await tickStep('readFrpcVersion', readFrpcVersion)) || frpcVersion;
     }
-    follower.setFile(paths.logPath);
+    activeFollower().setFile(paths.logPath);
     if (settings.pollIntervalMs !== pollInterval) startPolling();
     /* 管理 API 的端口/口令改了，frpc.toml 里的 webServer 必须跟着改，
      * 否则控制台问 7401、frpc 还在 7400 上听着，界面会永远停在“等待管理 API 就绪”。 */
@@ -3735,9 +3835,10 @@ function registerIpc() {
     let restarted = false;
     let restartError = '';
     if (connChanged && manager && manager.isChildAlive) {
+      const targetId = settings.activeConnectionId;
       const r = await manager.restart({ runMode: settings.runMode });
       restarted = !!(r && r.ok !== false);
-      if (restarted) startedFingerprint = configModule.connFingerprint(model);
+      if (restarted) setStartedFingerprint(targetId, configModule.connFingerprint(model));
       else restartError = String((r && r.error) || '重启失败');
       if (manager) await manager.refresh().catch(() => {});
       healthCache.clear();
@@ -4118,8 +4219,12 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '' } = {})
     const mm = managerForConnection(targetId);
     const result = await mm.start({ runMode: settings.runMode });
     await mm.refresh().catch(() => {});
-    /* await 期间用户可能已经切到别的连接：这次结果不属于「当前」，别写回界面与指纹。 */
+    /* await 期间用户可能已经切到别的连接：这次结果不属于「当前」，别写回界面与当前连接指纹。 */
     if (startEpoch !== connectionEpoch) {
+      if (result.ok) {
+        const targetModel = connectionModel(connectionById(targetId));
+        if (targetModel) setStartedFingerprint(targetId, configModule.connFingerprint(targetModel));
+      }
       pushState();
       refreshTray();
       return ok({ stale: true, state: buildState() });
@@ -4132,7 +4237,7 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '' } = {})
       if (guard) guard.arm(result.error || '启动失败');
       return fail(result.error, { state: buildState() });
     }
-    startedFingerprint = configModule.connFingerprint(model);
+    setStartedFingerprint(targetId, configModule.connFingerprint(model));
     const guard = multiConnection && multiConnection.guards.get(targetId);
     if (guard) guard.cancel('');
     return ok({ state: buildState(), mode: result.mode, adminNote: adminNote || '' });
@@ -4144,7 +4249,7 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '' } = {})
     const mm = managerForConnection(targetId);
     if (!mm) return fail('隧道管理器还没准备好', { state: buildState() });
     markStopQuiet(targetId, 12000);
-    startedFingerprint = '';
+    setStartedFingerprint(targetId, '');
     setDesired(targetId, false);
     const guard = multiConnection && multiConnection.guards.get(targetId);
     if (guard) guard.cancel('用户停止了隧道');
@@ -4175,7 +4280,11 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '' } = {})
     await mm.refresh().catch(() => {});
     /* 重启期间切走了：结果不属于当前连接，直接丢弃（进程已在目标连接上重启完成）。 */
     if (restartEpoch !== connectionEpoch) {
-      if (result.ok) setDesired(targetId, true);
+      if (result.ok) {
+        setDesired(targetId, true);
+        const targetModel = connectionModel(connectionById(targetId));
+        if (targetModel) setStartedFingerprint(targetId, configModule.connFingerprint(targetModel));
+      }
       pushState();
       refreshTray();
       return ok({ stale: true, state: buildState() });
@@ -4183,7 +4292,7 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '' } = {})
     pushState();
     if (!result.ok) return fail(result.error, { state: buildState() });
     setDesired(targetId, true);
-    startedFingerprint = configModule.connFingerprint(model);
+    setStartedFingerprint(targetId, configModule.connFingerprint(model));
     const guard = multiConnection && multiConnection.guards.get(targetId);
     if (guard) guard.cancel('');
     return ok({ state: buildState(), mode: result.mode });
@@ -4239,11 +4348,11 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '' } = {})
     await mm.refresh().catch(() => {});
     if (result.ok) {
       setDesired(conn.id, true);
-      if (conn.id === settings.activeConnectionId) {
-        startedFingerprint = configModule.connFingerprint(model);
-      }
+      const connModel = conn.id === settings.activeConnectionId ? model : connectionModel(conn);
+      if (connModel) setStartedFingerprint(conn.id, configModule.connFingerprint(connModel));
       const guard = multiConnection && multiConnection.guards.get(conn.id);
       if (guard) guard.cancel('');
+      logFor(conn.id).start();
     }
     pushState();
     refreshTray();
@@ -4260,7 +4369,7 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '' } = {})
     const runMode = isActive ? settings.runMode : 'managed';
     markStopQuiet(conn.id, 12000);
     setDesired(conn.id, false);
-    if (isActive) startedFingerprint = '';
+    setStartedFingerprint(conn.id, '');
     const guard = multiConnection && multiConnection.guards.get(conn.id);
     if (guard) guard.cancel('用户停止了这条连接');
     const result = await mm.stop({ runMode });
@@ -4421,11 +4530,7 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '' } = {})
     setDesired(conn.id, false);
     if (mm && mm.snapshot().running) await mm.stop({ runMode: 'managed' }).catch(() => {});
     if (multiConnection) {
-      managersMap().delete(conn.id);
-      multiConnection.guards.delete(conn.id);
-      multiConnection.stopRequests.delete(conn.id);
-      multiConnection.desired.delete(conn.id);
-      invalidateConnectionModel(conn.id);
+      multiConnection.removeConnection(conn.id);
     }
     settings = settingsModule.save({
       connections: (settings.connections || []).filter((item) => item.id !== conn.id),
@@ -4467,12 +4572,11 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '' } = {})
     paths = { ...paths, configPath: settings.configPath, adminPort: settings.adminPort, logPath: settings.logPath };
     invalidateConnectionModel(conn.id);
     loadConfigFromDisk();
-    updateLogFile();
-    /* 指针切换：只换引用。进程该跑还跑，A/B 两条隧道可以同时在线。 */
+    /* 指针切换：只换引用（manager / supervisor / follower / desired / fingerprint），
+     * 不碰任何进程，也不清其它连接的健康窗口与日志缓冲。 */
     setActiveManager(conn.id);
-    startedFingerprint = '';
-    apiDownSince = 0;
-    netChangedAt = 0;
+    updateLogFile();
+    send('logs:reset', { lines: activeFollower().recent(300) });
     if (manager) await manager.refresh().catch(() => {});
     pushState();
     refreshTray();
@@ -6557,19 +6661,20 @@ function domainOwners(domain) {
   ipcMain.handle('logs:get', async (event, payload = {}) => {
     const limit = Math.min(2000, Math.max(1, Number(payload.limit) || 500));
     const since = Number(payload.since) || 0;
+    const f = activeFollower();
     // since 用于增量拉取，但也要受 limit 约束，避免一次把上千行推给渲染层。
-    const lines = since ? follower.lines.filter((l) => l.id > since).slice(-limit) : follower.recent(limit);
+    const lines = since ? f.lines.filter((l) => l.id > since).slice(-limit) : f.recent(limit);
     return ok({ lines, file: paths.logPath, exists: fs.existsSync(paths.logPath || '') });
   });
 
   ipcMain.handle('logs:clear', async () => {
-    follower.clear();
+    activeFollower().clear();
     send('logs:reset', { lines: [] });
     return ok({ cleared: true });
   });
 
   ipcMain.handle('logs:export', async () => {
-    const lines = follower.recent(2000);
+    const lines = activeFollower().recent(2000);
     if (!lines.length) return fail('暂无日志可导出');
     const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
     const result = await dialog.showSaveDialog(win, {
@@ -6751,8 +6856,13 @@ function scheduleAutoRenew() {
   if (autoRenewTimer.unref) autoRenewTimer.unref();
 }
 
-follower.on('lines', (lines) => send('logs:append', lines));
-follower.on('reset', () => send('logs:reset', { lines: follower.recent(300) }));
+/* 占位 follower 的事件转发（仅在 bootstrap 完成前兜底；bootstrap 后由 logFor(connId) 接管）。 */
+follower.on('lines', (lines) => {
+  if (!multiConnection) send('logs:append', lines);
+});
+follower.on('reset', () => {
+  if (!multiConnection) send('logs:reset', { lines: follower.recent(300) });
+});
 
 /* 首次运行（哪儿都找不到 frpc.toml）时给一份骨架：服务器地址与 Token 留空，
  * **不带任何代理**。以前这里预置了一条 Windows-RDP，结果新用户装完就在概览看到
@@ -6847,7 +6957,6 @@ async function bootstrap() {
    * FrpcManager 与 ReconnectSupervisor，彻底消除闭包全局 settings/paths/model 的旧路径。 */
   multiConnection = createConnectionRuntime();
   setActiveManager(settings.activeConnectionId);
-  follower.start();
   ensureClientServerProfile();
   migrateLegacyServerSecret();
   /* 老数据里同一个 IP 可能堆着十几条档案（连接表单每连一次就新建一条）。
@@ -6862,7 +6971,7 @@ async function bootstrap() {
     const fallback = findServerProfile(settings.clientServerId) || settings.servers[0];
     settings = settingsModule.save({ activeServerId: fallback.id });
   }
-  follower.maxLines = Math.min(2000, Math.max(100, Number(settings.logBuffer) || 600));
+  activeFollower().maxLines = logBufferLimit();
   updateLogFile();
   /* 这几步拿的都是"锦上添花"的信息，读不到不该让整个启动失败。
    * sc.exe 被安全软件拉黑 / 权限不足的机器上，原来会在 refreshService 直接抛出，
@@ -6920,7 +7029,7 @@ async function quitApp({ source = 'user' } = {}) {
 
   try {
     if (pollTimer) clearInterval(pollTimer);
-    follower.stop();
+    stopAllFollowers();
   } catch { /* ignore */ }
 
   /* 统一遍历 managers：只停“控制台自己拉起来的”托管进程（系统服务模式不去越权停服务）。 */
@@ -7165,15 +7274,25 @@ function startApp() {
         .then(() => pushState())
         .catch(() => {});
     }
-    /* 档 3：系统唤醒 / 解锁 / 换网之后，连接常常已经假死了（socket 还在，包发不出去）。
-     * 这里先让 frpc 自己试 20 秒，没恢复就交给守护重启。 */
+    /* 档 3：系统唤醒 / 解锁之后，每条期望在线的连接各自宽限 20 秒，没恢复就交给它自己的守护重启。 */
     const afterSystemResume = (why) => {
-      if (!tunnelDesired || updatingNow) return;
+      if (updatingNow || !multiConnection) return;
+      const targets = (settings.connections || []).filter((c) => desiredFor(c.id)).map((c) => c.id);
+      if (!targets.length) return;
       setTimeout(() => {
-        if (!tunnelDesired || updatingNow) return;
-        manager.refresh().catch(() => {});
-        if (manager.snapshot().connected) return;
-        if (supervisor && !supervisor.isWaiting()) supervisor.arm(why);
+        if (updatingNow || isQuitting) return;
+        for (const id of targets) {
+          if (!desiredFor(id)) continue;
+          const mm = managersMap().get(id);
+          const guard = multiConnection && multiConnection.guards.get(id);
+          if (!mm || !guard) continue;
+          mm.refresh().then(() => {
+            if (!desiredFor(id) || updatingNow || isQuitting) return;
+            const snap = mm.snapshot();
+            if (snap.connected || snap.foreign) return;
+            if (!guard.isWaiting()) guard.arm(why);
+          }).catch(() => {});
+        }
       }, 20000);
     };
     try {
@@ -7247,7 +7366,7 @@ if (!gotLock) {
     }
     isQuitting = true;
     if (pollTimer) clearInterval(pollTimer);
-    follower.stop();
+    stopAllFollowers();
     serverSession.disconnect();
     if (instanceChannel) {
       try {
