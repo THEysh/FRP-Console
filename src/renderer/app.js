@@ -4828,7 +4828,12 @@ function domainWizardHtml() {
               ? (dnsOk ? `已解析到服务器（${esc((dns.resolved || []).join(', '))}），公网能访问。`
                 : dnsResolvedOther ? `已解析到 ${esc((dns.resolved || []).join(', '))}，但没指向当前服务器。`
                 : `还没解析${dns.error ? `（${esc(dns.error)}）` : ''}，公网访问不到。`)
-              : '输入上面的域名，点「检测」。'}</span>
+              : '填好上面的域名后点「检测解析」。'}</span>
+            ${!dns
+              ? `<div class="dw-inline-form">
+                  <button class="btn small" type="button" data-act="dw.check" title="对上面填的域名做一次解析检测（本机 / 公共 DNS / Cloudflare 三路对比）">${icon('reload')}<span>检测解析</span></button>
+                </div>`
+              : ''}
             ${dns && !dnsOk
               ? `<div class="dw-inline-form">
                   <button class="btn small" type="button" data-act="dw.set-a" ${hasToken ? '' : 'disabled'} title="${hasToken ? '' : '需要先配置 Cloudflare token'}">${icon('globe')}<span>${w.setA ? '处理中…' : '一键建解析'}</span></button>
@@ -4855,6 +4860,7 @@ function domainWizardHtml() {
               <button class="btn primary" type="button" data-act="certs.issue" ${S.certs.issuing ? 'disabled' : ''}>${S.certs.issuing ? '<span class="spinner-sm"></span>' : icon('shield')}<span>${S.certs.issuing ? '签发中，请稍候…' : '签发证书'}</span></button>
             </div>
             <span style="font-size:11px">第一项作为主域名；通配符填 <code>*.example.com</code>。签发的是 Let's Encrypt 正式证书（有效期 90 天，到期前会自动续期）。</span>
+            ${domain ? '' : '<span style="font-size:11px" class="dw-need-domain">第 1 步还没填域名：这里也可以直接输入要签发的域名（上面的「检测解析」只影响解析结论，不影响签发本身）。</span>'}
           </div>
         </div>
 
