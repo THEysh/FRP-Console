@@ -32,7 +32,7 @@ const S = {
   update: null,
   /* 已知服务器指纹（userData/known-hosts.json）：首次连接记录、之后比对，设置页可以查看与删除 */
   knownHosts: { loaded: false, loading: false, hosts: [], error: '' },
-  certs: { list: [], dns: { dnsProvider: '', hasToken: false, acmeEmail: '' }, loaded: false, busy: false, issuing: false, wizard: { domain: '', checking: false, dns: null, setA: false, result: null }, server: { loaded: false, loading: false, certs: [], host: '', scannedAt: 0, truncated: false, error: '' } },
+  certs: { list: [], dns: { dnsProvider: '', hasToken: false, acmeEmail: '' }, loaded: false, busy: false, issuing: false, wizard: { domain: '', checking: false, dns: null, setA: false, result: null }, server: { loaded: false, loading: false, servers: [], certs: [], scannedAt: 0, error: '', filter: 'all', authConnId: '' } },
   lastKeys: {},
   viewScroll: {},
   busy: new Set(),
@@ -3707,7 +3707,7 @@ async function autoConnectActiveProfile() {
     S.server.confView = null;
     S.server.firewall = null;   // 旧服务器的防火墙状态不残留
     S.server.firewallReady = false;
-    S.certs.server = { loaded: false, loading: false, certs: [], host: '', scannedAt: 0, truncated: false, error: '' }; // 换服务器后证书列表要重扫
+    if (S.certs && S.certs.server) S.certs.server.loaded = false; // 连上新服务器后下次进证书页自动补扫（60 秒内已扫机器仍走缓存）
   } catch (e) {
     toast('error', '自动连接失败', String((e && e.message) || e));
   } finally {
@@ -4178,7 +4178,7 @@ async function connectServer(btn, options = undefined) {
     S.server.confView = null;
     S.server.firewall = null;   // 旧服务器的防火墙状态不残留
     S.server.firewallReady = false;
-    S.certs.server = { loaded: false, loading: false, certs: [], host: '', scannedAt: 0, truncated: false, error: '' }; // 换服务器后证书列表要重扫
+    if (S.certs && S.certs.server) S.certs.server.loaded = false; // 连上新服务器后下次进证书页自动补扫（60 秒内已扫机器仍走缓存）
     renderServer(true);
     openShellTerm().catch(() => {});   // SSH 终端默认打开
     if (res.data && res.data.adoptProfile) {
@@ -4629,32 +4629,40 @@ function certRow(c, hasToken = false) {
     </div>`;
 }
 
-/* ---------------- 服务器上的证书（v1.2.62，只读扫描） ----------------
- * 本机 userData\certs 只是「本机签发/导入的」，服务器上往往还有企业面板（宝塔）或
- * 别的工具签的证书。这张卡片把服务器上实际存在的证书列出来：域名、来源、到期、路径。
+/* ---------------- 服务器上的证书（汇总全部已配置服务器，只读扫描） ----------------
+ * 本机 userData\certs 只是「本机签发/导入的」，各台服务器上往往还有宝塔 / certbot / nginx 签的证书。
+ * 进页自动静默汇总扫描全部已配置服务器（60 秒内按 host 走主进程缓存，不要求隧道启动，也不要求先去服务器页连 SSH）。
  * 纯只读：只 grep 配置 + openssl 读文件，不改任何东西。 */
 const CERT_SOURCE_LABEL = { bt: '宝塔', le: "Let's Encrypt", nginx: 'nginx' };
 
-async function loadServerCerts({ force = false } = {}) {
+async function loadServerCerts({ force = false, connectionId = '', password = '', remember = false } = {}) {
   const st = S.certs.server;
-  if (st.loading) return;
-  if (!S.server.connected) {
-    st.loaded = true;
-    st.certs = [];
-    st.host = '';
-    st.error = '未连接服务器';
-    if (S.view === 'certs') renderCerts(true);
-    return;
-  }
-  if (!force && st.loaded && st.host === String(S.server.host || '')) return;
+  if (st.loading) return null;
+  if (!connectionId && !force && st.loaded && st.scannedAt && Date.now() - st.scannedAt < 60000) return st;
   st.loading = true;
+  st.error = '';
+  if (S.view === 'certs') renderCerts(true);
+  let singleResult = null;
   try {
-    const res = await FRP.certServerScan({ force });
-    if (res && res.ok) {
-      st.certs = res.data.certs || [];
-      st.host = res.data.host || String(S.server.host || '');
-      st.scannedAt = res.data.scannedAt || Date.now();
-      st.truncated = !!res.data.truncated;
+    const res = await FRP.certServerScanAll({ force, connectionId, password, remember });
+    if (res && res.ok && res.data) {
+      const incoming = Array.isArray(res.data.servers) ? res.data.servers : [];
+      if (connectionId && res.data.single) {
+        singleResult = incoming[0] || null;
+        if (singleResult) {
+          const next = (st.servers || []).slice();
+          const idx = next.findIndex((s) => s.connectionId === singleResult.connectionId);
+          if (idx >= 0) next[idx] = singleResult;
+          else next.push(singleResult);
+          st.servers = next;
+          st.certs = next.flatMap((s) => (s && s.ok && Array.isArray(s.certs) ? s.certs : []));
+          if (singleResult.ok && st.authConnId === singleResult.connectionId) st.authConnId = '';
+        }
+      } else {
+        st.servers = incoming;
+        st.certs = Array.isArray(res.data.certs) ? res.data.certs : incoming.flatMap((s) => (s && s.ok ? s.certs || [] : []));
+        st.scannedAt = res.data.scannedAt || Date.now();
+      }
       st.error = '';
     } else {
       st.error = (res && res.error) || '扫描服务器证书失败';
@@ -4667,6 +4675,7 @@ async function loadServerCerts({ force = false } = {}) {
     st.loading = false;
   }
   if (S.view === 'certs') renderCerts(true);
+  return singleResult || st;
 }
 
 function serverCertRow(c, { hasLocal = false } = {}) {
@@ -4678,13 +4687,18 @@ function serverCertRow(c, { hasLocal = false } = {}) {
   const names = (Array.isArray(c.altNames) && c.altNames.length ? c.altNames : [c.domain]).filter(Boolean);
   const namesText = names.slice(0, 4).join('、') + (names.length > 4 ? ` 等 ${names.length} 个` : '');
   const daysText = c.daysLeft === null || c.daysLeft === undefined ? '到期未知' : `剩余 ${c.daysLeft} 天`;
+  const srvTag = c.serverName || c.serverHost || '服务器';
+  const connId = c.connectionId || '';
   return `
     <div class="cert-row">
       <div class="cert-main">
         <div class="cert-title">
           <strong>${esc(c.domain || c.certPath)}</strong>
+          <span class="badge" title="所在服务器：${esc(c.serverHost || srvTag)}">${icon('server')} ${esc(srvTag)}</span>
           <span class="badge">${esc(src)}</span>
-          <span class="badge amber" title="这张证书在服务器上，本机库里还没有">仅服务器</span>
+          ${hasLocal
+            ? '<span class="badge green" title="本机证书库已有同域名证书">本机已有</span>'
+            : '<span class="badge amber" title="这张证书仅在服务器上，本机库里还没有">仅服务器</span>'}
           ${String(c.domain || '').startsWith('*.') ? '<span class="badge">通配符</span>' : ''}
         </div>
         <div class="cert-meta mono">
@@ -4698,12 +4712,11 @@ function serverCertRow(c, { hasLocal = false } = {}) {
         </div>
       </div>
       <div class="cert-actions">
-        <button class="btn small" type="button" data-act="cert.import" data-domain="${esc(c.domain || '')}" data-cert-path="${esc(c.certPath)}" data-key-path="${esc(c.keyPath || '')}" title="把这张证书复制进本机库，之后可以统一查看/续期/部署" ${c.keyPath ? '' : 'disabled'}>${icon('down')}<span>导入到本机</span></button>
+        <button class="btn small" type="button" data-act="cert.import" data-conn="${esc(connId)}" data-domain="${esc(c.domain || '')}" data-cert-path="${esc(c.certPath)}" data-key-path="${esc(c.keyPath || '')}" title="把这张证书复制进本机库，之后可以统一查看/续期/部署" ${c.keyPath ? '' : 'disabled'}>${icon('down')}<span>导入到本机</span></button>
         <button class="btn small" type="button" data-act="cert.reissue" data-domain="${esc(c.domain || '')}" title="用本机的 ACME 渠道重新签一张同域名证书（需要已配置 DNS Token）">${icon('reload')}<span>用 ACME 重签</span></button>
         ${certbotManaged
           ? `<button class="btn small danger-text" type="button" disabled title="这张证书由 certbot 托管，直接删文件会让续期配置变成死链；请在服务器执行 certbot delete --cert-name ${esc(c.domain || '')}">${icon('trash')}<span>删除</span></button>`
-          : `<button class="btn small danger-text" type="button" data-act="cert.server.remove" data-domain="${esc(c.domain || '')}" data-cert-path="${esc(c.certPath)}" data-key-path="${esc(c.keyPath || '')}" title="从服务器删除证书文件（删前先检查有没有站点在引用，删完自动重载 nginx）">${icon('trash')}<span>删除</span></button>`}
-        ${hasLocal ? '<span class="badge">本机已有</span>' : ''}
+          : `<button class="btn small danger-text" type="button" data-act="cert.server.remove" data-conn="${esc(connId)}" data-domain="${esc(c.domain || '')}" data-cert-path="${esc(c.certPath)}" data-key-path="${esc(c.keyPath || '')}" title="从服务器删除证书文件（删前先检查有没有站点在引用，删完自动重载 nginx）">${icon('trash')}<span>删除</span></button>`}
       </div>
     </div>`;
 }
@@ -4711,13 +4724,13 @@ function serverCertRow(c, { hasLocal = false } = {}) {
 /* 「有站点在引用这张证书」弹窗：不硬拒，给用户三条出路。
  * ①换证书（站点不动、证书换个文件）②停用引用它的站点 ③确认没用就强制删除。
  * 服务器是用户自己的，程序只负责把后果说清楚 + 每一步都留回滚。 */
-function openCertRefsModal({ domain, certPath, keyPath, refs = [], sites = [] }) {
+function openCertRefsModal({ domain, certPath, keyPath, connectionId = '', refs = [], sites = [] }) {
   const isOwnConf = (f) => /frp-console\.conf$/.test(String(f || ''));
   const refFiles = Array.from(new Set(refs.map((r) => r.file)));
   const disableable = refFiles.filter((f) => !isOwnConf(f));
   const ownsConf = refFiles.some(isOwnConf);
 
-  /* 候选证书：服务器上现有的（除自己）+ 本机库里的，供「换成别的证书」用。 */
+  /* 候选证书：同一台服务器上现有的（除自己），避免把别台服务器的路径写进这台机器的 nginx。 */
   const candidates = [];
   const pushCand = (c) => {
     const cp = String((c && (c.certPath || c.crtPath)) || '').trim();
@@ -4726,12 +4739,14 @@ function openCertRefsModal({ domain, certPath, keyPath, refs = [], sites = [] })
     if (candidates.some((x) => x.certPath === cp)) return;
     candidates.push({ certPath: cp, keyPath: kp, domain: String((c && c.domain) || ''), from: c.from || '', daysLeft: c.daysLeft });
   };
-  for (const c of (S.certs.server && S.certs.server.certs) || []) pushCand({ ...c, from: '服务器' });
-  for (const c of S.certs.list || []) pushCand({ ...c, certPath: c.crtPath, from: '本机' });
+  for (const c of (S.certs.server && S.certs.server.certs) || []) {
+    if (connectionId && c.connectionId && c.connectionId !== connectionId) continue;
+    pushCand({ ...c, from: c.serverName || '服务器' });
+  }
 
   const candOptions = candidates.length
     ? candidates.map((c) => `<option value="${esc(c.certPath)}">${esc(c.domain || c.certPath)} · ${esc(c.from)} · ${c.daysLeft === null || c.daysLeft === undefined ? '到期未知' : `剩余 ${c.daysLeft} 天`}</option>`).join('')
-    : '<option value="">（没有其它可用证书）</option>';
+    : '<option value="">（这台服务器上没有其它可用证书）</option>';
 
   const who = sites.length ? sites.map((s) => `<strong>${esc(s)}</strong>`).join('、') : refFiles.map((f) => `<code>${esc(f)}</code>`).join('、');
 
@@ -4793,7 +4808,7 @@ function openCertRefsModal({ domain, certPath, keyPath, refs = [], sites = [] })
         closeModal();
         if (okNote) toast('success', okTitle, okNote);
         else toast('success', okTitle);
-        try { await loadServerCerts({ force: true }); } catch { /* ignore */ }
+        try { await loadServerCerts({ force: true, connectionId }); } catch { /* ignore */ }
         try { await loadCerts({ silent: true }); } catch { /* ignore */ }
         if (S.view === 'certs') renderCerts(true);
         return;
@@ -4811,9 +4826,9 @@ function openCertRefsModal({ domain, certPath, keyPath, refs = [], sites = [] })
     const target = sel ? candidates.find((c) => c.certPath === sel.value) : null;
     if (!target) return toast('warn', '请选择一张证书');
     finish(replaceBtn, async () => {
-      const rep = await FRP.certReplaceRefs({ fromCert: certPath, fromKey: keyPath, toCert: target.certPath, toKey: target.keyPath });
+      const rep = await FRP.certReplaceRefs({ connectionId, fromCert: certPath, fromKey: keyPath, toCert: target.certPath, toKey: target.keyPath });
       if (!rep || !rep.ok) return rep;
-      const del = await FRP.certServerRemove({ domain, certPath, keyPath });
+      const del = await FRP.certServerRemove({ connectionId, domain, certPath, keyPath });
       if (!del || !del.ok) return { ok: false, error: `引用已换成 ${target.domain || target.certPath}，但删除旧证书失败：${(del && del.error) || '未知错误'}` };
       return { ok: true, data: del.data, replaced: target.domain || target.certPath };
     }, '已换证并删除旧证书', `${domain || certPath} → ${target.domain || target.certPath}`);
@@ -4822,9 +4837,9 @@ function openCertRefsModal({ domain, certPath, keyPath, refs = [], sites = [] })
   const disableBtn = $('#cr-disable');
   if (disableBtn) disableBtn.addEventListener('click', () => {
     finish(disableBtn, async () => {
-      const dis = await FRP.certDisableRefs({ files: disableable });
+      const dis = await FRP.certDisableRefs({ connectionId, files: disableable });
       if (!dis || !dis.ok) return dis;
-      const del = await FRP.certServerRemove({ domain, certPath, keyPath });
+      const del = await FRP.certServerRemove({ connectionId, domain, certPath, keyPath });
       if (!del || !del.ok) return { ok: false, error: `站点已停用，但删除证书失败：${(del && del.error) || '未知错误'}` };
       return { ok: true, data: del.data };
     }, '站点已停用，证书已删除', disableable.map((f) => `${f} → ${f.split('/').pop()}.disabled-frpconsole-*`).join('；'));
@@ -4832,7 +4847,7 @@ function openCertRefsModal({ domain, certPath, keyPath, refs = [], sites = [] })
 
   if (forceBtn) forceBtn.addEventListener('click', () => {
     finish(forceBtn, async () => {
-      const res = await FRP.certServerRemove({ domain, certPath, keyPath, force: true });
+      const res = await FRP.certServerRemove({ connectionId, domain, certPath, keyPath, force: true });
       if (res && res.ok && res.data && res.data.warning) toast('warn', '已强制删除', res.data.warning);
       return res;
     }, '已强制删除证书', domain || certPath);
@@ -4854,32 +4869,120 @@ function certGroupKey(domain) {
   return multi ? parts.slice(-3).join('.') : two;
 }
 
-/* 证书总览：本机库 + 服务器上的证书，按父域名分组展示（有通配符时组标题写成 *.theysh.cn）。 */
+/* 证书总览：本机库 + 全部已配置服务器上的证书，按来源筛选、按父域名分组展示。 */
 function certOverviewHtml() {
   const local = S.certs.list || [];
   const srvSt = S.certs.server || {};
-  const srv = srvSt.certs || [];
+  const servers = Array.isArray(srvSt.servers) ? srvSt.servers : [];
+  const allSrvCerts = Array.isArray(srvSt.certs) ? srvSt.certs : [];
+  const configured = configuredServerConns();
   const localDomains = new Set(local.map((c) => String((c && c.domain) || '').toLowerCase()));
-  const srvOnly = srv.filter((s) => !localDomains.has(String((s && s.domain) || '').toLowerCase()));
+
+  let filter = String(srvSt.filter || 'all');
+  if (filter.startsWith('conn:')) {
+    const targetId = filter.slice(5);
+    const exists = servers.some((s) => s.connectionId === targetId) || configured.some((c) => c.id === targetId);
+    if (!exists) filter = 'all';
+  }
+
+  /* 筛选芯片栏：全部 / 本机库 / 各台已配置服务器 */
+  const chipList = servers.length
+    ? servers
+    : configured.map((c) => ({ connectionId: c.id, name: c.name || c.host || c.serverAddr, host: c.host || c.serverAddr || '', ok: false, pending: true, certs: [] }));
+
+  const totalCount = local.length + allSrvCerts.length;
+  const chipsBar = chipList.length
+    ? `<div class="chips" style="padding:0 16px 10px">
+        <button class="chip ${filter === 'all' ? 'on' : ''}" type="button" data-act="certs.filter" data-filter="all">
+          <span>全部</span><span class="chip-count">${totalCount}</span>
+        </button>
+        <button class="chip ${filter === 'local' ? 'on' : ''}" type="button" data-act="certs.filter" data-filter="local">
+          <span>本机库</span><span class="chip-count">${local.length}</span>
+        </button>
+        ${chipList.map((s) => {
+          const dotCls = s.ok ? 'ok' : (s.needsPassword || s.error ? 'warn' : 'idle');
+          const countText = s.ok ? String((s.certs || []).length) : (s.needsPassword ? '需密码' : (s.error ? '失败' : '…'));
+          const tip = s.ok
+            ? `${s.name}（${s.host}）：${(s.certs || []).length} 张证书${s.cached ? '（60 秒缓存）' : ''}`
+            : (s.error || `${s.name}（${s.host}）扫描中`);
+          return `<button class="chip ${filter === `conn:${s.connectionId}` ? 'on' : ''}" type="button" data-act="certs.filter" data-filter="conn:${esc(s.connectionId)}" title="${esc(tip)}">
+            <span class="schip-dot ${dotCls}"></span>
+            <span>${esc(s.name || s.host || '服务器')}</span>
+            <span class="chip-count">${esc(countText)}</span>
+          </button>`;
+        }).join('')}
+      </div>`
+    : '';
+
+  /* 扫描摘要与非阻塞提示（未存密码或扫描失败的服务器，就地补输入密码或重试） */
+  const okServers = servers.filter((s) => s.ok);
+  const failedServers = servers.filter((s) => !s.ok && !s.skipped);
+  const scanLine = !configured.length
+    ? `<div class="field-hint" style="padding:0 16px 10px">还没有配置服务器；在「服务器」页添加服务器后，这里会自动汇总扫描各台机器上的证书（只读不改，无需启动隧道）。</div>`
+    : srvSt.error
+      ? `<div class="note warn" style="margin:0 16px 10px">${icon('alert')}<div>${esc(srvSt.error)}</div></div>`
+      : (!srvSt.loaded || srvSt.loading)
+        ? `<div class="field-hint" style="padding:0 16px 10px"><span class="spinner-sm" style="vertical-align:-2px;margin-right:6px"></span>正在静默扫描 ${configured.length} 台服务器上的证书（60 秒内走缓存，无需启动隧道）…</div>`
+        : `<div class="field-hint" style="padding:0 16px 10px">已扫描 ${okServers.length} / ${servers.length} 台服务器，共找到 ${allSrvCerts.length} 张服务器证书${srvSt.scannedAt ? ` · ${new Date(srvSt.scannedAt).toLocaleTimeString('zh-CN')} 更新（60 秒内走缓存）` : ''}${servers.some((s) => s.truncated) ? ' · 部分服务器证书较多，仅展示前若干张' : ''}</div>`;
+
+  const visibleFailures = filter.startsWith('conn:')
+    ? failedServers.filter((s) => s.connectionId === filter.slice(5))
+    : failedServers;
+
+  const failBar = visibleFailures.length
+    ? `<div style="padding:0 16px 10px;display:flex;flex-direction:column;gap:8px">
+        ${visibleFailures.map((s) => `
+          <div class="note warn" style="margin:0;align-items:center">
+            ${icon('alert')}
+            <div style="flex:1;min-width:0">
+              <strong>${esc(s.name || s.host)}</strong>${s.host ? ` <span class="mono" style="opacity:.75">(${esc(s.host)})</span>` : ''}：${esc(s.error || '扫描失败')}
+            </div>
+            ${s.needsPassword
+              ? `<button class="btn small" type="button" data-act="certs.server.auth.open" data-conn="${esc(s.connectionId)}">${icon('shield')}<span>输入密码扫描</span></button>`
+              : `<button class="btn small" type="button" data-act="certs.server.retry" data-conn="${esc(s.connectionId)}">${icon('reload')}<span>重试</span></button>`}
+          </div>`).join('')}
+      </div>`
+    : '';
+
+  const authTarget = srvSt.authConnId ? servers.find((s) => s.connectionId === srvSt.authConnId) : null;
+  const authBar = authTarget
+    ? `<div class="note" style="margin:0 16px 12px;flex-direction:column;align-items:stretch;gap:8px">
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          ${icon('shield')}
+          <strong>输入「${esc(authTarget.name || authTarget.host)}」的 SSH 密码</strong>
+          <span class="field-hint mono" style="margin:0">${esc(authTarget.username || 'root')}@${esc(authTarget.host || '')}:${esc(String(authTarget.port || 22))}</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          <input class="input" id="certs-ssh-pass" type="password" placeholder="SSH 密码（仅用于扫描证书，不修改服务器）" autocomplete="current-password" style="flex:1;min-width:200px" />
+          <label class="check-inline" style="margin:0"><input type="checkbox" id="certs-ssh-remember" checked /> 记住密码（DPAPI 本机加密）</label>
+          <button class="btn primary small" type="button" data-act="certs.server.auth.submit" data-conn="${esc(authTarget.connectionId)}" ${srvSt.loading ? 'disabled' : ''}>${icon('check')}<span>连接并扫描</span></button>
+          <button class="btn small ghost" type="button" data-act="certs.server.auth.cancel">取消</button>
+        </div>
+      </div>`
+    : '';
+
+  const showLocal = filter === 'all' || filter === 'local';
+  const showSrv = filter === 'all'
+    ? allSrvCerts
+    : (filter.startsWith('conn:') ? allSrvCerts.filter((c) => c.connectionId === filter.slice(5)) : []);
 
   const groups = new Map();
   const push = (key, entry) => {
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(entry);
   };
-  for (const c of local) push(certGroupKey(c.domain), { kind: 'local', item: c });
-  for (const s of srvOnly) push(certGroupKey(s.domain), { kind: 'server', item: s });
+  if (showLocal) {
+    for (const c of local) push(certGroupKey(c.domain), { kind: 'local', item: c });
+  }
+  for (const s of showSrv) push(certGroupKey(s.domain), { kind: 'server', item: s });
 
-  const scanLine = !S.server.connected
-    ? `<div class="field-hint" style="padding:0 16px 10px">还没连服务器：连上后会自动扫一遍它上面的证书（宝塔 / certbot / nginx），只读不改。</div>`
-    : srvSt.error
-      ? `<div class="note warn" style="margin:0 16px 10px">${icon('alert')}<div>${esc(srvSt.error)}</div></div>`
-      : (!srvSt.loaded || srvSt.loading)
-        ? `<div class="field-hint" style="padding:0 16px 10px">正在扫描 ${esc(S.server.host || '服务器')} 上的证书…</div>`
-        : `<div class="field-hint" style="padding:0 16px 10px">${esc(S.server.host || '服务器')} 上找到 ${srv.length} 张证书${srvSt.scannedAt ? ` · ${new Date(srvSt.scannedAt).toLocaleTimeString('zh-CN')} 扫描` : ''}${srvOnly.length ? `，其中 ${srvOnly.length} 张本机还没有` : ''}${srvSt.truncated ? ' · 证书较多，只显示前 ' + srv.length + ' 张' : ''}</div>`;
-
-  if (!local.length && !srvOnly.length) {
-    return `${scanLine}<div class="empty"><span class="spinner"></span><h3>还没有证书</h3><p>照上面向导「签发证书」一步签发第一张；已经有证书的话，连上服务器会在这里列出来，点「导入到本机」即可纳入管理。</p></div>`;
+  if (!groups.size) {
+    const emptyMsg = filter === 'local'
+      ? '本机证书库里还没有证书。照上面向导「签发证书」，或者切换到服务器标签把已有证书点「导入到本机」。'
+      : filter.startsWith('conn:')
+        ? '这台服务器上没有扫描到 nginx / 宝塔 / Let\'s Encrypt 证书。'
+        : '照上面向导「签发证书」一步签发第一张；服务器上已有证书的话会自动汇总列在这里，点「导入到本机」即可纳入管理。';
+    return `${chipsBar}${scanLine}${failBar}${authBar}<div class="empty"><h3>还没有证书</h3><p>${esc(emptyMsg)}</p></div>`;
   }
 
   const blocks = [...groups.entries()]
@@ -4889,8 +4992,12 @@ function certOverviewHtml() {
       const title = hasWildcard ? `*.${key}` : key;
       const localCount = items.filter((e) => e.kind === 'local').length;
       const srvCount = items.length - localCount;
-      const counts = [localCount ? `本机 ${localCount}` : '', srvCount ? `服务器独有 ${srvCount}` : ''].filter(Boolean).join(' · ');
-      const rows = items.map((e) => (e.kind === 'local' ? certRow(e.item, !!(S.certs.dns || {}).hasToken) : serverCertRow(e.item))).join('');
+      const counts = [localCount ? `本机 ${localCount}` : '', srvCount ? `服务器 ${srvCount}` : ''].filter(Boolean).join(' · ');
+      const rows = items
+        .map((e) => (e.kind === 'local'
+          ? certRow(e.item, !!(S.certs.dns || {}).hasToken)
+          : serverCertRow(e.item, { hasLocal: localDomains.has(String((e.item && e.item.domain) || '').toLowerCase()) })))
+        .join('');
       return `
         <div class="cert-group">
           <div class="cert-group-head">
@@ -4902,7 +5009,7 @@ function certOverviewHtml() {
     })
     .join('');
 
-  return `${scanLine}${blocks}`;
+  return `${chipsBar}${scanLine}${failBar}${authBar}${blocks}`;
 }
 
 /* ---------------- DNS 记录面板（v1.2.58） ----------------
@@ -5173,15 +5280,35 @@ function domainWizardHtml() {
             <div class="dw-inline-form">
               <select class="select" id="cert-dns-provider">
                 <option value="" ${!provider ? 'selected' : ''}>未配置</option>
-                <option value="cloudflare" ${provider === 'cloudflare' ? 'selected' : ''}>Cloudflare</option>
+                <option value="cloudflare" ${provider === 'cloudflare' || (!provider && !hasToken) ? 'selected' : ''}>Cloudflare</option>
               </select>
-              <input class="input" id="cert-dns-token" type="password" placeholder="${hasToken ? '已保存（留空不改动）' : 'Cloudflare API Token'}" autocomplete="new-password" />
+              <input class="input" id="cert-dns-token" type="password" placeholder="${hasToken ? '已保存（留空不改动）' : '粘贴 Cloudflare API Token'}" autocomplete="new-password" />
               <button class="btn icon" type="button" data-act="certs.dns.eye" title="显示 / 隐藏">${icon('eye')}</button>
               <button class="btn primary" type="button" data-act="certs.dns.save">${icon('check')}<span>保存</span></button>
               <button class="btn" type="button" data-act="certs.dns.verify">${icon('shield')}<span>验证</span></button>
               ${hasToken ? `<button class="btn danger-text" type="button" data-act="certs.dns.clear">${icon('trash')}<span>清除</span></button>` : ''}
             </div>
-            <span style="font-size:11px">权限至少需要 <code>Zone.Zone:Read</code> + <code>Zone.DNS:Edit</code>，范围限定到你自己的域名；token 用 Windows DPAPI 加密存在本机，绝不出现在配置或日志里。</span>
+            ${(() => {
+              const guideInner = `
+                <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-bottom:6px">
+                  <strong style="font-size:12px">如何获取 Cloudflare API Token（4 步，约 1 分钟）</strong>
+                  <button class="btn small" type="button" data-act="open" data-url="https://dash.cloudflare.com/profile/api-tokens">${icon('external')}<span>打开 Cloudflare 令牌页</span></button>
+                </div>
+                <ol style="margin:0;padding-left:18px;font-size:11.5px;line-height:1.75;color:var(--text-2)">
+                  <li>点击上方<strong>「打开 Cloudflare 令牌页」</strong>并登录账号，点击页面里的<strong>「创建令牌 / Create Token」</strong>。</li>
+                  <li>在模板列表中找到<strong>「编辑区域 DNS / Edit zone DNS」</strong>，点击右侧<strong>「使用模板 / Use template」</strong>（会自动勾选所需权限 <code>Zone:Read</code> + <code>DNS:Edit</code>，无需手改）。</li>
+                  <li>在<strong>「区域资源 / Zone Resources」</strong>下拉框中选中你自己的域名（或选「所有区域」），滑到底部依次点<strong>「继续以显示摘要」→「创建令牌」</strong>。</li>
+                  <li>点<strong>「复制」</strong>拿到 Token，粘贴到上方输入框，依次点击<strong>「保存」</strong>和<strong>「验证」</strong>（显示绿字即成功）。</li>
+                </ol>
+                <div style="margin-top:6px;font-size:11px;opacity:.78">安全说明：Token 仅使用 Windows DPAPI 加密保存在本机，不会写入任何配置文件、不会上传，也绝不会出现在日志里。</div>`;
+              if (hasToken) {
+                return `<details style="margin-top:6px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:rgba(0,0,0,.16)">
+                  <summary style="cursor:pointer;font-size:11.5px;color:var(--text-2)">需要更换或重新创建 Token？展开查看 4 步获取指引</summary>
+                  <div style="margin-top:8px">${guideInner}</div>
+                </details>`;
+              }
+              return `<div style="margin-top:6px;padding:10px 12px;border:1px solid var(--line);border-radius:8px;background:rgba(0,0,0,.18)">${guideInner}</div>`;
+            })()}
           </div>
         </div>
 
@@ -5272,12 +5399,17 @@ function renderCerts(force = false) {
   const coveredText = coveredDomains.join('、');
   // 自动折叠：没手动点过「展开/收起」时，token 与证书都齐了就默认收起向导
   const expanded = w.expanded === undefined ? !(hasToken && certs.length) : w.expanded;
-  // 证书按服务器显示：顶部标注当前连接的服务器，每张证书的部署徽标带服务器名。
-  const serverHost = S.server.connected ? String(S.server.host || '') : '';
-  const connName = (activeConnectionInfo() || {}).name || '';
-  const serverCtx = serverHost
-    ? `<span class="badge">当前服务器 ${esc(serverHost)}${connName ? ` · ${esc(connName)}` : ''}</span>`
-    : '<span class="badge amber">未连接服务器</span>';
+  // 证书汇总扫描全部已配置服务器（无需先启隧道，也无需先在服务器页连接 SSH）。
+  const configuredSrvs = configuredServerConns();
+  const srvSt = S.certs.server || {};
+  const scannedOkCount = (srvSt.servers || []).filter((s) => s.ok).length;
+  const serverCtx = !configuredSrvs.length
+    ? '<span class="badge amber">未配置服务器</span>'
+    : srvSt.loading
+      ? `<span class="badge">正在扫描 ${configuredSrvs.length} 台服务器…</span>`
+      : srvSt.loaded
+        ? `<span class="badge ${scannedOkCount === configuredSrvs.length ? 'green' : ''}">已扫描 ${scannedOkCount} / ${configuredSrvs.length} 台服务器</span>`
+        : `<span class="badge">共 ${configuredSrvs.length} 台服务器</span>`;
 
   /* 30 天内到期的那张证书 —— 自动续期只有配了 DNS 渠道才跑得动，没配就得明说。 */
   const expiring = (certs || [])
@@ -5293,7 +5425,7 @@ function renderCerts(force = false) {
             : '没有配置 DNS 验证渠道，自动续期不会运行 —— 证书到期后 https://域名 会直接打不开。下面的「续期」按钮也要先配好渠道才能用。'}</div>
           ${hasToken
             ? ''
-            : `<button class="btn small" type="button" data-act="certs.godns">${icon('key')}<span>去配置 Cloudflare token</span></button>`}
+            : `<button class="btn small" type="button" data-act="certs.godns">${icon('shield')}<span>去配置 Cloudflare token</span></button>`}
         </div>
       </section>`;
 
@@ -5302,7 +5434,7 @@ function renderCerts(force = false) {
       <div class="page-head">
         <div class="page-title">
           <h1>HTTPS 证书</h1>
-          <p>给域名上 HTTPS：签证书 → 部署到服务器 → 浏览器就能 <code>https://</code> 访问、不带端口。不配置也能正常使用隧道。</p>
+          <p>给域名上 HTTPS：签证书 → 部署到服务器 → 浏览器就能 <code>https://</code> 访问、不带端口。无需启动隧道即可汇总查看全部服务器证书。</p>
         </div>
       </div>
 
@@ -5318,10 +5450,10 @@ function renderCerts(force = false) {
 
       <section class="card section">
         <div class="section-head">
-          <div class="section-title"><strong>证书总览</strong><span>${coveredDomains.length ? `已覆盖域名：${esc(coveredText)} · ` : ''}按父域名分组；本机证书存在 userData\\certs，服务器上的证书（宝塔 / certbot / nginx）只读扫描后可一键导入。</span></div>
+          <div class="section-title"><strong>证书总览</strong><span>${coveredDomains.length ? `本机已覆盖：${esc(coveredText)} · ` : ''}汇总本机证书库与全部已配置服务器上的证书（宝塔 / certbot / nginx），按父域名分组。</span></div>
           <div class="page-actions">
             ${serverCtx}
-            ${S.server.connected ? `<button class="btn small" type="button" data-act="certs.server.scan" ${S.certs.server.loading ? 'disabled' : ''}>${icon('reload')}<span>${S.certs.server.loading ? '扫描中…' : '扫描服务器'}</span></button>` : ''}
+            ${configuredSrvs.length ? `<button class="btn small" type="button" data-act="certs.server.scan" ${srvSt.loading ? 'disabled' : ''}>${icon('reload')}<span>${srvSt.loading ? '扫描中…' : '扫描全部服务器'}</span></button>` : ''}
             <button class="btn small" type="button" data-act="certs.refresh">${icon('reload')}<span>刷新</span></button>
           </div>
         </div>
@@ -5329,9 +5461,8 @@ function renderCerts(force = false) {
       </section>
     </div>`;
 
-  // 连上服务器才扫描；进页面自动扫一次（60 秒内主进程有缓存，不会反复 SSH）。
-  const srvSt = S.certs.server;
-  if (S.server.connected && !srvSt.loaded && !srvSt.loading) loadServerCerts();
+  // 进页自动静默汇总扫描全部已配置服务器一次（60 秒内主进程走缓存，不会反复 SSH，也不需要启动隧道）。
+  if (configuredSrvs.length && !srvSt.loaded && !srvSt.loading) loadServerCerts({ force: false });
   /* 渲染完再按输入框的当前值校正一次按钮状态（1.2.220） */
   refreshWizardButtons();
 }
@@ -6622,16 +6753,74 @@ async function handleAction(act, dataset, btn) {
       }
       case 'certs.refresh':
         await loadCerts();
+        if (configuredServerConns().length) await loadServerCerts({ force: false });
         break;
+      case 'certs.filter': {
+        const nextFilter = String((dataset && dataset.filter) || 'all');
+        S.certs.server.filter = nextFilter;
+        renderCerts(true);
+        break;
+      }
       case 'certs.server.scan': {
-        if (!S.server.connected) { toast('warn', '还没连服务器', '到「服务器」页连上服务器后再扫描'); break; }
+        if (!configuredServerConns().length) {
+          toast('warn', '还没有配置服务器', '先在「服务器」页添加服务器后再扫描');
+          break;
+        }
         await loadServerCerts({ force: true });
         const st = S.certs.server;
-        if (st.error) toast('error', '扫描失败', st.error);
-        else toast('ok', '扫描完成', `服务器上有 ${st.certs.length} 张证书`);
+        if (st.error) {
+          toast('error', '扫描失败', st.error);
+        } else {
+          const srvs = st.servers || [];
+          const okCount = srvs.filter((s) => s.ok).length;
+          const needPw = srvs.filter((s) => s.needsPassword).length;
+          const extra = needPw ? `（另有 ${needPw} 台需要输入 SSH 密码）` : '';
+          toast('ok', '扫描完成', `已扫描 ${okCount}/${srvs.length} 台服务器，共找到 ${st.certs.length} 张证书${extra}`);
+        }
+        break;
+      }
+      case 'certs.server.auth.open': {
+        const connId = String((dataset && dataset.conn) || '').trim();
+        S.certs.server.authConnId = connId;
+        renderCerts(true);
+        const inp = $('#certs-ssh-pass');
+        if (inp) inp.focus();
+        break;
+      }
+      case 'certs.server.auth.cancel': {
+        S.certs.server.authConnId = '';
+        renderCerts(true);
+        break;
+      }
+      case 'certs.server.auth.submit': {
+        const connId = String((dataset && dataset.conn) || S.certs.server.authConnId || '').trim();
+        const pwInput = $('#certs-ssh-pass');
+        const pw = pwInput ? String(pwInput.value || '') : '';
+        const remEl = $('#certs-ssh-remember');
+        const remember = remEl ? !!remEl.checked : true;
+        if (!connId) break;
+        if (!pw) { toast('warn', '请输入 SSH 密码'); if (pwInput) pwInput.focus(); break; }
+        const res = await loadServerCerts({ force: true, connectionId: connId, password: pw, remember });
+        if (res && res.ok) {
+          toast('ok', '扫描完成', `${res.name || res.host} 上找到 ${(res.certs || []).length} 张证书`);
+        } else {
+          toast('error', '扫描失败', (res && res.error) || 'SSH 验证或扫描失败');
+        }
+        break;
+      }
+      case 'certs.server.retry': {
+        const connId = String((dataset && dataset.conn) || '').trim();
+        if (!connId) break;
+        const res = await loadServerCerts({ force: true, connectionId: connId });
+        if (res && res.ok) {
+          toast('ok', '扫描完成', `${res.name || res.host} 上找到 ${(res.certs || []).length} 张证书`);
+        } else {
+          toast('error', '重试失败', (res && res.error) || '扫描失败');
+        }
         break;
       }
       case 'cert.import': {
+        const connectionId = String((dataset && dataset.conn) || '').trim();
         const domain = dataset.domain || '';
         const certPath = dataset.certPath || '';
         const keyPath = dataset.keyPath || '';
@@ -6642,7 +6831,7 @@ async function handleAction(act, dataset, btn) {
           confirmText: '导入',
         });
         if (!okImport) break;
-        const res = await withBusy(btn, () => FRP.certImport({ domain, certPath, keyPath }));
+        const res = await withBusy(btn, () => FRP.certImport({ connectionId, domain, certPath, keyPath }));
         if (!res || !res.ok) { toast('error', '导入失败', (res && res.error) || '未知错误'); break; }
         toast('ok', '已导入到本机', `${res.data.domain} · ${(res.data.domains || []).join(', ')}`);
         // 重新拉列表并强制重画：只靠 loadCerts 内部的重画在某些时序下（弹窗关闭后）会被跳过
@@ -6667,6 +6856,7 @@ async function handleAction(act, dataset, btn) {
         break;
       }
       case 'cert.server.remove': {
+        const connectionId = String((dataset && dataset.conn) || '').trim();
         const domain = dataset.domain || '';
         const certPath = dataset.certPath || '';
         const keyPath = dataset.keyPath || '';
@@ -6680,12 +6870,12 @@ async function handleAction(act, dataset, btn) {
         });
         if (!okDel) break;
         await withBusy(btn, async () => {
-          const res = await FRP.certServerRemove({ domain, certPath, keyPath });
+          const res = await FRP.certServerRemove({ connectionId, domain, certPath, keyPath });
           if (!res || !res.ok) {
             const refs = (res && res.references) || [];
             /* 有站点引用：不硬拒，交给三选一弹窗（换证书 / 停用站点 / 强制删除）。 */
             if (refs.length) {
-              openCertRefsModal({ domain, certPath, keyPath, refs, sites: (res && res.sites) || [] });
+              openCertRefsModal({ domain, certPath, keyPath, connectionId, refs, sites: (res && res.sites) || [] });
               return;
             }
             return toastResult(res);
@@ -6693,7 +6883,7 @@ async function handleAction(act, dataset, btn) {
           const moved = (res.data && res.data.deleted) || [];
           const trash = (res.data && res.data.trash) || '';
           toast('success', '已从服务器删除证书', `${domain || certPath}${trash ? ` · 已移入 ${trash}` : ''}`);
-          try { await loadServerCerts({ force: true }); } catch { /* ignore */ }
+          try { await loadServerCerts({ force: true, connectionId }); } catch { /* ignore */ }
           if (moved.length && S.view === 'certs') renderCerts(true);
         });
         break;
@@ -6914,8 +7104,9 @@ async function handleAction(act, dataset, btn) {
       }
       case 'certs.dns.save': {
         await withBusy(btn, async () => {
-          const provider = $('#cert-dns-provider') ? $('#cert-dns-provider').value : '';
+          const rawProvider = $('#cert-dns-provider') ? $('#cert-dns-provider').value : '';
           const token = $('#cert-dns-token') ? $('#cert-dns-token').value.trim() : '';
+          const provider = rawProvider || (token ? 'cloudflare' : '');
           const res = await FRP.dnsSave({ provider, token: token || undefined });
           if (res && res.ok) {
             if (res.data && res.data.state) S.state = res.data.state;

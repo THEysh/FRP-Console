@@ -213,8 +213,30 @@ let lastNginxState = null;
 /* 配置体检缓存（1.2.72）：{at, host, data}；切服务器/修复后清掉。 */
 let nginxHealthCache = null;
 
-/* 服务器证书扫描结果缓存（按 host 记，60 秒内不重复 SSH 扫盘）。 */
-let serverCertScanCache = { at: 0, host: '', certs: [], truncated: false };
+/* 服务器证书扫描结果缓存（按 host:port 记，60 秒内不重复 SSH 扫盘，供单机与全服务器汇总共用）。 */
+const serverCertScanByHost = new Map();
+function certScanCacheKey(host, port = 22) {
+  return `${String(host || '').trim().toLowerCase()}:${Number(port) || 22}`;
+}
+function invalidateCertScanCache(host = '', port = 22) {
+  if (!host) {
+    serverCertScanByHost.clear();
+    return;
+  }
+  serverCertScanByHost.delete(certScanCacheKey(host, port));
+}
+function normalizeScannedCerts(rawCerts, now = Date.now()) {
+  return (rawCerts || []).map((c) => {
+    const t = Date.parse(c.notAfterRaw || '');
+    const notAfter = Number.isFinite(t) ? t : 0;
+    return {
+      ...c,
+      notAfter,
+      notAfterText: notAfter ? new Date(notAfter).toISOString().slice(0, 10) : '',
+      daysLeft: notAfter ? Math.floor((notAfter - now) / 86400000) : null,
+    };
+  });
+}
 
 /* 额外只读扫描的证书目录：安装版的 certs 目录 + 用户自定义目录。
  * 让源码版（独立 userData）也能看到安装版签/导入的证书，不必复制文件。 */
@@ -6534,59 +6556,231 @@ function domainOwners(domain) {
     return ok({ removed: true, usedBy });
   });
 
+  /* 证书远端操作统一分派：带 connectionId 时走按需 SSH（复用当前会话或短期直连），
+   * 不带时回退到服务器页当前已连接的 serverSession。 */
+  async function runCertServerOp(connId, fn) {
+    const id = String(connId || '').trim();
+    if (id) {
+      return withConnectionSsh(id, (sess, meta) => fn(sess, meta));
+    }
+    if (!serverSession.connected) return fail('尚未连接服务器');
+    return fn(serverSession, {
+      conn: connectionById(settings.activeConnectionId),
+      host: serverSession.host,
+      port: Number(serverSession.port) || 22,
+      username: serverSession.username || 'root',
+      reused: true,
+    });
+  }
+
+  /* 扫描单台服务器连接上的证书（带 60 秒按 host:port 缓存，不要求隧道启动）。 */
+  async function scanSingleServerCerts(conn, { force = false, password = '', remember = false } = {}) {
+    let fallbackAddr = '';
+    try {
+      const m = conn.id === settings.activeConnectionId ? model : connectionModel(conn);
+      fallbackAddr = String((m && m.serverAddr) || '').trim();
+    } catch { fallbackAddr = ''; }
+    const host = String(conn.host || fallbackAddr || '').trim();
+    const port = Number(conn.port) || 22;
+    const username = String(conn.username || 'root').trim() || 'root';
+    const name = conn.name || host || conn.id;
+    const tagCerts = (list) => (list || []).map((c) => ({
+      ...c,
+      connectionId: conn.id,
+      serverName: name,
+      serverHost: host,
+    }));
+    if (!host) {
+      return {
+        connectionId: conn.id,
+        name,
+        host: '',
+        port,
+        username,
+        ok: false,
+        skipped: true,
+        error: '未配置服务器地址',
+        certs: [],
+        truncated: false,
+        scannedAt: 0,
+        cached: false,
+      };
+    }
+    const key = certScanCacheKey(host, port);
+    const hit = serverCertScanByHost.get(key);
+    if (!force && hit && Date.now() - hit.at < 60000) {
+      return {
+        connectionId: conn.id,
+        name,
+        host,
+        port,
+        username,
+        ok: true,
+        cached: true,
+        scannedAt: hit.at,
+        truncated: !!hit.truncated,
+        certs: tagCerts(hit.certs),
+        error: '',
+      };
+    }
+    const res = await withConnectionSsh(
+      conn.id,
+      async (sess, meta) => {
+        const scan = await sess.scanCertificates();
+        if (!scan.ok) return fail(scan.error || '扫描服务器证书失败');
+        const now = Date.now();
+        const certs = normalizeScannedCerts(scan.certs, now);
+        serverCertScanByHost.set(certScanCacheKey(meta.host, meta.port), {
+          at: now,
+          host: meta.host,
+          port: meta.port,
+          certs,
+          truncated: !!scan.truncated,
+        });
+        return ok({
+          certs,
+          truncated: !!scan.truncated,
+          scannedAt: now,
+          host: meta.host,
+          port: meta.port,
+        });
+      },
+      { password, remember },
+    );
+    if (!res || !res.ok) {
+      return {
+        connectionId: conn.id,
+        name,
+        host,
+        port,
+        username,
+        ok: false,
+        needsPassword: !!(res && res.needsPassword),
+        needsTrustHost: (res && res.needsTrustHost) || null,
+        error: (res && res.error) || '扫描服务器证书失败',
+        certs: [],
+        truncated: false,
+        scannedAt: 0,
+        cached: false,
+      };
+    }
+    return {
+      connectionId: conn.id,
+      name,
+      host: res.data.host || host,
+      port: res.data.port || port,
+      username,
+      ok: true,
+      cached: false,
+      scannedAt: res.data.scannedAt || Date.now(),
+      truncated: !!res.data.truncated,
+      certs: tagCerts(res.data.certs),
+      error: '',
+    };
+  }
+
   /* 把服务器上已有的证书（宝塔 / certbot）导入本机库，之后就能统一查看/续期/部署。 */
   ipcMain.handle('cert:import', async (event, payload = {}) => {
     try {
-      if (!serverSession.connected) return fail('尚未连接服务器');
       const certPath = String((payload && payload.certPath) || '').trim();
       const keyPath = String((payload && payload.keyPath) || '').trim();
       const domain = String((payload && payload.domain) || '').trim();
       if (!certPath) return fail('缺少证书路径');
-      const read = await serverSession.readRemoteCert({ certPath, keyPath });
-      if (!read.ok) return fail(read.error);
-      const res = acmeManager.importCertificate({
-        domain,
-        certPem: read.certPem,
-        keyPem: read.keyPem,
-        source: 'server',
-        serverHost: serverSession.host,
-        remoteCertPath: certPath,
-        remoteKeyPath: keyPath,
+      return await runCertServerOp(payload && payload.connectionId, async (sess, meta) => {
+        const read = await sess.readRemoteCert({ certPath, keyPath });
+        if (!read.ok) return fail(read.error);
+        const res = acmeManager.importCertificate({
+          domain,
+          certPem: read.certPem,
+          keyPem: read.keyPem,
+          source: 'server',
+          serverHost: meta.host,
+          remoteCertPath: certPath,
+          remoteKeyPath: keyPath,
+        });
+        if (!res.ok) return fail(res.error);
+        pushState();
+        return ok(res);
       });
-      if (!res.ok) return fail(res.error);
-      pushState();
-      return ok(res);
     } catch (e) {
       return fail(String((e && e.message) || e));
     }
   });
 
   /* 服务器上已有的证书盘点（只读）：nginx 引用的 + 宝塔 vhost/cert + letsencrypt/live + /etc/nginx/ssl。
-   * 结果按 host 缓存 60 秒，force=true 可强刷。 */
+   * 结果按 host:port 缓存 60 秒，force=true 可强刷。 */
   ipcMain.handle('cert:server-scan', async (event, payload = {}) => {
     try {
       if (!serverSession.connected) return fail('尚未连接服务器，无法读取服务器上的证书');
       const force = !!(payload && payload.force);
       const host = serverSession.host;
-      const fresh = serverCertScanCache.host === host && Date.now() - serverCertScanCache.at < 60000;
-      if (!force && fresh) {
-        return ok({ ...serverCertScanCache, cached: true, scannedAt: serverCertScanCache.at });
+      const port = Number(serverSession.port) || 22;
+      const key = certScanCacheKey(host, port);
+      const hit = serverCertScanByHost.get(key);
+      if (!force && hit && Date.now() - hit.at < 60000) {
+        return ok({ ...hit, cached: true, scannedAt: hit.at });
       }
       const scan = await serverSession.scanCertificates();
       if (!scan.ok) return fail(scan.error || '扫描服务器证书失败');
       const now = Date.now();
-      const certs = (scan.certs || []).map((c) => {
-        const t = Date.parse(c.notAfterRaw || '');
-        const notAfter = Number.isFinite(t) ? t : 0;
-        return {
-          ...c,
-          notAfter,
-          notAfterText: notAfter ? new Date(notAfter).toISOString().slice(0, 10) : '',
-          daysLeft: notAfter ? Math.floor((notAfter - now) / 86400000) : null,
-        };
-      });
-      serverCertScanCache = { at: now, host, certs, truncated: !!scan.truncated };
-      return ok({ ...serverCertScanCache, cached: false, scannedAt: now });
+      const certs = normalizeScannedCerts(scan.certs, now);
+      const entry = { at: now, host, port, certs, truncated: !!scan.truncated };
+      serverCertScanByHost.set(key, entry);
+      return ok({ ...entry, cached: false, scannedAt: now });
+    } catch (e) {
+      return fail(String((e && e.message) || e));
+    }
+  });
+
+  /* 汇总扫描全部已配置服务器上的证书（不要求隧道启动，也不要求先去服务器页连 SSH）。
+   * 支持：
+   *   - 默认（无 connectionId）：按 host:port 去重后，以最多 3 路并发扫描全部已配置服务器，60 秒内走缓存；
+   *   - 指定 connectionId：单独重扫某一台（常用于输入 SSH 密码或失败重试）。 */
+  ipcMain.handle('cert:server-scan-all', async (event, payload = {}) => {
+    try {
+      const targetId = String((payload && payload.connectionId) || '').trim();
+      const force = !!(payload && payload.force);
+      if (targetId) {
+        const conn = connectionById(targetId);
+        if (!conn) return fail('服务器连接不存在');
+        const one = await scanSingleServerCerts(conn, {
+          force: payload.force !== false,
+          password: payload.password || '',
+          remember: !!payload.remember,
+        });
+        return ok({ servers: [one], certs: one.certs || [], single: true, scannedAt: Date.now() });
+      }
+
+      const list = Array.isArray(settings.connections) ? settings.connections : [];
+      const targets = [];
+      const seenKeys = new Set();
+      for (const conn of list) {
+        let fallbackAddr = '';
+        try {
+          const m = conn.id === settings.activeConnectionId ? model : connectionModel(conn);
+          fallbackAddr = String((m && m.serverAddr) || '').trim();
+        } catch { fallbackAddr = ''; }
+        const host = String(conn.host || fallbackAddr || '').trim();
+        if (!host) continue;
+        const key = certScanCacheKey(host, Number(conn.port) || 22);
+        if (seenKeys.has(key)) continue;
+        seenKeys.add(key);
+        targets.push(conn);
+      }
+
+      const results = new Array(targets.length);
+      let cursor = 0;
+      const workerCount = Math.min(3, targets.length);
+      await Promise.all(Array.from({ length: workerCount }, async () => {
+        while (cursor < targets.length) {
+          const idx = cursor;
+          cursor += 1;
+          results[idx] = await scanSingleServerCerts(targets[idx], { force });
+        }
+      }));
+
+      const certs = results.flatMap((r) => (r && r.ok ? r.certs : []));
+      return ok({ servers: results, certs, single: false, scannedAt: Date.now() });
     } catch (e) {
       return fail(String((e && e.message) || e));
     }
@@ -6598,19 +6792,20 @@ function domainOwners(domain) {
    * （前端要先让他勾选「我知道后果」才带这个参数）。 */
   ipcMain.handle('cert:server-remove', async (event, payload = {}) => {
     try {
-      if (!serverSession.connected) return fail('尚未连接服务器');
       const certPath = String((payload && payload.certPath) || '').trim();
       const keyPath = String((payload && payload.keyPath) || '').trim();
       const force = !!(payload && payload.force);
-      const res = await serverSession.deleteRemoteCert({ certPath, keyPath, force });
-      if (!res.ok) {
-        if (res.blocked) return fail(res.error, { blocked: true, references: res.references || [], sites: res.sites || [] });
-        return fail(res.error);
-      }
-      /* 删完让下一次扫描重新读盘，别拿缓存里的旧列表糊弄用户。 */
-      serverCertScanCache = { at: 0, host: '', certs: [], truncated: false };
-      pushState();
-      return ok(res);
+      return await runCertServerOp(payload && payload.connectionId, async (sess, meta) => {
+        const res = await sess.deleteRemoteCert({ certPath, keyPath, force });
+        if (!res.ok) {
+          if (res.blocked) return fail(res.error, { blocked: true, references: res.references || [], sites: res.sites || [] });
+          return fail(res.error);
+        }
+        /* 删完让下一次扫描重新读盘，别拿缓存里的旧列表糊弄用户。 */
+        invalidateCertScanCache(meta.host, meta.port);
+        pushState();
+        return ok(res);
+      });
     } catch (e) {
       return fail(String((e && e.message) || e));
     }
@@ -6619,17 +6814,18 @@ function domainOwners(domain) {
   /* 把引用某张证书的 nginx 配置改指到另一张证书（换证不换站点）。 */
   ipcMain.handle('cert:replace-refs', async (event, payload = {}) => {
     try {
-      if (!serverSession.connected) return fail('尚未连接服务器');
-      const res = await serverSession.replaceCertReference({
-        fromCert: String((payload && payload.fromCert) || '').trim(),
-        fromKey: String((payload && payload.fromKey) || '').trim(),
-        toCert: String((payload && payload.toCert) || '').trim(),
-        toKey: String((payload && payload.toKey) || '').trim(),
+      return await runCertServerOp(payload && payload.connectionId, async (sess, meta) => {
+        const res = await sess.replaceCertReference({
+          fromCert: String((payload && payload.fromCert) || '').trim(),
+          fromKey: String((payload && payload.fromKey) || '').trim(),
+          toCert: String((payload && payload.toCert) || '').trim(),
+          toKey: String((payload && payload.toKey) || '').trim(),
+        });
+        if (!res.ok) return fail(res.error, res.changed ? { changed: res.changed } : {});
+        invalidateCertScanCache(meta.host, meta.port);
+        pushState();
+        return ok(res);
       });
-      if (!res.ok) return fail(res.error, res.changed ? { changed: res.changed } : {});
-      serverCertScanCache = { at: 0, host: '', certs: [], truncated: false };
-      pushState();
-      return ok(res);
     } catch (e) {
       return fail(String((e && e.message) || e));
     }
@@ -6638,13 +6834,14 @@ function domainOwners(domain) {
   /* 停用引用某张证书的站点（配置文件改名成 .disabled-frpconsole-<时间戳>，随时可改回）。 */
   ipcMain.handle('cert:disable-refs', async (event, payload = {}) => {
     try {
-      if (!serverSession.connected) return fail('尚未连接服务器');
       const files = Array.isArray(payload && payload.files) ? payload.files : [];
-      const res = await serverSession.disableNginxSites({ files });
-      if (!res.ok) return fail(res.error);
-      serverCertScanCache = { at: 0, host: '', certs: [], truncated: false };
-      pushState();
-      return ok(res);
+      return await runCertServerOp(payload && payload.connectionId, async (sess, meta) => {
+        const res = await sess.disableNginxSites({ files });
+        if (!res.ok) return fail(res.error);
+        invalidateCertScanCache(meta.host, meta.port);
+        pushState();
+        return ok(res);
+      });
     } catch (e) {
       return fail(String((e && e.message) || e));
     }
