@@ -10,6 +10,9 @@
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 
+/* 代理表的排序（1.2.217）：key 为空表示按配置里的原始顺序。 */
+const proxySortInitial = { key: '', dir: 1 };
+
 const S = {
   ready: false,
   state: null,
@@ -19,6 +22,8 @@ const S = {
   listeners: null,
   listenersBusy: false,
   proxyQuery: '',
+  /* 代理表排序（1.2.217）：key 为空 = 配置里的原始顺序 */
+  proxySort: { key: '', dir: 1 },
   logLevel: '',
   follow: true,
   logSource: 'local',   // 'local' = 本机 frpc；'server' = 服务器 frps（1.2.91 起两者都在「实时日志」页）
@@ -959,6 +964,8 @@ function proxiesKey() {
     /* 全量视图（1.2.190）：别的连接的代理变化也要触发重绘，所以 key 里带上
      * connectionId 与连接筛选。 */
     flt: S.proxyConnFilter || '',
+    /* 排序状态进 key（1.2.217），否则点表头不重绘 */
+    sort: `${(S.proxySort || proxySortInitial).key}:${(S.proxySort || proxySortInitial).dir}`,
     list: ((Array.isArray(s.proxiesAll) && s.proxiesAll.length ? s.proxiesAll : (s.proxies || []))).map((p) => [p.connectionId || '', p.name, p.type, p.status, p.statusError, p.publicAddress, p.localPort, p.health && p.health.ok, p.health && p.health.ms, p.health && p.health.reason]),
   });
 }
@@ -988,6 +995,35 @@ function tunnelIdleNote(all) {
   </div></div>`;
 }
 
+/* 按表头点击排序（1.2.217）。key 为空 → 原始顺序（配置里的顺序）。 */
+function proxySortValue(p, key) {
+  if (key === 'name') return String(p.name || '').toLowerCase();
+  if (key === 'conn') return `${p.connectionName || ''}::${p.name || ''}`.toLowerCase();
+  if (key === 'local') return Number(p.localPort) || 0;
+  if (key === 'public') return String(p.publicAddress || '').toLowerCase();
+  if (key === 'status') return p.status === 'running' ? 0 : 1;
+  return 0;
+}
+function sortProxies(list) {
+  const s = S.proxySort || proxySortInitial;
+  if (!s.key) return list;
+  const dir = s.dir < 0 ? -1 : 1;
+  return [...list].sort((a, b) => {
+    const x = proxySortValue(a, s.key);
+    const y = proxySortValue(b, s.key);
+    if (x < y) return -1 * dir;
+    if (x > y) return 1 * dir;
+    return String(a.name || '').localeCompare(String(b.name || ''));
+  });
+}
+/* 可点的表头：显示箭头只在当前排序列上。 */
+function sortThTh(key, label, extra = '') {
+  const s = S.proxySort || proxySortInitial;
+  const on = s.key === key;
+  const arrow = on ? (s.dir < 0 ? '↓' : '↑') : '';
+  return `<th${extra}><button class="sort-th${on ? ' on' : ''}" type="button" data-act="proxy.sort" data-key="${key}" title="点击按${esc(label)}排序${on ? '（再点切换升降序）' : ''}">${esc(label)}<span class="sort-arrow">${arrow}</span></button></th>`;
+}
+
 function renderProxies(force = false) {
   const key = proxiesKey();
   const q = S.proxyQuery;
@@ -1007,7 +1043,7 @@ function renderProxies(force = false) {
     return text.includes(q.toLowerCase());
   });
 
-  const rows = list.map(proxyRowHtml).join('');
+  const rows = sortProxies(list).map(proxyRowHtml).join('');
   const empty = !all.length;
 
   $('#view').innerHTML = `
@@ -1046,7 +1082,7 @@ function renderProxies(force = false) {
             </div>`
           : `<table class="proxy-table">
               <thead><tr>
-                <th>名称 / 类型</th><th>服务器</th><th>本地服务</th><th>公网地址</th><th>状态</th><th style="text-align:right">操作</th>
+                ${sortThTh('name', '名称 / 类型')}${sortThTh('conn', '服务器')}${sortThTh('local', '本地服务')}${sortThTh('public', '公网地址')}${sortThTh('status', '状态')}<th style="text-align:right">操作</th>
               </tr></thead>
               <tbody>${rows || `<tr><td colspan="6"><div class="empty" style="padding:26px"><p>没有匹配「${esc(q)}」的代理</p></div></td></tr>`}</tbody>
             </table>`}
@@ -5428,7 +5464,16 @@ async function handleAction(act, dataset, btn) {
         S.discoveryRiskOnly = !S.discoveryRiskOnly;
         renderDiscovery(true);
         break;
-      case 'listener.publish': {
+      case 'proxy.sort': {
+        /* 点表头：第一次升序，再点切降序。 */
+        const sortKey = dataset.key || '';
+        const curSort = S.proxySort || { key: '', dir: 1 };
+        S.proxySort = curSort.key === sortKey ? { key: sortKey, dir: -curSort.dir } : { key: sortKey, dir: 1 };
+        renderProxies(true);
+        break;
+      }
+
+    case 'listener.publish': {
         const proc = String(dataset.process || '').replace(/\.exe$/i, '').replace(/[^A-Za-z0-9._-]/g, '');
         /* 高危端口（SMB / 远程桌面 / 数据库 / Redis 之类）一键发布到公网前先拦一下：
          * 这类服务要么没有认证，要么被爆破就等于交出整台机器。确认框不阻止用户，

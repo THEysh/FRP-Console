@@ -609,6 +609,13 @@ a { color: var(--accent); text-decoration: none; }
 .seg button.active { background: rgba(90, 209, 255, 0.13); color: var(--accent); }
 
 .table-card { overflow: hidden; }
+/* 可排序表头（1.2.217）：透明按钮铺满单元格，箭头只在当前列显示 */
+.sort-th { display: inline-flex; align-items: center; gap: 4px; padding: 0; border: 0; background: none;
+  color: inherit; font: inherit; letter-spacing: inherit; text-transform: inherit; cursor: pointer; }
+.sort-th:hover { color: var(--text); }
+.sort-th.on { color: var(--accent); }
+.sort-arrow { font-size: 10px; opacity: .9; }
+
 .proxy-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
 .proxy-table thead th {
   text-align: left;

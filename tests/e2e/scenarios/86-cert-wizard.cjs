@@ -13,11 +13,18 @@ module.exports = {
     const inst = await ctx.startApp({ cdpOffset: 6 });
 
     try {
-      await inst.eval(`(async () => {
-        document.querySelector('.nav-item[data-view="certs"]').click();
-        await new Promise((r) => setTimeout(r, 900));
-        return true;
-      })()`);
+      /* 起实例后界面可能还没解析完（1.2.217 全量跑时偶发 null.click），先等侧栏与向导出现 */
+      await ctx.waitFor(
+        () => inst.eval(`!!document.querySelector('.nav-item[data-view="certs"]')`),
+        (v) => v === true,
+        { timeout: 30000, label: '侧栏就绪' },
+      );
+      await inst.eval(`(function(){ document.querySelector('.nav-item[data-view="certs"]').click(); return true; })()`);
+      await ctx.waitFor(
+        () => inst.eval(`document.querySelectorAll('.dw-step').length`),
+        (v) => Number(v) === 4,
+        { timeout: 20000, label: '向导四步渲染' },
+      );
 
       const before = JSON.parse(
         await inst.eval(`(function() {

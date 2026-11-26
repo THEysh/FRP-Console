@@ -49,6 +49,12 @@ function retryable(err) {
   return /Execution context was destroyed|Target closed|no page target|Session closed/i.test(String((err && err.message) || err));
 }
 
+/* 「cdp timeout」也给一次重试：全量跑时同时开着好几个实例，渲染进程偶尔被拖到
+ * 上百秒才回一次求值（真死掉的情况重试同样会失败，所以不算掩盖问题）。 */
+function timedOut(err) {
+  return /cdp timeout/i.test(String((err && err.message) || err));
+}
+
 async function evalIn(port, expr, timeoutMs = 120000) {
   let last = null;
   for (let i = 0; i < 3; i += 1) {
@@ -56,8 +62,9 @@ async function evalIn(port, expr, timeoutMs = 120000) {
       return await evalOnce(port, expr, timeoutMs);
     } catch (e) {
       last = e;
-      if (!retryable(e)) throw e;
-      await new Promise((r) => setTimeout(r, 700));
+      if (!retryable(e) && !timedOut(e)) throw e;
+      if (timedOut(e)) await new Promise((r) => setTimeout(r, 2000));
+      else await new Promise((r) => setTimeout(r, 700));
     }
   }
   throw last;
