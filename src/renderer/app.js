@@ -5148,6 +5148,14 @@ function renderSettings(force = false) {
   const settings = state.settings || {};
   const paths = state.paths || {};
   const app = state.app || {};
+  /* 多连接时这两个文件属于「当前连接」，卡片里要标出来（1.2.222） */
+  const connsAll = Array.isArray(state.connections) ? state.connections : [];
+  const multiConn = connsAll.length > 1;
+  const curConn = connsAll.find((c) => c.id === (state.activeConnectionId || '')) || null;
+  const curConnName = curConn ? String(curConn.name || curConn.id || '') : '';
+  const connNote = multiConn && curConnName
+    ? `<span class="tag" title="这个文件属于当前连接「${esc(curConnName)}」；切换连接会换成它的文件">${esc(curConnName)}</span>`
+    : '';
   const log = config.log || {};
 
   $('#view').innerHTML = `
@@ -5162,12 +5170,12 @@ function renderSettings(force = false) {
       <div class="settings-grid">
         <section class="card section">
           <div class="section-head">
-            <div class="section-title"><strong>可执行文件与路径</strong><span>frpc.exe 与 frpc.toml 的位置。</span></div>
+            <div class="section-title"><strong>可执行文件与路径</strong><span>${multiConn && curConnName ? `frpc.exe 与各连接的 frpc.toml 位置；下面显示的是当前连接「${esc(curConnName)}」的文件。` : 'frpc.exe 与 frpc.toml 的位置。'}</span></div>
             <button class="btn" type="button" data-act="settings.reveal">${icon('folder')}<span>打开配置目录</span></button>
           </div>
           <div class="stack" style="gap:12px">
             ${pathRow('frpc.exe', paths.frpcPath, paths.frpcExists, 'frpc')}
-            ${pathRow('frpc.toml', paths.configPath, paths.configExists, 'config')}
+            ${pathRow('frpc.toml', paths.configPath, paths.configExists, 'config', connNote)}
             <div class="path-row">
               <div class="path-display grow">
                 <span class="p-label">frps 面板地址（可选）</span>
@@ -5179,6 +5187,7 @@ function renderSettings(force = false) {
               <div class="path-display grow">
                 <span class="p-label">日志文件</span>
                 <span class="p-value mono" title="${esc(paths.logPath || '')}">${esc(paths.logPath || '')}</span>
+                ${connNote}
                 <span class="tag ${paths.logExists ? 'ok' : 'amber'}" title="${paths.logExists ? 'frpc 已经在往这里写日志' : '日志文件由 frpc 在第一次启动时创建，隧道还没跑过时它本来就不存在'}">${paths.logExists ? '已生成' : '还没生成'}</span>
               </div>
               <button class="btn small" type="button" data-act="reveal.log">${icon('folder')}</button>
@@ -5293,11 +5302,12 @@ function renderSettings(force = false) {
   loadKnownHosts().catch(() => {});
 }
 
-function pathRow(label, value, exists, kind) {
+function pathRow(label, value, exists, kind, note = '') {
   return `<div class="path-row">
     <div class="path-display grow">
       <span class="p-label">${esc(label)}</span>
       <span class="p-value mono" title="${esc(value || '')}">${esc(value || '未设置')}</span>
+      ${note}
       <span class="tag ${exists ? 'ok' : 'bad'}" title="${exists ? '这个文件在这台机器上找得到' : '这个路径下没有文件：可能被删掉、改名，或换了一台机器'}">${exists ? '可用' : '未找到'}</span>
     </div>
     <button class="btn small" type="button" data-act="settings.pick" data-kind="${esc(kind)}">选择</button>
