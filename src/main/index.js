@@ -5430,7 +5430,10 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '', exclud
       shouldCancel: () => bootstrapCancelRequested,
     });
     if (result.cancelled) return fail(result.error || '初始化已取消', { cancelled: true, steps: result.steps || [] });
-    if (!result.ok) return fail(result.error, { steps: result.steps || [] });
+    if (!result.ok) {
+      const errMsg = frpsConfig.refineStartError(result.error, frpsConfig.summary(generated.data || {}));
+      return fail(errMsg, { steps: result.steps || [] });
+    }
     // 初始化过程可能长达几十秒，期间切了档案就不再改写任何本机状态。
     if (epoch !== sessionEpoch) {
       return fail('初始化已完成，但期间切换了服务器档案，未回写本机配置', { stale: true, steps: result.steps || [] });

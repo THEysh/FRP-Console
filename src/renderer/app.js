@@ -1867,6 +1867,7 @@ function applyServerState(data, seq) {
     const activeProfile = (S.server.profiles || []).find((p) => p.id === S.server.activeServerId);
     S.server.wizard = {
       ...wizardDefaults(),
+      bindPort: (activeProfile && Number(activeProfile.clientPort)) || 7000,
       token: (activeProfile && (activeProfile.clientToken || activeProfile.token)) || randomToken(20),
       webPassword: randomToken(14),
     };
@@ -3202,9 +3203,57 @@ function renderServer(force = false) {
   }
 }
 
+function bootstrapPortError(bindRaw, webRaw, webEnabled) {
+  const bindPort = Number(String(bindRaw ?? '').trim());
+  if (!String(bindRaw ?? '').trim() || !Number.isInteger(bindPort) || bindPort < 1 || bindPort > 65535) {
+    return '连接端口（bindPort）必须是 1–65535 的整数';
+  }
+  if (webEnabled) {
+    const webPort = Number(String(webRaw ?? '').trim());
+    if (!String(webRaw ?? '').trim() || !Number.isInteger(webPort) || webPort < 1 || webPort > 65535) {
+      return '面板端口（Dashboard）必须是 1–65535 的整数';
+    }
+    if (webPort === bindPort) {
+      return '面板端口（Dashboard）不能与连接端口（bindPort）相同';
+    }
+  }
+  return '';
+}
+
+function updateBootstrapPortUi() {
+  const card = $('#bootstrap-card');
+  if (!card) return;
+  const bindInput = $('#bootstrap-bind-port');
+  const webInput = $('#bootstrap-web-port');
+  const webToggle = $('#bootstrap-web-enabled');
+  const webHint = $('#bootstrap-web-hint');
+  const warnEl = $('#bc-port-warn');
+  const resetBtn = card.querySelector('[data-act="server.bootstrap.resetports"]');
+  const webEnabled = webToggle ? !!webToggle.checked : true;
+  if (webInput) webInput.disabled = !!S.server.installBusy || !webEnabled;
+  if (webHint) {
+    webHint.textContent = webEnabled
+      ? 'Web 控制台端口，默认 4096（可改为任意未占用端口）'
+      : '已关闭 Dashboard 面板，本次仅部署连接端口';
+  }
+  const bindRaw = bindInput ? bindInput.value : '';
+  const webRaw = webInput ? webInput.value : '';
+  if (warnEl) warnEl.textContent = bootstrapPortError(bindRaw, webRaw, webEnabled);
+  if (resetBtn) {
+    const isDefault = Number(bindRaw) === 7000 && Number(webRaw) === 4096 && webEnabled;
+    resetBtn.disabled = !!S.server.installBusy || isDefault;
+  }
+}
+
 function bootstrapCardMarkup(info, s) {
   const p = s.installProgress || null;
   const percent = Math.max(0, Math.min(100, Number(p && p.percent) || 0));
+  const w = s.wizard || wizardDefaults();
+  const bindPortVal = w.bindPort !== undefined && w.bindPort !== null ? String(w.bindPort) : '7000';
+  const webEnabled = w.webEnabled !== false;
+  const webPortVal = w.webPort !== undefined && w.webPort !== null ? String(w.webPort) : '4096';
+  const portWarn = bootstrapPortError(bindPortVal, webPortVal, webEnabled);
+  const isDefaultPorts = Number(bindPortVal) === 7000 && Number(webPortVal) === 4096 && webEnabled;
   const reasons = [];
   if (!info.frpsInstalled && info.version === 'unknown') reasons.push('未检测到 frps 可执行文件');
   if (!s.configPath || info.configExists === false) reasons.push(`配置文件${s.configPath ? ` ${s.configPath} 不存在` : '未找到'}`);
@@ -3216,15 +3265,34 @@ function bootstrapCardMarkup(info, s) {
           <h3>从零初始化 frps</h3>
           <span class="badge amber"><span class="bdot"></span>需要初始化</span>
         </div>
-        <p class="bc-sub">${esc(reasons.join(' · ') || '服务器尚未完成 frps 初始化')}。控制台会按下方向导配置完成全部步骤，不需要登录服务器手动安装。</p>
+        <p class="bc-sub">${esc(reasons.join(' · ') || '服务器尚未完成 frps 初始化')}。默认使用 7000（连接端口）与 4096（面板端口），部署前可自由修改，不需要登录服务器手动安装。</p>
         <ul class="bc-steps">
           <li>上传内置 frps 0.61.0（按服务器架构自动选择 amd64 / arm64）</li>
           <li>写入配置并执行 <code>frps verify</code> 校验，原文件自动备份</li>
-          <li>注册 <code>frps.service</code>、设置开机自启并启动</li>
+          <li>注册 <code>frps.service</code>、设置开机自启并启动，同时自动放行所选端口防火墙</li>
           <li>检查进程、版本与监听端口，完成后自动刷新状态</li>
         </ul>
+        <div class="bc-ports">
+          <div class="bc-port-field">
+            <label for="bootstrap-bind-port">连接端口（bindPort）</label>
+            <input class="input" id="bootstrap-bind-port" name="bindPort" type="number" min="1" max="65535" value="${esc(bindPortVal)}" placeholder="7000" ${s.installBusy ? 'disabled' : ''}>
+            <span class="field-hint">客户端 frpc 连接此端口，默认 7000</span>
+          </div>
+          <div class="bc-port-field">
+            <div class="bc-port-label-row">
+              <label for="bootstrap-web-port">面板端口（Dashboard）</label>
+              <label class="bc-inline-toggle"><input type="checkbox" id="bootstrap-web-enabled" ${webEnabled ? 'checked' : ''} ${s.installBusy ? 'disabled' : ''}> 启用面板</label>
+            </div>
+            <input class="input" id="bootstrap-web-port" name="webPort" type="number" min="1" max="65535" value="${esc(webPortVal)}" placeholder="4096" ${s.installBusy || !webEnabled ? 'disabled' : ''}>
+            <span class="field-hint" id="bootstrap-web-hint">${webEnabled ? 'Web 控制台端口，默认 4096（可改为任意未占用端口）' : '已关闭 Dashboard 面板，本次仅部署连接端口'}</span>
+          </div>
+          <div class="bc-port-reset">
+            <button class="btn small ghost" type="button" data-act="server.bootstrap.resetports" ${s.installBusy || isDefaultPorts ? 'disabled' : ''} title="恢复默认端口 7000 / 4096">恢复默认</button>
+          </div>
+        </div>
+        <div class="bc-port-warn" id="bc-port-warn">${esc(portWarn)}</div>
         ${p ? `<div class="bc-progress"><div class="bc-bar"><span style="width:${percent}%"></span></div><p>${esc(p.text || '')} · ${percent}%</p></div>` : ''}
-        <label class="check-line bc-sync"><input type="checkbox" id="bootstrap-sync" checked> 同时把本机 frpc 的服务器地址与 Token 改为本次配置，并重启隧道</label>
+        <label class="check-line bc-sync"><input type="checkbox" id="bootstrap-sync" checked> 同时把本机 frpc 的服务器地址、连接端口与 Token 改为本次配置，并重启隧道</label>
         <div class="bc-actions">
           <button class="btn primary" type="button" data-act="server.bootstrap" ${s.installBusy ? 'disabled' : ''}>${icon('download')}<span>${s.installBusy ? '正在初始化…' : '一键初始化并启动'}</span></button>
           ${s.installBusy ? `<button class="btn ghost" type="button" data-act="server.bootstrap.cancel">${icon('x')}<span>取消</span></button>` : ''}
@@ -4477,10 +4545,27 @@ async function applyServerConfigSave(res, restart, seq) {
 
 async function runServerBootstrap(btn) {
   if (S.server.installBusy) return;
-  /* 1.2.49 起配置卡片改成了 frps.toml / frpc.toml 两个编辑器，不再渲染「服务端配置向导」
-   * 表单；一键初始化改用内存里的向导字段（连接时已按档案 token + 随机面板密码填好）。 */
-  const fields = S.server.wizard || wizardDefaults();
-  if (!fields || !Number(fields.bindPort)) return toast('error', '请先填写配置向导');
+  const base = S.server.wizard || wizardDefaults();
+  const bindInput = $('#bootstrap-bind-port');
+  const webInput = $('#bootstrap-web-port');
+  const webToggle = $('#bootstrap-web-enabled');
+  const bindRaw = bindInput ? bindInput.value : base.bindPort;
+  const webRaw = webInput ? webInput.value : base.webPort;
+  const webEnabled = webToggle ? !!webToggle.checked : base.webEnabled !== false;
+  const portErr = bootstrapPortError(bindRaw, webRaw, webEnabled);
+  if (portErr) {
+    toast('error', '端口配置有误', portErr);
+    if (/连接端口/.test(portErr) && bindInput) bindInput.focus();
+    else if (webInput && !webInput.disabled) webInput.focus();
+    return;
+  }
+  const fields = {
+    ...base,
+    bindPort: Number(String(bindRaw).trim()),
+    webEnabled,
+    webPort: webEnabled ? Number(String(webRaw).trim()) : (Number(base.webPort) || 4096),
+  };
+  S.server.wizard = fields;
   S.server.installBusy = true;
   S.server.installProgress = { percent: 0, text: '正在检查服务器环境…' };
   const syncLocal = $('#bootstrap-sync') ? $('#bootstrap-sync').checked : true;
@@ -4513,15 +4598,16 @@ async function runServerBootstrap(btn) {
   const via = res.data && res.data.via === 'systemd' ? '已注册 systemd 服务' : '已以后台进程方式启动';
   const bootWarning = (res.data && res.data.bootWarning) || '';
   const sync = res.data && res.data.localSync;
+  const portNote = `连接端口 ${fields.bindPort}${fields.webEnabled ? ` / 面板端口 ${fields.webPort}` : ' / 未启用面板'}`;
   if (sync && !sync.ok) {
-    toast('warn', 'frps 已初始化，但本机隧道同步失败', sync.error || '请在概览页手动重启隧道');
+    toast('warn', 'frps 已初始化，但本机隧道同步失败', `${portNote} · ${sync.error || '请在概览页手动重启隧道'}`);
   } else if (bootWarning) {
     // 服务起来了，但「重启后还会不会起来」没设上：这比装成功更值得说一句。
     toast('warn', 'frps 已启动，但开机自启没设上', bootWarning);
   } else if (sync && sync.ok) {
-    toast('success', 'frps 已初始化，本机隧道已同步并重启', `${via} · ${(res.data && res.data.configPath) || ''}`);
+    toast('success', 'frps 已初始化，本机隧道已同步并重启', `${portNote} · ${via} · ${(res.data && res.data.configPath) || ''}`);
   } else {
-    toast('success', 'frps 已初始化并启动', `${via} · ${(res.data && res.data.configPath) || ''}`);
+    toast('success', 'frps 已初始化并启动', `${portNote} · ${via} · ${(res.data && res.data.configPath) || ''}`);
   }
   if (res.data && res.data.appState) S.state = res.data.appState;
   /* 面板密码留空时后端会自动生成一个：必须让用户看到，否则他登录不进 Dashboard。 */
@@ -4581,6 +4667,8 @@ async function runServerUninstall(btn) {
   await withBusy(btn, async () => {
     const res = await FRP.serverUninstall({ removeConfig: true }).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
     if (res && res.ok) {
+      S.server.wizard = null;
+      S.server.wizardDirty = false;
       applyServerState(res.data && res.data.state);
       if (res.data && res.data.appState) S.state = res.data.appState;
       const removed = (res.data && res.data.removedBinary) ? `已删除 ${res.data.removedBinary}` : '';
@@ -6605,6 +6693,23 @@ async function handleAction(act, dataset, btn) {
       case 'server.bootstrap':
         await runServerBootstrap(btn);
         break;
+      case 'server.bootstrap.resetports': {
+        S.server.wizard = {
+          ...(S.server.wizard || wizardDefaults()),
+          bindPort: 7000,
+          webPort: 4096,
+          webEnabled: true,
+        };
+        S.server.wizardDirty = true;
+        const bindInput = $('#bootstrap-bind-port');
+        const webInput = $('#bootstrap-web-port');
+        const webToggle = $('#bootstrap-web-enabled');
+        if (bindInput) bindInput.value = '7000';
+        if (webInput) webInput.value = '4096';
+        if (webToggle) webToggle.checked = true;
+        updateBootstrapPortUi();
+        break;
+      }
       case 'server.bootstrap.cancel':
         await FRP.serverBootstrapCancel();
         toast('warn', '正在取消初始化…', '将在当前步骤完成后停止并清理已安装内容');
@@ -8453,8 +8558,26 @@ function bindStaticEvents() {
       if (e.target.name === 'host' || e.target.name === 'port') updateConnectHostNote();
       return;
     }
+    /* 从零初始化卡片里的自定义端口输入：实时同步到内存向导状态，避免后台刷新冲掉用户输入。 */
+    if (e.target.closest('#bootstrap-card')) {
+      if (e.target.id === 'bootstrap-bind-port' || e.target.id === 'bootstrap-web-port') {
+        S.server.wizard = S.server.wizard || wizardDefaults();
+        S.server.wizard[e.target.id === 'bootstrap-bind-port' ? 'bindPort' : 'webPort'] = e.target.value;
+        S.server.wizardDirty = true;
+        updateBootstrapPortUi();
+      }
+      return;
+    }
   });
   document.addEventListener('change', (e) => {
+    const bootWebToggle = e.target.closest('#bootstrap-web-enabled');
+    if (bootWebToggle) {
+      S.server.wizard = S.server.wizard || wizardDefaults();
+      S.server.wizard.webEnabled = !!bootWebToggle.checked;
+      S.server.wizardDirty = true;
+      updateBootstrapPortUi();
+      return;
+    }
     const profileSelect = e.target.closest('#server-profile-select');
     if (profileSelect) {
       selectServerProfile(profileSelect.value).catch((error) => toast('error', '切换档案失败', String(error && error.message || error)));

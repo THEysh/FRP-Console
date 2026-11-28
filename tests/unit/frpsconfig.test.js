@@ -213,3 +213,33 @@ test('parseAllowPorts：认不出来时把整段原文写进报错，并提示�
   assert.match(r.error, /abc def|abc/);
   assert.match(r.error, /逗号/);
 });
+
+test('preview：自定义部署端口（非 7000/4096）正确写入配置，关闭面板时不生成 webServer', () => {
+  const custom = frps.preview('', {
+    bindPort: 17000,
+    authEnabled: true,
+    token: 'custom-port-token-1234',
+    webEnabled: true,
+    webPort: 14096,
+    webUser: 'admin',
+    webPassword: 'custom-password-1234',
+  });
+  assert.equal(custom.ok, true);
+  assert.equal(custom.data.bindPort, 17000);
+  assert.equal(custom.data.webServer.port, 14096);
+  const sum = frps.summary(custom.data);
+  assert.equal(sum.bindPort, 17000);
+  assert.equal(sum.webPort, 14096);
+
+  const noDash = frps.preview('', {
+    bindPort: 17001,
+    authEnabled: true,
+    token: 'custom-port-token-1234',
+    webEnabled: false,
+    webPort: 14096,
+  });
+  assert.equal(noDash.ok, true);
+  assert.equal(noDash.data.bindPort, 17001);
+  assert.equal(noDash.data.webServer, undefined);
+  assert.equal(frps.summary(noDash.data).webPort, 0);
+});
