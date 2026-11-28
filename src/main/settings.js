@@ -348,18 +348,40 @@ function serverSecretFile() {
  * 每台服务器的密码只属于自己的档案槽位，绝不跨档案回退；
  * legacy 是 v1 的单密码，迁移成功后立即删除。
  */
+/* 密文库内存缓存（1.2.239）：
+ * buildState()/connectionSummary() 每 3 秒轮询会反复调用 hasConnectionSecret/hasServerSecret/hasCloudflareToken，
+ * 此前每次都同步 fs.readFileSync + JSON.parse + Windows DPAPI 解密。
+ * 改为缓存密文结构 + 按密文串缓存「是否可解密」布尔值（内存不存明文密码），写入/清除时立即同步更新。 */
+let secretStoreCache = null;
+let secretStoreCacheFile = '';
+let dnsSecretStoreCache = null;
+let dnsSecretStoreCacheFile = '';
+const validEncCache = new Map();
+
 function readSecretStore() {
-  const raw = readJson(serverSecretFile(), null);
-  if (!raw || typeof raw !== 'object') return { v: 2, items: {}, legacy: null };
-  const items = raw.items && typeof raw.items === 'object' ? raw.items : {};
-  const legacySource = raw.legacy && raw.legacy.enc ? raw.legacy : raw.enc ? raw : null;
-  return { v: 2, items, legacy: legacySource ? { enc: legacySource.enc, at: Number(legacySource.at) || 0 } : null };
+  const file = serverSecretFile();
+  if (secretStoreCache && secretStoreCacheFile === file) return secretStoreCache;
+  const raw = readJson(file, null);
+  let store;
+  if (!raw || typeof raw !== 'object') {
+    store = { v: 2, items: {}, legacy: null };
+  } else {
+    const items = raw.items && typeof raw.items === 'object' ? raw.items : {};
+    const legacySource = raw.legacy && raw.legacy.enc ? raw.legacy : raw.enc ? raw : null;
+    store = { v: 2, items, legacy: legacySource ? { enc: legacySource.enc, at: Number(legacySource.at) || 0 } : null };
+  }
+  secretStoreCache = store;
+  secretStoreCacheFile = file;
+  return store;
 }
 
 function writeSecretStore(store) {
   const payload = { v: 2, items: store.items || {} };
   if (store.legacy && store.legacy.enc) payload.legacy = store.legacy;
-  writeJsonAtomic(serverSecretFile(), payload);
+  const file = serverSecretFile();
+  writeJsonAtomic(file, payload);
+  secretStoreCache = { v: 2, items: payload.items, legacy: payload.legacy || null };
+  secretStoreCacheFile = file;
   return payload;
 }
 
@@ -370,6 +392,16 @@ function decrypt(value) {
   } catch {
     return '';
   }
+}
+
+function hasValidEncrypted(value) {
+  if (!value || !value.enc) return false;
+  const key = String(value.enc);
+  if (validEncCache.has(key)) return validEncCache.get(key);
+  const ok = !!decrypt(value);
+  if (validEncCache.size > 128) validEncCache.clear();
+  validEncCache.set(key, ok);
+  return ok;
 }
 
 function readServerSecret(serverId = '') {
@@ -395,7 +427,9 @@ function readConnectionSecret(connectionId = '') {
 }
 
 function hasConnectionSecret(connectionId = '') {
-  return !!readConnectionSecret(connectionId);
+  const key = connectionSecretKey(connectionId);
+  if (!key) return false;
+  return hasValidEncrypted(readSecretStore().items[key]);
 }
 
 function saveConnectionSecret(connectionId, password) {
@@ -411,11 +445,16 @@ function clearConnectionSecret(connectionId = '') {
 }
 
 function hasServerSecret(serverId = '') {
-  return !!readServerSecret(serverId);
+  const store = readSecretStore();
+  const id = String(serverId || '').trim();
+  if (id) return hasValidEncrypted(store.items[id]);
+  const first = Object.values(store.items)[0];
+  if (first) return hasValidEncrypted(first);
+  return hasValidEncrypted(store.legacy);
 }
 
 function hasLegacySecret() {
-  return !!decrypt(readSecretStore().legacy);
+  return hasValidEncrypted(readSecretStore().legacy);
 }
 
 function saveServerSecret(serverId, password) {
@@ -465,15 +504,24 @@ function dnsSecretFile() {
 }
 
 function readDnsSecretStore() {
-  const raw = readJson(dnsSecretFile(), null);
-  if (!raw || typeof raw !== 'object') return { v: 1, cloudflare: null };
-  return { v: 1, cloudflare: raw.cloudflare && raw.cloudflare.enc ? raw.cloudflare : null };
+  const file = dnsSecretFile();
+  if (dnsSecretStoreCache && dnsSecretStoreCacheFile === file) return dnsSecretStoreCache;
+  const raw = readJson(file, null);
+  const store = (!raw || typeof raw !== 'object')
+    ? { v: 1, cloudflare: null }
+    : { v: 1, cloudflare: raw.cloudflare && raw.cloudflare.enc ? raw.cloudflare : null };
+  dnsSecretStoreCache = store;
+  dnsSecretStoreCacheFile = file;
+  return store;
 }
 
 function writeDnsSecretStore(store) {
   const payload = { v: 1 };
   if (store.cloudflare && store.cloudflare.enc) payload.cloudflare = store.cloudflare;
-  writeJsonAtomic(dnsSecretFile(), payload);
+  const file = dnsSecretFile();
+  writeJsonAtomic(file, payload);
+  dnsSecretStoreCache = { v: 1, cloudflare: payload.cloudflare || null };
+  dnsSecretStoreCacheFile = file;
   return payload;
 }
 
@@ -483,7 +531,7 @@ function readCloudflareToken() {
 }
 
 function hasCloudflareToken() {
-  return !!readCloudflareToken();
+  return hasValidEncrypted(readDnsSecretStore().cloudflare);
 }
 
 function saveCloudflareToken(token) {

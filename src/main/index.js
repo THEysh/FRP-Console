@@ -29,7 +29,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const net = require('node:net');
-const { execFileSync } = require('node:child_process');
+const { execFile } = require('node:child_process');
 const { app, BrowserWindow, ipcMain, dialog, shell, clipboard, Tray, Menu, nativeImage, Notification, powerMonitor } = require('electron');
 
 app.setName('frp-console');
@@ -698,19 +698,21 @@ function loginItemCommandLine() {
 }
 
 /* reg query 的值行长这样：  frp-console    REG_SZ    "C:\path\app.exe" "C:\dir" */
-function regQueryValue(key, name) {
-  try {
-    /* stderr 必须自己吞掉：execFileSync 的 stderr 默认继承父进程，
-     * 而 reg 查不到值时一定往 stderr 写「系统找不到指定的注册表项」，
-     * 每次轮询都往控制台刷一行错误，看着像程序坏了。 */
-    const out = execFileSync('reg', ['query', key, '/v', name], { windowsHide: true, encoding: 'utf8', timeout: 8000, stdio: ['ignore', 'pipe', 'pipe'] });
-    const line = out.split(/\r?\n/).find((l) => l.trim().startsWith(name));
-    if (!line) return null;
-    const parts = line.trim().split(/\s{2,}/);
-    return { type: parts[1] || '', data: parts.slice(2).join('  ') };
-  } catch {
-    return null;
-  }
+function parseRegQueryOutput(out, name) {
+  const line = String(out || '').split(/\r?\n/).find((l) => l.trim().startsWith(name));
+  if (!line) return null;
+  const parts = line.trim().split(/\s{2,}/);
+  return { type: parts[1] || '', data: parts.slice(2).join('  ') };
+}
+
+/* 异步版 reg query：绝不阻塞 Electron 主线程事件循环。 */
+function regQueryValueAsync(key, name) {
+  return new Promise((resolve) => {
+    execFile('reg', ['query', key, '/v', name], { windowsHide: true, encoding: 'utf8', timeout: 8000 }, (err, stdout) => {
+      if (err) { resolve(null); return; }
+      resolve(parseRegQueryOutput(stdout, name));
+    });
+  });
 }
 
 /* 写注册表走 PowerShell（-EncodedCommand，见 util.powershell），不走 reg.exe：
@@ -760,8 +762,7 @@ async function regRemoveValue(key, name) {
 }
 
 /* StartupApproved\Run 里是 12 字节二进制：首字节 02/06 = 启用，03/07 = 禁用。 */
-function startupApprovedDisabled(name) {
-  const value = regQueryValue(STARTUP_APPROVED_KEY, name);
+function parseStartupApprovedDisabled(value) {
   if (!value || !value.data) return false;
   const first = String(value.data).replace(/[^0-9a-f]/gi, '').slice(0, 2);
   if (!first) return false;
@@ -769,30 +770,62 @@ function startupApprovedDisabled(name) {
   return byte === 3 || byte === 7;
 }
 
-/* 返回 { registered, enabled, blocked, error }：
- *   registered  启动项存在（Run 键里有）
- *   enabled     重启后真的会启动（没被任务管理器禁用）
- *   blocked     已注册但被禁用——这正是「设置里显示开着、重启却不启动」的原因 */
-function launchAtLoginSnapshot() {
-  if (process.platform !== 'win32') {
-    let result;
-    try {
-      result = app.getLoginItemSettings();
-    } catch (e) {
-      return { registered: false, enabled: false, blocked: false, error: String((e && e.message) || e) };
-    }
-    const on = !!result.openAtLogin;
-    return { registered: on, enabled: on, blocked: false, error: '' };
+/* 开机启动项状态缓存（1.2.239）：
+ * buildState() 每 3 秒执行一次；此前每次同步跑 2~4 次 execFileSync('reg', ...) 直接卡死主线程事件循环。
+ * 改为内存缓存（60s TTL）+ 异步 reg query 刷新；状态真正变化时再主动 pushState()。 */
+const LOGIN_ITEM_CACHE_TTL_MS = 60000;
+const loginItemCache = {
+  at: 0,
+  value: { registered: false, enabled: false, blocked: false, error: '' },
+  pending: null,
+};
+
+async function refreshLoginItemSnapshotAsync({ force = false, notifyChange = false } = {}) {
+  const now = Date.now();
+  if (!force && loginItemCache.at && now - loginItemCache.at < LOGIN_ITEM_CACHE_TTL_MS) {
+    return loginItemCache.value;
   }
-  const name = loginItemName();
-  const value = regQueryValue(RUN_KEY, name);
-  if (!value) return { registered: false, enabled: false, blocked: false, error: '' };
-  const disabled = startupApprovedDisabled(name);
-  return { registered: true, enabled: !disabled, blocked: disabled, error: '' };
+  if (loginItemCache.pending) return loginItemCache.pending;
+  loginItemCache.pending = (async () => {
+    let next;
+    if (process.platform !== 'win32') {
+      try {
+        const result = app.getLoginItemSettings();
+        const on = !!result.openAtLogin;
+        next = { registered: on, enabled: on, blocked: false, error: '' };
+      } catch (e) {
+        next = { registered: false, enabled: false, blocked: false, error: String((e && e.message) || e) };
+      }
+    } else {
+      const name = loginItemName();
+      const value = await regQueryValueAsync(RUN_KEY, name);
+      if (!value) {
+        next = { registered: false, enabled: false, blocked: false, error: '' };
+      } else {
+        const approved = await regQueryValueAsync(STARTUP_APPROVED_KEY, name);
+        const disabled = parseStartupApprovedDisabled(approved);
+        next = { registered: true, enabled: !disabled, blocked: disabled, error: '' };
+      }
+    }
+    const prev = loginItemCache.value;
+    loginItemCache.value = next;
+    loginItemCache.at = Date.now();
+    if (notifyChange && (prev.enabled !== next.enabled || prev.blocked !== next.blocked)) {
+      try { pushState(); } catch { /* 启动早期忽略 */ }
+    }
+    return next;
+  })().finally(() => {
+    loginItemCache.pending = null;
+  });
+  return loginItemCache.pending;
 }
 
-function launchAtLoginState() {
-  return launchAtLoginSnapshot().enabled;
+/* 同步读取缓存快照（0ms，不阻塞主线程），过期时自动后台异步刷新。 */
+function launchAtLoginSnapshotCached() {
+  if (!loginItemCache.at || Date.now() - loginItemCache.at >= LOGIN_ITEM_CACHE_TTL_MS) {
+    refreshLoginItemSnapshotAsync({ notifyChange: true }).catch(() => {});
+  }
+  return loginItemCache.value;
 }
 
 /* 注册表写不进去时的退路：把快捷方式放进当前用户的「启动」文件夹。
@@ -853,7 +886,7 @@ async function applyLaunchAtLogin(enabled) {
     } catch (e) {
       return { ok: false, error: `写入开机启动项失败：${e.message || e}` };
     }
-    const on = launchAtLoginSnapshot().enabled;
+    const on = (await refreshLoginItemSnapshotAsync({ force: true })).enabled;
     if (on === !!enabled) return { ok: true, actual: on };
     return {
       ok: false,
@@ -871,7 +904,7 @@ async function applyLaunchAtLogin(enabled) {
   } catch {
     /* 忽略：下面自己写 */
   }
-  let state = launchAtLoginSnapshot();
+  let state = await refreshLoginItemSnapshotAsync({ force: true });
   if (state.enabled === !!enabled) return { ok: true, actual: state.enabled };
 
   const name = loginItemName();
@@ -879,22 +912,24 @@ async function applyLaunchAtLogin(enabled) {
     const removed = await regRemoveValue(RUN_KEY, name);
     await regRemoveValue(STARTUP_APPROVED_KEY, name);
     if (!removed.ok) {
-      return { ok: false, actual: launchAtLoginSnapshot().enabled, error: `删除开机启动项失败：${removed.detail}` };
+      return { ok: false, actual: (await refreshLoginItemSnapshotAsync({ force: true })).enabled, error: `删除开机启动项失败：${removed.detail}` };
     }
   } else {
     const written = await regSetValue(RUN_KEY, name, loginItemCommandLine(), 'String');
     if (!written.ok) {
       return {
         ok: false,
-        actual: launchAtLoginSnapshot().enabled,
+        actual: (await refreshLoginItemSnapshotAsync({ force: true })).enabled,
         error: `写入开机启动项失败：${written.detail}。可以改用 shell:startup 文件夹里的快捷方式`,
       };
     }
     // 以前被任务管理器禁用过就在 StartupApproved 里留着「已禁用」，这里顺手改回启用。
-    if (startupApprovedDisabled(name)) await regSetValue(STARTUP_APPROVED_KEY, name, '', 'Binary');
+    if (parseStartupApprovedDisabled(await regQueryValueAsync(STARTUP_APPROVED_KEY, name))) {
+      await regSetValue(STARTUP_APPROVED_KEY, name, '', 'Binary');
+    }
   }
 
-  state = launchAtLoginSnapshot();
+  state = await refreshLoginItemSnapshotAsync({ force: true });
   if (enabled && state.blocked) {
     return {
       ok: false,
@@ -919,7 +954,7 @@ async function applyLaunchAtLogin(enabled) {
 async function syncLaunchAtLogin() {
   if (!settings) return;
   const want = settings.launchAtLogin === true;
-  const state = launchAtLoginSnapshot();
+  const state = await refreshLoginItemSnapshotAsync({ force: true });
   if (want && state.blocked) {
     settings = settingsModule.save({ launchAtLogin: false });
     console.warn('[startup] 启动项被用户在任务管理器里禁用，已把设置同步为关闭');
@@ -2485,11 +2520,11 @@ function buildState() {
       // 设置页据此提示“关闭窗口会不会真退出”
       tray: canHideToTray(),
       trayCreated: !!tray,
-      // 系统里的真实开机启动状态（用户可能在任务管理器里手动关掉过）
-      launchAtLogin: launchAtLoginState(),
-      // 启动项写进去了但被任务管理器禁用：界面要能把这句话说出来，
-      // 否则用户看到“已开启”却在重启后发现没启动。
-      launchAtLoginBlocked: launchAtLoginSnapshot().blocked,
+      // 系统里的真实开机启动状态（读取 60s 异步缓存，绝不在 buildState 热路径同步起 reg.exe）
+      ...(() => {
+        const snap = launchAtLoginSnapshotCached();
+        return { launchAtLogin: snap.enabled, launchAtLoginBlocked: snap.blocked };
+      })(),
     },
     settings: settingsForState(),
     paths: pathsForState(),
@@ -2735,17 +2770,26 @@ async function tick({ force = false } = {}) {
     await tickStep('checkExternalConfig', checkExternalConfig);
     /* 非当前连接的配置被外部改了，frpc 不会自己重读 —— 这里主动 reload 一次。 */
     await tickStep('syncParkedConnectionConfigs', syncParkedConnectionConfigs);
-    // 先刷隧道真实状态：它决定了界面"通不通"，优先级高于服务托管信息
-    await tickStep('manager.refresh', () => (manager ? manager.refresh() : null));
-    /* 非当前但正在跑或期望运行的连接也一起刷新，让各自的健康守护窗口保持新鲜。 */
+    // 并发刷新当前与所有在途/期望运行的连接（互不串行阻塞）
+    const refreshJobs = [];
+    if (manager) refreshJobs.push(tickStep('manager.refresh', () => manager.refresh()));
     if (multiConnection) {
       for (const [id, mm] of managersMap()) {
         if (id === settings.activeConnectionId || !mm) continue;
         if (!mm.isChildAlive && !desiredFor(id)) continue;
-        await tickStep(`manager.refresh:${id}`, () => mm.refresh());
+        refreshJobs.push(tickStep(`manager.refresh:${id}`, () => mm.refresh()));
       }
     }
-    if (Date.now() - lastServiceCheck > 3800 || force) {
+    if (refreshJobs.length) await Promise.all(refreshJobs);
+    /* 仅在单连接且 runMode !== 'managed'（有可能命中 Windows 服务）时每 15 秒查一次 sc.exe；
+     * 多连接强制走应用托管进程，不再每 3.8 秒白起 sc.exe 子进程。 */
+    const needsServicePoll = force || (
+      settings
+      && settings.runMode !== 'managed'
+      && (settings.connections || []).length <= 1
+      && Date.now() - lastServiceCheck > 15000
+    );
+    if (needsServicePoll) {
       lastServiceCheck = Date.now();
       await tickStep('refreshService', () => refreshService({ detect: false }));
     }
@@ -3600,8 +3644,10 @@ function registerIpc() {
         // 而不是像往常那样收进托盘（否则窗口会消失且叫不回来）。
         tray: canHideToTray(),
         trayCreated: !!tray,
-        launchAtLogin: launchAtLoginState(),
-        launchAtLoginBlocked: launchAtLoginSnapshot().blocked,
+        ...(() => {
+          const snap = launchAtLoginSnapshotCached();
+          return { launchAtLogin: snap.enabled, launchAtLoginBlocked: snap.blocked };
+        })(),
       },
     });
   });
@@ -3662,7 +3708,7 @@ function registerIpc() {
     const settingWarnings = [];
     if (clean.launchAtLogin !== undefined) {
       const desired = !!clean.launchAtLogin;
-      if (desired === !!settings.launchAtLogin && launchAtLoginSnapshot().enabled === desired) {
+      if (desired === !!settings.launchAtLogin && (await refreshLoginItemSnapshotAsync({ force: true })).enabled === desired) {
         clean.launchAtLogin = desired;
       } else {
         let result = await applyLaunchAtLogin(desired);
@@ -7371,13 +7417,21 @@ async function bootstrap() {
   }
   activeFollower().maxLines = logBufferLimit();
   updateLogFile();
-  /* 这几步拿的都是"锦上添花"的信息，读不到不该让整个启动失败。
-   * sc.exe 被安全软件拉黑 / 权限不足的机器上，原来会在 refreshService 直接抛出，
-   * 连轮询都起不来，界面从此定格在初始状态。 */
-  await tickStep('refreshService', () => refreshService({ detect: true }));
-  frpcVersion = (await tickStep('readFrpcVersion', readFrpcVersion)) || '';
-  elevated = !!(await tickStep('isElevated', () => service.isElevated()));
-  if (manager) await manager.refresh().catch(() => {});
+  /* 启动加速（1.2.239）：这几步外部进程（sc.exe / frpc -v / net session / reg）互不依赖，
+   * 改为并发执行并设 1200ms 首屏软上限——被杀软拖慢时先出界面，结果回来后再 pushState() 补齐。 */
+  const bootBackground = Promise.all([
+    tickStep('refreshService', () => refreshService({ detect: true })),
+    tickStep('readFrpcVersion', readFrpcVersion).then((v) => { if (v) frpcVersion = v; }),
+    tickStep('isElevated', () => service.isElevated()).then((v) => { elevated = !!v; }),
+    refreshLoginItemSnapshotAsync({ force: true }).catch(() => {}),
+  ]).then(() => {
+    pushState();
+    refreshTray();
+  }).catch(() => {});
+  await Promise.all([
+    manager ? manager.refresh().catch(() => {}) : Promise.resolve(),
+    Promise.race([bootBackground, new Promise((r) => setTimeout(r, 1200))]),
+  ]);
   checkHealth().catch(() => {});
   startPolling();
   scheduleAutoRenew();
@@ -7426,7 +7480,9 @@ async function quitApp({ source = 'user' } = {}) {
   if (hardExit.unref) hardExit.unref();
 
   try {
-    if (pollTimer) clearInterval(pollTimer);
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    if (healthTimer) { clearTimeout(healthTimer); healthTimer = null; }
+    if (autoRenewTimer) { clearInterval(autoRenewTimer); autoRenewTimer = null; }
     stopAllFollowers();
   } catch { /* ignore */ }
 

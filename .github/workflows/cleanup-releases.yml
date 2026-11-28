@@ -5,9 +5,9 @@ on:
   workflow_dispatch:
     inputs:
       keep_tag:
-        description: '要保留的唯一版本标签（如 v1.2.238）'
+        description: '要保留的唯一版本标签（如 v1.2.239）'
         required: true
-        default: 'v1.2.238'
+        default: 'v1.2.239'
         type: string
 
 permissions:

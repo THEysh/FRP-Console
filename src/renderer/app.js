@@ -410,13 +410,25 @@ function renderConnectionSwitch() {
   if (!box) return;
   const list = connList();
   if (list.length <= 1) {
-    box.hidden = true;
-    box.innerHTML = '';
+    if (S.lastKeys.connSwitch !== 'hidden') {
+      S.lastKeys.connSwitch = 'hidden';
+      box.hidden = true;
+      box.innerHTML = '';
+    }
     return;
   }
-  box.hidden = false;
   const activeId = activeConnId();
   const runningCount = list.filter(connIsRunning).length;
+  /* 签名缓存（1.2.239）：每 3 秒 state:update 必调 updateChrome()；状态未变时跳过 innerHTML 重建，
+   * 避免悬停/点击侧栏按钮时 DOM 节点被瞬间销毁导致点击失效或闪烁。 */
+  const sig = `${activeId}|${runningCount}/${list.length}|` + list.map((c) => {
+    const rt = c.runtime || {};
+    const cnt = c.counts || {};
+    return `${c.id}:${c.name || ''}:${rt.connected ? 2 : (rt.running ? 1 : 0)}:${cnt.online || 0}/${cnt.total || 0}`;
+  }).join(',');
+  if (!box.hidden && S.lastKeys.connSwitch === sig) return;
+  S.lastKeys.connSwitch = sig;
+  box.hidden = false;
   const items = list.map((c) => {
     const rt = c.runtime || {};
     const isRunning = connIsRunning(c);
@@ -562,11 +574,15 @@ function setView(view, { force = false } = {}) {
   if (main) {
     main.scrollTop = S.viewScroll[view] || 0;
     if (changed) {
-      // 只在切换页面时播放一次入场动画，播完就摘掉类，避免后续重渲染重放
+      // 只在切换页面时播放一次入场动画，播完就摘掉类，避免后续重渲染重放；快速切页时清掉旧定时器。
+      if (S.enterTimer) clearTimeout(S.enterTimer);
       main.classList.remove('enter');
       void main.offsetWidth;
       main.classList.add('enter');
-      setTimeout(() => main.classList.remove('enter'), 400);
+      S.enterTimer = setTimeout(() => {
+        S.enterTimer = null;
+        main.classList.remove('enter');
+      }, 400);
     }
   }
 }
@@ -621,10 +637,16 @@ function miniLogHtml() {
     : '<div class="log-empty"><span>暂无日志</span></div>';
 }
 
+/* 概览页“最近日志”卡片的最小刷新（150ms 合并节流）：高频日志突发时不反复重建 DOM。 */
 function refreshMiniLog() {
-  const body = document.querySelector('.mini-log .log-body');
-  if (!body) return;
-  body.innerHTML = miniLogHtml();
+  if (S.miniLogTimer) return;
+  S.miniLogTimer = setTimeout(() => {
+    S.miniLogTimer = null;
+    if (S.view !== 'overview') return;
+    const body = document.querySelector('.mini-log .log-body');
+    if (!body) return;
+    body.innerHTML = miniLogHtml();
+  }, 150);
 }
 
 // 把“三层检查失败”落到具体层级，别只丢一句模糊结论。
@@ -1086,6 +1108,27 @@ function sortThTh(key, label, extra = '') {
   return `<th${extra}><button class="sort-th${on ? ' on' : ''}" type="button" data-act="proxy.sort" data-key="${key}" title="点击按${esc(label)}排序${on ? '（再点切换升降序）' : ''}">${esc(label)}<span class="sort-arrow">${arrow}</span></button></th>`;
 }
 
+/* 局部刷新代理表格：搜索框输入时只替换 tbody 与结果条数，不销毁输入框，不打断中文输入法，不丢滚动位置。 */
+function updateProxiesTable() {
+  const state = S.state || {};
+  const all = Array.isArray(state.proxiesAll) && state.proxiesAll.length ? state.proxiesAll : (state.proxies || []);
+  const connFilter = S.proxyConnFilter || '';
+  const scoped = connFilter ? all.filter((p) => p.connectionId === connFilter) : all;
+  const q = S.proxyQuery;
+  const list = scoped.filter((p) => {
+    if (!q) return true;
+    const text = `${p.name} ${p.type} ${p.localPort} ${p.publicAddress} ${p.connectionName || ''}`.toLowerCase();
+    return text.includes(q.toLowerCase());
+  });
+  const tbody = $('#proxy-tbody');
+  const countEl = $('#proxy-result-count');
+  if (countEl) countEl.textContent = `${list.length} 条结果`;
+  if (!tbody) return false;
+  const rows = sortProxies(list).map(proxyRowHtml).join('');
+  tbody.innerHTML = rows || `<tr><td colspan="6"><div class="empty" style="padding:26px"><p>没有匹配「${esc(q)}」的代理</p></div></td></tr>`;
+  return true;
+}
+
 function renderProxies(force = false) {
   const key = proxiesKey();
   const q = S.proxyQuery;
@@ -1132,7 +1175,7 @@ function renderProxies(force = false) {
             ${icon('search')}
             <input id="proxy-search" type="text" placeholder="搜索名称、本地端口或公网地址…" value="${esc(q)}" autocomplete="off" />
           </div>
-          <span class="muted" style="font-size:11px">${esc(list.length)} 条结果</span>
+          <span class="muted" id="proxy-result-count" style="font-size:11px">${esc(list.length)} 条结果</span>
         </div>
         ${proxyConnChips(all, connFilter)}
         ${empty
@@ -1146,7 +1189,7 @@ function renderProxies(force = false) {
               <thead><tr>
                 ${sortThTh('name', '名称 / 类型')}${sortThTh('conn', '服务器')}${sortThTh('local', '本地服务')}${sortThTh('public', '公网地址')}${sortThTh('status', '状态')}<th style="text-align:right">操作</th>
               </tr></thead>
-              <tbody>${rows || `<tr><td colspan="6"><div class="empty" style="padding:26px"><p>没有匹配「${esc(q)}」的代理</p></div></td></tr>`}</tbody>
+              <tbody id="proxy-tbody">${rows || `<tr><td colspan="6"><div class="empty" style="padding:26px"><p>没有匹配「${esc(q)}」的代理</p></div></td></tr>`}</tbody>
             </table>`}
       </section>
     </div>`;
@@ -1155,11 +1198,8 @@ function renderProxies(force = false) {
   if (input) {
     input.addEventListener('input', () => {
       S.proxyQuery = input.value;
-      S.lastKeys.proxies = '';
-      const pos = input.selectionStart;
-      renderProxies(true);
-      const next = $('#proxy-search');
-      if (next) { next.focus(); next.setSelectionRange(pos, pos); }
+      S.lastKeys.proxies = proxiesKey();
+      if (!updateProxiesTable()) renderProxies(true);
     });
   }
 }
@@ -1293,31 +1333,12 @@ function proxyRowHtml(p) {
 
 /* 服务发现搜索框：输入即筛（1.2.221）。列表最多 200 行，重绘足够快；
  * 重绘后把焦点和光标位置还给输入框，否则每敲一个字就丢焦点。 */
-let discoverySearchBound = false;
-function bindDiscoverySearch() {
-  if (discoverySearchBound) return;
-  discoverySearchBound = true;
-  document.addEventListener('input', (ev) => {
-    if (!ev.target || ev.target.id !== 'discovery-q') return;
-    S.discoveryQuery = String(ev.target.value || '');
-    renderDiscovery(true);
-    const input = document.getElementById('discovery-q');
-    if (input) {
-      input.focus();
-      const end = input.value.length;
-      try { input.setSelectionRange(end, end); } catch { /* 某些浏览器对 number 输入不支持 */ }
-    }
-  });
-}
-function renderDiscovery(force = false) {
-  bindDiscoverySearch();
-  if (!force && S.lastKeys.discovery === 'rendered') return;
-  S.lastKeys.discovery = 'rendered';
+/* 局部刷新服务发现表格：搜索时只更新表格容器与结果计数，不销毁输入框，不打断输入法。 */
+function filteredDiscoveryListeners() {
   const listeners = S.listeners || [];
   const scopeFilter = S.discoveryScope || '';
   const riskOnly = !!S.discoveryRiskOnly;
   const byScope = scopeFilter ? listeners.filter((l) => (l.scopes || (l.loopbackOnly ? ['loopback'] : [])).includes(scopeFilter)) : listeners;
-  /* 搜索（1.2.221）：端口 / 监听地址 / 进程名 / PID 都能匹配，叠加在分类之上。 */
   const query = String(S.discoveryQuery || '').trim().toLowerCase();
   const byQuery = !query
     ? byScope
@@ -1327,8 +1348,50 @@ function renderDiscovery(force = false) {
           .toLowerCase()
           .includes(query),
       );
-  /* 「只看高危」叠加在分类与搜索上：先按分类/搜索筛，再按风险筛（1.2.213）。 */
   const visible = riskOnly ? byQuery.filter((l) => l.risk && l.risk.level === 'danger') : byQuery;
+  return { listeners, visible };
+}
+
+function discoveryTableHtml(listeners, visible) {
+  if (S.listenersBusy && !listeners.length) {
+    return `<div class="empty" style="padding:34px 20px"><span class="spinner-sm"></span><p style="margin-top:10px">正在扫描本机端口…</p></div>`;
+  }
+  if (visible.length) {
+    return `<table class="listener-table">
+      <thead><tr><th>端口</th><th>监听地址</th><th>进程</th><th>PID</th><th style="text-align:right">操作</th></tr></thead>
+      <tbody>${visible.slice(0, 200).map(listenerRow).join('')}</tbody>
+    </table>`;
+  }
+  return `<div class="empty" style="padding:30px 20px"><p>${listeners.length ? '这个分类下没有监听端口。' : '还没有扫描结果，点击右上角“扫描本机端口”。'}</p></div>`;
+}
+
+function updateDiscoveryTable() {
+  const wrap = $('#discovery-table-wrap');
+  const countEl = $('#discovery-result-count');
+  if (!wrap) return false;
+  const { listeners, visible } = filteredDiscoveryListeners();
+  if (countEl) countEl.textContent = listeners.length ? `${visible.length} / ${listeners.length} 个 TCP 监听` : '尚未扫描';
+  wrap.innerHTML = discoveryTableHtml(listeners, visible);
+  return true;
+}
+
+let discoverySearchBound = false;
+function bindDiscoverySearch() {
+  if (discoverySearchBound) return;
+  discoverySearchBound = true;
+  document.addEventListener('input', (ev) => {
+    if (!ev.target || ev.target.id !== 'discovery-q') return;
+    S.discoveryQuery = String(ev.target.value || '');
+    if (!updateDiscoveryTable()) renderDiscovery(true);
+  });
+}
+function renderDiscovery(force = false) {
+  bindDiscoverySearch();
+  if (!force && S.lastKeys.discovery === 'rendered') return;
+  S.lastKeys.discovery = 'rendered';
+  const scopeFilter = S.discoveryScope || '';
+  const riskOnly = !!S.discoveryRiskOnly;
+  const { listeners, visible } = filteredDiscoveryListeners();
   const riskyCount = listeners.filter((l) => l.risk && l.risk.level === 'danger').length;
   const scopeCounts = { loopback: 0, all: 0, docker: 0, lan: 0, public: 0, other: 0 };
   listeners.forEach((l) => {
@@ -1354,7 +1417,7 @@ function renderDiscovery(force = false) {
           ${listeners.length
             ? `<input class="input" id="discovery-q" style="max-width:260px" placeholder="搜索端口 / 进程名 / 地址" value="${esc(S.discoveryQuery || '')}" spellcheck="false" />`
             : ''}
-          <span class="muted" style="font-size:11px">${listeners.length ? `${visible.length} / ${listeners.length} 个 TCP 监听` : '尚未扫描'}</span>
+          <span class="muted" id="discovery-result-count" style="font-size:11px">${listeners.length ? `${visible.length} / ${listeners.length} 个 TCP 监听` : '尚未扫描'}</span>
         </div>
         ${listeners.length
           ? `<div class="seg" id="discovery-scope" style="margin:0 16px 12px">
@@ -1363,14 +1426,7 @@ function renderDiscovery(force = false) {
             </div>`
           : ''}
         ${S.listenersError && listeners.length ? `<div class="note warn" style="margin:0 16px 12px">${icon('alert')}<div>有一部分端口的进程名读不出来：${esc(S.listenersError)}</div></div>` : ''}
-        ${S.listenersBusy && !listeners.length
-          ? `<div class="empty" style="padding:34px 20px"><span class="spinner-sm"></span><p style="margin-top:10px">正在扫描本机端口…</p></div>`
-          : visible.length
-            ? `<table class="listener-table">
-                <thead><tr><th>端口</th><th>监听地址</th><th>进程</th><th>PID</th><th style="text-align:right">操作</th></tr></thead>
-                <tbody>${visible.slice(0, 200).map(listenerRow).join('')}</tbody>
-              </table>`
-            : `<div class="empty" style="padding:30px 20px"><p>${listeners.length ? '这个分类下没有监听端口。' : '还没有扫描结果，点击右上角“扫描本机端口”。'}</p></div>`}
+        <div id="discovery-table-wrap">${discoveryTableHtml(listeners, visible)}</div>
       </section>
 
       <div class="note" style="margin-top:14px">
@@ -2632,19 +2688,39 @@ function terminalCardMarkup() {
     </section>`;
 }
 
-/* renderServer 整页 innerHTML 重写后调用：把还活着的终端重新挂回新 DOM。
- * xterm 的 Term.open() 只能对一个容器调一次，所以这里「搬家」——
- * 把旧 .xterm 元素 append 进新容器，canvas 渲染层会跟着走。 */
+/* 给当前活动的 #ssh-term-shell 绑定防抖 ResizeObserver：重绘后先断开旧节点的观察器，防止脱离 DOM 泄漏与失效。 */
+function bindShellResizeObserver() {
+  const st = shellState;
+  if (st.resizeObs) { try { st.resizeObs.disconnect(); } catch { /* ignore */ } st.resizeObs = null; }
+  if (st.resizeTimer) { clearTimeout(st.resizeTimer); st.resizeTimer = null; }
+  const shell = $('#ssh-term-shell');
+  if (!st.open || !st.term || !st.fit || !shell || typeof ResizeObserver !== 'function') return;
+  st.resizeObs = new ResizeObserver(() => {
+    if (st.resizeTimer) clearTimeout(st.resizeTimer);
+    st.resizeTimer = setTimeout(() => {
+      st.resizeTimer = null;
+      if (!shellState.term || !shellState.fit) return;
+      try {
+        shellState.fit.fit();
+        FRP.shellResize(shellState.term.rows, shellState.term.cols);
+      } catch { /* ignore */ }
+    }, 80);
+  });
+  st.resizeObs.observe(shell);
+}
+
+/* renderServer 整页 innerHTML 重写后调用：把还活着的终端重新挂回新 DOM 并重绑尺寸监听。 */
 function remountShellTerm() {
   const st = shellState;
   if (!st.open || !st.term) return;
   const host = $('#ssh-term');
   if (!host) return;
-  if (st.term.element && st.term.element.parentElement === host) return; // 已挂载
-  if (st.term.element) host.appendChild(st.term.element);
-  else st.term.open(host);
+  if (!st.term.element || st.term.element.parentElement !== host) {
+    if (st.term.element) host.appendChild(st.term.element);
+    else st.term.open(host);
+  }
+  bindShellResizeObserver();
   if (st.fit) { try { st.fit.fit(); } catch { /* ignore */ } }
-  st.term.focus();
 }
 
 function disposeShellTerm(notifyClosed) {
@@ -2652,6 +2728,7 @@ function disposeShellTerm(notifyClosed) {
   st.open = false;
   st.opening = false;
   if (st.unSub) { try { st.unSub(); } catch { /* ignore */ } st.unSub = null; }
+  if (st.resizeTimer) { clearTimeout(st.resizeTimer); st.resizeTimer = null; }
   if (st.resizeObs) { try { st.resizeObs.disconnect(); } catch { /* ignore */ } st.resizeObs = null; }
   if (st.term) { try { st.term.dispose(); } catch { /* ignore */ } st.term = null; }
   st.fit = null;
@@ -2857,18 +2934,7 @@ async function openShellTerm() {
 
     st.open = true;
     st.opening = false;
-    // 容器尺寸变化 → fit（本地重排）+ setWindow（远端 PTY 跟着变，vim 才不会错位）。
-    const shell = $('#ssh-term-shell');
-    if (shell && typeof ResizeObserver === 'function') {
-      st.resizeObs = new ResizeObserver(() => {
-        if (!shellState.term || !shellState.fit) return;
-        try {
-          shellState.fit.fit();
-          FRP.shellResize(shellState.term.rows, shellState.term.cols);
-        } catch { /* ignore */ }
-      });
-      st.resizeObs.observe(shell);
-    }
+    // renderServer(true) 会调用 remountShellTerm()，自动把终端与 ResizeObserver 挂到新的 #ssh-term-shell。
     renderServer(true);
     term.focus();
   } catch (e) {
