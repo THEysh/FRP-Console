@@ -5900,6 +5900,90 @@ async function reloadAfterConnectionChange() {
   renderCurrent({ force: true });
 }
 
+/* 统一的零卡顿切换连接入口（1.2.240）：
+ * 侧栏列表（conn.switch）、服务器页左栏/顶部标签（server.conn.switch）、概览「管理」（conn.manage）全部走这一条路：
+ *   1. 立刻取消旧连接在途请求、乐观切换选中态并呈现平滑进度条；
+ *   2. 复用 connectionActive 返回的 state + serverState，不再阻塞跑全量 FRP.refresh()；
+ *   3. 停留在服务器页且目标服务器已存 SSH 密码时，无缝自动连接并加载目标服务器状态。 */
+async function switchActiveConnection(id, { openServerView = false } = {}) {
+  const targetId = String(id || '').trim();
+  const target = connList().find((c) => c.id === targetId);
+  if (!target) return;
+  if (openServerView && S.view !== 'server') {
+    S.viewScroll[S.view] = $('#view') ? $('#view').scrollTop : 0;
+    S.view = 'server';
+    $$('.nav-item').forEach((el) => el.classList.toggle('active', el.dataset.view === 'server'));
+  }
+  if (target.id === activeConnId() && !S.server.switching) {
+    if (openServerView) {
+      updateChrome();
+      renderServer(true);
+      if (!S.server.loaded) loadServerState({ autoConnect: true }).catch(() => {});
+      else if (!S.server.connected && !S.server.connecting && !S.server.autoConnecting) autoConnectActiveProfile().catch(() => {});
+    }
+    return;
+  }
+
+  const mySwitchId = ++S.server.switchReqId;
+  S.server.connectReqId += 1;
+  if (shellState.open || shellState.term) disposeShellTerm(false);
+  S.server.loaded = true;
+  S.server.switching = true;
+  S.server.connecting = false;
+  S.server.autoConnecting = false;
+  S.server.connected = false;
+  S.server.info = null;
+  S.server.summary = null;
+  S.server.configPath = '';
+  S.server.config = '';
+  S.server.nginx = null;
+  S.server.nginxReady = false;
+  S.server.firewall = null;
+  S.server.firewallReady = false;
+  S.server.nginxHealth = null;
+  S.server.selftest = null;
+  S.server.logs = '';
+  S.server.wizard = null;
+  S.server.wizardDirty = false;
+  S.server.connectProgress = {
+    label: `正在切换到「${target.name || target.host || target.id}」…`,
+    percent: 18,
+    host: target.host || '',
+  };
+  S.lastKeys.server = '';
+  if (S.state) S.state.activeConnectionId = target.id;
+  updateChrome();
+  if (S.view === 'server') renderServer(true);
+
+  const res = await FRP.connectionActive(target.id).catch(() => null);
+  if (mySwitchId !== S.server.switchReqId) return;
+  S.server.switching = false;
+  if (!res || !res.ok) {
+    S.server.connectProgress = null;
+    toast('error', '切换失败', (res && res.error) || '请稍后再试');
+    renderCurrent({ force: true });
+    return;
+  }
+  if (res.data && res.data.state) S.state = res.data.state;
+  if (res.data && res.data.serverState) applyServerState(res.data.serverState);
+  updateChrome();
+  if (S.view === 'server') {
+    const nextConn = activeConnectionInfo();
+    const canAuto = !S.server.connected
+      && !!(nextConn && nextConn.host)
+      && !!(S.server.savedCredential || (nextConn && nextConn.hasSecret));
+    if (canAuto) {
+      autoConnectActiveProfile().catch(() => {});
+    } else {
+      S.server.connectProgress = null;
+      renderServer(true);
+    }
+  } else {
+    S.server.connectProgress = null;
+    renderCurrent({ force: true });
+  }
+}
+
 async function handleAction(act, dataset, btn) {
   try {
     switch (act) {
@@ -5940,15 +6024,7 @@ async function handleAction(act, dataset, btn) {
       openConnectionEditor();
       return;
     case 'conn.manage': {
-      const id = (dataset && dataset.id) || '';
-      const target = connList().find((c) => c.id === id);
-      if (!target) return;
-      if (target.id !== activeConnId()) {
-        const res = await FRP.connectionActive(id).catch(() => null);
-        if (!res || !res.ok) { toast('error', '打开服务器失败', (res && res.error) || '请稍后再试'); return; }
-        await reloadAfterConnectionChange();
-      }
-      setView('server');
+      await switchActiveConnection((dataset && dataset.id) || '', { openServerView: true });
       return;
     }
     case 'conn.remove': {
@@ -6015,66 +6091,7 @@ async function handleAction(act, dataset, btn) {
       return;
     }
     case 'conn.switch': {
-      const id = (dataset && dataset.id) || '';
-      const target = connList().find((c) => c.id === id);
-      if (!target) return;
-      if (target.id === activeConnId() && !S.server.switching) return;
-
-      /* 1.2.238：零卡顿切换 —— 立即取消上一台在途连接、乐观切换选中态并呈现平滑进度条，
-       * 直接复用 connectionActive 返回的 state + serverState，不再阻塞跑全量 FRP.refresh()。 */
-      const mySwitchId = ++S.server.switchReqId;
-      S.server.connectReqId += 1;
-      if (shellState.open || shellState.term) disposeShellTerm(false);
-      S.server.switching = true;
-      S.server.connecting = false;
-      S.server.autoConnecting = false;
-      S.server.connected = false;
-      S.server.info = null;
-      S.server.nginx = null;
-      S.server.nginxReady = false;
-      S.server.firewall = null;
-      S.server.firewallReady = false;
-      S.server.nginxHealth = null;
-      S.server.selftest = null;
-      S.server.logs = '';
-      S.server.wizard = null;
-      S.server.wizardDirty = false;
-      S.server.connectProgress = {
-        label: `正在切换到「${target.name || target.host || target.id}」…`,
-        percent: 18,
-        host: target.host || '',
-      };
-      if (S.state) S.state.activeConnectionId = id;
-      updateChrome();
-      if (S.view === 'server') renderServer(true);
-
-      const res = await FRP.connectionActive(id).catch(() => null);
-      if (mySwitchId !== S.server.switchReqId) return;
-      S.server.switching = false;
-      if (!res || !res.ok) {
-        S.server.connectProgress = null;
-        toast('error', '切换失败', (res && res.error) || '请稍后再试');
-        renderCurrent({ force: true });
-        return;
-      }
-      if (res.data && res.data.state) S.state = res.data.state;
-      if (res.data && res.data.serverState) applyServerState(res.data.serverState);
-      updateChrome();
-      if (S.view === 'server') {
-        const nextConn = activeConnectionInfo();
-        const canAuto = !S.server.connected
-          && !!(nextConn && nextConn.host)
-          && !!(S.server.savedCredential || (nextConn && nextConn.hasSecret));
-        if (canAuto) {
-          autoConnectActiveProfile().catch(() => {});
-        } else {
-          S.server.connectProgress = null;
-          renderServer(true);
-        }
-      } else {
-        S.server.connectProgress = null;
-        renderCurrent({ force: true });
-      }
+      await switchActiveConnection((dataset && dataset.id) || '');
       return;
     }
     case 'tunnel.start': {
@@ -6258,24 +6275,7 @@ async function handleAction(act, dataset, btn) {
         await saveServerProfileModal(btn);
         break;
       case 'server.conn.switch': {
-        const id = dataset.conn || '';
-        const cur = (S.state && S.state.activeConnectionId) || '';
-        if (!id || id === cur) break;
-        const list = connList();
-        const target = list.find((c) => c.id === id);
-        const res = await FRP.connectionActive(id).catch(() => null);
-        if (!res || !res.ok) { toast('error', '切换失败', (res && res.error) || '请稍后再试'); break; }
-        const dropped = res.data && res.data.sshDropped;
-        if (dropped) {
-          toast('info', '已断开上一台的 SSH', 'SSH 之前连着 ' + dropped + '，切换连接时已经断开，正在查看「' + (target ? target.name : id) + '」。');
-        }
-        /* 先刷全量状态：chips 高亮读的是 S.state.activeConnectionId，只拉 serverState 不会更新它。 */
-        await reloadAfterConnectionChange();
-        /* 换了当前连接，SSH 会话与服务器快照都属于上一台的，先清干净再读。 */
-        S.server = { ...S.server, connected: false, info: null, summary: null, configPath: '', config: '', nginx: null, firewall: null, selftest: null, nginxHealth: null };
-        S.lastKeys.server = '';
-        await loadServerState();
-        renderServer(true);
+        await switchActiveConnection((dataset && dataset.conn) || '');
         break;
       }
       case 'server.connect':
