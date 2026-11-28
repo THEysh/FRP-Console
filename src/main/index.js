@@ -184,27 +184,31 @@ let serverConfigStamp = '';
 
 const knownHosts = new KnownHosts(path.join(settingsModule.dataDir(), 'known-hosts.json'));
 
-function hostKeyGuard(key) {
-  const host = serverSession.host;
-  const port = serverSession.port || 22;
-  const verdict = knownHosts.check(host, port, key);
-  if (verdict.status === 'new') {
-    knownHosts.trust(host, port, verdict.fingerprint);
-    console.log(`[ssh] 首次连接 ${verdict.target}，记录主机指纹 ${verdict.fingerprint}`);
-    /* 首次信任说白了是「这次先信你」：给一条可见的通知，用户才知道有这么一层，
-     * 也知道真出事时该去哪儿对比（设置页「已知服务器指纹」）。 */
-    notify(
-      'info',
-      `首次连接 ${verdict.target}`,
-      `已记下它的主机指纹 ${String(verdict.fingerprint).slice(0, 24)}…，之后每次连接都会比对；对不上会拒绝并让你确认。`,
-    );
+/* 按目标 host:port 生成主机密钥校验器：绝不读取全局 serverSession.host，
+ * 避免后台临时 SSH（证书汇总扫描 / 多机实时日志）错把目标机器的公钥拿去跟当前服务器页的主机指纹比对。 */
+function makeHostKeyGuard(targetHost, targetPort = 22) {
+  return (key, meta) => {
+    const host = String((meta && meta.host) || targetHost || serverSession.host || '').trim();
+    const port = Number((meta && meta.port) || targetPort || serverSession.port) || 22;
+    const verdict = knownHosts.check(host, port, key);
+    if (verdict.status === 'new') {
+      knownHosts.trust(host, port, verdict.fingerprint);
+      console.log(`[ssh] 首次连接 ${verdict.target}，记录主机指纹 ${verdict.fingerprint}`);
+      /* 首次信任说白了是「这次先信你」：给一条可见的通知，用户才知道有这么一层，
+       * 也知道真出事时该去哪儿对比（设置页「已知服务器指纹」）。 */
+      notify(
+        'info',
+        `首次连接 ${verdict.target}`,
+        `已记下它的主机指纹 ${String(verdict.fingerprint).slice(0, 24)}…，之后每次连接都会比对；对不上会拒绝并让你确认。`,
+      );
+      return { ...verdict, ok: true };
+    }
+    if (verdict.status === 'changed') {
+      console.warn(`[ssh] ${verdict.target} 主机指纹变了：${verdict.previous} → ${verdict.fingerprint}`);
+      return { ...verdict, ok: false };
+    }
     return { ...verdict, ok: true };
-  }
-  if (verdict.status === 'changed') {
-    console.warn(`[ssh] ${verdict.target} 主机指纹变了：${verdict.previous} → ${verdict.fingerprint}`);
-    return { ...verdict, ok: false };
-  }
-  return { ...verdict, ok: true };
+  };
 }
 let serverConfig = { path: '', content: '', summary: null, error: '' };
 let sessionServerId = '';
@@ -4682,8 +4686,14 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '', exclud
         send('server:session-changed', { connected: false });
       }
     }
+    /* 1.2.238：切换连接时同步 activeServerId（命中同 host:port 档案），让 serverState() 立即对齐新连接，
+     * 不再残留上一台服务器的 savedCredential / saved 地址。 */
+    const matchedProfile = conn.host
+      ? findServerProfileByKey({ host: conn.host, port: Number(conn.port) || 22 })
+      : null;
     settings = settingsModule.save({
       activeConnectionId: conn.id,
+      activeServerId: matchedProfile ? matchedProfile.id : (conn.serverId || ''),
       configPath: conn.configPath,
       adminPort: Number(conn.adminPort) || settings.adminPort,
       logPath: conn.logPath || settingsModule.logPathFromConfig(connectionModel(conn), conn.configPath) || '',
@@ -4696,10 +4706,13 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '', exclud
     setActiveManager(conn.id);
     updateLogFile();
     send('logs:reset', { lines: activeFollower().recent(300) });
-    if (manager) await manager.refresh().catch(() => {});
+    /* 不阻塞切换响应：异步刷新新 manager 状态，界面 0 等待先完成切换。 */
+    if (manager) manager.refresh().then(() => pushState()).catch(() => {});
+    const nextState = buildState();
+    const nextServerState = serverState();
     pushState();
     refreshTray();
-    return ok({ changed: true, sshDropped: droppedHost, connections: connectionList(), state: buildState() });
+    return ok({ changed: true, sshDropped: droppedHost, connections: connectionList(), state: nextState, serverState: nextServerState });
   });
   ipcMain.handle('listen:scan', async () => {
     const result = await netport.listListeners();
@@ -4776,25 +4789,26 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '', exclud
     const configResult = await serverSession.readConfig();
     if (epoch !== sessionEpoch) return { ok: false, stale: true };
     /* 读不到文件时不要把旧指纹留着：留着的话，「文件被删了」在指纹比对里永远显示成「没变化」，
-     * 界面会一直停在删除前那份摘要上（真机 rm /etc/frp/frps.toml 复现过）。 */
-    const stampNow = await serverSession.fileStamp(serverSession.configPath || configResult.path);
+     * 界面会一直停在删除前那份摘要上（真机 rm /etc/frp/frps.toml 复现过）。
+     * fileStamp 与 verifyConfigFile 并发执行，省掉一次海外 SSH RTT 往返。 */
+    const parsed = configResult.ok ? frpsConfig.parseConfig(configResult.content) : null;
+    const [stampNow, verified] = await Promise.all([
+      serverSession.fileStamp(serverSession.configPath || configResult.path).catch(() => ''),
+      configResult.ok && parsed && parsed.ok
+        ? serverSession.verifyConfigFile(configResult.path).catch(() => ({ ok: true, skipped: true }))
+        : Promise.resolve({ ok: true, skipped: true }),
+    ]);
+    if (epoch !== sessionEpoch) return { ok: false, stale: true };
     serverConfigStamp = stampNow || (configResult.ok ? serverConfigStamp : '');
     if (configResult.ok) {
-      const parsed = frpsConfig.parseConfig(configResult.content);
       serverConfig = {
         path: configResult.path,
         content: configResult.content,
         summary: parsed.ok ? frpsConfig.summary(parsed.data) : null,
         error: parsed.ok ? '' : `配置解析失败：${parsed.error}`,
       };
-      /* 文件能读出来不等于 frps 认它：服务器上被人手改过（塞错字段、写坏引号）时，
-       * 现在是「读进来、界面上看着一切正常」，可一旦重启 frps 就起不来。
-       * 用服务器自己的 frps verify 过一遍，不通过就把错误摊在配置卡上。 */
-      if (parsed.ok) {
-        const verified = await serverSession.verifyConfigFile(configResult.path).catch(() => ({ ok: true, skipped: true }));
-        if (!verified.ok) {
-          serverConfig.error = `服务器上的 frps.toml 校验没通过：${verified.message}（现在跑着的还是旧配置，但重启 frps 或重启机器后会起不来）`;
-        }
+      if (parsed.ok && !verified.ok) {
+        serverConfig.error = `服务器上的 frps.toml 校验没通过：${verified.message}（现在跑着的还是旧配置，但重启 frps 或重启机器后会起不来）`;
       }
     } else {
       serverConfig = { path: serverSession.configPath || '', content: '', summary: null, error: configResult.error || '' };
@@ -4858,8 +4872,11 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '', exclud
   }
 
   function serverState() {
-    const active = activeServerProfile();
+    const connNow = connectionById(settings && settings.activeConnectionId);
+    const active = (connNow && connNow.host ? findServerProfileByKey({ host: connNow.host, port: Number(connNow.port) || 22 }) : null) || activeServerProfile();
     const profiles = serverProfiles().map(serverProfileView);
+    const hasConnSecret = !!(connNow && settingsModule.hasConnectionSecret(connNow.id));
+    const hasProfileSecret = !!(active && settingsModule.hasServerSecret(active.id));
     return {
       connected: serverSession.connected,
       host: serverSession.host,
@@ -4870,8 +4887,10 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '', exclud
       config: serverConfig.content,
       summary: serverConfig.summary,
       configError: serverConfig.error,
-      saved: active ? { host: active.host, port: active.port, username: active.username } : {},
-      savedCredential: active ? settingsModule.hasServerSecret(active.id) : false,
+      saved: connNow && connNow.host
+        ? { host: connNow.host, port: Number(connNow.port) || 22, username: connNow.username || 'root' }
+        : (active ? { host: active.host, port: active.port, username: active.username } : {}),
+      savedCredential: hasConnSecret || hasProfileSecret,
       profiles,
       activeServerId: settings.activeServerId || '',
       clientServerId: settings.clientServerId || '',
@@ -5225,10 +5244,15 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '', exclud
       );
     }
 
-    // 会话即将变更：让所有在途的读请求结果失效，防止旧档案的数据回写到新页面。
+    // 会话即将变更：先断开可能残留的上一台 SSH 会话，并让所有在途读请求结果失效，防止旧数据回写。
     bumpSessionEpoch();
     const myEpoch = sessionEpoch;
-    const result = await serverSession.connect({ host, port, username, password, onHostKey: hostKeyGuard });
+    const emitConnectProgress = (step, label, percent) => {
+      if (sessionEpoch !== myEpoch) return;
+      send('server:connect-progress', { host, port, step, label, percent });
+    };
+    emitConnectProgress('ssh', `正在建立 SSH 连接（${host}:${port}）…`, 22);
+    const result = await serverSession.connect({ host, port, username, password, onHostKey: makeHostKeyGuard(host, port) });
     // SSH 连接期间用户可能删掉了这个档案 / 切到了别的档案：此时必须放弃这次连接，
     // 不能继续 upsert（会偷偷重建一个档案），更不能去读配置回写页面。
     if (sessionEpoch !== myEpoch) {
@@ -5267,6 +5291,7 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '', exclud
       settingsModule.clearServerSecret(profile.id);
       if (connNow) settingsModule.clearConnectionSecret(connNow.id);
     }
+    emitConnectProgress('inspect', 'SSH 已连通，正在识别系统与 frps 运行状态…', 56);
     const inspected = await serverSession.inspect();
     if (sessionEpoch !== myEpoch) {
       serverSession.disconnect();
@@ -5277,6 +5302,7 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '', exclud
     sessionServerId = profile.id;
     profile.lastConnectedAt = Date.now();
     settings = settingsModule.save({ servers: serverProfiles().map((item) => (item.id === profile.id ? profile : item)), activeServerId: profile.id });
+    emitConnectProgress('config', '正在读取并校验服务器 frps.toml 配置…', 82);
     const snap = await loadServerSnapshot({ epoch: myEpoch });
     if (snap && snap.stale) {
       serverSession.disconnect();
@@ -5284,6 +5310,7 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '', exclud
       serverConfig = { path: '', content: '', summary: null, error: '' };
       return fail('连接期间服务器档案已变更，本次连接已取消', { stale: true, state: serverState() });
     }
+    emitConnectProgress('done', '状态读取完成', 100);
     send('server:session-changed', { connected: true, host: serverSession.host || host });
     /* 续期多半发生在「没连服务器」的时候，连上来的第一时间把落后的证书补部署。
      * 不阻塞这次连接的结果：部署失败只发通知，界面照常可用。 */
@@ -6202,7 +6229,7 @@ function crossConnectionPortClash(proxy, { excludeName = '', connId = '', exclud
     }
 
     const tmp = new ServerSession();
-    const res = await tmp.connect({ host, port, username, password: secret, onHostKey: hostKeyGuard });
+    const res = await tmp.connect({ host, port, username, password: secret, onHostKey: makeHostKeyGuard(host, port) });
     if (!res.ok) {
       if (res.needsTrustHost) {
         return fail(res.error, { needsTrustHost: res.needsTrustHost, connectionId: conn.id, host, port });
@@ -7148,7 +7175,7 @@ async function syncNginxProxyStateInBackground() {
       port: profile.port || 22,
       username: profile.username,
       password: secret,
-      onHostKey: hostKeyGuard,
+      onHostKey: makeHostKeyGuard(profile.host, Number(profile.port) || 22),
     });
     if (!conn.ok) return;
     try {

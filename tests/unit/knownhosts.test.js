@@ -79,3 +79,14 @@ test('打开文件时忽略格式不对的条目（手工改坏也不会误信�
   const kh = new KnownHosts(file);
   assert.deepStrictEqual(kh.list(), [{ target: 'a:22', host: 'a', port: 22, fingerprint: 'SHA256:good' }]);
 });
+
+test('多台服务器指纹彼此隔离：校验主机 B 时绝不受已信任的主机 A 影响', () => {
+  const kh = new KnownHosts(tempFile());
+  kh.trust('10.0.0.1', 22, fingerprintOf(keyA));
+  const checkB = kh.check('10.0.0.2', 22, keyB);
+  assert.strictEqual(checkB.status, 'new');
+  kh.trust('10.0.0.2', 22, checkB.fingerprint);
+  assert.strictEqual(kh.check('10.0.0.1', 22, keyA).status, 'known');
+  assert.strictEqual(kh.check('10.0.0.2', 22, keyB).status, 'known');
+  assert.strictEqual(kh.check('10.0.0.2', 22, keyA).status, 'changed');
+});

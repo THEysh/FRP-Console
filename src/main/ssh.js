@@ -315,6 +315,7 @@ class ServerSession {
       this.host = host;
       this.port = port;
       this.username = username;
+      this._hostKeyVerdict = null;
 
       client.on('ready', () => {
         if (gen !== this._connGen) return; // 旧连接的迟到事件，忽略
@@ -361,7 +362,7 @@ class ServerSession {
             if (typeof onHostKey !== 'function') return true;
             let verdict = null;
             try {
-              verdict = onHostKey(key);
+              verdict = onHostKey(key, { host, port });
             } catch {
               return true; /* 校验器自身出错不该把用户锁在门外 */
             }

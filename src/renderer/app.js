@@ -52,7 +52,11 @@ const S = {
     // 请求序号：异步返回时序号已变，说明用户在等待期间切了档案，结果直接丢弃。
     seq: 0,
     switching: false,
+    connecting: false,
     autoConnecting: false,
+    connectReqId: 0,
+    switchReqId: 0,
+    connectProgress: null,
     sessionServerId: '',
     client: null,
     info: null,
@@ -3652,59 +3656,57 @@ async function saveServerProfileModal(btn) {
   });
 }
 
-/* 档案里已经存了密码，就没必要每次再点一次「连接并读取状态」：
- * 选中档案、或第一次打开服务器页时，直接用保存的密码连上去。 */
+/* 档案或当前连接已存 SSH 密码时，自动连接并读取状态（带实时进度条，不被后台事件打断）。 */
 async function autoConnectActiveProfile() {
+  const connNow = activeConnectionInfo();
   const active = activeServerProfile();
-  if (!active) return;
-  if (S.server.connected && S.server.sessionServerId === active.id) return;
-  if (!S.server.savedCredential) {
-    // 刚启动那一下，主进程可能还没把档案里的密码读出来（savedCredential 是快照），
-    // 这时候如果直接放弃，界面就会一直停在「未连接」，用户只能切一次档案才好。
-    // 档案里明明有密码就再拉一次状态重试一次；真的没存密码才走表单。
-    const p = (S.server.profiles || []).find((x) => x.id === active.id);
-    if (!p || !p.hasPassword) return;
-    if (!S.server.credRetry) {
-      S.server.credRetry = true;
-      setTimeout(() => {
-        S.server.credRetry = false;
-        loadServerState({ autoConnect: true }).catch(() => {});
-      }, 900);
-    }
+  const targetHost = String((connNow && connNow.host) || (active && active.host) || '').trim();
+  const targetPort = Number((connNow && connNow.port) || (active && active.port)) || 22;
+  const targetUser = String((connNow && connNow.username) || (active && active.username) || 'root').trim() || 'root';
+  const targetName = (connNow && connNow.name) || (active && active.name) || targetHost || '服务器';
+  if (!targetHost) return;
+  if (S.server.connected && String(S.server.host || '').toLowerCase() === targetHost.toLowerCase() && Number(S.server.port || 22) === targetPort) {
     return;
   }
-  if (S.server.autoConnecting) return;
+  const hasSaved = !!(S.server.savedCredential || (connNow && connNow.hasSecret) || (active && active.hasPassword));
+  if (!hasSaved) return;
+  if (S.server.autoConnecting || S.server.connecting) return;
+
+  const myConnectId = ++S.server.connectReqId;
   S.server.autoConnecting = true;
-  renderServer(true);
-  const seq = serverSeq();
+  S.server.connectProgress = { label: `正在连接 ${targetHost}:${targetPort}…`, percent: 15, host: targetHost };
+  if (S.view === 'server') renderServer(true);
+
   try {
     let res = null;
     for (let attempt = 0; attempt < 2; attempt += 1) {
+      if (myConnectId !== S.server.connectReqId) return;
       res = await FRP.serverConnect({
-        host: active.host,
-        port: Number(active.port) || 22,
-        username: active.username || 'root',
+        host: targetHost,
+        port: targetPort,
+        username: targetUser,
         password: '',
         remember: true,
-        serverId: active.id,
-      });
+        serverId: (active && active.id) || '',
+        connectionId: (connNow && connNow.id) || activeConnId() || '',
+      }).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+      if (myConnectId !== S.server.connectReqId) return;
       if (res && res.ok) break;
-      // 需要人工介入（密码失效 / 地址与档案不一致 / 主机指纹变化）的错误重试也没意义
-      if (res && (res.needsPassword || res.needsDecision || res.needsTrustHost)) break;
-      // 开机那几秒 SSH 偶尔会失败一次（网络栈还没起来 / sshd 还在加载），等 1.5 秒再来一遍
-      if (attempt === 0) await new Promise((r) => setTimeout(r, 1500));
+      // 需要人工介入或已切换服务器的错误直接停，绝不无意义重试卡住界面
+      if (res && (res.needsPassword || res.needsDecision || res.needsTrustHost || res.stale)) break;
+      if (attempt === 0) {
+        updateServerConnectProgress({ host: targetHost, label: '首次连接超时，正在重试…', percent: 20 });
+        await new Promise((r) => setTimeout(r, 900));
+      }
     }
-    if (serverSeqStale(seq)) {
-      /* 连接其实已经成功，但状态序号被别的刷新抢走了（连接过程中主进程会发
-       * server:binding-changed，前端会顺带 refresh 一次），那次刷新的快照可能是在
-       * 连接完成之前取的。直接 return 会让界面停在「无法连接」，后端却已经连上。
-       * 所以这里补一次状态同步，让界面追上真实状态。 */
-      if (res && res.ok) await loadServerState().catch(() => {});
-      return;
-    }
+    if (myConnectId !== S.server.connectReqId) return;
     if (!res || !res.ok) {
+      if (res && res.stale) return;
       if (res && res.needsTrustHost) {
         const info = res.needsTrustHost;
+        S.server.autoConnecting = false;
+        S.server.connectProgress = null;
+        if (S.view === 'server') renderServer(true);
         askTrustHost(info, async () => {
           const trusted = await FRP.serverTrustHost({ host: info.host, port: info.port, fingerprint: info.fingerprint });
           if (!trusted || !trusted.ok) { toastResult(trusted); return; }
@@ -3713,8 +3715,7 @@ async function autoConnectActiveProfile() {
         });
         return;
       }
-      // 保存的密码失效（服务器改过密码）时退回表单，让用户补一次。
-      if (res && res.needsPassword) toast('info', '需要手动输入密码', `「${active.name}」保存的密码已不可用`);
+      if (res && res.needsPassword) toast('info', '需要手动输入密码', `「${targetName}」保存的密码已不可用`);
       else toastResult(res);
       return;
     }
@@ -3724,7 +3725,7 @@ async function autoConnectActiveProfile() {
     S.server.frpcRaw = '';
     S.server.logs = '';
     S.server.logsError = '';
-    applyServerState(res.data, seq);
+    applyServerState(res.data);
     S.server.nginx = null;      // 旧服务器的 nginx 状态不残留，连接后重新检测
     S.server.nginxReady = false;
     S.server.selftest = null;   // 旧服务器的就绪检查结果不残留
@@ -3734,16 +3735,21 @@ async function autoConnectActiveProfile() {
     S.server.firewallReady = false;
     if (S.certs && S.certs.server) S.certs.server.loaded = false; // 连上新服务器后下次进证书页自动补扫（60 秒内已扫机器仍走缓存）
   } catch (e) {
-    toast('error', '自动连接失败', String((e && e.message) || e));
+    if (myConnectId === S.server.connectReqId) {
+      toast('error', '自动连接失败', String((e && e.message) || e));
+    }
   } finally {
-    S.server.autoConnecting = false;
-    renderServer(true);
-    if (S.server.connected) {
-      loadServerLogs().catch(() => {});
-      loadServerNginx(true).catch(() => {});
-    loadServerNginxHealth({ force: false }).catch(() => {});
-      loadServerFirewall(true).catch(() => {});
-      openShellTerm().catch(() => {});   // SSH 终端默认打开
+    if (myConnectId === S.server.connectReqId) {
+      S.server.autoConnecting = false;
+      S.server.connectProgress = null;
+      if (S.view === 'server') renderServer(true);
+      if (S.server.connected) {
+        loadServerLogs().catch(() => {});
+        loadServerNginx(true).catch(() => {});
+        loadServerNginxHealth({ force: false }).catch(() => {});
+        loadServerFirewall(true).catch(() => {});
+        openShellTerm().catch(() => {});   // SSH 终端默认打开
+      }
     }
   }
 }
@@ -4047,6 +4053,47 @@ function sessionMismatchMarkup(connNow, s) {
   ].join('');
 }
 
+/* 实时更新服务器切换 / 连接进度条（就地改 DOM，不触发整页闪烁）。 */
+function updateServerConnectProgress(payload) {
+  if (!payload) return;
+  const pct = Math.max(0, Math.min(100, Number(payload.percent) || 0));
+  const label = String(payload.label || '正在连接…');
+  S.server.connectProgress = { ...(S.server.connectProgress || {}), ...payload, percent: pct, label };
+  const fill = $('#srv-connect-bar-fill');
+  const text = $('#srv-connect-bar-label');
+  const pctEl = $('#srv-connect-bar-pct');
+  if (fill) fill.style.width = `${pct}%`;
+  if (text) text.textContent = label;
+  if (pctEl) pctEl.textContent = `${Math.round(pct)}%`;
+}
+
+function connectingProgressCardMarkup(connNow, s, defaultHost, defaultUser, defaultPort) {
+  const prog = s.connectProgress || {};
+  const pct = Math.max(8, Math.min(100, Number(prog.percent) || (s.switching ? 18 : 25)));
+  const label = prog.label || (s.switching ? '正在切换服务器视图…' : '正在建立 SSH 连接并读取状态…');
+  const name = (connNow && (connNow.name || connNow.host)) || defaultHost || '服务器';
+  const hostMeta = defaultHost ? `${defaultUser}@${defaultHost}:${defaultPort}` : '正在准备连接参数…';
+  return `
+    <section class="card" id="srv-connect-progress-card">
+      <div class="card-head">
+        <div class="ch-icon"><span class="spinner-sm"></span></div>
+        <div class="grow">
+          <h3>${s.switching ? `正在切换到「${esc(name)}」` : `正在连接「${esc(name)}」`}</h3>
+          <p class="mono" style="margin:2px 0 0">${esc(hostMeta)}</p>
+        </div>
+        <button class="btn small ghost" type="button" data-act="server.connect.cancel">${icon('x')}<span>取消</span></button>
+      </div>
+      <div style="padding:4px 16px 14px">
+        <div class="cert-progress-track"><div class="cert-progress-fill" id="srv-connect-bar-fill" style="width:${pct}%"></div></div>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px;gap:8px">
+          <span class="cert-progress-label" id="srv-connect-bar-label">${esc(label)}</span>
+          <span class="cert-progress-pct" id="srv-connect-bar-pct" style="margin:0">${Math.round(pct)}%</span>
+        </div>
+        <div class="field-hint" style="margin-top:8px">切换或连接服务器不会影响任何正在运行的隧道；可直接点左侧列表切到其它服务器。</div>
+      </div>
+    </section>`;
+}
+
 function connectedFormMarkup() {
   const s = S.server;
   const saved = s.saved || {};
@@ -4056,6 +4103,8 @@ function connectedFormMarkup() {
   const defaultHost = (connNow && connNow.host) || (active && active.host) || saved.host || (state.config && state.config.serverAddr) || '';
   const defaultUser = (connNow && connNow.username) || (active && active.username) || saved.username || 'root';
   const defaultPort = (connNow && connNow.port) || (active && active.port) || saved.port || 22;
+  const busyNow = !!(s.switching || s.connecting || s.autoConnecting);
+  const hasSavedCred = !!(s.savedCredential || (connNow && connNow.hasSecret));
   return `
     <div class="view">
       <div class="page-head">
@@ -4073,6 +4122,7 @@ function connectedFormMarkup() {
         ${serverListMarkup()}
         <div class="server-main">
       ${connCardMarkup()}
+      ${busyNow ? connectingProgressCardMarkup(connNow, s, defaultHost, defaultUser, defaultPort) : `
       <section class="card">
         <div class="card-head">
           <div class="ch-icon">${icon('server')}</div>
@@ -4084,7 +4134,7 @@ function connectedFormMarkup() {
             <input class="input" name="host" value="${esc(defaultHost)}" placeholder="例如 frps.example.com" spellcheck="false">
             <div class="field-hint" id="cf-host-note">${connNow && connNow.host
               ? '这条连接现在指向 <b class="mono">' + esc(connNow.host) + '</b>：填别的地址就会把这条连接改成那台机器（原来保存的密码会被清掉，需要重新输入一次）。'
-              : '连过的机器会记住地址与密码（密码用 Windows DPAPI 加密保存），下次直接点「连接并获取状态」即可。'}</div>
+              : '连过的机器会记住地址与密码（密码用 Windows DPAPI 加密保存），下次直接点「连接并读取状态」即可。'}</div>
           </div>
           <div class="field">
             <label>SSH 端口</label>
@@ -4095,24 +4145,21 @@ function connectedFormMarkup() {
             <input class="input" name="username" value="${esc(defaultUser)}" placeholder="root" spellcheck="false">
           </div>
           <div class="field span-2">
-            <label>密码 ${s.savedCredential ? '<span class="field-hint">已保存，留空可直接连接</span>' : '<span class="req">*</span>'}</label>
+            <label>密码 ${hasSavedCred ? '<span class="field-hint">已保存，留空可直接连接</span>' : '<span class="req">*</span>'}</label>
             <div class="input-group">
-              <input class="input" id="server-password" name="password" type="password" placeholder="${s.savedCredential ? '使用已保存的密码' : 'SSH 登录密码'}" autocomplete="new-password">
+              <input class="input" id="server-password" name="password" type="password" placeholder="${hasSavedCred ? '使用已保存的密码' : 'SSH 登录密码'}" autocomplete="new-password">
               <button class="icon-btn" type="button" data-act="server.eye" title="显示 / 隐藏密码">${icon('eye')}</button>
             </div>
           </div>
           <div class="field span-2">
-            <label class="check-line"><input type="checkbox" name="remember" ${s.savedCredential ? 'checked' : ''}> 记住密码（使用 Windows DPAPI 加密保存在本机）</label>
+            <label class="check-line"><input type="checkbox" name="remember" ${hasSavedCred ? 'checked' : ''}> 记住密码（使用 Windows DPAPI 加密保存在本机）</label>
           </div>
         </form>
         <div class="card-actions">
-          ${s.autoConnecting
-            ? `<button class="btn primary" type="button" disabled><span class="spinner-sm"></span><span>正在自动连接…</span></button>
-               <span class="field-hint">使用档案里保存的密码，无需再次输入。</span>`
-            : `<button class="btn primary" type="button" data-act="server.connect">${icon('link')}<span>连接并读取状态</span></button>
-               <span class="field-hint">${s.savedCredential ? '已保存密码：切换档案会自动连接并读取状态。' : '密码不会写入 frpc 配置或日志。'}</span>`}
+          <button class="btn primary" type="button" data-act="server.connect">${icon('link')}<span>连接并读取状态</span></button>
+          <span class="field-hint">${hasSavedCred ? '已保存密码：留空直接点连接，切换服务器时也会自动连接。' : '密码不会写入 frpc 配置或日志。'}</span>
         </div>
-      </section>
+      </section>`}
       <div class="note">${icon('shield')}<div>连接后按顺序走：检查 frps 是否在跑 → 需要时一键从零初始化 → 保存配置并重启 → 做一次「服务器就绪检查」。都绿了再去代理映射添加隧道。</div></div>
         </div>
       </div>
@@ -4147,30 +4194,41 @@ async function askTrustHost(info, onTrust) {
 
 async function connectServer(btn, options = undefined) {
   const form = $('#server-form');
-  if (!form) return;
-  const host = form.querySelector('[name="host"]').value.trim();
-  const port = Number(form.querySelector('[name="port"]').value);
-  const username = form.querySelector('[name="username"]').value.trim();
-  const password = form.querySelector('[name="password"]').value;
-  const remember = form.querySelector('[name="remember"]').checked;
+  const connNow = activeConnectionInfo();
+  const host = String((form && form.querySelector('[name="host"]') ? form.querySelector('[name="host"]').value : '') || (connNow && connNow.host) || (S.server.saved && S.server.saved.host) || '').trim();
+  const port = Number((form && form.querySelector('[name="port"]') ? form.querySelector('[name="port"]').value : 0) || (connNow && connNow.port) || (S.server.saved && S.server.saved.port) || 22);
+  const username = String((form && form.querySelector('[name="username"]') ? form.querySelector('[name="username"]').value : '') || (connNow && connNow.username) || (S.server.saved && S.server.saved.username) || 'root').trim();
+  const password = form && form.querySelector('[name="password"]') ? form.querySelector('[name="password"]').value : '';
+  const remember = form && form.querySelector('[name="remember"]') ? form.querySelector('[name="remember"]').checked : true;
+  const hasSavedCred = !!(S.server.savedCredential || (connNow && connNow.hasSecret));
   if (!host) return toast('error', '请输入服务器 IP 或域名');
   if (!username) return toast('error', '请输入 SSH 用户名');
   if (!Number.isInteger(port) || port < 1 || port > 65535) return toast('error', 'SSH 端口无效');
-  if (!password && !S.server.savedCredential) return toast('error', '请输入密码');
+  if (!password && !hasSavedCred) return toast('error', '请输入密码');
 
-  /* 1.2.227：地址由「这条连接」决定，不再传档案 id —— 传了反而会拿旧档案的地址去比对。 */
+  /* 1.2.238：使用独立 connectReqId，不再被后台 session-changed / state:update 推高 seq 吞掉回包；
+   * 立即显示实时进度条，并在连接前清掉残留的自动连接态。 */
   const payload = { host, port, username, password, remember, connectionId: (S.state && S.state.activeConnectionId) || '' };
+  const myConnectId = ++S.server.connectReqId;
+  S.server.connecting = true;
+  S.server.autoConnecting = false;
+  S.server.connectProgress = { label: `正在连接 ${host}:${port}…`, percent: 15, host };
+  if (S.view === 'server') renderServer(true);
 
-  await withBusy(btn, async () => {
-    const seq = serverSeq();
-    const res = await FRP.serverConnect(payload);
-    if (serverSeqStale(seq)) return;
+  try {
+    const res = await FRP.serverConnect(payload).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+    if (myConnectId !== S.server.connectReqId) return;
     if (!res || !res.ok) {
+      if (res && res.stale) return;
+      S.server.connecting = false;
+      S.server.connectProgress = null;
+      if (S.view === 'server') renderServer(true);
       if (res && res.needsTrustHost) {
         const info = res.needsTrustHost;
         askTrustHost(info, async () => {
           const trusted = await FRP.serverTrustHost({ host: info.host, port: info.port, fingerprint: info.fingerprint });
           if (!trusted || !trusted.ok) { toastResult(trusted); return; }
+          toast('success', '已信任新指纹', `${info.host}:${info.port || 22}`);
           connectServer(null, { adoptProfile: false }).catch((error) =>
             toast('error', '连接失败', String((error && error.message) || error)),
           );
@@ -4186,6 +4244,7 @@ async function connectServer(btn, options = undefined) {
           input.placeholder = changedAddr ? '地址变了，请重新输入这台机器的密码' : '请输入 SSH 密码';
         }
         if (res.error) toast('warn', changedAddr ? '地址变了，密码需要重新输入' : '请输入密码', res.error);
+        return;
       }
       toastResult(res);
       return;
@@ -4195,7 +4254,7 @@ async function connectServer(btn, options = undefined) {
     S.server.mode = 'frps';
     S.server.frpcRaw = '';
     S.server.logs = '';
-    applyServerState(res.data, seq);
+    applyServerState(res.data);
     S.server.nginx = null;      // 旧服务器的 nginx 状态不残留，连接后重新检测
     S.server.nginxReady = false;
     S.server.selftest = null;   // 旧服务器的就绪检查结果不残留
@@ -4204,6 +4263,8 @@ async function connectServer(btn, options = undefined) {
     S.server.firewall = null;   // 旧服务器的防火墙状态不残留
     S.server.firewallReady = false;
     if (S.certs && S.certs.server) S.certs.server.loaded = false; // 连上新服务器后下次进证书页自动补扫（60 秒内已扫机器仍走缓存）
+    S.server.connecting = false;
+    S.server.connectProgress = null;
     renderServer(true);
     openShellTerm().catch(() => {});   // SSH 终端默认打开
     if (res.data && res.data.adoptProfile) {
@@ -4211,11 +4272,17 @@ async function connectServer(btn, options = undefined) {
     } else {
       toast('success', '已连接服务器', `${username}@${host}:${port}`);
     }
-    await loadServerLogs();
+    loadServerLogs().catch(() => {});
     loadServerNginx(true).catch(() => {});
     loadServerNginxHealth({ force: false }).catch(() => {});
     loadServerFirewall(true).catch(() => {});
-  });
+  } finally {
+    if (myConnectId === S.server.connectReqId) {
+      S.server.connecting = false;
+      S.server.connectProgress = null;
+      if (S.view === 'server' && !S.server.connected) renderServer(true);
+    }
+  }
 }
 
 function setServerMode(mode) {
@@ -5885,10 +5952,63 @@ async function handleAction(act, dataset, btn) {
       const id = (dataset && dataset.id) || '';
       const target = connList().find((c) => c.id === id);
       if (!target) return;
-      if (target.id === activeConnId()) return;
+      if (target.id === activeConnId() && !S.server.switching) return;
+
+      /* 1.2.238：零卡顿切换 —— 立即取消上一台在途连接、乐观切换选中态并呈现平滑进度条，
+       * 直接复用 connectionActive 返回的 state + serverState，不再阻塞跑全量 FRP.refresh()。 */
+      const mySwitchId = ++S.server.switchReqId;
+      S.server.connectReqId += 1;
+      if (shellState.open || shellState.term) disposeShellTerm(false);
+      S.server.switching = true;
+      S.server.connecting = false;
+      S.server.autoConnecting = false;
+      S.server.connected = false;
+      S.server.info = null;
+      S.server.nginx = null;
+      S.server.nginxReady = false;
+      S.server.firewall = null;
+      S.server.firewallReady = false;
+      S.server.nginxHealth = null;
+      S.server.selftest = null;
+      S.server.logs = '';
+      S.server.wizard = null;
+      S.server.wizardDirty = false;
+      S.server.connectProgress = {
+        label: `正在切换到「${target.name || target.host || target.id}」…`,
+        percent: 18,
+        host: target.host || '',
+      };
+      if (S.state) S.state.activeConnectionId = id;
+      updateChrome();
+      if (S.view === 'server') renderServer(true);
+
       const res = await FRP.connectionActive(id).catch(() => null);
-      if (!res || !res.ok) { toast('error', '切换失败', (res && res.error) || '请稍后再试'); return; }
-      await reloadAfterConnectionChange();
+      if (mySwitchId !== S.server.switchReqId) return;
+      S.server.switching = false;
+      if (!res || !res.ok) {
+        S.server.connectProgress = null;
+        toast('error', '切换失败', (res && res.error) || '请稍后再试');
+        renderCurrent({ force: true });
+        return;
+      }
+      if (res.data && res.data.state) S.state = res.data.state;
+      if (res.data && res.data.serverState) applyServerState(res.data.serverState);
+      updateChrome();
+      if (S.view === 'server') {
+        const nextConn = activeConnectionInfo();
+        const canAuto = !S.server.connected
+          && !!(nextConn && nextConn.host)
+          && !!(S.server.savedCredential || (nextConn && nextConn.hasSecret));
+        if (canAuto) {
+          autoConnectActiveProfile().catch(() => {});
+        } else {
+          S.server.connectProgress = null;
+          renderServer(true);
+        }
+      } else {
+        S.server.connectProgress = null;
+        renderCurrent({ force: true });
+      }
       return;
     }
     case 'tunnel.start': {
@@ -6094,6 +6214,17 @@ async function handleAction(act, dataset, btn) {
       }
       case 'server.connect':
         await connectServer(btn);
+        break;
+      case 'server.connect.cancel':
+        S.server.connectReqId += 1;
+        S.server.switchReqId += 1;
+        S.server.connecting = false;
+        S.server.autoConnecting = false;
+        S.server.switching = false;
+        S.server.connectProgress = null;
+        FRP.serverDisconnect().catch(() => {});
+        renderServer(true);
+        toast('info', '已取消连接');
         break;
       case 'server.disconnect':
         await disconnectServer();
@@ -8385,14 +8516,16 @@ async function boot() {
       if (S.server.syncTick % 3 === 0) syncServerSession().catch(() => {});
     });
 
-    /* 主进程连上/断开 SSH 后主动推一条：走 IPC、自动连接、托盘进来的会话，
-     * 不用等「会话同步」节拍（最多 9 秒）也不会停在连接表单上。 */
+    /* 主进程连上/断开 SSH 后主动推一条：正在主动切换或连接时跳过，避免竞态覆盖连接状态。 */
     FRP.on('server:session-changed', () => {
+      if (S.server.connecting || S.server.autoConnecting || S.server.switching) return;
       loadServerState().catch(() => {});
     });
     FRP.on('server:binding-changed', () => {
+      if (S.server.connecting || S.server.autoConnecting || S.server.switching) return;
       if (S.server.loaded) loadServerState().catch(() => {});
     });
+    FRP.on('server:connect-progress', (payload) => updateServerConnectProgress(payload));
 
     FRP.on('server:install-progress', (payload) => updateBootstrapProgress(payload));
     FRP.on('server:switch-progress', (payload) => {
