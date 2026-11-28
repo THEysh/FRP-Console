@@ -28,6 +28,9 @@ let beforeInstall = async () => {};
  * 否则一次“检查失败”的 error 也会让界面放行下载，downloadUpdate() 拿不到
  * updateInfo 只会抛更难懂的错误。 */
 let availableVersion = '';
+/* 防止下载进度条在分片/差量更新并发回报时出现瞬间回退；当差量回退到全量下载导致 total 明显变大时重置。 */
+let downloadHighPercent = 0;
+let downloadLastTotal = 0;
 
 let status = {
   state: 'idle',
@@ -130,10 +133,14 @@ function init({ onStatus: statusCallback, beforeInstall: hook } = {}) {
   };
 
   autoUpdater.on('checking-for-update', () => {
+    downloadHighPercent = 0;
+    downloadLastTotal = 0;
     emit({ state: 'checking', message: '正在检查更新…', percent: 0 });
   });
   autoUpdater.on('update-available', (info) => {
     availableVersion = (info && info.version) || '';
+    downloadHighPercent = 0;
+    downloadLastTotal = 0;
     emit({
       state: 'available',
       supported: true,
@@ -156,17 +163,28 @@ function init({ onStatus: statusCallback, beforeInstall: hook } = {}) {
     });
   });
   autoUpdater.on('download-progress', (p) => {
-    const percent = Math.max(0, Math.min(100, Math.round((p && p.percent) || 0)));
+    const rawPercent = Math.max(0, Math.min(100, Math.round((p && p.percent) || 0)));
+    const total = (p && p.total) || 0;
+    let switchedToFull = false;
+    // 差量更新失败回退到全量安装包时 total 会突然增大，此时允许进度重新从新包比例起步并明确提示
+    if (downloadLastTotal > 0 && total > downloadLastTotal * 1.25) {
+      downloadHighPercent = 0;
+      switchedToFull = true;
+    }
+    if (total > 0) downloadLastTotal = total;
+    const percent = Math.max(downloadHighPercent, rawPercent);
+    downloadHighPercent = percent;
     emit({
       state: 'downloading',
       percent,
       transferred: (p && p.transferred) || 0,
-      total: (p && p.total) || 0,
+      total,
       bytesPerSecond: (p && p.bytesPerSecond) || 0,
-      message: `正在下载 ${percent}%（${humanSize(p && p.transferred)} / ${humanSize(p && p.total)}）`,
+      message: `${switchedToFull ? '已切换完整包下载' : '正在下载'} ${percent}%（${humanSize(p && p.transferred)} / ${humanSize(total)}）`,
     });
   });
   autoUpdater.on('update-downloaded', (info) => {
+    downloadHighPercent = 100;
     emit({
       state: 'ready',
       version: (info && info.version) || status.version,
@@ -175,6 +193,8 @@ function init({ onStatus: statusCallback, beforeInstall: hook } = {}) {
     });
   });
   autoUpdater.on('error', (e) => {
+    downloadHighPercent = 0;
+    downloadLastTotal = 0;
     emit({ state: 'error', message: explain(e) });
   });
 

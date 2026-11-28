@@ -45,7 +45,7 @@
 
 | 安装包 | 说明 |
 | --- | --- |
-| `FRP-Console-Setup-<版本>-x64.exe` | **NSIS 安装版（推荐）**：安装至 `%LOCALAPPDATA%\Programs\frp-console`，自动创建快捷方式，支持应用内差分自动更新 |
+| `FRP-Console-Setup-<版本>-x64.exe` | **NSIS 安装版（推荐）**：向导式安装（支持自定义目录，默认 `%LOCALAPPDATA%\Programs\FRP-Console`），自动创建快捷方式，支持应用内静默自动更新 |
 | `FRP-Console-<版本>.exe` | **单文件便携版**：双击即用，数据保存在 exe 同级 `frp-console-data\` 目录（升级时手动替换 exe） |
 
 - **开箱即用**：安装包已内置 `frpc.exe`（frp `0.61.0`），首次启动自动初始化数据目录，无需单独下载 `frpc`。

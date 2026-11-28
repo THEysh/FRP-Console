@@ -1,7 +1,7 @@
 {
   "name": "frp-console",
   "productName": "FRP控制台",
-  "version": "1.2.240",
+  "version": "1.2.241",
   "description": "FRP 内网穿透图形控制台：代理管理、本机端口扫描、frps 远程管理、热重载与实时日志",
   "main": "src/main/index.js",
   "author": "杨盛晖",
@@ -105,10 +105,15 @@
       "artifactName": "FRP-Console-Setup-${version}-${arch}.${ext}"
     },
     "nsis": {
-      "oneClick": true,
+      "oneClick": false,
       "perMachine": false,
       "allowElevation": false,
-      "runAfterFinish": false,
+      "allowToChangeInstallationDirectory": true,
+      "runAfterFinish": true,
+      "language": "2052",
+      "installerLanguages": [
+        "zh_CN"
+      ],
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
       "shortcutName": "FRP 控制台",
